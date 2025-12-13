@@ -91,7 +91,7 @@ This creates a **deliberate friction point** that forces reconsideration of dest
 - The real value is the second perspective, not the model difference
 - Optional strict mode where human must approve if same-model
 
-#### 5. What Counts as "Dangerous"?
+#### 4. What Counts as "Dangerous"?
 
 **Missing**: Clear definition of which commands need review.
 
@@ -602,6 +602,43 @@ CREATE TABLE execution_outcomes (
 
   created_at TEXT NOT NULL
 );
+
+-- Pattern management (agents can ADD, only humans can REMOVE)
+CREATE TABLE pattern_changes (
+  id TEXT PRIMARY KEY,
+  change_type TEXT NOT NULL,        -- 'add', 'remove_request', 'remove_approved', 'suggest'
+  tier TEXT NOT NULL,               -- 'critical', 'dangerous', 'caution', 'safe'
+  pattern TEXT NOT NULL,
+  reason TEXT NOT NULL,             -- Why add/remove this pattern
+
+  -- Who made the change
+  agent_session_id TEXT REFERENCES sessions(id),
+  agent_name TEXT,
+
+  -- For removal requests
+  status TEXT,                      -- 'pending', 'approved', 'rejected' (for remove_request)
+  reviewed_by TEXT,                 -- Human who approved/rejected
+  reviewed_at TEXT,
+
+  created_at TEXT NOT NULL,
+
+  INDEX idx_pattern_changes_status (status),
+  INDEX idx_pattern_changes_type (change_type)
+);
+
+-- Track which patterns are agent-added vs built-in
+CREATE TABLE custom_patterns (
+  id TEXT PRIMARY KEY,
+  tier TEXT NOT NULL,
+  pattern TEXT NOT NULL,
+  reason TEXT,
+  source TEXT NOT NULL,             -- 'builtin', 'agent', 'human', 'suggested'
+  added_by TEXT,                    -- Agent name or 'human'
+  added_at TEXT NOT NULL,
+  removed_at TEXT,                  -- NULL if still active
+
+  UNIQUE(tier, pattern)
+);
 ```
 
 ### Go Types
@@ -790,6 +827,10 @@ slb init [--force]
   Adds .slb to .gitignore
   Generates project config.toml
 
+# Version info
+slb version [--json]
+  Shows version, build info, config paths
+
 # Daemon management
 slb daemon start [--foreground]
 slb daemon stop
@@ -799,11 +840,19 @@ slb daemon logs [--follow] [--lines N]
 # Session management (for agents)
 slb session start --agent <name> --program <prog> --model <model>
   Returns: session ID and key
+  Alias: -a for --agent, -p for --program, -m for --model
 
 slb session end [--session-id <id>]
-slb session list [--project <path>]
+  Alias: -s for --session-id (used globally for all commands)
+
+slb session list [--project <path>] [--json]
 slb session heartbeat --session-id <id>
 ```
+
+**Global flag aliases** (apply to all commands):
+- `-s` → `--session-id`
+- `-j` → `--json`
+- `-p` → `--project`
 
 ### Request Commands
 
@@ -909,10 +958,31 @@ slb config set <key> <value>
 slb config edit             # Opens in $EDITOR
 
 # Pattern management
-slb patterns list
-slb patterns add --tier <tier> "<pattern>"
-slb patterns remove "<pattern>"
+slb patterns list [--tier <tier>] [-j]
 slb patterns test "<command>"    # Shows which tier it matches
+  Alias: slb check "<command>"   # Shorter version for agents
+  --exit-code                    # Return non-zero if approval needed (for hooks)
+
+# Adding patterns (agents CAN do this freely)
+slb patterns add --tier <tier> "<pattern>" [--reason "why this is dangerous"]
+  Agents can add patterns to protect against mistakes they've seen
+  Added patterns are logged with agent name and reason
+  Example: slb patterns add --tier critical "^kubectl drain" --reason "Can evict all pods"
+
+# Removing patterns (requires human approval!)
+slb patterns remove "<pattern>"
+  BLOCKED for agents - prints message to use TUI or get human approval
+  Returns exit code 1 with JSON: {"error": "pattern_removal_requires_human", "use": "slb tui"}
+
+slb patterns request-removal "<pattern>" --reason "why this should be safe"
+  Agents can REQUEST removal, creates a pending removal request
+  Human reviews in TUI and approves/rejects
+  Removal requests shown in TUI dashboard alongside command requests
+
+# Pattern suggestions (for agents to propose new patterns)
+slb patterns suggest --tier <tier> "<pattern>" --reason "..."
+  Like add, but marks as "suggested" for human review
+  Human can promote to permanent or dismiss
 ```
 
 ### Watch Mode (for reviewing agents)
@@ -933,33 +1003,71 @@ slb tui
 slb dashboard                 # Alias
 ```
 
-### Base Command: Agent Quickstart
+### Base Command: Quick Reference Card
 
-The entire CLI is designed for agent (robot) usage. Running `slb` with no arguments prints a non-interactive quickstart reminder:
+The entire CLI is designed for agent (robot) usage. Running `slb` with no arguments prints a colorful quick reference card using lipgloss styling:
 
-```bash
-$ slb
-
-SLB - Simultaneous Launch Button
-================================
-Two-agent approval system for dangerous commands.
-
-QUICKSTART (run these in order):
-  1. slb session start --agent <name> --program claude-code --model opus-4.5
-  2. slb patterns test "<command>"              # Check if approval needed
-  3. slb request "<command>" --reason "..." --expected-effect "..." --goal "..." --safety "..."
-  4. slb status <request-id> --wait             # Wait for approval
-  5. slb execute <request-id>                   # Run approved command
-
-AS REVIEWER:
-  slb pending                                   # See pending requests
-  slb review <id>                               # View request details
-  slb approve <id> --session-id <sid>           # Approve with signature
-  slb reject <id> --session-id <sid> --reason   # Reject with reason
-
-All commands support --json for structured output.
-Run 'slb <command> --help' for detailed usage.
+```go
+// internal/cli/root.go - when no subcommand provided
+func printQuickRef() {
+    // Colors (Catppuccin Mocha)
+    title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cba6f7")) // Mauve
+    section := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89b4fa")) // Blue
+    cmd := lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1")) // Green
+    flag := lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af")) // Yellow
+    comment := lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086")) // Overlay0
+    tier := map[string]lipgloss.Style{
+        "critical":  lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#f38ba8")), // Red
+        "dangerous": lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#fab387")), // Peach
+        "caution":   lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#f9e2af")), // Yellow
+    }
+    // ... render card with box drawing
+}
 ```
+
+**Output** (rendered with colors):
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  ⚡ SLB — Simultaneous Launch Button                           v1.0.0  │
+│     Two-agent approval for dangerous commands                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  START SESSION (once per agent):                                        │
+│    slb session start -a <Name> -p claude-code -m opus-4.5 -j           │
+│    → Save session_id from JSON output                                   │
+│                                                                         │
+│  BEFORE DANGEROUS COMMANDS:                                             │
+│    slb check "rm -rf ./build"                    # Need approval?       │
+│    slb request "..." -s $SID \                                          │
+│        --reason "..." --expected-effect "..."                           │
+│        --goal "..." --safety "..."                                      │
+│    slb status $REQ --wait -j                     # Block til decision   │
+│    slb execute $REQ -j                           # Run if approved      │
+│                                                                         │
+│  AS REVIEWER (check periodically!):                                     │
+│    slb pending -j                                # List pending         │
+│    slb review <id> -j                            # Full details         │
+│    slb approve <id> -s $SID                      # Sign off             │
+│    slb reject <id> -s $SID --reason "..."        # Block it             │
+│                                                                         │
+│  ADD NEW DANGEROUS PATTERNS (agents can do this!):                      │
+│    slb patterns add --tier critical "^kubectl drain" --reason "..."     │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│  TIERS: 🔴 CRITICAL (2 approvals)  🟠 DANGEROUS (1)  🟡 CAUTION (auto)  │
+│  FLAGS: -s/--session-id   -j/--json   -p/--project                      │
+│  HUMAN: slb tui                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation notes**:
+- Box drawing uses lipgloss borders with rounded corners
+- Title uses gradient text effect (mauve → blue)
+- Commands are syntax-highlighted (green for commands, yellow for flags)
+- Tier badges are colored: 🔴 red, 🟠 orange, 🟡 yellow
+- Responsive: adjusts to terminal width (min 72 cols, max 100)
+- Falls back to ASCII on terminals without Unicode support
 
 **Design Philosophy**:
 - Every command is CLI-first, non-interactive
@@ -1188,7 +1296,8 @@ auto_git_commit = true
 # Patterns are regex (case-insensitive by default)
 
 [patterns.critical]
-# These ALWAYS require 2+ approvals
+# These ALWAYS require 2+ approvals from OTHER agents (not the requestor)
+# So for CRITICAL: requestor + 2 reviewers = minimum 3 agents involved
 min_approvals = 2
 patterns = [
   "^rm\\s+-rf\\s+/(?!tmp)",           # rm -rf / (but not /tmp)
@@ -1196,6 +1305,8 @@ patterns = [
   "DROP\\s+DATABASE",                 # SQL DROP DATABASE
   "DROP\\s+SCHEMA",
   "TRUNCATE\\s+TABLE",
+  "DELETE\\s+FROM\\s+\\w+\\s*;",      # DELETE without WHERE (deletes ALL rows!)
+  "DELETE\\s+FROM(?!.*WHERE)",        # DELETE without WHERE clause
   "^terraform\\s+destroy(?!.*-target)", # terraform destroy (without -target)
   "^kubectl\\s+delete\\s+(node|namespace|pv|pvc)",
   "^helm\\s+uninstall.*--all",
@@ -1231,13 +1342,12 @@ patterns = [
 min_approvals = 0
 auto_approve_delay_seconds = 30
 patterns = [
-  "^rm\\s+",                          # Any rm (without -r)
+  "^rm\\s+[^-]",                       # rm without flags (single files)
   "^git\\s+stash\\s+drop",
   "^git\\s+branch\\s+-[dD]",
   "^npm\\s+uninstall",
   "^pip\\s+uninstall",
   "^cargo\\s+remove",
-  "DELETE\\s+FROM(?!.*WHERE)",        # DELETE without WHERE (wait, this is MORE dangerous)
 ]
 
 [patterns.safe]
@@ -1314,17 +1424,19 @@ Generate a `.claude/hooks.json` that intercepts dangerous commands:
 {
   "hooks": {
     "pre_bash": {
-      "command": "slb check-command",
+      "command": "slb patterns test --exit-code",
       "input": {
         "command": "${COMMAND}"
       },
       "on_block": {
-        "message": "This command requires slb approval. Use: slb request \"${COMMAND}\" --reason \"...\""
+        "message": "This command requires slb approval. Use: slb request \"${COMMAND}\" --reason \"...\" --expected-effect \"...\" --goal \"...\" --safety \"...\""
       }
     }
   }
 }
 ```
+
+The `--exit-code` flag makes `slb patterns test` return non-zero if approval is needed, triggering the hook's `on_block`.
 
 Generate with:
 ```bash
@@ -1350,34 +1462,43 @@ Never run dangerous commands directly.
 
 ### Agent Mail Integration
 
-When a request is created:
+When a request is created, slb sends a notification via Agent Mail:
 
-```typescript
-await agentMail.sendMessage({
-  project_key: projectPath,
-  sender_name: agentName,
-  to: ['SLB-Broadcast'],  // Virtual broadcast address
-  subject: `[SLB] ${riskTier.toUpperCase()}: ${command.slice(0, 50)}...`,
-  body_md: `
-## Command Approval Request
+```go
+// internal/integrations/agentmail.go
+func (am *AgentMailClient) NotifyNewRequest(req *db.Request) error {
+    importance := "normal"
+    if req.RiskTier == db.RiskCritical {
+        importance = "urgent"
+    }
 
-**ID**: ${requestId}
-**Risk**: ${riskTier}
-**Command**: \`${command}\`
+    return am.SendMessage(agentmail.Message{
+        ProjectKey: req.ProjectPath,
+        SenderName: "SLB-System",
+        To:         []string{"SLB-Broadcast"}, // Virtual broadcast
+        Subject:    fmt.Sprintf("[SLB] %s: %s", strings.ToUpper(string(req.RiskTier)), truncate(req.Command, 50)),
+        BodyMD: fmt.Sprintf(`## Command Approval Request
+
+**ID**: %s
+**Risk**: %s
+**Command**: ` + "`%s`" + `
 
 ### Justification
-${justification.reason}
+%s
 
 ### Expected Effect
-${justification.expectedEffect}
+%s
 
 ---
-To review: \`slb review ${requestId}\`
-To approve: \`slb approve ${requestId} --session-id <your-session>\`
-  `,
-  importance: riskTier === 'critical' ? 'urgent' : 'normal',
-  thread_id: 'SLB-Reviews',
-});
+To review: ` + "`slb review %s`" + `
+To approve: ` + "`slb approve %s --session-id <your-session>`",
+            req.ID, req.RiskTier, req.Command,
+            req.Justification.Reason, req.Justification.ExpectedEffect,
+            req.ID, req.ID),
+        Importance: importance,
+        ThreadID:   "SLB-Reviews",
+    })
+}
 ```
 
 ---
@@ -1510,11 +1631,12 @@ done
 
 **Scenario**: Single agent working alone, needs dangerous command.
 
-**Solutions** (configurable):
-1. Timeout → escalate to human (desktop notification)
-2. Self-approve after longer delay (5 min) with extra logging
-3. Queue until another agent comes online
-4. Require human `slb emergency-approve`
+**Solution**: This is by design. slb requires multiple agents for peer review. If you're working solo:
+1. Request times out → escalates to human (desktop notification)
+2. Human uses `slb tui` to approve/reject
+3. Or human uses `slb emergency-execute` with full logging
+
+**No self-approval**: The whole point is peer review. If you're alone, get a human.
 
 ### Edge Case 2: Agent Approves Own Request
 
@@ -1586,8 +1708,10 @@ done
 - [ ] SQLite schema and basic queries
 - [ ] File-based pending queue
 - [ ] JSON output mode for all commands
+- [ ] Unit tests for pattern matching
+- [ ] Unit tests for state machine transitions
 
-**Deliverable**: Can manually test request→approve→execute cycle.
+**Deliverable**: Can manually test request→approve→execute cycle. Core logic has test coverage.
 
 ### Phase 2: Daemon & Watching (Days 2-3)
 
@@ -1639,8 +1763,10 @@ done
 - [ ] Cursor rules generator
 - [ ] Emergency override
 - [ ] Analytics/learning mode
-- [ ] Documentation
-- [ ] Cross-platform testing
+- [ ] Documentation (README, --help text)
+- [ ] Integration tests (full request→approve→execute flow)
+- [ ] Cross-platform testing (Linux, macOS, Windows)
+- [ ] GoReleaser config for binary distribution
 
 **Deliverable**: Ready for AGENTS.md deployment.
 
@@ -1659,49 +1785,55 @@ Add this section to AGENTS.md:
 
 When multiple agents work in parallel, one agent's mistake can destroy another's work or critical infrastructure. A second opinion catches errors before they become irreversible.
 
+### Forgotten How to Use slb?
+
+Just run `slb` with no arguments - it prints a quickstart guide.
+
 ### Quick Start
 
 ```bash
 # 1. Start your session (do this once when you begin)
-slb session start --agent "<YourAgentName>" --program "claude-code" --model "opus-4.5"
-# Save the session-id from output
+SESSION=$(slb session start --agent "<YourAgentName>" --program "claude-code" --model "opus-4.5" --json)
+SESSION_ID=$(echo "$SESSION" | jq -r '.session_id')
 
 # 2. Check if a command needs approval
-slb patterns test "rm -rf ./build"
-# Output: DANGEROUS - requires 1 approval
+slb patterns test "rm -rf ./build" --json
+# {"needs_approval": true, "tier": "dangerous", "min_approvals": 1}
 
 # 3. Request approval for dangerous commands
-slb request "rm -rf ./build" \
-  --session-id "<your-session-id>" \
+REQUEST=$(slb request "rm -rf ./build" \
+  --session-id "$SESSION_ID" \
   --reason "Removing stale build artifacts" \
   --expected-effect "Deletes ./build directory" \
   --goal "Free up disk space before rebuild" \
-  --safety "Build dir is regenerated, no source code affected"
+  --safety "Build dir is regenerated, no source code affected" \
+  --json)
+REQUEST_ID=$(echo "$REQUEST" | jq -r '.request_id')
 
-# 4. Wait for approval
-slb status <request-id> --wait
+# 4. Wait for approval (blocks until approved/rejected/timeout)
+slb status "$REQUEST_ID" --wait --json
 
 # 5. Execute when approved
-slb execute <request-id>
+slb execute "$REQUEST_ID" --json
 
 # 6. End session when done
-slb session end --session-id "<your-session-id>"
+slb session end --session-id "$SESSION_ID"
 ```
 
 ### As a Reviewer
 
 Check for pending requests periodically:
 ```bash
-slb pending
-slb review <request-id>
-slb approve <request-id> --session-id "<your-session-id>" --reason-response "Verified safe"
+slb pending --json
+slb review <request-id> --json
+slb approve <request-id> --session-id "$SESSION_ID" --reason-response "Verified safe"
 # OR
-slb reject <request-id> --session-id "<your-session-id>" --reason "Path contains source code"
+slb reject <request-id> --session-id "$SESSION_ID" --reason "Path contains source code"
 ```
 
-Or run in watch mode:
+Or run in watch mode (will prompt for each pending request):
 ```bash
-slb watch --session-id "<your-session-id>"
+slb watch --session-id "$SESSION_ID"
 ```
 
 ### Risk Tiers
@@ -1711,6 +1843,13 @@ slb watch --session-id "<your-session-id>"
 | CRITICAL | 2+ approvals | `DROP DATABASE`, `terraform destroy`, `kubectl delete node` |
 | DANGEROUS | 1 approval | `rm -rf`, `git reset --hard`, `kubectl delete deployment` |
 | CAUTION | Auto-approved (30s) | `rm *.log`, `git stash drop` |
+
+### All Commands Support --json
+
+Every slb command outputs structured JSON with `--json`. Parse with jq:
+```bash
+slb pending --json | jq '.[] | select(.risk_tier == "critical")'
+```
 
 ### What to Include in Requests
 
@@ -1731,11 +1870,22 @@ Be specific. "Cleaning up" is not enough. "Removing ./build directory (500MB of 
 
 When in doubt, reject and ask for clarification.
 
+### Adding New Dangerous Patterns
+
+If you encounter a command that SHOULD require approval but doesn't, ADD IT:
+
+```bash
+slb patterns add --tier dangerous "^helm upgrade.*--force" \
+  --reason "Force upgrades can cause downtime"
+```
+
+You can freely ADD patterns (making things safer). You CANNOT remove patterns - that requires human approval via `slb patterns request-removal`.
+
 ### Never Bypass slb
 
 Do NOT run dangerous commands directly. Even if you're confident. The point is peer review, not just approval.
 
-If no other agents are available and the command is urgent, escalate to human via TUI or use `slb emergency-execute` with detailed justification.
+Human operators can use `slb tui` for a visual dashboard, or `slb emergency-execute` for urgent overrides with full logging.
 ```
 
 ---
@@ -1881,25 +2031,25 @@ go install github.com/Dicklesworthstone/slb/cmd/slb@latest
 brew install dicklesworthstone/tap/slb
 ```
 
-### Shell Integration
+### Shell Completions
 
 After installing, add to your shell rc file:
 
 ```bash
 # zsh (~/.zshrc)
-eval "$(slb init zsh)"
+eval "$(slb completion zsh)"
 
 # bash (~/.bashrc)
-eval "$(slb init bash)"
+eval "$(slb completion bash)"
 
 # fish (~/.config/fish/config.fish)
-slb init fish | source
+slb completion fish | source
 ```
 
-Shell integration provides:
-- Tab completions for all commands
-- Aliases for common operations
-- Session-aware prompt indicators (optional)
+Shell completions provide:
+- Tab completions for all commands and flags
+- Request ID completion from pending list
+- Session ID completion from active sessions
 
 ---
 
@@ -1929,12 +2079,53 @@ prompt = "Check slb pending and review any dangerous command requests"
 key = "slb_status"
 label = "SLB: Check Status"
 category = "Safety"
-prompt = "Run slb --robot-status to see all pending approvals"
+prompt = "Run 'slb pending --json' to see all pending approvals and 'slb sessions --json' to see active agents"
 ```
 
 ---
 
-*Document version: 1.1*
+## Appendix: Quick Reference Card
+
+This is what `slb` (no args) prints. Copy the text version to AGENTS.md if needed:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  ⚡ SLB QUICK REFERENCE - Dangerous Command Approval                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│  START SESSION (once):                                                  │
+│    slb session start -a MyName -p claude-code -m opus-4.5 -j            │
+│                                                                         │
+│  BEFORE DANGEROUS COMMAND:                                              │
+│    slb check "rm -rf ./build"              # Is approval needed?        │
+│    slb request "rm -rf ./build" -s $SID \                               │
+│      --reason "..." --expected-effect "..." --goal "..." --safety "..." │
+│    slb status $REQ_ID --wait -j            # Wait for approval          │
+│    slb execute $REQ_ID -j                  # Run when approved          │
+│                                                                         │
+│  AS REVIEWER:                                                           │
+│    slb pending -j                          # Check for pending          │
+│    slb review $ID -j                       # Read details               │
+│    slb approve $ID -s $SID                 # Approve                    │
+│    slb reject $ID -s $SID --reason "..."   # Reject                     │
+│                                                                         │
+│  ADD DANGEROUS PATTERNS (you can do this!):                             │
+│    slb patterns add --tier critical "^pattern" --reason "..."           │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│  TIERS: 🔴 CRITICAL (2)  🟠 DANGEROUS (1)  🟡 CAUTION (auto-30s)        │
+│  FLAGS: -s/--session-id  -j/--json   FORGOT? Just run: slb              │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+*Document version: 1.4*
 *Created: 2025-12-13*
-*Updated: 2025-12-13 (Go + Charmbracelet stack)*
+*Updated: 2025-12-13*
+*Changes:*
+- *v1.0: Initial comprehensive plan*
+- *v1.1: Updated to Go + Charmbracelet stack (matching NTM)*
+- *v1.2: Removed robot mode (CLI is agent-first by design), base `slb` shows quickstart, added huh/lo/go-pretty/conc libraries*
+- *v1.3: Fixed DELETE without WHERE (now CRITICAL), fixed section numbering, replaced TypeScript with Go in examples, simplified Edge Case 1 (no self-approval), added `slb check` alias, added `-s/-j/-p` short flags, added `slb version`, added tests to implementation phases, fixed `slb completion` (was `slb init`)*
+- *v1.4: Added pattern management (agents can ADD but not REMOVE patterns), `slb patterns add/remove/request-removal/suggest`, pattern_changes and custom_patterns tables, base `slb` now shows colorful quick reference card with lipgloss styling*
 *Status: Ready for review*
