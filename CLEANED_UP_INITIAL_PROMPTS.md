@@ -3726,4 +3726,989 @@ ________________________
 
 Suggestions from GPT 5.2 Pro with Extending Thinking in Web App:
 
+Below is how I approached this review (so you can sanity-check my assumptions), then a set of **separable, git-diff–style patches** to your `PLAN_TO_MAKE_SLB.md`, each followed by a **detailed rationale**.
 
+Assumptions I’m optimizing for:
+
+* **Primary failure mode is accidental, not adversarial** (agents hallucinate/tunnel-vision; humans fat-finger; “malicious agent” is out of scope).
+* **Ergonomics matter more than purity**: agents should have *one obvious happy path*; humans should have *one obvious dashboard*.
+* **Reliability > cleverness**: avoid designs where correctness depends on “regex matches what you meant” or “SQLite uniqueness works like you think.”
+* **Cross-platform is real**: if the plan says Windows support, command parsing + execution semantics must be explicit.
+
+---
+
+## Change 1 — Make JSON a stable contract (snake_case everywhere) + fix inconsistent examples
+
+````diff
+diff --git a/PLAN_TO_MAKE_SLB.md b/PLAN_TO_MAKE_SLB.md
+--- a/PLAN_TO_MAKE_SLB.md
++++ b/PLAN_TO_MAKE_SLB.md
+@@ -1,6 +1,6 @@
+ # PLAN_TO_MAKE_SLB.md
+ 
+-## Simultaneous Launch Button (slb) — Multi-Agent Command Authorization System
++## Simultaneous Launch Button (slb) — Multi-Agent Command Authorization System
+ 
+ ---
+ 
+@@ -503,12 +503,30 @@ slb session heartbeat --session-id <id>
+ **Global flag aliases** (apply to all commands):
+ - `-s` → `--session-id`
+ - `-j` → `--json`
+-- `-p` → `--project`
++- `-p` → `--project`
++
++### JSON Output Contract (Stable)
++
++The CLI is agent-first, so `--json` output should be treated as a **stable API contract**:
++
++- **All JSON keys are `snake_case`** (no mixed `camelCase`).
++- **Timestamps are RFC3339 UTC** (e.g., `2025-12-13T14:32:05Z`).
++- Human-friendly formatting goes to **stderr**, machine JSON goes to **stdout**.
++- Commands that return “lists” return a **JSON array**.
++- Commands that “stream” (e.g., watch) output **NDJSON** (one JSON object per line) under `--json`.
+ 
+@@ -835,7 +853,7 @@ SESSION_JSON=$(slb session start \
+ --program "claude-code" \
+ --model "opus-4.5" \
+ --json)
+ 
+-SESSION_ID=$(echo "$SESSION_JSON" | jq -r '.sessionId')
++SESSION_ID=$(echo "$SESSION_JSON" | jq -r '.session_id')
+ 
+ # 2. When dangerous command needed, check pattern first
+ PATTERN_CHECK=$(slb patterns test "rm -rf ./build" --json)
+-NEEDS_APPROVAL=$(echo "$PATTERN_CHECK" | jq -r '.needsApproval')
++NEEDS_APPROVAL=$(echo "$PATTERN_CHECK" | jq -r '.needs_approval')
+ 
+ if [ "$NEEDS_APPROVAL" = "true" ]; then
+ # 3. Submit request
+@@ -847,7 +865,7 @@ if [ "$NEEDS_APPROVAL" = "true" ]; then
+ --goal "Free up disk space before next build" \
+ --safety "Build directory is regenerated on next build, no source code" \
+ --json)
+ 
+- REQUEST_ID=$(echo "$REQUEST_JSON" | jq -r '.requestId')
++ REQUEST_ID=$(echo "$REQUEST_JSON" | jq -r '.request_id')
+ 
+ # 4. Wait for approval (with timeout)
+ STATUS_JSON=$(slb status "$REQUEST_ID" --wait --timeout 300 --json)
+@@ -1078,29 +1096,29 @@ type Request struct {
+ 
+ ## Appendix: Example Request JSON
+ 
+ ```json
+ {
+ "id": "req-a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+- "projectPath": "/data/projects/myapp",
++ "project_path": "/data/projects/myapp",
+ "command": "kubectl delete node worker-3",
+- "riskTier": "critical",
++ "risk_tier": "critical",
+ "requestor": {
+- "sessionId": "sess-1234",
+- "agentName": "BlueDog",
++ "session_id": "sess-1234",
++ "agent_name": "BlueDog",
+ "model": "gpt-5.1-codex"
+ },
+ "justification": {
+ "reason": "Worker-3 has been in NotReady state for 15 minutes after kernel panic",
+- "expectedEffect": "Node removed from cluster, pods already evicted",
++ "expected_effect": "Node removed from cluster, pods already evicted",
+ "goal": "Clean up cluster state by removing dead node reference",
+- "safetyArgument": "Node is dead, removal is cosmetic cleanup, can re-provision later"
++ "safety_argument": "Node is dead, removal is cosmetic cleanup, can re-provision later"
+ },
+- "dryRun": {
++ "dry_run": {
+ "command": "kubectl delete node worker-3 --dry-run=client",
+ "output": "node \"worker-3\" deleted (dry run)"
+ },
+ "attachments": [
+ {
+ "type": "file_snippet",
+ "content": "NAME STATUS ROLES AGE\nworker-1 Ready <none> 5d\nworker-2 Ready <none> 5d\nworker-3 NotReady <none> 5d"
+ }
+ ],
+ "status": "pending",
+- "minApprovals": 2,
+- "requireDifferentModel": false,
+- "createdAt": "2025-12-13T14:32:05Z",
+- "expiresAt": "2025-12-13T15:02:05Z"
++ "min_approvals": 2,
++ "require_different_model": false,
++ "created_at": "2025-12-13T14:32:05Z",
++ "expires_at": "2025-12-13T15:02:05Z"
+ }
+````
+
+````
+
+### Rationale
+
+- **Agents break on schema drift.** Right now the doc mixes `sessionId`/`session_id`, `needsApproval`/`needs_approval`, `projectPath`/`project_path`, etc. That guarantees real integration pain once *any* agent hardcodes jq paths.
+- **Choosing snake_case matches your Go tags** (`json:"project_path"` etc.), so you reduce translation friction and avoid having two “canonical” schemas.
+- **“stderr for humans, stdout for JSON”** is one of the simplest choices that massively improves composability (pipes, hooks, `jq`, CI logs) without adding architectural complexity.
+
+---
+
+## Change 2 — Fix the `-p` flag conflict (project vs program) by reserving `-C` for project
+
+You currently claim **global `-p`** is `--project`, but also use **`-p`** for `--program` in `slb session start`. That’s a real foot-gun.
+
+```diff
+diff --git a/PLAN_TO_MAKE_SLB.md b/PLAN_TO_MAKE_SLB.md
+--- a/PLAN_TO_MAKE_SLB.md
++++ b/PLAN_TO_MAKE_SLB.md
+@@ -495,12 +495,12 @@ slb session heartbeat --session-id <id>
+ **Global flag aliases** (apply to all commands):
+ - `-s` → `--session-id`
+ - `-j` → `--json`
+-- `-p` → `--project`
++- `-C` → `--project`
+ 
+@@ -606,7 +606,7 @@ The entire CLI is designed for agent (robot) usage. Running `slb` with no argume
+ │ TIERS: 🔴 CRITICAL (2 approvals) 🟠 DANGEROUS (1) 🟡 CAUTION (auto) │
+-│ FLAGS: -s/--session-id -j/--json -p/--project │
++│ FLAGS: -s/--session-id -j/--json -C/--project │
+ │ HUMAN: slb tui │
+ └─────────────────────────────────────────────────────────────────────────┘
+@@ -1617,7 +1617,7 @@ This is what `slb` (no args) prints. Copy the text version to AGENTS.md if neede
+ │ │
+ ├─────────────────────────────────────────────────────────────────────────┤
+ │ TIERS: 🔴 CRITICAL (2) 🟠 DANGEROUS (1) 🟡 CAUTION (auto-30s) │
+-│ FLAGS: -s/--session-id -j/--json FORGOT? Just run: slb │
++│ FLAGS: -s/--session-id -j/--json -C/--project FORGOT? Just run: slb│
+ └─────────────────────────────────────────────────────────────────────────┘
+````
+
+### Rationale
+
+* This removes a **hard ambiguity**. In agentic workflows, ambiguous flags are catastrophic because agents “memorize” a workflow and then repeat it.
+* `-C` is already a mental model many people have (git’s `-C <path>` “operate on another directory”), so it’s ergonomic without new conceptual baggage.
+* This fix is **pure docs + flag wiring**, not a new subsystem.
+
+---
+
+## Change 3 — Resolve the conflicting “default conflict policy” (first-response-wins vs any-rejection-blocks)
+
+You state two different defaults:
+
+* “Default: First response wins” (earlier)
+* “Default: Any rejection blocks” (later)
+
+Pick one. For this tool, the safer default is **any rejection blocks**, with speed mode configurable.
+
+```diff
+diff --git a/PLAN_TO_MAKE_SLB.md b/PLAN_TO_MAKE_SLB.md
+--- a/PLAN_TO_MAKE_SLB.md
++++ b/PLAN_TO_MAKE_SLB.md
+@@ -233,18 +233,20 @@ When reviewers disagree (one approves, one rejects):
+ 
+-- Default: First response wins (for speed)
+-- Configurable: Require N approvals with 0 rejections
+-- Configurable: Human breaks ties
+-- Always: Log the disagreement for audit
++- Default: **Any rejection blocks** (safety priority)
++- Configurable: **First response wins** (speed priority)
++- Configurable: Require **N approvals** with **0 rejections**
++- Configurable: Human breaks ties (explicit escalation path)
++- Always: Log the disagreement for audit
+ 
+@@ -1215,7 +1217,7 @@ ### Edge Case 3: Conflicting Reviews
+ **Resolution options** (configurable):
+ 1. First response wins (speed priority)
+ 2. Any rejection blocks (safety priority)
+ 3. Majority vote with minimum threshold
+ 4. Human breaks tie
+ 
+-**Default**: Any rejection blocks. Safety over speed.
++**Default**: Any rejection blocks. Safety over speed.
+```
+
+### Rationale
+
+* A system that is explicitly about preventing irreversible damage should not default to “fastest finger wins.” That *recreates* agent tunnel-vision at the review layer.
+* You still support the speed-optimized mode for teams that want it; but making safety the default reduces silent disaster risk with no added architecture.
+
+---
+
+## Change 4 — Clarify *where the source of truth lives* (right now it’s split and confusing)
+
+Right now you have:
+
+* Project `.slb/pending/*.json` as “active pending requests”
+* User `~/.slb/history.db` as the DB of record
+* Also `.slb/processed/` archives and a user-level git repo
+
+That’s workable, but *unclear*. In practice, ambiguity here produces “I approved it but it’s still pending” class bugs.
+
+This patch declares a single authoritative store for request state (project DB), and makes file trees explicit as **materialized snapshots** / **interop**.
+
+```diff
+diff --git a/PLAN_TO_MAKE_SLB.md b/PLAN_TO_MAKE_SLB.md
+--- a/PLAN_TO_MAKE_SLB.md
++++ b/PLAN_TO_MAKE_SLB.md
+@@ -360,6 +360,22 @@ slb integrates naturally with NTM for multi-agent orchestration:
+ 
+ ## Technical Architecture
+ 
++### Storage Model (Single Source of Truth)
++
++To avoid “split brain” between JSON files and SQLite, slb should clearly define:
++
++- **Authoritative state** for a project lives in **`.slb/state.db`** (SQLite, WAL).
++ - Requests, reviews, sessions, pattern changes, and execution outcomes are written here.
++- **`.slb/pending/` and `.slb/processed/` are materialized JSON snapshots**, generated from the DB:
++ - They exist for **file watching**, **human inspection**, and **interop** (agents that prefer files).
++ - They are **rebuildable**; deleting them does not lose history.
++- **User-level `~/.slb/` stores are optional mirrors** (cross-project search, personal audit),
++ written by the daemon as a “replica,” not as the coordination source of truth.
++
+ ### State Directories
+ 
+ **Project-level** (`.slb/` in project root):
+```
+
+.slb/
++├── state.db # Authoritative SQLite DB for THIS project (WAL)
+├── pending/ # Active pending requests
+│ └── req-<uuid>.json
+├── sessions/ # Active agent sessions
+│ └── <agent-name>.json
+@@ -380,16 +396,18 @@
+└── config.toml # Project-specific config overrides
+
+```
+
+**User-level** (`~/.slb/`):
+```
+
+~/.slb/
+├── config.toml # User configuration
+-├── history.db # SQLite database
+-├── history_git/ # Git repository for audit trail
++├── history.db # Optional: cross-project index/analytics (replica)
++├── history_git/ # Optional: personal audit trail git repo (replica)
+│ ├── .git/
+│ └── requests/
+│ └── <year>/
+│ └── <month>/
+│ └── req-<uuid>.md
+└── sessions/ # Cross-project session info
+
+````
+
+### Rationale
+
+- This removes the most dangerous ambiguity: **“what do I trust if they disagree?”**
+- It also matches the real operational need: reviewers and requestors are collaborating **in a project**, so the coordination state should live **with the project**, not in a user-global file that may be invisible in some execution contexts (containers, different users, remote mounts).
+- Making pending/processed “snapshots” also reduces concurrency hazards: you can regenerate them from DB rather than treating them as mutable shared state.
+
+---
+
+## Change 5 — Fix SQLite schema issues (indexes-in-table, NULL uniqueness) + add FTS triggers
+
+As written, the schema snippet contains patterns that will cause bugs or confusion in implementation:
+
+- SQLite **does not** support `INDEX ...` lines inside `CREATE TABLE`.
+- Your `UNIQUE(agent_name, project_path, ended_at)` doesn’t enforce “only one active session” because in SQLite **NULLs do not collide** in UNIQUE constraints.
+- FTS5 with `content='requests'` needs triggers to stay in sync.
+
+```diff
+diff --git a/PLAN_TO_MAKE_SLB.md b/PLAN_TO_MAKE_SLB.md
+--- a/PLAN_TO_MAKE_SLB.md
++++ b/PLAN_TO_MAKE_SLB.md
+@@ -420,7 +420,7 @@
+ ### SQLite Tables
+ 
+ ```sql
+--- Agent sessions
++-- Agent sessions
+ CREATE TABLE sessions (
+ id TEXT PRIMARY KEY, -- UUID
+ agent_name TEXT NOT NULL, -- e.g., "GreenLake"
+@@ -433,8 +433,16 @@ CREATE TABLE sessions (
+ started_at TEXT NOT NULL, -- ISO 8601
+ last_active_at TEXT NOT NULL,
+ ended_at TEXT, -- NULL if still active
+- UNIQUE(agent_name, project_path, ended_at)
+ );
++
++-- Enforce: at most one ACTIVE (ended_at IS NULL) session per agent_name+project
++CREATE UNIQUE INDEX idx_sessions_one_active
++ ON sessions(agent_name, project_path)
++ WHERE ended_at IS NULL;
++
++CREATE INDEX idx_sessions_last_active
++ ON sessions(project_path, last_active_at DESC);
+ 
+ -- Command requests
+ CREATE TABLE requests (
+@@ -488,11 +496,14 @@ CREATE TABLE requests (
+ resolved_at TEXT, -- When approved/rejected/etc
+ expires_at TEXT -- Auto-timeout deadline
+-
+- -- Indexes
+- INDEX idx_requests_status (status),
+- INDEX idx_requests_project (project_path),
+- INDEX idx_requests_created (created_at DESC)
+ );
++
++CREATE INDEX idx_requests_status
++ ON requests(status);
++CREATE INDEX idx_requests_project
++ ON requests(project_path);
++CREATE INDEX idx_requests_created
++ ON requests(created_at DESC);
+ 
+ -- Reviews (approvals and rejections)
+ CREATE TABLE reviews (
+@@ -548,6 +559,30 @@ CREATE VIRTUAL TABLE requests_fts USING fts5(
+ content='requests',
+ content_rowid='rowid'
+ );
++
++-- Keep FTS in sync with requests (external content table mode)
++CREATE TRIGGER requests_ai AFTER INSERT ON requests BEGIN
++ INSERT INTO requests_fts(rowid, command, reason, expected_effect, goal, safety_argument)
++ VALUES (new.rowid, new.command, new.reason, new.expected_effect, new.goal, new.safety_argument);
++END;
++CREATE TRIGGER requests_ad AFTER DELETE ON requests BEGIN
++ INSERT INTO requests_fts(requests_fts, rowid, command, reason, expected_effect, goal, safety_argument)
++ VALUES ('delete', old.rowid, old.command, old.reason, old.expected_effect, old.goal, old.safety_argument);
++END;
++CREATE TRIGGER requests_au AFTER UPDATE ON requests BEGIN
++ INSERT INTO requests_fts(requests_fts, rowid, command, reason, expected_effect, goal, safety_argument)
++ VALUES ('delete', old.rowid, old.command, old.reason, old.expected_effect, old.goal, old.safety_argument);
++ INSERT INTO requests_fts(rowid, command, reason, expected_effect, goal, safety_argument)
++ VALUES (new.rowid, new.command, new.reason, new.expected_effect, new.goal, new.safety_argument);
++END;
+ 
+@@ -589,10 +624,11 @@ CREATE TABLE pattern_changes (
+ reviewed_by TEXT, -- Human who approved/rejected
+ reviewed_at TEXT,
+ 
+ created_at TEXT NOT NULL,
+-
+- INDEX idx_pattern_changes_status (status),
+- INDEX idx_pattern_changes_type (change_type)
+ );
++
++CREATE INDEX idx_pattern_changes_status
++ ON pattern_changes(status);
++CREATE INDEX idx_pattern_changes_type
++ ON pattern_changes(change_type);
+````
+
+````
+
+### Rationale
+
+- This is **pure correctness**: without these changes, the “plan” will silently generate a broken or misleading implementation.
+- The partial unique index is a *minimal* SQLite-native way to enforce what you actually want (“one active session”), without requiring extra application logic or locks.
+- FTS triggers are boilerplate, but they’re the difference between “search works sometimes” and “search is reliable.”
+
+---
+
+## Change 6 — Make command execution reproducible + safer by storing `cwd`, `argv`, and binding approvals to a command hash
+
+Right now you store `command TEXT NOT NULL` and later you “execute the command.” That leaves nasty foot-guns:
+
+- Relative paths depend on **working directory** (which may differ at execution time).
+- If execution uses a shell, you inherit **shell injection** and “surprise extra commands” (`rm -rf ./x; curl ...`).
+- A request can be approved for one string but executed later after subtle mutation.
+
+This patch adds a very small, high-leverage concept: **the command being approved is a structured object** and approvals bind to a **hash**.
+
+```diff
+diff --git a/PLAN_TO_MAKE_SLB.md b/PLAN_TO_MAKE_SLB.md
+--- a/PLAN_TO_MAKE_SLB.md
++++ b/PLAN_TO_MAKE_SLB.md
+@@ -445,7 +445,20 @@ CREATE TABLE requests (
+ id TEXT PRIMARY KEY, -- UUID
+ project_path TEXT NOT NULL,
+- command TEXT NOT NULL,
++ command_raw TEXT NOT NULL, -- Exactly what the agent requested
++ command_argv TEXT, -- JSON array (preferred execution form)
++ command_cwd TEXT NOT NULL, -- Working directory at request time
++ command_shell INTEGER NOT NULL DEFAULT 0, -- 1 if shell parsing/execution required
++ command_hash TEXT NOT NULL, -- sha256(raw + "\n" + cwd + "\n" + argv_json + "\n" + shell)
+ risk_tier TEXT NOT NULL, -- 'critical', 'dangerous', 'caution'
+@@ -485,10 +498,17 @@ CREATE TABLE requests (
+ -- Execution results
+ executed_at TEXT,
+- execution_output TEXT,
++ executed_by_session_id TEXT REFERENCES sessions(id),
++ executed_by_agent TEXT,
++ executed_by_model TEXT,
++ execution_stdout TEXT,
++ execution_stderr TEXT,
+ execution_exit_code INTEGER,
++ execution_duration_ms INTEGER,
+ 
+@@ -635,7 +665,29 @@ type Requestor struct {
+ Model string `json:"model"`
+ }
+ 
++type CommandSpec struct {
++ Raw string `json:"raw"`
++ Argv []string `json:"argv,omitempty"`
++ Cwd string `json:"cwd"`
++ Shell bool `json:"shell"`
++ Hash string `json:"hash"`
++}
++
+ type Justification struct {
+ Reason string `json:"reason"`
+ ExpectedEffect string `json:"expected_effect"`
+ Goal string `json:"goal"`
+ SafetyArgument string `json:"safety_argument"`
+ }
+@@ -669,9 +729,9 @@ type Rollback struct {
+ }
+ 
+ type Request struct {
+ ID string `json:"id"`
+ ProjectPath string `json:"project_path"`
+- Command string `json:"command"`
++ Command CommandSpec `json:"command"`
+ RiskTier RiskTier `json:"risk_tier"`
+@@ -692,7 +752,7 @@ type Request struct {
+ RequireDifferentModel bool `json:"require_different_model"`
+ 
+ Execution *Execution `json:"execution,omitempty"`
+ Rollback *Rollback `json:"rollback,omitempty"`
+````
+
+### Rationale
+
+* **Reproducibility**: reviewers can reason about “what exactly will run” (cwd + argv), not a loosely interpreted string.
+* **Safety**: you can execute via `execve` (no shell) whenever possible, which eliminates an entire category of accidental multi-command lines and injection-like surprises.
+* **Anti-time-travel**: binding approvals to a `command_hash` ensures “approved thing == executed thing,” which is the core promise of the system. This is a tiny addition (one hash) that yields huge trust improvements.
+
+---
+
+## Change 7 — Add “approval TTL” + re-check tier at execution time to prevent stale or policy-drift approvals
+
+Right now “approved” is timeless. That’s a trap:
+
+* The world changes between approval and execution (files move, infra state changes).
+* Patterns/policy may get tightened after an incident (command should now be CRITICAL).
+* Approved requests sitting around become “loaded guns.”
+
+```diff
+diff --git a/PLAN_TO_MAKE_SLB.md b/PLAN_TO_MAKE_SLB.md
+--- a/PLAN_TO_MAKE_SLB.md
++++ b/PLAN_TO_MAKE_SLB.md
+@@ -119,6 +119,20 @@ Before executing any command matching "dangerous" patterns, agents must:
+ 
+ This creates a **deliberate friction point** that forces reconsideration of destructive actions.
+ 
++### Important Safety Property: Approval Is Time-Bounded
++
++To avoid stale approvals, slb should treat approval as a **short-lived capability**:
++
++- Requests have `expires_at` while pending.
++- After reaching APPROVED, slb sets an additional `approval_expires_at` (default short, e.g. 5–15 minutes).
++- `slb execute` must refuse to run if approval has expired, forcing a re-review.
++- `slb execute` must also **re-evaluate patterns** against current policy:
++ - If the same command now matches a higher tier (e.g., DANGEROUS → CRITICAL), execution is blocked until the higher-tier approvals are obtained.
++
+@@ -1015,6 +1029,14 @@ slb execute <request-id> [--session-id <id>]
+ Runs the command, captures output
+ Returns: exit code, stdout, stderr
++
++Execution gate conditions (enforced by `slb execute`):
++- Request status is APPROVED
++- `approval_expires_at` has not elapsed
++- `command_hash` still matches (no mutation)
++- Current pattern policy does not raise the required tier/approvals
++- Execution is idempotent (first successful executor wins)
+```
+
+### Rationale
+
+* This handles a subtle but very real safety failure mode: **“approved yesterday, executed today.”**
+* The re-check-at-execute rule keeps policy changes effective immediately—no new subsystem required; you’re already evaluating patterns.
+* Approval TTL is small complexity (one timestamp + check) that dramatically improves correctness and user trust.
+
+---
+
+## Change 8 — Make pattern matching robust to real shells: strip wrappers + treat compound commands explicitly
+
+Right now, many defaults anchor at `^rm` / `^kubectl`, which will miss common real commands:
+
+* `sudo rm -rf …`
+* `env KUBECONFIG=… kubectl delete …`
+* `time terraform destroy …`
+* `cd dir && rm -rf …`
+* `rm -rf … | tee log` (compound)
+
+The minimum fix isn’t “write more regex.” It’s defining **a normalization step**.
+
+```diff
+diff --git a/PLAN_TO_MAKE_SLB.md b/PLAN_TO_MAKE_SLB.md
+--- a/PLAN_TO_MAKE_SLB.md
++++ b/PLAN_TO_MAKE_SLB.md
+@@ -1502,6 +1502,39 @@ ## Appendix: Pattern Matching Details
+ 
+ ### Pattern Syntax
+ 
+ Patterns use regex with these conventions:
+ - Case-insensitive by default
+ - `^` anchors to command start
+ - `\s+` for whitespace
+ - `(?!...)` for negative lookahead
+ - `.*` for any characters
+ 
++### Command Normalization (Before Pattern Matching)
++
++To reduce false negatives/positives, slb should normalize the command before applying tier patterns:
++
++1. **Parse** with a shell-aware tokenizer (POSIX-like quoting rules).
++2. Extract the **primary command** and args from common wrappers:
++ - `sudo`, `doas`
++ - `env VAR=...`
++ - `command`, `builtin`
++ - `time`, `nice`, `ionice`
++3. Detect **compound commands** (`;`, `&&`, `||`, `|`, subshells):
++ - If any segment matches a tier, the whole request is treated as at least that tier.
++ - If parsing fails, fall back to raw-regex and **upgrade** tier by one step as a conservative default.
++4. Normalize whitespace and produce a canonical “display form” for the reviewer.
++
++This keeps config patterns simple (they can still look like `^rm\s+-rf`) while making them work in real terminals.
++
+ ### Pattern Precedence
+ 
+ When a command matches multiple patterns:
+ 1. Check SAFE patterns first → skip entirely
+ 2. Check CRITICAL → highest risk wins
+```
+
+### Rationale
+
+* This is a **huge reliability win**: most real-world destructive commands are wrapped (`sudo`, `env`, etc.).
+* You avoid a config arms-race of brittle regex like `^(sudo\s+)?(env\s+.*\s+)?rm...`.
+* The “if parse fails, conservatively upgrade tier” rule makes failures safe by default, without complex heuristics.
+
+---
+
+## Change 9 — Make `slb watch` non-interactive (stream events), keep interactive review in TUI
+
+Your doc claims: “Every command is CLI-first, non-interactive” and “TUI is the only human-facing interface,” but `slb watch` says it will “prompt for review.”
+
+Make `slb watch` an **event stream** (perfect for agents), not a prompt UI.
+
+````diff
+diff --git a/PLAN_TO_MAKE_SLB.md b/PLAN_TO_MAKE_SLB.md
+--- a/PLAN_TO_MAKE_SLB.md
++++ b/PLAN_TO_MAKE_SLB.md
+@@ -1129,12 +1129,18 @@ slb patterns suggest --tier <tier> "<pattern>" --reason "..."
+ 
+ ### Watch Mode (for reviewing agents)
+ 
+ ```bash
+-# Watch for pending requests and prompt for review
++# Watch for pending requests and emit events for agents
+ slb watch \
+ [--project <path>] \
+ [--session-id <id>] \
+- [--auto-approve-caution] # Auto-approve CAUTION tier
++ [--auto-approve-caution] # Auto-approve CAUTION tier
++ [--json] # NDJSON stream: one event per line
++
++# Example NDJSON event:
++# {"event":"request_pending","request_id":"req-...","risk_tier":"dangerous","created_at":"..."}
+````
+
++Interactive approve/reject UX remains exclusively in **`slb tui`**.
+
+````
+
+### Rationale
+
+- Keeps your **design philosophy consistent**: CLI is non-interactive; TUI is interactive.
+- Event streams are exactly what agents want: they can plug into a policy agent, auto-review scripts, or a dedicated reviewer agent.
+- This is tiny complexity: just define the event schema + printing loop; no new UI.
+
+---
+
+## Change 10 — Fix risk emoji/color inconsistencies (DANGEROUS should be 🟠, CAUTION 🟡)
+
+In the TUI mockups, “🟡 DANGEROUS” appears, but elsewhere dangerous is orange and caution is yellow. Same problem in the “Color coding” bullets.
+
+```diff
+diff --git a/PLAN_TO_MAKE_SLB.md b/PLAN_TO_MAKE_SLB.md
+--- a/PLAN_TO_MAKE_SLB.md
++++ b/PLAN_TO_MAKE_SLB.md
+@@ -706,7 +706,7 @@
+ │ 🟢 RedStone │ │
+ │ cursor claude-sonnet │ ┌────────────────────────────────────────────────┐│
+ │ Last: 2m ago │ │ 🟡 DANGEROUS req-c3d4 5m ago ││
+ │ │ │ git reset --hard HEAD~3 ││
+ │ │ │ By: GreenLake (claude-code opus-4.5) ││
+ │ │ │ "Reverting broken commits from..." ││
++│ │ │ 🟠 DANGEROUS req-c3d4 5m ago ││
+@@ -781,10 +781,10 @@ ### Visual Design Principles
+ 2. **Color coding**:
+ - 🔴 Red: CRITICAL risk, rejected requests
+- - 🟡 Yellow: DANGEROUS risk, pending
++ - 🟠 Orange: DANGEROUS risk, pending
+ - 🟢 Green: approved, executed, safe
+ - 🔵 Blue: informational
++ - 🟡 Yellow: CAUTION risk, auto-approved
+````
+
+### Rationale
+
+* This is deceptively important: dashboards are “muscle memory” tools. If yellow sometimes means dangerous and sometimes caution, humans will misread.
+* Zero engineering complexity: it’s a documentation/UI consistency fix that prevents operational mistakes.
+
+---
+
+## Change 11 — Make `emergency-execute` consistent with “non-interactive CLI” by requiring explicit flags (not a prompt)
+
+Right now: “Requires interactive confirmation.” That breaks the “CLI is non-interactive” rule and is hard to use in scripted incident response.
+
+Replace interactive confirmation with **explicit acknowledgement flags** and an **optional hash**.
+
+```diff
+diff --git a/PLAN_TO_MAKE_SLB.md b/PLAN_TO_MAKE_SLB.md
+--- a/PLAN_TO_MAKE_SLB.md
++++ b/PLAN_TO_MAKE_SLB.md
+@@ -1019,12 +1019,20 @@ slb emergency-execute "<command>" \
+ --reason "Why this can't wait" \
+ [--capture-rollback]
+ 
+- Requires: interactive confirmation
+- Logs: extensively for audit
++ Requires: explicit acknowledgement flags (non-interactive, scriptable)
++ --yes
++ --ack "<sha256(command_raw)>"
++ Logs: extensively for audit (includes reason, cwd, argv, stdout/stderr)
+```
+
+### Rationale
+
+* This keeps the CLI truly automation-friendly: no hidden prompts that hang headless runs.
+* `--ack` prevents “oops I ran the wrong emergency command” because the invoker must bind to the exact payload they’re authorizing.
+* It is minimal complexity: compute a hash and compare strings; no new UI.
+
+---
+
+## Change 12 — Add one high-leverage ergonomic tweak: `slb request --wait --execute`
+
+Your happy-path currently requires 3–4 commands (`request` → `status --wait` → `execute`). Agents will forget steps.
+
+You already have `--wait`. Add **`--execute`** to make the common path a single command when the agent genuinely intends to run the command if approved.
+
+```diff
+diff --git a/PLAN_TO_MAKE_SLB.md b/PLAN_TO_MAKE_SLB.md
+--- a/PLAN_TO_MAKE_SLB.md
++++ b/PLAN_TO_MAKE_SLB.md
+@@ -928,7 +928,8 @@ slb request "<command>" \
+ [--session-id <id>] \
+ [--wait] # Block until approved/rejected
++ [--execute] # If approved, execute immediately (binds to command_hash)
+ [--timeout <seconds>]
+ 
+ Returns: request ID
+@@ -852,10 +852,11 @@ if [ "$NEEDS_APPROVAL" = "true" ]; then
+ REQUEST_JSON=$(slb request "rm -rf ./build" \
+ --session-id "$SESSION_ID" \
+ --reason "Removing stale build artifacts" \
+ --expected-effect "Deletes ./build directory (~500MB)" \
+ --goal "Free up disk space before next build" \
+ --safety "Build directory is regenerated on next build, no source code" \
+- --json)
++ --wait --execute --json)
+ 
+ REQUEST_ID=$(echo "$REQUEST_JSON" | jq -r '.request_id')
+-
+- # 4. Wait for approval (with timeout)
+- STATUS_JSON=$(slb status "$REQUEST_ID" --wait --timeout 300 --json)
+- STATUS=$(echo "$STATUS_JSON" | jq -r '.status')
+-
+- case "$STATUS" in
+- approved)
+- # 5. Execute
+- slb execute "$REQUEST_ID" --json
+- ;;
+- rejected)
+- echo "Request rejected: $(echo "$STATUS_JSON" | jq -r '.reviews[0].reason')"
+- # Reconsider approach...
+- ;;
+- timeout)
+- echo "Request timed out, escalating to human..."
+- ;;
+- esac
+ fi
+```
+
+### Rationale
+
+* This reduces the “ritual length” of doing the right thing, which is the #1 predictor that agents will actually use the tool.
+* It also reduces subtle mismatches: the execution step is guaranteed to use the same `command_hash` and `cwd/argv` the reviewer approved.
+* Implementation complexity is tiny: `request` already knows the request ID; it can internally call the same code path as `status --wait` and `execute`.
+
+---
+
+# A few *non-diff* observations worth acting on (but I didn’t bake them into patches)
+
+These are high-impact, but would require larger structural edits than a clean patch:
+
+* **Your current plan mixes “file queue” and “DB coordination” in a way that will cause operational ambiguity** unless you fully centralize writes (daemon-only writes) or fully decentralize (files-only with DB as a read model). I pushed you toward a clear single-source-of-truth model; if you prefer the other direction, I’d rewrite accordingly.
+* **Dry-run/rollback capture needs explicit “side-effect policy”** (no network calls, no following symlinks, size caps, secret handling) or it will become the *new* dangerous thing.
+* The library list includes both **Viper** and **BurntSushi/toml**; that’s usually either redundant or a sign you want strict config decoding. Decide which you want and document why.
+
+If you want, I can produce a second round of diffs that (a) formalizes the “dry-run side-effect policy,” (b) resolves “daemon vs direct-mode” authority with an explicit write path, and (c) tightens request state transitions for idempotent execute (single-writer semantics).
+
+________________________
+
+# Claude Opus 4.5's review of Gemini3's suggestions:
+
+Gemini's feedback is excellent and catches some truly critical architectural flaws that I missed. Let me break down my assessment:
+
+## Strong Agreement (These Are Critical Fixes)
+
+**Change 2: Client-Side Execution** — This is the most important fix I completely overlooked. The daemon absolutely cannot execute commands because it won't have:
+- `AWS_PROFILE`, `AWS_ACCESS_KEY_ID` 
+- `KUBECONFIG` pointing to the right cluster
+- Activated virtualenvs (`VIRTUAL_ENV`, modified `PATH`)
+- `SSH_AUTH_SOCK` for SSH agent forwarding
+- Database connection strings in env vars
+- Any shell aliases or functions
+
+This is a fundamental architectural flaw. The daemon must be a "notary" (Gemini's term is perfect), not an executor. The client process inherits the agent's shell environment and must be the one to `exec()`.
+
+**Change 1: Atomic `slb run`** — Also critical. I proposed an "abbreviated request mode" to reduce friction, but Gemini's solution is architecturally superior. A single blocking command that handles the entire flow:
+
+```bash
+slb run "rm -rf ./build" --reason "Cleanup before rebuild"
+```
+
+This is dramatically better than asking an LLM to manage a state machine. Agents lose context, hallucinate protocol steps, or simply give up mid-flow. One command, one mental model.
+
+**Change 3: Canonical Path Resolution** — I improved SQL patterns but missed this fundamental issue. The bypass scenario is real:
+
+```bash
+cd /etc && rm -rf * # Passes pattern check for "rm -rf /etc"
+```
+
+Capturing CWD and resolving to absolute paths before pattern matching is essential.
+
+## Agreement With Caveats
+
+**Change 6: Dynamic Quorum** — The deadlock scenario is real, and the `--yield` flag is clever. However, this needs careful implementation. "If only 2 agents exist, CRITICAL only needs 1 approval" could be gamed by not starting other sessions. I'd add:
+
+```toml
+[patterns.critical]
+min_approvals = 2
+dynamic_quorum = true
+dynamic_quorum_floor = 1 # Never go below this, even with few agents
+```
+
+**Change 7: TCP Support** — Agree it's needed for Docker, but this opens security surface. Would add:
+
+```toml
+[daemon]
+tcp_addr = "127.0.0.1:3333"
+tcp_require_auth = true # Require session key in TCP handshake
+tcp_allowed_ips = ["127.0.0.1", "172.17.0.0/16"] # Docker bridge
+```
+
+## Overlap Analysis
+
+| Gemini | Mine | Relationship |
+|--------|------|--------------|
+| #1 `slb run` | #3 Abbreviated Request | Gemini's is architecturally superior; mine is subsumed |
+| #2 Client Execution | #5 Execution Timeout | Complementary—both needed |
+| #3 Path Resolution | #8 SQL Patterns | Complementary—both needed |
+| #5 Stdin Input | #3 Abbreviated Request | Complementary—both reduce friction differently |
+| #6 Dynamic Quorum | #15 Same-Model Failure | Gemini's solves what mine only documents |
+
+## What I Caught That Gemini Missed
+
+Several of my suggestions address concerns Gemini didn't cover:
+
+- **#2 Replay Attack Prevention**: Signatures need timestamps, or an attacker could replay captured approvals
+- **#4 Sensitive Data Handling**: Commands often contain secrets—needs redaction for logs/display
+- **#7 Rate Limiting**: Prevents a malfunctioning agent from flooding the queue
+- **#9 Session Persistence**: Agents crash; they need to resume sessions
+- **#10 Bulk Operations**: With 30 agents, reviewing one-by-one is tedious
+- **#12 Graceful Degradation**: Core flow should work even if daemon is down
+
+## Recommended Priority Order
+
+If implementing both feedback sets, I'd prioritize:
+
+1. **Gemini #2**: Client-side execution (architectural foundation)
+2. **Gemini #1**: `slb run` atomic command (agent UX foundation) 
+3. **Gemini #3**: Path resolution (security)
+4. **Mine #4**: Sensitive data redaction (security/compliance)
+5. **Gemini #4**: Stream logs to files (performance)
+6. **Gemini #5**: Stdin input (agent UX)
+7. **Mine #2**: Signature timestamps (security)
+8. **Gemini #6**: Dynamic quorum (operational)
+9. Everything else
+
+Gemini identified the load-bearing architectural issues. My suggestions are more about hardening, edge cases, and operational polish. Both are needed for production readiness.
+
+
+________________________
+
+# Claude Opus 4.5's review of Gemini3's suggestions:
+
+GPT 5.2 Pro's feedback is exceptionally thorough and catches a different class of issues—primarily **internal consistency problems** and **implementation correctness bugs** that would cause real pain during development. Let me break it down:
+
+## Strong Agreement (These Are Critical Fixes)
+
+**Change 5: SQLite Schema Fixes** — This is embarrassing but crucial. The original schema has syntax errors that would fail on first migration:
+
+```sql
+-- This doesn't work in SQLite:
+CREATE TABLE requests (
+  ...
+  INDEX idx_requests_status (status),  -- INVALID SYNTAX
+);
+```
+
+And the NULL uniqueness issue is subtle but real:
+```sql
+UNIQUE(agent_name, project_path, ended_at)
+-- Two sessions with ended_at = NULL are NOT considered duplicates!
+```
+
+The partial unique index solution is correct:
+```sql
+CREATE UNIQUE INDEX idx_sessions_one_active
+  ON sessions(agent_name, project_path)
+  WHERE ended_at IS NULL;
+```
+
+**Change 1: JSON Contract (snake_case)** — I should have caught this. The document uses `sessionId`, `session_id`, `needsApproval`, `needs_approval` interchangeably. Agents will hardcode jq paths like `.sessionId` and break when the implementation uses `.session_id`. This is a documentation bug that becomes an integration nightmare.
+
+**Change 2: -p Flag Conflict** — Completely missed this. The doc claims `-p` is globally `--project` but also uses `-p` for `--program` in `slb session start -a <name> -p claude-code`. An agent following the quick reference will break. The `-C` suggestion (matching git's semantics) is clean.
+
+**Change 6: Command Hash Binding** — This is more comprehensive than both Gemini's path resolution and my replay prevention. The insight that approvals should bind to a cryptographic hash of `(command_raw + cwd + argv + shell_flag)` is elegant:
+
+```go
+type CommandSpec struct {
+    Raw   string   `json:"raw"`
+    Argv  []string `json:"argv,omitempty"`
+    Cwd   string   `json:"cwd"`
+    Shell bool     `json:"shell"`
+    Hash  string   `json:"hash"`  // sha256 of the above
+}
+```
+
+This prevents:
+- Approval for `rm -rf ./build` being used to execute `rm -rf ./src` (mutation)
+- Approval in `/app` being used in `/` (cwd change)
+- Shell injection via crafted strings
+
+**Change 8: Command Normalization** — This solves a real problem I didn't address. Current patterns like `^rm\s+-rf` miss:
+- `sudo rm -rf ...`
+- `env KUBECONFIG=... kubectl delete ...`
+- `time terraform destroy ...`
+- `cd /etc && rm -rf *`
+
+The normalization approach (strip wrappers, parse compound commands, upgrade tier on parse failure) is much better than writing fragile regex like `^(sudo\s+)?(env\s+.*\s+)?rm...`.
+
+## Agreement With Caveats
+
+**Change 4: Single Source of Truth** — The architecture clarification is needed, but I'd push further. GPT says project `.slb/state.db` is authoritative with JSON files as "materialized snapshots." But this creates a sync problem—when does the daemon regenerate snapshots? What if an agent reads a stale JSON file?
+
+I'd prefer: **SQLite is the only truth. JSON files are write-through caches regenerated on every state change.** Or alternatively: **JSON files are the only truth, SQLite is a read-optimized index.** The hybrid model needs explicit sync semantics.
+
+**Change 7: Approval TTL** — Great concept, but 5-15 minutes default might be too short for some workflows. A `terraform destroy` might get approved, then the agent does some prep work before executing. I'd suggest:
+
+```toml
+[general]
+approval_ttl_minutes = 30           # Default
+approval_ttl_critical_minutes = 10  # Shorter for CRITICAL
+```
+
+**Change 12: `--wait --execute`** — This is a conservative version of Gemini's `slb run`. Both solve the same problem (agents forgetting multi-step flows), but Gemini's is more radical (one command does everything) while GPT's preserves the existing command structure.
+
+I slightly prefer Gemini's `slb run` because it's a cleaner mental model, but GPT's approach is lower risk to implement and maintains backward compatibility.
+
+## Overlap Analysis
+
+| GPT 5.2 Pro | Mine | Gemini | Relationship |
+|-------------|------|--------|--------------|
+| #1 JSON snake_case | — | — | Unique, critical for integration |
+| #2 -p flag conflict | — | — | Unique, would break agents |
+| #3 Conflicting defaults | — | — | Unique, doc contradiction |
+| #4 Single source of truth | — | #4 (stream logs) | Complementary storage concerns |
+| #5 SQLite schema | — | — | Unique, implementation bugs |
+| #6 Command hash | #2 (replay prevention) | #3 (path resolution) | Most comprehensive version |
+| #7 Approval TTL | #5 (execution timeout) | — | Complementary time-bounding |
+| #8 Command normalization | — | — | Unique, huge reliability win |
+| #9 watch non-interactive | — | — | Unique, consistency fix |
+| #10 Color consistency | — | — | Unique, UX polish |
+| #11 emergency-execute flags | #6 (same) | — | Same fix |
+| #12 --wait --execute | #3 (abbreviated) | #1 (slb run) | Less radical than Gemini |
+
+## What GPT Caught That Others Missed
+
+Several issues are unique to GPT's review:
+
+- **#1, #2, #3**: Internal document consistency (JSON casing, flag conflicts, contradictory defaults)
+- **#5**: SQLite syntax correctness and NULL semantics
+- **#8**: Shell wrapper parsing (`sudo`, `env`, compound commands)
+- **#9**: `slb watch` violates the "CLI is non-interactive" principle
+- **#10**: Visual consistency (emoji/colors for tiers)
+
+These are "boring" but high-impact. A dev implementing from this spec would hit these walls immediately.
+
+## What GPT Missed That Others Caught
+
+- **Gemini #2**: Client-side execution (daemon can't inherit agent's shell environment)
+- **Gemini #5**: Stdin input for complex metadata (quoting hell)
+- **Gemini #6**: Dynamic quorum for small agent counts
+- **Gemini #7**: TCP support for Docker containers
+- **Mine #4**: Sensitive data redaction in commands
+- **Mine #7**: Rate limiting to prevent queue flooding
+- **Mine #9**: Session persistence across agent restarts
+- **Mine #10**: Bulk operations for efficiency
+
+## Comparative Strengths
+
+| Reviewer | Primary Strength |
+|----------|------------------|
+| **Gemini** | Architectural fundamentals (execution model, agent UX) |
+| **GPT 5.2 Pro** | Implementation correctness, internal consistency |
+| **Mine** | Security hardening, operational edge cases |
+
+## Recommended Priority Order (All Three Combined)
+
+If implementing all feedback:
+
+1. **Gemini #2**: Client-side execution (architectural foundation)
+2. **Gemini #1**: `slb run` atomic command (agent UX)
+3. **GPT #5**: SQLite schema fixes (won't compile otherwise)
+4. **GPT #6**: Command hash binding (security + correctness)
+5. **GPT #1**: JSON snake_case contract (integration)
+6. **GPT #8**: Command normalization (reliability)
+7. **Gemini #3 + GPT #6**: Path resolution with CWD capture
+8. **GPT #2**: Fix -p flag conflict (ergonomics)
+9. **Mine #4**: Sensitive data redaction (security)
+10. **GPT #7 + Mine #5**: Approval TTL + execution timeout
+11. **Gemini #5**: Stdin input (agent UX)
+12. **GPT #3**: Resolve conflicting defaults
+13. **GPT #4**: Single source of truth architecture
+14. **Gemini #6**: Dynamic quorum
+15. Everything else (rate limiting, bulk ops, watch non-interactive, colors, etc.)
+
+## Meta-Observation
+
+The three reviews form a complementary triad:
+
+- **Gemini** asks "will this work in the real world?" (operational architecture)
+- **GPT 5.2 Pro** asks "is this internally consistent and implementable?" (spec quality)
+- **Mine** asks "what happens when things go wrong?" (failure modes)
+
+You need all three perspectives. Gemini catches the load-bearing walls, GPT catches the spec bugs that would waste implementation time, and I catch the edge cases that become production incidents.
