@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/charmbracelet/log"
 )
 
@@ -876,5 +877,188 @@ func TestIPCClient_PingOverTCPWithSLBHost(t *testing.T) {
 
 	if err := client.Ping(callCtx); err != nil {
 		t.Fatalf("Ping over TCP: %v", err)
+	}
+}
+
+func TestIPCServer_handleVerifyExecute_VerifierNotConfigured(t *testing.T) {
+	t.Parallel()
+
+	srv := &IPCServer{}
+	req := RPCRequest{
+		Method: "verify_execute",
+		Params: json.RawMessage(`{"request_id":"req-1","session_id":"sess-1"}`),
+		ID:     1,
+	}
+
+	resp := srv.handleVerifyExecute(req)
+	if resp.Error == nil {
+		t.Fatalf("expected error")
+	}
+	if resp.Error.Code != ErrCodeInternal {
+		t.Fatalf("error code=%d want %d", resp.Error.Code, ErrCodeInternal)
+	}
+}
+
+func TestIPCServer_handleVerifyExecute_InvalidParams(t *testing.T) {
+	t.Parallel()
+
+	srv := &IPCServer{}
+	srv.SetVerifier(NewVerifier(setupTestDB(t)))
+
+	req := RPCRequest{
+		Method: "verify_execute",
+		Params: json.RawMessage(`not-json`),
+		ID:     1,
+	}
+
+	resp := srv.handleVerifyExecute(req)
+	if resp.Error == nil {
+		t.Fatalf("expected error")
+	}
+	if resp.Error.Code != ErrCodeInvalidParams {
+		t.Fatalf("error code=%d want %d", resp.Error.Code, ErrCodeInvalidParams)
+	}
+}
+
+func TestIPCServer_handleVerifyExecute_RequiresRequestIDAndSessionID(t *testing.T) {
+	t.Parallel()
+
+	srv := &IPCServer{}
+	srv.SetVerifier(NewVerifier(setupTestDB(t)))
+
+	t.Run("missing request_id", func(t *testing.T) {
+		req := RPCRequest{
+			Method: "verify_execute",
+			Params: json.RawMessage(`{"session_id":"sess-1"}`),
+			ID:     1,
+		}
+		resp := srv.handleVerifyExecute(req)
+		if resp.Error == nil {
+			t.Fatalf("expected error")
+		}
+		if resp.Error.Code != ErrCodeInvalidParams {
+			t.Fatalf("error code=%d want %d", resp.Error.Code, ErrCodeInvalidParams)
+		}
+	})
+
+	t.Run("missing session_id", func(t *testing.T) {
+		req := RPCRequest{
+			Method: "verify_execute",
+			Params: json.RawMessage(`{"request_id":"req-1"}`),
+			ID:     1,
+		}
+		resp := srv.handleVerifyExecute(req)
+		if resp.Error == nil {
+			t.Fatalf("expected error")
+		}
+		if resp.Error.Code != ErrCodeInvalidParams {
+			t.Fatalf("error code=%d want %d", resp.Error.Code, ErrCodeInvalidParams)
+		}
+	})
+}
+
+func TestIPCServer_handleVerifyExecute_RequestNotFound(t *testing.T) {
+	t.Parallel()
+
+	srv := &IPCServer{}
+	srv.SetVerifier(NewVerifier(setupTestDB(t)))
+
+	req := RPCRequest{
+		Method: "verify_execute",
+		Params: json.RawMessage(`{"request_id":"does-not-exist","session_id":"sess-1"}`),
+		ID:     1,
+	}
+
+	resp := srv.handleVerifyExecute(req)
+	if resp.Error == nil {
+		t.Fatalf("expected error")
+	}
+	if resp.Error.Code != ErrCodeInternal {
+		t.Fatalf("error code=%d want %d", resp.Error.Code, ErrCodeInternal)
+	}
+}
+
+func TestIPCServer_handleVerifyExecute_AllowedMarksExecuting(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	requestor := createTestSession(t, database, "sess-requestor")
+	createTestRequest(t, database, "req-1", requestor.ID, db.StatusApproved, 1)
+
+	reviewer := createTestSession(t, database, "sess-reviewer")
+	createTestReview(t, database, "req-1", reviewer.ID, db.DecisionApprove)
+
+	srv := &IPCServer{}
+	srv.SetVerifier(NewVerifier(database))
+
+	req := RPCRequest{
+		Method: "verify_execute",
+		Params: json.RawMessage(`{"request_id":"req-1","session_id":"sess-executor"}`),
+		ID:     1,
+	}
+
+	resp := srv.handleVerifyExecute(req)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+
+	out, ok := resp.Result.(*VerifyExecuteResponse)
+	if !ok {
+		t.Fatalf("unexpected result type: %T", resp.Result)
+	}
+	if !out.Allowed {
+		t.Fatalf("expected allowed, got denied: %s", out.Reason)
+	}
+	if out.RequestID != "req-1" {
+		t.Fatalf("request_id=%q want %q", out.RequestID, "req-1")
+	}
+
+	got, err := database.GetRequest("req-1")
+	if err != nil {
+		t.Fatalf("GetRequest: %v", err)
+	}
+	if got.Status != db.StatusExecuting {
+		t.Fatalf("status=%s want %s", got.Status, db.StatusExecuting)
+	}
+}
+
+func TestIPCServer_handleVerifyExecute_DeniedDoesNotMarkExecuting(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	requestor := createTestSession(t, database, "sess-requestor")
+	createTestRequest(t, database, "req-1", requestor.ID, db.StatusApproved, 2)
+
+	reviewer := createTestSession(t, database, "sess-reviewer")
+	createTestReview(t, database, "req-1", reviewer.ID, db.DecisionApprove)
+
+	srv := &IPCServer{}
+	srv.SetVerifier(NewVerifier(database))
+
+	req := RPCRequest{
+		Method: "verify_execute",
+		Params: json.RawMessage(`{"request_id":"req-1","session_id":"sess-executor"}`),
+		ID:     1,
+	}
+
+	resp := srv.handleVerifyExecute(req)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+
+	out, ok := resp.Result.(*VerifyExecuteResponse)
+	if !ok {
+		t.Fatalf("unexpected result type: %T", resp.Result)
+	}
+	if out.Allowed {
+		t.Fatalf("expected denied")
+	}
+
+	got, err := database.GetRequest("req-1")
+	if err != nil {
+		t.Fatalf("GetRequest: %v", err)
+	}
+	if got.Status != db.StatusApproved {
+		t.Fatalf("status=%s want %s", got.Status, db.StatusApproved)
 	}
 }

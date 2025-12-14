@@ -64,12 +64,15 @@ func newIPCServer(listener net.Listener, addr string, logger *log.Logger, cleanu
 		logger = log.Default()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	startDone := make(chan struct{})
+	close(startDone)
 	return &IPCServer{
 		socketPath:  addr,
 		listener:    listener,
 		logger:      logger,
 		startTime:   time.Now(),
 		subscribers: make(map[int64]*subscriber),
+		startDone:   startDone,
 		ctx:         ctx,
 		cancel:      cancel,
 		cleanup:     cleanup,
@@ -99,6 +102,8 @@ type IPCServer struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	startMu   sync.Mutex
+	startDone chan struct{}
 
 	// Optional verifier for execution gate checks.
 	verifier *Verifier
@@ -163,12 +168,26 @@ func NewIPCServer(socketPath string, logger *log.Logger) (*IPCServer, error) {
 
 // Start begins accepting connections. Blocks until context is cancelled.
 func (s *IPCServer) Start(ctx context.Context) error {
+	s.startMu.Lock()
+	startDone := make(chan struct{})
+	s.startDone = startDone
+	s.startMu.Unlock()
+	defer func() {
+		s.startMu.Lock()
+		close(startDone)
+		stopped := make(chan struct{})
+		close(stopped)
+		s.startDone = stopped
+		s.startMu.Unlock()
+	}()
+
 	s.logger.Info("ipc server started", "socket", s.socketPath)
 
 	// Merge with our internal context.
 	go func() {
 		<-ctx.Done()
 		s.cancel()
+		_ = s.listener.Close()
 	}()
 
 	for {
@@ -199,6 +218,11 @@ func (s *IPCServer) Stop() error {
 	if err := s.listener.Close(); err != nil {
 		s.logger.Warn("closing listener", "error", err)
 	}
+
+	s.startMu.Lock()
+	startDone := s.startDone
+	s.startMu.Unlock()
+	<-startDone
 
 	// Close all subscribers.
 	s.subscribersMu.Lock()
