@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
+	"github.com/Dicklesworthstone/slb/internal/integrations"
 	"github.com/Dicklesworthstone/slb/internal/output"
 	"github.com/spf13/cobra"
 )
@@ -25,7 +27,7 @@ var (
 func init() {
 	approveCmd.Flags().StringVarP(&flagApproveSessionID, "session-id", "s", "", "reviewer session ID (required)")
 	approveCmd.Flags().StringVarP(&flagApproveSessionKey, "session-key", "k", "", "session HMAC key for signing (required)")
-	approveCmd.Flags().StringVarP(&flagApproveComments, "comments", "c", "", "additional comments")
+	approveCmd.Flags().StringVarP(&flagApproveComments, "comments", "m", "", "additional comments")
 
 	// Structured response flags for justification fields
 	approveCmd.Flags().StringVar(&flagApproveReasonResponse, "reason-response", "", "response to the reason justification")
@@ -45,10 +47,10 @@ The approval is cryptographically signed with your session key to ensure
 authenticity. Your session must be active, and you cannot approve your own
 requests (unless you are a trusted self-approve agent).
 
-Examples:
-  slb approve abc123 -s $SESSION_ID -k $SESSION_KEY
-  slb approve abc123 -s $SESSION_ID -k $SESSION_KEY -c "Looks safe"
-  slb approve abc123 -s $SESSION_ID -k $SESSION_KEY --reason-response "Valid use case"`,
+	Examples:
+	  slb approve abc123 -s $SESSION_ID -k $SESSION_KEY
+	  slb approve abc123 -s $SESSION_ID -k $SESSION_KEY -m "Looks safe"
+	  slb approve abc123 -s $SESSION_ID -k $SESSION_KEY --reason-response "Valid use case"`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		requestID := args[0]
@@ -59,6 +61,11 @@ Examples:
 		}
 		if flagApproveSessionKey == "" {
 			return fmt.Errorf("--session-key is required")
+		}
+
+		project, err := projectPath()
+		if err != nil {
+			return err
 		}
 
 		// Open database
@@ -85,6 +92,7 @@ Examples:
 
 		// Create review service and submit
 		reviewSvc := core.NewReviewService(dbConn, core.DefaultReviewConfig())
+		reviewSvc.SetNotifier(buildAgentMailNotifier(project))
 		result, err := reviewSvc.SubmitReview(opts)
 		if err != nil {
 			return fmt.Errorf("submitting approval: %w", err)
@@ -135,4 +143,19 @@ Examples:
 
 		return nil
 	},
+}
+
+// buildAgentMailNotifier constructs a notifier from config; falls back to no-op on errors/disabled.
+func buildAgentMailNotifier(project string) integrations.RequestNotifier {
+	cfg, err := config.Load(config.LoadOptions{
+		ProjectDir: project,
+		ConfigPath: flagConfig,
+	})
+	if err != nil {
+		return integrations.NoopNotifier{}
+	}
+	if !cfg.Integrations.AgentMailEnabled {
+		return integrations.NoopNotifier{}
+	}
+	return integrations.NewAgentMailClient(project, cfg.Integrations.AgentMailThread, "")
 }

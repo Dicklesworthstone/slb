@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/Dicklesworthstone/slb/internal/core"
@@ -17,7 +18,7 @@ type AttachmentFlags struct {
 
 // CollectAttachments loads and processes attachments from CLI flags.
 // It returns a slice of attachments ready to be included in a request.
-func CollectAttachments(flags AttachmentFlags) ([]db.Attachment, error) {
+func CollectAttachments(ctx context.Context, flags AttachmentFlags) ([]db.Attachment, error) {
 	config := core.DefaultAttachmentConfig()
 	var attachments []db.Attachment
 
@@ -32,7 +33,7 @@ func CollectAttachments(flags AttachmentFlags) ([]db.Attachment, error) {
 
 	// Process context command attachments
 	for _, cmd := range flags.Contexts {
-		attachment, err := core.RunContextCommand(cmd, &config)
+		attachment, err := core.RunContextCommand(ctx, cmd, &config)
 		if err != nil {
 			return nil, fmt.Errorf("running context command %q: %w", cmd, err)
 		}

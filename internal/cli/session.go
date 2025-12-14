@@ -15,10 +15,9 @@ import (
 )
 
 var (
-	flagSessionAgent  string
-	flagSessionProg   string
-	flagSessionModel  string
-	flagSessionIDOnly string
+	flagSessionAgent string
+	flagSessionProg  string
+	flagSessionModel string
 
 	flagResumeCreateIfMissing bool
 	flagResumeForce           bool
@@ -32,7 +31,6 @@ func init() {
 	sessionCmd.PersistentFlags().StringVarP(&flagSessionAgent, "agent", "a", "", "agent name (required for start/resume)")
 	sessionCmd.PersistentFlags().StringVarP(&flagSessionProg, "program", "p", "", "agent program (e.g., codex-cli)")
 	sessionCmd.PersistentFlags().StringVarP(&flagSessionModel, "model", "m", "", "agent model (e.g., gpt-5.1-codex)")
-	sessionCmd.PersistentFlags().StringVarP(&flagSessionIDOnly, "session-id", "s", "", "session ID")
 
 	sessionResumeCmd.Flags().BoolVar(&flagResumeCreateIfMissing, "create-if-missing", true, "create a new session if none active")
 	sessionResumeCmd.Flags().BoolVar(&flagResumeForce, "force", false, "end mismatched active session and create a new one")
@@ -104,7 +102,7 @@ var sessionEndCmd = &cobra.Command{
 	Use:   "end",
 	Short: "End a session",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if flagSessionIDOnly == "" {
+		if flagSessionID == "" {
 			return fmt.Errorf("--session-id is required")
 		}
 		dbConn, err := db.Open(GetDB())
@@ -113,13 +111,13 @@ var sessionEndCmd = &cobra.Command{
 		}
 		defer dbConn.Close()
 
-		if err := dbConn.EndSession(flagSessionIDOnly); err != nil {
+		if err := dbConn.EndSession(flagSessionID); err != nil {
 			return err
 		}
 
 		out := output.New(output.Format(GetOutput()))
 		return out.Write(map[string]any{
-			"session_id": flagSessionIDOnly,
+			"session_id": flagSessionID,
 			"ended_at":   time.Now().UTC().Format(time.RFC3339),
 		})
 	},
@@ -219,7 +217,7 @@ var sessionHeartbeatCmd = &cobra.Command{
 	Use:   "heartbeat",
 	Short: "Update session heartbeat (last_active_at)",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if flagSessionIDOnly == "" {
+		if flagSessionID == "" {
 			return fmt.Errorf("--session-id is required")
 		}
 		dbConn, err := db.Open(GetDB())
@@ -228,13 +226,13 @@ var sessionHeartbeatCmd = &cobra.Command{
 		}
 		defer dbConn.Close()
 
-		if err := dbConn.UpdateSessionHeartbeat(flagSessionIDOnly); err != nil {
+		if err := dbConn.UpdateSessionHeartbeat(flagSessionID); err != nil {
 			return err
 		}
 
 		out := output.New(output.Format(GetOutput()))
 		return out.Write(map[string]any{
-			"session_id":     flagSessionIDOnly,
+			"session_id":     flagSessionID,
 			"last_active_at": time.Now().UTC().Format(time.RFC3339),
 		})
 	},
@@ -242,17 +240,29 @@ var sessionHeartbeatCmd = &cobra.Command{
 
 var sessionResetLimitsCmd = &cobra.Command{
 	Use:   "reset-limits",
-	Short: "Reset rate limits for a session (placeholder, no-op)",
+	Short: "Reset rate limits for a session",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if flagSessionIDOnly == "" {
+		if flagSessionID == "" {
 			return fmt.Errorf("--session-id is required")
 		}
-		// No rate-limiting implemented yet; return success placeholder.
+
+		dbConn, err := db.OpenAndMigrate(GetDB())
+		if err != nil {
+			return err
+		}
+		defer dbConn.Close()
+
+		limiter := core.NewRateLimiter(dbConn, core.DefaultRateLimitConfig())
+		resetAt, err := limiter.ResetRateLimits(flagSessionID)
+		if err != nil {
+			return err
+		}
+
 		out := output.New(output.Format(GetOutput()))
 		return out.Write(map[string]any{
-			"session_id": flagSessionIDOnly,
-			"status":     "ok",
-			"message":    "rate limits reset (no-op)",
+			"session_id":          flagSessionID,
+			"rate_limit_reset_at": resetAt.Format(time.RFC3339),
+			"status":              "ok",
 		})
 	},
 }

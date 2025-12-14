@@ -21,7 +21,7 @@ func init() {
 	rejectCmd.Flags().StringVarP(&flagRejectSessionID, "session-id", "s", "", "reviewer session ID (required)")
 	rejectCmd.Flags().StringVarP(&flagRejectSessionKey, "session-key", "k", "", "session HMAC key for signing (required)")
 	rejectCmd.Flags().StringVarP(&flagRejectReason, "reason", "r", "", "reason for rejection (required)")
-	rejectCmd.Flags().StringVarP(&flagRejectComments, "comments", "c", "", "additional comments")
+	rejectCmd.Flags().StringVarP(&flagRejectComments, "comments", "m", "", "additional comments")
 
 	rootCmd.AddCommand(rejectCmd)
 }
@@ -37,9 +37,9 @@ what was wrong and potentially submit a corrected request.
 The rejection is cryptographically signed with your session key to ensure
 authenticity.
 
-Examples:
-  slb reject abc123 -s $SESSION_ID -k $SESSION_KEY -r "Command too dangerous"
-  slb reject abc123 -s $SESSION_ID -k $SESSION_KEY -r "Justification insufficient" -c "Please add more context"`,
+	Examples:
+	  slb reject abc123 -s $SESSION_ID -k $SESSION_KEY -r "Command too dangerous"
+	  slb reject abc123 -s $SESSION_ID -k $SESSION_KEY -r "Justification insufficient" -m "Please add more context"`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		requestID := args[0]
@@ -53,6 +53,11 @@ Examples:
 		}
 		if flagRejectReason == "" {
 			return fmt.Errorf("--reason is required for rejections")
+		}
+
+		project, err := projectPath()
+		if err != nil {
+			return err
 		}
 
 		// Open database
@@ -78,6 +83,7 @@ Examples:
 
 		// Create review service and submit
 		reviewSvc := core.NewReviewService(dbConn, core.DefaultReviewConfig())
+		reviewSvc.SetNotifier(buildAgentMailNotifier(project))
 		result, err := reviewSvc.SubmitReview(opts)
 		if err != nil {
 			return fmt.Errorf("submitting rejection: %w", err)

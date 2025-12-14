@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/output"
 	"github.com/spf13/cobra"
@@ -40,7 +42,7 @@ Examples:
 		requestID := args[0]
 
 		// Open database
-		dbConn, err := db.Open(GetDB())
+		dbConn, err := db.OpenAndMigrate(GetDB())
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}
@@ -70,12 +72,15 @@ Examples:
 			}
 		}
 
-		// TODO: Implement actual rollback logic
-		// This would depend on what kind of state was captured:
-		// - File backups: restore from backup path
-		// - Git state: reset to captured commit
-		// - Database snapshot: restore from dump
-		// For now, we just record the rollback attempt
+		rollbackData, err := core.LoadRollbackData(request.Rollback.Path)
+		if err != nil {
+			return fmt.Errorf("loading rollback data: %w", err)
+		}
+
+		ctx := context.Background()
+		if err := core.RestoreRollbackState(ctx, rollbackData, core.RollbackRestoreOptions{Force: flagRollbackForce}); err != nil {
+			return fmt.Errorf("restoring rollback state: %w", err)
+		}
 
 		// Build output
 		type rollbackResult struct {
@@ -87,12 +92,16 @@ Examples:
 		}
 
 		now := time.Now().UTC()
+		if err := dbConn.UpdateRequestRolledBackAt(requestID, now); err != nil {
+			return fmt.Errorf("recording rolled_back_at: %w", err)
+		}
+
 		resp := rollbackResult{
 			RequestID:    requestID,
 			RollbackPath: request.Rollback.Path,
 			RolledBackAt: now.Format(time.RFC3339),
-			Status:       "pending",
-			Message:      "Rollback functionality is not yet implemented. Rollback data is available at the specified path.",
+			Status:       "rolled_back",
+			Message:      "Rollback completed using captured state.",
 		}
 
 		out := output.New(output.Format(GetOutput()))
@@ -104,8 +113,7 @@ Examples:
 		fmt.Printf("Rollback for request %s\n", requestID)
 		fmt.Printf("Rollback data: %s\n", request.Rollback.Path)
 		fmt.Println()
-		fmt.Println("Note: Automatic rollback is not yet implemented.")
-		fmt.Println("You can manually restore from the captured state at the path above.")
+		fmt.Println("Rollback completed.")
 
 		return nil
 	},

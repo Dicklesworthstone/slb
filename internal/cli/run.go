@@ -2,11 +2,14 @@
 package cli
 
 import (
+	"context"
 	"fmt"
+	"math"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/output"
@@ -72,6 +75,14 @@ Examples:
 			return err
 		}
 
+		cfg, err := config.Load(config.LoadOptions{
+			ProjectDir: project,
+			ConfigPath: flagConfig,
+		})
+		if err != nil {
+			return fmt.Errorf("loading config: %w", err)
+		}
+
 		cwd, err := os.Getwd()
 		if err != nil {
 			cwd = project
@@ -86,7 +97,7 @@ Examples:
 		out := output.New(output.Format(GetOutput()))
 
 		// Collect attachments from flags
-		attachments, err := CollectAttachments(AttachmentFlags{
+		attachments, err := CollectAttachments(cmd.Context(), AttachmentFlags{
 			Files:       flagRunAttachFile,
 			Contexts:    flagRunAttachContext,
 			Screenshots: flagRunAttachScreen,
@@ -95,8 +106,9 @@ Examples:
 			return writeError(out, "attachment_error", command, err)
 		}
 
-		// Step 1: Classify and create request
-		creator := core.NewRequestCreator(dbConn, nil, nil, nil)
+		// Step 1: Classify and create request using config-derived limits and notifiers
+		rl := core.NewRateLimiter(dbConn, toRateLimitConfig(cfg))
+		creator := core.NewRequestCreator(dbConn, rl, nil, toRequestCreatorConfig(cfg))
 		result, err := creator.CreateRequest(core.CreateRequestOptions{
 			SessionID: flagSessionID,
 			Command:   command,
@@ -117,7 +129,7 @@ Examples:
 
 		// Step 2: If SAFE, execute immediately
 		if result.Skipped {
-			return runAndOutput(out, command, cwd, nil)
+			return runSafeCommand(out, command, cwd, project)
 		}
 
 		request := result.Request
@@ -162,69 +174,182 @@ Examples:
 		}
 
 		// Step 5: Execute the approved command
-		return runAndOutput(out, command, cwd, request)
+		return runApprovedRequest(out, dbConn, cfg, project, request.ID)
 	},
 }
 
-// runAndOutput executes a command and writes the result.
-func runAndOutput(out *output.Writer, command, cwd string, request *db.Request) error {
-	startTime := time.Now()
+func runSafeCommand(out *output.Writer, command, cwd, project string) error {
+	logPath, err := createRunLogFile(project, "safe")
+	if err != nil {
+		return writeError(out, "log_create_failed", command, err)
+	}
 
-	// Execute using shell
-	shellCmd := exec.Command("sh", "-c", command)
-	shellCmd.Dir = cwd
-	shellCmd.Env = os.Environ()
-	shellCmd.Stdin = os.Stdin
-	shellCmd.Stdout = os.Stdout
-	shellCmd.Stderr = os.Stderr
+	spec := &db.CommandSpec{
+		Raw:   command,
+		Cwd:   cwd,
+		Shell: true,
+	}
+	spec.Hash = core.ComputeCommandHash(*spec)
 
-	err := shellCmd.Run()
-	duration := time.Since(startTime)
+	var streamWriter *os.File
+	if GetOutput() != "json" {
+		streamWriter = os.Stdout
+	}
+
+	result, execErr := core.RunCommand(context.Background(), spec, logPath, streamWriter)
 
 	exitCode := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
+	durationMs := int64(0)
+	if result != nil {
+		exitCode = result.ExitCode
+		durationMs = result.Duration.Milliseconds()
+	}
+
+	resp := map[string]any{
+		"status":           "executed",
+		"command":          command,
+		"exit_code":        exitCode,
+		"duration_ms":      durationMs,
+		"log_path":         logPath,
+		"tier":             "safe",
+		"skipped_approval": true,
+	}
+	if execErr != nil {
+		resp["error"] = execErr.Error()
+	}
+
+	if GetOutput() == "json" {
+		_ = out.Write(resp)
+		if execErr != nil {
+			os.Exit(1)
 		}
+		if exitCode != 0 {
+			os.Exit(exitCode)
+		}
+		return nil
+	}
+
+	if execErr != nil {
+		fmt.Fprintf(os.Stderr, "[slb] Execution failed: %s\n", execErr.Error())
+		os.Exit(1)
+	}
+	if exitCode != 0 {
+		fmt.Fprintf(os.Stderr, "\n[slb] Command exited with code %d\n", exitCode)
+		os.Exit(exitCode)
+	}
+	return nil
+}
+
+func runApprovedRequest(out *output.Writer, dbConn *db.DB, cfg config.Config, project, requestID string) error {
+	executor := core.NewExecutor(dbConn, nil).WithNotifier(buildAgentMailNotifier(project))
+
+	execResult, execErr := executor.ExecuteApprovedRequest(context.Background(), core.ExecuteOptions{
+		RequestID:         requestID,
+		SessionID:         flagSessionID,
+		LogDir:            ".slb/logs",
+		SuppressOutput:    GetOutput() == "json",
+		CaptureRollback:   cfg.General.EnableRollbackCapture,
+		MaxRollbackSizeMB: cfg.General.MaxRollbackSizeMB,
+	})
+
+	exitCode := 0
+	durationMs := int64(0)
+	logPath := ""
+	if execResult != nil {
+		exitCode = execResult.ExitCode
+		durationMs = execResult.Duration.Milliseconds()
+		logPath = execResult.LogPath
 	}
 
 	resp := map[string]any{
 		"status":      "executed",
-		"command":     command,
+		"request_id":  requestID,
 		"exit_code":   exitCode,
-		"duration_ms": duration.Milliseconds(),
+		"duration_ms": durationMs,
+		"log_path":    logPath,
+	}
+	if execErr != nil {
+		resp["error"] = execErr.Error()
 	}
 
-	if request != nil {
-		resp["request_id"] = request.ID
-		resp["tier"] = string(request.RiskTier)
-	} else {
-		resp["tier"] = "safe"
-		resp["skipped_approval"] = true
-	}
-
-	if err != nil && exitCode == 0 {
-		resp["execution_error"] = err.Error()
-	}
-
-	// Output based on format - for text mode, we already printed stdout/stderr
 	if GetOutput() == "json" {
-		return out.Write(resp)
+		_ = out.Write(resp)
+		if execErr != nil {
+			os.Exit(1)
+		}
+		if exitCode != 0 {
+			os.Exit(exitCode)
+		}
+		return nil
 	}
 
-	// For text mode, only print summary if there was an error
+	if execErr != nil {
+		fmt.Fprintf(os.Stderr, "[slb] Execution failed: %s\n", execErr.Error())
+		os.Exit(1)
+	}
 	if exitCode != 0 {
 		fmt.Fprintf(os.Stderr, "\n[slb] Command exited with code %d\n", exitCode)
-	}
-
-	// Exit with the command's exit code
-	if exitCode != 0 {
 		os.Exit(exitCode)
 	}
-
 	return nil
+}
+
+func createRunLogFile(project, prefix string) (string, error) {
+	if prefix == "" {
+		prefix = "run"
+	}
+	baseDir := ".slb/logs"
+	if project != "" {
+		baseDir = filepath.Join(project, ".slb", "logs")
+	}
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return "", fmt.Errorf("creating log dir: %w", err)
+	}
+
+	timestamp := time.Now().Format("20060102-150405")
+	logName := fmt.Sprintf("%s_%s.log", timestamp, prefix)
+	logPath := filepath.Join(baseDir, logName)
+
+	f, err := os.Create(logPath)
+	if err != nil {
+		return "", fmt.Errorf("creating log file: %w", err)
+	}
+	_ = f.Close()
+	return logPath, nil
+}
+
+// Helpers to adapt config into core types ------------------------------------
+
+func toRateLimitConfig(cfg config.Config) core.RateLimitConfig {
+	action := core.RateLimitAction(cfg.RateLimits.RateLimitAction)
+	switch action {
+	case core.RateLimitActionReject, core.RateLimitActionQueue, core.RateLimitActionWarn:
+	default:
+		action = core.RateLimitActionReject
+	}
+	return core.RateLimitConfig{
+		MaxPendingPerSession: cfg.RateLimits.MaxPendingPerSession,
+		MaxRequestsPerMinute: cfg.RateLimits.MaxRequestsPerMinute,
+		Action:               action,
+	}
+}
+
+func toRequestCreatorConfig(cfg config.Config) *core.RequestCreatorConfig {
+	timeoutMinutes := int(math.Ceil(float64(cfg.General.RequestTimeoutSecs) / 60.0))
+	if timeoutMinutes <= 0 {
+		timeoutMinutes = 30
+	}
+	return &core.RequestCreatorConfig{
+		BlockedAgents:              cfg.Agents.Blocked,
+		DynamicQuorumEnabled:       false,
+		DynamicQuorumFloor:         1,
+		RequestTimeoutMinutes:      timeoutMinutes,
+		ApprovalTTLMinutes:         cfg.General.ApprovalTTLMins,
+		ApprovalTTLCriticalMinutes: cfg.General.ApprovalTTLCriticalMins,
+		AgentMailEnabled:           cfg.Integrations.AgentMailEnabled,
+		AgentMailThread:            cfg.Integrations.AgentMailThread,
+		AgentMailSender:            "",
+	}
 }
 
 // writeError outputs an error response.

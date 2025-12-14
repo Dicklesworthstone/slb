@@ -12,15 +12,13 @@ import (
 )
 
 var (
-	flagReviewAll     bool
-	flagReviewProject string
-	flagReviewPool    bool
+	flagReviewAll  bool
+	flagReviewPool bool
 )
 
 func init() {
-	reviewCmd.Flags().BoolVarP(&flagReviewAll, "all", "a", false, "show requests from all projects")
-	reviewCmd.Flags().StringVarP(&flagReviewProject, "project", "C", "", "filter by project path")
-	reviewCmd.Flags().BoolVar(&flagReviewPool, "review-pool", false, "show requests from configured review pool (cross-project)")
+	reviewCmd.PersistentFlags().BoolVarP(&flagReviewAll, "all", "a", false, "show requests from all projects")
+	reviewCmd.PersistentFlags().BoolVar(&flagReviewPool, "review-pool", false, "show requests from configured review pool (cross-project)")
 
 	reviewCmd.AddCommand(reviewListCmd)
 	reviewCmd.AddCommand(reviewShowCmd)
@@ -52,13 +50,9 @@ var reviewListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List pending requests awaiting review",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		project := flagReviewProject
-		if project == "" {
-			var err error
-			project, err = projectPath()
-			if err != nil {
-				return err
-			}
+		project, err := projectPath()
+		if err != nil {
+			return err
 		}
 
 		cfg, err := config.Load(config.LoadOptions{

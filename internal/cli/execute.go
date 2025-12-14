@@ -5,17 +5,19 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
+	"github.com/Dicklesworthstone/slb/internal/integrations"
 	"github.com/Dicklesworthstone/slb/internal/output"
 	"github.com/spf13/cobra"
 )
 
 var (
-	flagExecuteSessionID string
-	flagExecuteTimeout   int
+	flagExecuteSessionID  string
+	flagExecuteTimeout    int
 	flagExecuteBackground bool
-	flagExecuteLogDir    string
+	flagExecuteLogDir     string
 )
 
 func init() {
@@ -23,6 +25,8 @@ func init() {
 	executeCmd.Flags().IntVarP(&flagExecuteTimeout, "timeout", "t", 300, "execution timeout in seconds")
 	executeCmd.Flags().BoolVar(&flagExecuteBackground, "background", false, "run in background, return immediately")
 	executeCmd.Flags().StringVar(&flagExecuteLogDir, "log-dir", ".slb/logs", "directory for execution logs")
+	// Reuse Agent Mail notifier builder from approve/reject
+	_ = integrations.NoopNotifier{} // keep import if build tags change
 
 	rootCmd.AddCommand(executeCmd)
 }
@@ -61,8 +65,21 @@ Examples:
 		}
 		defer dbConn.Close()
 
+		// Load config based on the request's project path (not just CWD).
+		req, err := dbConn.GetRequest(requestID)
+		if err != nil {
+			return fmt.Errorf("getting request: %w", err)
+		}
+		cfg, err := config.Load(config.LoadOptions{
+			ProjectDir: req.ProjectPath,
+			ConfigPath: flagConfig,
+		})
+		if err != nil {
+			return fmt.Errorf("loading config: %w", err)
+		}
+
 		// Create executor
-		executor := core.NewExecutor(dbConn, nil)
+		executor := core.NewExecutor(dbConn, nil).WithNotifier(buildAgentMailNotifier(req.ProjectPath))
 
 		// Check if we can execute first
 		canExec, reason := executor.CanExecute(requestID)
@@ -72,11 +89,14 @@ Examples:
 
 		// Build options
 		opts := core.ExecuteOptions{
-			RequestID:  requestID,
-			SessionID:  flagExecuteSessionID,
-			Timeout:    time.Duration(flagExecuteTimeout) * time.Second,
-			Background: flagExecuteBackground,
-			LogDir:     flagExecuteLogDir,
+			RequestID:         requestID,
+			SessionID:         flagExecuteSessionID,
+			Timeout:           time.Duration(flagExecuteTimeout) * time.Second,
+			Background:        flagExecuteBackground,
+			LogDir:            flagExecuteLogDir,
+			SuppressOutput:    GetOutput() == "json",
+			CaptureRollback:   cfg.General.EnableRollbackCapture,
+			MaxRollbackSizeMB: cfg.General.MaxRollbackSizeMB,
 		}
 
 		// Execute
@@ -85,12 +105,12 @@ Examples:
 
 		// Build output
 		type executeResult struct {
-			RequestID   string `json:"request_id"`
-			ExitCode    int    `json:"exit_code"`
-			DurationMs  int64  `json:"duration_ms"`
-			LogPath     string `json:"log_path"`
-			TimedOut    bool   `json:"timed_out,omitempty"`
-			Error       string `json:"error,omitempty"`
+			RequestID  string `json:"request_id"`
+			ExitCode   int    `json:"exit_code"`
+			DurationMs int64  `json:"duration_ms"`
+			LogPath    string `json:"log_path"`
+			TimedOut   bool   `json:"timed_out,omitempty"`
+			Error      string `json:"error,omitempty"`
 		}
 
 		resp := executeResult{
@@ -110,7 +130,10 @@ Examples:
 
 		out := output.New(output.Format(GetOutput()))
 		if GetOutput() == "json" {
-			return out.Write(resp)
+			if writeErr := out.Write(resp); writeErr != nil {
+				return writeErr
+			}
+			return err
 		}
 
 		// Human-readable output

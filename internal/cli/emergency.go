@@ -10,9 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/output"
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 )
 
@@ -114,12 +116,47 @@ To get the command hash for --ack, run:
 			cwd = "."
 		}
 
+		project, err := projectPath()
+		if err != nil {
+			return err
+		}
+
+		cfg, err := config.Load(config.LoadOptions{
+			ProjectDir: project,
+			ConfigPath: flagConfig,
+		})
+		if err != nil {
+			return fmt.Errorf("loading config: %w", err)
+		}
+
 		// Build command spec
 		cmdSpec := &db.CommandSpec{
 			Raw:   command,
 			Cwd:   cwd,
 			Shell: true, // Emergency commands always use shell
 			Hash:  commandHash,
+		}
+
+		var rollbackPath string
+		if flagEmergencyCapture {
+			if !cfg.General.EnableRollbackCapture {
+				return fmt.Errorf("rollback capture is disabled by config (general.enable_rollback_capture=false)")
+			}
+			rollbackReq := &db.Request{
+				ID:          uuid.NewString(),
+				ProjectPath: project,
+				Command:     *cmdSpec,
+			}
+			data, err := core.CaptureRollbackState(context.Background(), rollbackReq, core.RollbackCaptureOptions{
+				MaxSizeBytes: int64(cfg.General.MaxRollbackSizeMB) * 1024 * 1024,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: rollback capture failed: %v\n", err)
+			} else if data == nil {
+				fmt.Fprintf(os.Stderr, "warning: rollback capture unsupported for this command type\n")
+			} else {
+				rollbackPath = data.RollbackPath
+			}
 		}
 
 		// Create log file
@@ -151,7 +188,11 @@ To get the command hash for --ack, run:
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(flagEmergencyTimeout)*time.Second)
 		defer cancel()
 
-		result, err := core.RunCommand(ctx, cmdSpec, logPath)
+		var streamWriter *os.File
+		if GetOutput() != "json" {
+			streamWriter = os.Stdout
+		}
+		result, err := core.RunCommand(ctx, cmdSpec, logPath, streamWriter)
 
 		// Build output
 		type emergencyResult struct {
@@ -160,6 +201,7 @@ To get the command hash for --ack, run:
 			ExitCode   int    `json:"exit_code"`
 			DurationMs int64  `json:"duration_ms"`
 			LogPath    string `json:"log_path"`
+			RollbackPath string `json:"rollback_path,omitempty"`
 			Reason     string `json:"reason"`
 			Actor      string `json:"actor"`
 			ExecutedAt string `json:"executed_at"`
@@ -170,6 +212,7 @@ To get the command hash for --ack, run:
 			Command:    command,
 			Hash:       commandHash,
 			LogPath:    logPath,
+			RollbackPath: rollbackPath,
 			Reason:     flagEmergencyReason,
 			Actor:      GetActor(),
 			ExecutedAt: time.Now().Format(time.RFC3339),
@@ -186,7 +229,10 @@ To get the command hash for --ack, run:
 
 		out := output.New(output.Format(GetOutput()))
 		if GetOutput() == "json" {
-			return out.Write(resp)
+			if writeErr := out.Write(resp); writeErr != nil {
+				return writeErr
+			}
+			return err
 		}
 
 		// Human-readable output
@@ -199,6 +245,9 @@ To get the command hash for --ack, run:
 			fmt.Printf("Duration: %dms\n", resp.DurationMs)
 		}
 		fmt.Printf("Log: %s\n", resp.LogPath)
+		if resp.RollbackPath != "" {
+			fmt.Printf("Rollback: %s\n", resp.RollbackPath)
+		}
 		fmt.Println()
 		fmt.Println("Note: This execution was logged for audit purposes.")
 

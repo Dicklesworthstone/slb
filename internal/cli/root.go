@@ -4,6 +4,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 
 	"github.com/spf13/cobra"
@@ -43,6 +44,15 @@ Commands are classified by risk level:
   SAFE       - Skipped entirely (read-only commands)`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		if flagProject == "" {
+			return nil
+		}
+		if err := os.Chdir(flagProject); err != nil {
+			return fmt.Errorf("changing directory to %s: %w", flagProject, err)
+		}
+		return nil
+	},
 	Run: func(cmd *cobra.Command, args []string) {
 		// When no subcommand given, show quick reference card
 		showQuickReference()
@@ -95,8 +105,12 @@ func GetDB() string {
 	if flagDB != "" {
 		return flagDB
 	}
+	project, err := projectPath()
+	if err == nil && project != "" {
+		return filepath.Join(project, ".slb", "state.db")
+	}
 	home, _ := os.UserHomeDir()
-	return home + "/.local/share/slb/slb.db"
+	return filepath.Join(home, ".slb", "history.db")
 }
 
 // GetActor returns the actor identifier.

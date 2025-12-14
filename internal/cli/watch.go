@@ -16,18 +16,14 @@ import (
 )
 
 var (
-	flagWatchProject          string
-	flagWatchSessionID        string
+	flagWatchSessionID          string
 	flagWatchAutoApproveCaution bool
-	flagWatchJSON             bool
-	flagWatchPollInterval     time.Duration
+	flagWatchPollInterval       time.Duration
 )
 
 func init() {
-	watchCmd.Flags().StringVarP(&flagWatchProject, "project", "C", "", "project path (defaults to current directory)")
 	watchCmd.Flags().StringVarP(&flagWatchSessionID, "session-id", "s", "", "session ID for auto-approve attribution")
 	watchCmd.Flags().BoolVar(&flagWatchAutoApproveCaution, "auto-approve-caution", false, "automatically approve CAUTION tier requests")
-	watchCmd.Flags().BoolVar(&flagWatchJSON, "json", true, "output NDJSON format (default true)")
 	watchCmd.Flags().DurationVar(&flagWatchPollInterval, "poll-interval", 2*time.Second, "polling interval when daemon not available")
 
 	rootCmd.AddCommand(watchCmd)

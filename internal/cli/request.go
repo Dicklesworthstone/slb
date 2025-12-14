@@ -2,10 +2,12 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/output"
@@ -71,6 +73,14 @@ Use --execute with --wait to execute after approval.`,
 			return err
 		}
 
+		cfg, err := config.Load(config.LoadOptions{
+			ProjectDir: project,
+			ConfigPath: flagConfig,
+		})
+		if err != nil {
+			return fmt.Errorf("loading config: %w", err)
+		}
+
 		cwd, err := os.Getwd()
 		if err != nil {
 			cwd = project
@@ -83,7 +93,7 @@ Use --execute with --wait to execute after approval.`,
 		defer dbConn.Close()
 
 		// Collect attachments from flags
-		attachments, err := CollectAttachments(AttachmentFlags{
+		attachments, err := CollectAttachments(cmd.Context(), AttachmentFlags{
 			Files:       flagRequestAttachFile,
 			Contexts:    flagRequestAttachContext,
 			Screenshots: flagRequestAttachScreen,
@@ -92,8 +102,9 @@ Use --execute with --wait to execute after approval.`,
 			return fmt.Errorf("collecting attachments: %w", err)
 		}
 
-		// Create the request using the core logic
-		creator := core.NewRequestCreator(dbConn, nil, nil, nil)
+		// Create the request using the core logic (config-driven rate limits + integrations).
+		rl := core.NewRateLimiter(dbConn, toRateLimitConfig(cfg))
+		creator := core.NewRequestCreator(dbConn, rl, nil, toRequestCreatorConfig(cfg))
 		result, err := creator.CreateRequest(core.CreateRequestOptions{
 			SessionID: flagSessionID,
 			Command:   command,
@@ -117,10 +128,10 @@ Use --execute with --wait to execute after approval.`,
 		// If skipped (safe command), return immediately
 		if result.Skipped {
 			return out.Write(map[string]any{
-				"status":      "skipped",
-				"reason":      result.SkipReason,
-				"tier":        result.Classification.Tier,
-				"command":     command,
+				"status":  "skipped",
+				"reason":  result.SkipReason,
+				"tier":    result.Classification.Tier,
+				"command": command,
 			})
 		}
 
@@ -128,13 +139,13 @@ Use --execute with --wait to execute after approval.`,
 
 		// Build response
 		resp := map[string]any{
-			"request_id":      request.ID,
-			"status":          string(request.Status),
-			"tier":            string(request.RiskTier),
-			"command":         request.Command.Raw,
-			"command_hash":    request.Command.Hash,
-			"min_approvals":   request.MinApprovals,
-			"created_at":      request.CreatedAt.Format(time.RFC3339),
+			"request_id":    request.ID,
+			"status":        string(request.Status),
+			"tier":          string(request.RiskTier),
+			"command":       request.Command.Raw,
+			"command_hash":  request.Command.Hash,
+			"min_approvals": request.MinApprovals,
+			"created_at":    request.CreatedAt.Format(time.RFC3339),
 		}
 
 		if request.Command.DisplayRedacted != "" {
@@ -172,29 +183,58 @@ Use --execute with --wait to execute after approval.`,
 
 		// Execute if approved and --execute was specified
 		if flagRequestExecute && request.Status == db.StatusApproved {
-			exitCode, execErr := executeCommand(command, cwd)
+			executor := core.NewExecutor(dbConn, nil).WithNotifier(buildAgentMailNotifier(project))
+			execResult, execErr := executor.ExecuteApprovedRequest(context.Background(), core.ExecuteOptions{
+				RequestID:         request.ID,
+				SessionID:         flagSessionID,
+				LogDir:            ".slb/logs",
+				SuppressOutput:    GetOutput() == "json",
+				CaptureRollback:   cfg.General.EnableRollbackCapture,
+				MaxRollbackSizeMB: cfg.General.MaxRollbackSizeMB,
+			})
+
+			exitCode := 0
+			durationMs := int64(0)
+			logPath := ""
+			if execResult != nil {
+				exitCode = execResult.ExitCode
+				durationMs = execResult.Duration.Milliseconds()
+				logPath = execResult.LogPath
+			}
+
 			resp["executed"] = true
 			resp["exit_code"] = exitCode
+			resp["duration_ms"] = durationMs
+			resp["log_path"] = logPath
+
 			if execErr != nil {
 				resp["execution_error"] = execErr.Error()
+			}
+
+			// Refresh status after execution.
+			if updated, err := dbConn.GetRequest(request.ID); err == nil && updated != nil {
+				resp["status"] = string(updated.Status)
+			}
+
+			if GetOutput() == "json" {
+				_ = out.Write(resp)
+				if execErr != nil {
+					os.Exit(1)
+				}
+				if exitCode != 0 {
+					os.Exit(exitCode)
+				}
+				return nil
+			}
+
+			if execErr != nil {
+				return fmt.Errorf("executing request: %w", execErr)
+			}
+			if exitCode != 0 {
+				os.Exit(exitCode)
 			}
 		}
 
 		return out.Write(resp)
 	},
-}
-
-// executeCommand runs a command in the shell and returns the exit code.
-// This is a placeholder - full implementation would capture output and update DB.
-func executeCommand(command, cwd string) (int, error) {
-	// For now, use a simple exec approach
-	// In the full implementation, this would:
-	// 1. Update request status to "executing"
-	// 2. Run the command with proper environment
-	// 3. Capture output to log file
-	// 4. Update request status and execution details
-
-	// Placeholder: return success for now
-	// Real implementation will be in run.go
-	return 0, fmt.Errorf("execution not implemented in request command (use 'slb run' for atomic execution)")
 }

@@ -94,14 +94,15 @@ func showQuickReference() {
 
 	setup := renderSection(useUnicode, "🔷 SETUP (once per session)", []string{
 		bullet("slb session start -a <name> -p <program> -m <model> -j", "start an agent session (get session_id)"),
+		bullet("slb daemon start", "optional: start background daemon (faster + notifications)"),
 		bullet("slb patterns test \"rm -rf ./build\" --json", "see if command needs approval"),
-		bullet("export SLB_PROJECT=<path>", "override project (optional)"),
+		bullet("slb -C /path/to/repo pending -j", "operate on a different project (optional)"),
 	})
 
 	requestor := renderSection(useUnicode, "🔶 AS REQUESTOR (dangerous commands)", []string{
-		bullet("slb run \"rm -rf ./build\" --reason \"Cleanup\" --timeout 300 -j", "classify, request approval, wait, then execute"),
+		bullet("slb run \"rm -rf ./build\" -s $SID --reason \"Cleanup\" --timeout 300 -j", "classify, request approval, wait, then execute"),
 		bullet("slb status <request-id> --wait -j", "block until approved/rejected/timeout"),
-		bullet("slb execute <request-id> -j", "execute once approved (client-side)"),
+		bullet("slb execute <request-id> -s $SID -j", "execute once approved (client-side)"),
 	})
 
 	plumbing := renderSection(useUnicode, "🔧 PLUMBING (advanced)", []string{
@@ -113,8 +114,8 @@ func showQuickReference() {
 	reviewer := renderSection(useUnicode, "🔷 AS REVIEWER (check frequently)", []string{
 		bullet("slb pending -j", "list pending approvals"),
 		bullet("slb review <id> -j", "inspect details"),
-		bullet("slb approve <id> <id2> -s $SID --reason-response \"Verified\"", "approve (bulk ok)"),
-		bullet("slb reject <id> -s $SID --reason \"Need safer path\"", "reject with justification"),
+		bullet("slb approve <id> -s $SID -k $SKEY --reason-response \"Verified\"", "approve (signed)"),
+		bullet("slb reject <id> -s $SID -k $SKEY --reason \"Need safer path\"", "reject (signed)"),
 	})
 
 	patterns := renderSection(useUnicode, "🛡️ PATTERNS (agents can add, not remove)", []string{
