@@ -557,6 +557,31 @@ func TestIsUniqueConstraintError_Nil(t *testing.T) {
 	}
 }
 
+func TestScanSessions_BadRows(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	s := &Session{
+		AgentName:   "BadRows",
+		Program:     "codex-cli",
+		Model:       "gpt-5",
+		ProjectPath: "/test/project",
+	}
+	if err := db.CreateSession(s); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	rows, err := db.Query(`SELECT id FROM sessions`)
+	if err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+	defer rows.Close()
+
+	if _, err := scanSessions(rows); err == nil {
+		t.Fatalf("expected scanSessions to fail with wrong column count")
+	}
+}
+
 // setupTestDB creates a temporary database for testing.
 func setupTestDB(t *testing.T) *DB {
 	t.Helper()

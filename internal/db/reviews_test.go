@@ -428,6 +428,77 @@ func TestIsRequestorSameAsReviewer_RequestNotFound(t *testing.T) {
 	}
 }
 
+func TestCreateReview_ForeignKeyError(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	reviewerSess := &Session{
+		AgentName:   "ReviewerFK",
+		Program:     "codex-cli",
+		Model:       "gpt-5",
+		ProjectPath: "/test/project",
+	}
+	if err := db.CreateSession(reviewerSess); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	now := time.Now().UTC()
+	sig := ComputeReviewSignature(reviewerSess.SessionKey, "missing-request", DecisionApprove, now)
+	review := &Review{
+		RequestID:          "missing-request",
+		ReviewerSessionID:  reviewerSess.ID,
+		ReviewerAgent:      reviewerSess.AgentName,
+		ReviewerModel:      reviewerSess.Model,
+		Decision:           DecisionApprove,
+		Signature:          sig,
+		SignatureTimestamp: now,
+	}
+	err := db.CreateReview(review)
+	if err == nil {
+		t.Fatalf("expected foreign key error")
+	}
+}
+
+func TestScanReviewList_BadRows(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	_, req := createTestRequest(t, db)
+	reviewerSess := &Session{
+		AgentName:   "ReviewerBadRows",
+		Program:     "codex-cli",
+		Model:       "gpt-5",
+		ProjectPath: "/test/project",
+	}
+	if err := db.CreateSession(reviewerSess); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	now := time.Now().UTC()
+	sig := ComputeReviewSignature(reviewerSess.SessionKey, req.ID, DecisionApprove, now)
+	if err := db.CreateReview(&Review{
+		RequestID:          req.ID,
+		ReviewerSessionID:  reviewerSess.ID,
+		ReviewerAgent:      reviewerSess.AgentName,
+		ReviewerModel:      reviewerSess.Model,
+		Decision:           DecisionApprove,
+		Signature:          sig,
+		SignatureTimestamp: now,
+	}); err != nil {
+		t.Fatalf("CreateReview failed: %v", err)
+	}
+
+	rows, err := db.Query(`SELECT id FROM reviews`)
+	if err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+	defer rows.Close()
+
+	if _, err := scanReviewList(rows); err == nil {
+		t.Fatalf("expected scanReviewList to fail with wrong column count")
+	}
+}
+
 func TestCreateReviewWithValidation_ApproveRejectAndValidationErrors(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()

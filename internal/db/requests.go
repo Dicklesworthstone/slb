@@ -220,6 +220,31 @@ func (db *DB) ListRequestsByStatus(status RequestStatus, projectPath string) ([]
 	return scanRequests(rows)
 }
 
+// ListAllRequests returns all requests for a project, ordered by creation time descending.
+func (db *DB) ListAllRequests(projectPath string) ([]*Request, error) {
+	rows, err := db.Query(`
+		SELECT id, project_path,
+			command_raw, command_argv_json, command_cwd, command_shell, command_hash,
+			command_display_redacted, command_contains_sensitive,
+			risk_tier, requestor_session_id, requestor_agent, requestor_model,
+			justification_reason, justification_expected_effect, justification_goal, justification_safety_argument,
+			dry_run_command, dry_run_output, attachments_json,
+			status, min_approvals, require_different_model,
+			execution_log_path, execution_exit_code, execution_duration_ms,
+			execution_executed_at, execution_executed_by_session_id, execution_executed_by_agent, execution_executed_by_model,
+			rollback_path, rollback_rolled_back_at,
+			created_at, resolved_at, expires_at, approval_expires_at
+		FROM requests WHERE project_path = ?
+		ORDER BY created_at DESC
+	`, projectPath)
+	if err != nil {
+		return nil, fmt.Errorf("querying all requests: %w", err)
+	}
+	defer rows.Close()
+
+	return scanRequests(rows)
+}
+
 // UpdateRequestStatus updates a request's status using the state machine.
 func (db *DB) UpdateRequestStatus(id string, status RequestStatus) error {
 	// Get current request

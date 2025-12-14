@@ -345,6 +345,63 @@ func TestListRequestsByStatus(t *testing.T) {
 	}
 }
 
+func TestListAllRequests(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	project1 := "/test/project"
+	project2 := "/test/other"
+
+	sess1 := &Session{AgentName: "ListAll1", Program: "codex-cli", Model: "gpt-5", ProjectPath: project1}
+	if err := db.CreateSession(sess1); err != nil {
+		t.Fatalf("CreateSession sess1 failed: %v", err)
+	}
+	sess2 := &Session{AgentName: "ListAll2", Program: "codex-cli", Model: "gpt-5", ProjectPath: project2}
+	if err := db.CreateSession(sess2); err != nil {
+		t.Fatalf("CreateSession sess2 failed: %v", err)
+	}
+
+	makeReq := func(sess *Session, raw string) *Request {
+		r := &Request{
+			ProjectPath:        sess.ProjectPath,
+			RequestorSessionID: sess.ID,
+			RequestorAgent:     sess.AgentName,
+			RequestorModel:     sess.Model,
+			RiskTier:           RiskTierDangerous,
+			MinApprovals:       1,
+			Command:            CommandSpec{Raw: raw, Cwd: sess.ProjectPath},
+			Justification:      Justification{Reason: "list all"},
+		}
+		if err := db.CreateRequest(r); err != nil {
+			t.Fatalf("CreateRequest failed: %v", err)
+		}
+		return r
+	}
+
+	r1 := makeReq(sess1, "rm -rf ./build")
+	r2 := makeReq(sess1, "rm -rf ./dist")
+	_ = makeReq(sess2, "rm -rf ./other") // different project, should be excluded
+
+	base := time.Now().UTC().Truncate(time.Second)
+	if _, err := db.Exec(`UPDATE requests SET created_at = ? WHERE id = ?`, base.Format(time.RFC3339), r1.ID); err != nil {
+		t.Fatalf("update created_at r1 failed: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE requests SET created_at = ? WHERE id = ?`, base.Add(1*time.Minute).Format(time.RFC3339), r2.ID); err != nil {
+		t.Fatalf("update created_at r2 failed: %v", err)
+	}
+
+	all, err := db.ListAllRequests(project1)
+	if err != nil {
+		t.Fatalf("ListAllRequests failed: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("expected 2 requests, got %d", len(all))
+	}
+	if all[0].ID != r2.ID || all[1].ID != r1.ID {
+		t.Fatalf("unexpected order: got [%s,%s] want [%s,%s]", all[0].ID, all[1].ID, r2.ID, r1.ID)
+	}
+}
+
 func TestListPendingRequestsAllProjects(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()

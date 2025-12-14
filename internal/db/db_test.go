@@ -135,6 +135,31 @@ func TestApplyMigrations_Idempotent(t *testing.T) {
 	}
 }
 
+func TestAddColumnIfMissing_AlreadyExistsAndMissingTable(t *testing.T) {
+	tmpDir := t.TempDir()
+	db, err := Open(filepath.Join(tmpDir, "test.db"))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	tx, err := db.conn.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BeginTx failed: %v", err)
+	}
+	defer tx.Rollback()
+
+	// rate_limit_reset_at should already exist after migrations.
+	if err := addColumnIfMissing(context.Background(), tx, "sessions", "rate_limit_reset_at", "TEXT"); err != nil {
+		t.Fatalf("addColumnIfMissing(existing) failed: %v", err)
+	}
+
+	// Missing tables should error on ALTER TABLE.
+	if err := addColumnIfMissing(context.Background(), tx, "missing_table", "col", "TEXT"); err == nil {
+		t.Fatalf("expected addColumnIfMissing to fail for missing table")
+	}
+}
+
 func TestDB_ReturnsErrorsWhenClosed(t *testing.T) {
 	tmpDir := t.TempDir()
 	db, err := Open(filepath.Join(tmpDir, "test.db"))
@@ -160,17 +185,110 @@ func TestDB_ReturnsErrorsWhenClosed(t *testing.T) {
 	if _, err := db.ListOutcomes(10); err == nil {
 		t.Fatalf("expected ListOutcomes to fail on closed DB")
 	}
+	if _, err := db.GetOutcomeStats(); err == nil {
+		t.Fatalf("expected GetOutcomeStats to fail on closed DB")
+	}
+	if _, err := db.GetRequestStatsByAgent("Agent"); err == nil {
+		t.Fatalf("expected GetRequestStatsByAgent to fail on closed DB")
+	}
+	if _, err := db.GetTimeToApprovalStats(); err == nil {
+		t.Fatalf("expected GetTimeToApprovalStats to fail on closed DB")
+	}
 	if _, err := db.ListPendingRequestsAllProjects(); err == nil {
 		t.Fatalf("expected ListPendingRequestsAllProjects to fail on closed DB")
+	}
+	if _, err := db.ListAllRequests("/test/project"); err == nil {
+		t.Fatalf("expected ListAllRequests to fail on closed DB")
+	}
+	if _, err := db.ListRequestsByStatus(StatusPending, "/test/project"); err == nil {
+		t.Fatalf("expected ListRequestsByStatus to fail on closed DB")
+	}
+	if _, err := db.CountPendingBySession("sess"); err == nil {
+		t.Fatalf("expected CountPendingBySession to fail on closed DB")
+	}
+	if _, err := db.CountRequestsSince("sess", time.Now()); err == nil {
+		t.Fatalf("expected CountRequestsSince to fail on closed DB")
+	}
+	if _, err := db.OldestRequestCreatedAtSince("sess", time.Now()); err == nil {
+		t.Fatalf("expected OldestRequestCreatedAtSince to fail on closed DB")
 	}
 	if _, err := db.SearchRequests("test"); err == nil {
 		t.Fatalf("expected SearchRequests to fail on closed DB")
 	}
+	if _, err := db.FindExpiredRequests(); err == nil {
+		t.Fatalf("expected FindExpiredRequests to fail on closed DB")
+	}
+	if _, _, err := db.GetRequestWithReviews("req"); err == nil {
+		t.Fatalf("expected GetRequestWithReviews to fail on closed DB")
+	}
 	if _, err := db.ListActiveSessions("/test/project"); err == nil {
 		t.Fatalf("expected ListActiveSessions to fail on closed DB")
 	}
+	if _, err := db.ListAllActiveSessions(); err == nil {
+		t.Fatalf("expected ListAllActiveSessions to fail on closed DB")
+	}
+	if err := db.UpdateSessionHeartbeat("sess"); err == nil {
+		t.Fatalf("expected UpdateSessionHeartbeat to fail on closed DB")
+	}
+	if err := db.EndSession("sess"); err == nil {
+		t.Fatalf("expected EndSession to fail on closed DB")
+	}
+	if _, err := db.GetSessionRateLimitResetAt("sess"); err == nil {
+		t.Fatalf("expected GetSessionRateLimitResetAt to fail on closed DB")
+	}
+	if _, err := db.ResetSessionRateLimits("sess", time.Now()); err == nil {
+		t.Fatalf("expected ResetSessionRateLimits to fail on closed DB")
+	}
+	if _, err := db.FindStaleSessions(1 * time.Hour); err == nil {
+		t.Fatalf("expected FindStaleSessions to fail on closed DB")
+	}
+	if _, err := db.ListActiveSessionsWithDifferentModel("/test/project", "gpt-5"); err == nil {
+		t.Fatalf("expected ListActiveSessionsWithDifferentModel to fail on closed DB")
+	}
+	if _, err := db.HasActiveSessionWithDifferentModel("/test/project", "gpt-5"); err == nil {
+		t.Fatalf("expected HasActiveSessionWithDifferentModel to fail on closed DB")
+	}
+	if _, err := db.GetDifferentModelStatus("/test/project", "gpt-5"); err == nil {
+		t.Fatalf("expected GetDifferentModelStatus to fail on closed DB")
+	}
 	if err := db.UpdateRequestExecution("req", &Execution{LogPath: "/tmp/log"}); err == nil {
 		t.Fatalf("expected UpdateRequestExecution to fail on closed DB")
+	}
+	if err := db.UpdateRequestRollbackPath("req", "/tmp/rollback"); err == nil {
+		t.Fatalf("expected UpdateRequestRollbackPath to fail on closed DB")
+	}
+	if err := db.UpdateRequestRolledBackAt("req", time.Now()); err == nil {
+		t.Fatalf("expected UpdateRequestRolledBackAt to fail on closed DB")
+	}
+	if err := db.CreateSession(&Session{AgentName: "A", Program: "p", Model: "m", ProjectPath: "/p"}); err == nil {
+		t.Fatalf("expected CreateSession to fail on closed DB")
+	}
+	if err := db.CreateReview(&Review{RequestID: "req", ReviewerSessionID: "sess", ReviewerAgent: "A", ReviewerModel: "m", Decision: DecisionApprove}); err == nil {
+		t.Fatalf("expected CreateReview to fail on closed DB")
+	}
+	if _, _, err := db.CountReviewsByDecision("req"); err == nil {
+		t.Fatalf("expected CountReviewsByDecision to fail on closed DB")
+	}
+	if _, err := db.ListReviewsForRequest("req"); err == nil {
+		t.Fatalf("expected ListReviewsForRequest to fail on closed DB")
+	}
+	if _, err := db.HasDifferentModelApproval("req", "model"); err == nil {
+		t.Fatalf("expected HasDifferentModelApproval to fail on closed DB")
+	}
+	if _, _, err := db.CheckRequestApprovalStatus("req"); err == nil {
+		t.Fatalf("expected CheckRequestApprovalStatus to fail on closed DB")
+	}
+	if _, err := db.RecordOutcome("req", false, "", nil, ""); err == nil {
+		t.Fatalf("expected RecordOutcome to fail on closed DB")
+	}
+	if err := db.CreateOutcome(&ExecutionOutcome{RequestID: "req"}); err == nil {
+		t.Fatalf("expected CreateOutcome to fail on closed DB")
+	}
+	if _, err := db.ListProblematicOutcomes(10); err == nil {
+		t.Fatalf("expected ListProblematicOutcomes to fail on closed DB")
+	}
+	if err := db.UpdateOutcome(&ExecutionOutcome{ID: 1}); err == nil {
+		t.Fatalf("expected UpdateOutcome to fail on closed DB")
 	}
 }
 
