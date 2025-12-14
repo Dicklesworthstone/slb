@@ -7,16 +7,17 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
+	"github.com/Dicklesworthstone/slb/internal/integrations"
 )
 
 // Review errors.
 var (
-	ErrRequestNotPending  = errors.New("request is not pending")
-	ErrSelfReview         = errors.New("cannot review your own request")
-	ErrAlreadyReviewed    = errors.New("you have already reviewed this request")
-	ErrRequireDiffModel   = errors.New("different model required for approval")
-	ErrInvalidDecision    = errors.New("invalid decision (must be approve or reject)")
-	ErrMissingSessionKey  = errors.New("session key required for signature")
+	ErrRequestNotPending = errors.New("request is not pending")
+	ErrSelfReview        = errors.New("cannot review your own request")
+	ErrAlreadyReviewed   = errors.New("you have already reviewed this request")
+	ErrRequireDiffModel  = errors.New("different model required for approval")
+	ErrInvalidDecision   = errors.New("invalid decision (must be approve or reject)")
+	ErrMissingSessionKey = errors.New("session key required for signature")
 )
 
 // ConflictResolution specifies how to handle conflicting reviews.
@@ -86,15 +87,24 @@ type ReviewResult struct {
 
 // ReviewService handles review operations.
 type ReviewService struct {
-	db     *db.DB
-	config ReviewConfig
+	db       *db.DB
+	config   ReviewConfig
+	notifier integrations.RequestNotifier
 }
 
 // NewReviewService creates a new review service.
 func NewReviewService(database *db.DB, config ReviewConfig) *ReviewService {
 	return &ReviewService{
-		db:     database,
-		config: config,
+		db:       database,
+		config:   config,
+		notifier: integrations.NoopNotifier{},
+	}
+}
+
+// SetNotifier sets the notifier for review events (optional).
+func (rs *ReviewService) SetNotifier(n integrations.RequestNotifier) {
+	if n != nil {
+		rs.notifier = n
 	}
 }
 
@@ -203,6 +213,14 @@ func (rs *ReviewService) SubmitReview(opts ReviewOptions) (*ReviewResult, error)
 		}
 		result.RequestStatusChanged = true
 		result.NewRequestStatus = newStatus
+	}
+
+	// Notify asynchronously (best effort)
+	switch opts.Decision {
+	case db.DecisionApprove:
+		_ = rs.notifier.NotifyRequestApproved(request, review)
+	case db.DecisionReject:
+		_ = rs.notifier.NotifyRequestRejected(request, review)
 	}
 
 	return result, nil
@@ -393,10 +411,10 @@ func (rs *ReviewService) CheckDifferentModelEscalation(requestID string) (*Diffe
 	}
 
 	status := &DifferentModelEscalationStatus{
-		NeedsDifferentModel: request.RequireDifferentModel,
-		RequestorModel:      request.RequestorModel,
-		AvailableModels:     []string{},
-		SameModelAgents:     []string{},
+		NeedsDifferentModel:  request.RequireDifferentModel,
+		RequestorModel:       request.RequestorModel,
+		AvailableModels:      []string{},
+		SameModelAgents:      []string{},
 		DifferentModelAgents: []string{},
 	}
 

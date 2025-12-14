@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
+	"github.com/Dicklesworthstone/slb/internal/integrations"
 	shellwords "github.com/mattn/go-shellwords"
 )
 
@@ -64,6 +65,7 @@ type RequestCreator struct {
 	rateLimiter   *RateLimiter
 	patternEngine *PatternEngine
 	config        *RequestCreatorConfig
+	notifier      integrations.RequestNotifier
 }
 
 // RequestCreatorConfig holds configuration for request creation.
@@ -80,6 +82,12 @@ type RequestCreatorConfig struct {
 	ApprovalTTLMinutes int
 	// ApprovalTTLCriticalMinutes is the TTL for critical tier approvals.
 	ApprovalTTLCriticalMinutes int
+	// AgentMailEnabled toggles Agent Mail notifications.
+	AgentMailEnabled bool
+	// AgentMailThread is the thread to post notifications to.
+	AgentMailThread string
+	// AgentMailSender optional sender name.
+	AgentMailSender string
 }
 
 // DefaultRequestCreatorConfig returns the default configuration.
@@ -91,6 +99,9 @@ func DefaultRequestCreatorConfig() *RequestCreatorConfig {
 		RequestTimeoutMinutes:      30,
 		ApprovalTTLMinutes:         30,
 		ApprovalTTLCriticalMinutes: 10,
+		AgentMailEnabled:           true,
+		AgentMailThread:            "SLB-Reviews",
+		AgentMailSender:            "SLB-System",
 	}
 }
 
@@ -110,6 +121,7 @@ func NewRequestCreator(database *db.DB, rateLimiter *RateLimiter, patternEngine 
 		rateLimiter:   rateLimiter,
 		patternEngine: patternEngine,
 		config:        config,
+		notifier:      integrations.NoopNotifier{},
 	}
 }
 
@@ -133,6 +145,12 @@ func (rc *RequestCreator) CreateRequest(opts CreateRequestOptions) (*CreateReque
 	}
 	if session.EndedAt != nil {
 		return nil, ErrSessionInactive
+	}
+
+	// Initialize notifier with project context if enabled.
+	notifier := rc.notifier
+	if rc.config != nil && rc.config.AgentMailEnabled {
+		notifier = integrations.NewAgentMailClient(session.ProjectPath, rc.config.AgentMailThread, rc.config.AgentMailSender)
 	}
 
 	// Step 2: Check agent not blocked
@@ -223,6 +241,9 @@ func (rc *RequestCreator) CreateRequest(opts CreateRequestOptions) (*CreateReque
 	if err := rc.db.CreateRequest(request); err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
+
+	// Step 12: Notify via Agent Mail (best effort; errors ignored)
+	_ = notifier.NotifyNewRequest(request)
 
 	// Step 12: (TODO) Materialize JSON file in .slb/pending/
 	// This will be implemented when file materialization is needed

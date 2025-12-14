@@ -1,46 +1,13 @@
 package core
 
 import (
-	"os"
 	"testing"
 
-	"github.com/Dicklesworthstone/slb/internal/db"
+	"github.com/Dicklesworthstone/slb/internal/testutil"
 )
 
-func setupRequestTestDB(t *testing.T) *db.DB {
-	t.Helper()
-	tmpFile, err := os.CreateTemp("", "slb-request-test-*.db")
-	if err != nil {
-		t.Fatalf("failed to create temp file: %v", err)
-	}
-	tmpFile.Close()
-	t.Cleanup(func() { os.Remove(tmpFile.Name()) })
-
-	database, err := db.OpenAndMigrate(tmpFile.Name())
-	if err != nil {
-		t.Fatalf("failed to open database: %v", err)
-	}
-	t.Cleanup(func() { database.Close() })
-
-	return database
-}
-
-func createRequestTestSession(t *testing.T, database *db.DB, name string) *db.Session {
-	t.Helper()
-	session := &db.Session{
-		AgentName:   name,
-		Program:     "test",
-		Model:       "test-model",
-		ProjectPath: "/test/project",
-	}
-	if err := database.CreateSession(session); err != nil {
-		t.Fatalf("failed to create session: %v", err)
-	}
-	return session
-}
-
 func TestCreateRequest_MissingSessionID(t *testing.T) {
-	database := setupRequestTestDB(t)
+	database := testutil.NewTestDB(t)
 	creator := NewRequestCreator(database, nil, nil, nil)
 
 	_, err := creator.CreateRequest(CreateRequestOptions{
@@ -53,8 +20,8 @@ func TestCreateRequest_MissingSessionID(t *testing.T) {
 }
 
 func TestCreateRequest_MissingCommand(t *testing.T) {
-	database := setupRequestTestDB(t)
-	session := createRequestTestSession(t, database, "agent1")
+	database := testutil.NewTestDB(t)
+	session := testutil.MakeSession(t, database, testutil.SessionWithAgentName("agent1"))
 	creator := NewRequestCreator(database, nil, nil, nil)
 
 	_, err := creator.CreateRequest(CreateRequestOptions{
@@ -67,7 +34,7 @@ func TestCreateRequest_MissingCommand(t *testing.T) {
 }
 
 func TestCreateRequest_SessionNotFound(t *testing.T) {
-	database := setupRequestTestDB(t)
+	database := testutil.NewTestDB(t)
 	creator := NewRequestCreator(database, nil, nil, nil)
 
 	_, err := creator.CreateRequest(CreateRequestOptions{
@@ -81,8 +48,8 @@ func TestCreateRequest_SessionNotFound(t *testing.T) {
 }
 
 func TestCreateRequest_BlockedAgent(t *testing.T) {
-	database := setupRequestTestDB(t)
-	session := createRequestTestSession(t, database, "blocked-agent")
+	database := testutil.NewTestDB(t)
+	session := testutil.MakeSession(t, database, testutil.SessionWithAgentName("blocked-agent"))
 	config := DefaultRequestCreatorConfig()
 	config.BlockedAgents = []string{"blocked-agent"}
 	creator := NewRequestCreator(database, nil, nil, config)
@@ -98,8 +65,8 @@ func TestCreateRequest_BlockedAgent(t *testing.T) {
 }
 
 func TestCreateRequest_SafeCommand_Skipped(t *testing.T) {
-	database := setupRequestTestDB(t)
-	session := createRequestTestSession(t, database, "agent1")
+	database := testutil.NewTestDB(t)
+	session := testutil.MakeSession(t, database, testutil.SessionWithAgentName("agent1"))
 	creator := NewRequestCreator(database, nil, nil, nil)
 
 	result, err := creator.CreateRequest(CreateRequestOptions{
@@ -119,8 +86,8 @@ func TestCreateRequest_SafeCommand_Skipped(t *testing.T) {
 }
 
 func TestCreateRequest_DangerousCommand_Created(t *testing.T) {
-	database := setupRequestTestDB(t)
-	session := createRequestTestSession(t, database, "agent1")
+	database := testutil.NewTestDB(t)
+	session := testutil.MakeSession(t, database, testutil.SessionWithAgentName("agent1"))
 	creator := NewRequestCreator(database, nil, nil, nil)
 
 	// Use git reset --hard which is dangerous (not critical)
@@ -148,8 +115,8 @@ func TestCreateRequest_DangerousCommand_Created(t *testing.T) {
 }
 
 func TestCreateRequest_CriticalCommand_RequiresDifferentModel(t *testing.T) {
-	database := setupRequestTestDB(t)
-	session := createRequestTestSession(t, database, "agent1")
+	database := testutil.NewTestDB(t)
+	session := testutil.MakeSession(t, database, testutil.SessionWithAgentName("agent1"))
 	creator := NewRequestCreator(database, nil, nil, nil)
 
 	result, err := creator.CreateRequest(CreateRequestOptions{
@@ -263,12 +230,12 @@ func TestParseCommandToArgv(t *testing.T) {
 }
 
 func TestDynamicQuorum(t *testing.T) {
-	database := setupRequestTestDB(t)
+	database := testutil.NewTestDB(t)
 
 	// Create multiple sessions
-	createRequestTestSession(t, database, "agent1")
-	createRequestTestSession(t, database, "agent2")
-	createRequestTestSession(t, database, "agent3")
+	testutil.MakeSession(t, database, testutil.SessionWithAgentName("agent1"))
+	testutil.MakeSession(t, database, testutil.SessionWithAgentName("agent2"))
+	testutil.MakeSession(t, database, testutil.SessionWithAgentName("agent3"))
 
 	config := DefaultRequestCreatorConfig()
 	config.DynamicQuorumEnabled = true
@@ -284,10 +251,10 @@ func TestDynamicQuorum(t *testing.T) {
 }
 
 func TestDynamicQuorum_BelowFloor(t *testing.T) {
-	database := setupRequestTestDB(t)
+	database := testutil.NewTestDB(t)
 
 	// Only 1 session
-	createRequestTestSession(t, database, "agent1")
+	testutil.MakeSession(t, database, testutil.SessionWithAgentName("agent1"))
 
 	config := DefaultRequestCreatorConfig()
 	config.DynamicQuorumEnabled = true

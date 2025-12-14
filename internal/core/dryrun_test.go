@@ -1,8 +1,16 @@
 package core
 
 import (
+	"bytes"
+	"context"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
 func TestGetDryRunCommand(t *testing.T) {
@@ -76,5 +84,58 @@ func TestGetDryRunCommand(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRunCommand_StreamOptional(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell execution test uses /bin/sh or $SHELL")
+	}
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "run.log")
+
+	spec := &db.CommandSpec{
+		Raw:   "echo hi",
+		Cwd:   dir,
+		Shell: true,
+	}
+
+	// With stream writer, output should be written to it.
+	var streamed bytes.Buffer
+	res, err := RunCommand(context.Background(), spec, logPath, &streamed)
+	if err != nil {
+		t.Fatalf("RunCommand(streamed) error: %v", err)
+	}
+	if !strings.Contains(streamed.String(), "hi") {
+		t.Fatalf("expected stream to contain command output, got %q", streamed.String())
+	}
+	if res == nil || !strings.Contains(res.Output, "hi") {
+		t.Fatalf("expected captured output to contain command output, got %#v", res)
+	}
+
+	// With nil stream, command output should not be written to process stdout.
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	defer func() { os.Stdout = oldStdout }()
+
+	_, err = RunCommand(context.Background(), spec, logPath, nil)
+	_ = w.Close()
+	os.Stdout = oldStdout
+
+	b, readErr := io.ReadAll(r)
+	_ = r.Close()
+	if readErr != nil {
+		t.Fatalf("read stdout pipe: %v", readErr)
+	}
+	if len(bytes.TrimSpace(b)) != 0 {
+		t.Fatalf("expected no stdout when stream is nil, got %q", string(b))
+	}
+	if err != nil {
+		t.Fatalf("RunCommand(nil stream) error: %v", err)
 	}
 }

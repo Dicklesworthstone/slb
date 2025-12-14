@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
+	"github.com/Dicklesworthstone/slb/internal/integrations"
 )
 
 // Execution errors.
@@ -38,6 +39,14 @@ type ExecuteOptions struct {
 	Background bool
 	// LogDir is the directory for execution logs (default .slb/logs/).
 	LogDir string
+	// SuppressOutput prevents streaming command output to stdout (still logged to file).
+	// Useful for machine-readable output formats (e.g., --output json).
+	SuppressOutput bool
+
+	// CaptureRollback enables rollback state capture for supported destructive commands.
+	CaptureRollback bool
+	// MaxRollbackSizeMB limits filesystem rollback capture (0 uses config default).
+	MaxRollbackSizeMB int
 }
 
 // ExecutionResult holds the result of command execution.
@@ -62,6 +71,7 @@ type ExecutionResult struct {
 type Executor struct {
 	db            *db.DB
 	patternEngine *PatternEngine
+	notifier      integrations.RequestNotifier
 }
 
 // NewExecutor creates a new executor.
@@ -72,7 +82,16 @@ func NewExecutor(database *db.DB, patternEngine *PatternEngine) *Executor {
 	return &Executor{
 		db:            database,
 		patternEngine: patternEngine,
+		notifier:      integrations.NoopNotifier{},
 	}
+}
+
+// WithNotifier sets the notifier used for execution events.
+func (e *Executor) WithNotifier(n integrations.RequestNotifier) *Executor {
+	if n != nil {
+		e.notifier = n
+	}
+	return e
 }
 
 // ExecuteApprovedRequest validates and executes an approved request.
@@ -92,6 +111,10 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 	}
 	if opts.LogDir == "" {
 		opts.LogDir = ".slb/logs"
+	}
+
+	if opts.MaxRollbackSizeMB <= 0 {
+		opts.MaxRollbackSizeMB = 100
 	}
 
 	// Get the request
@@ -135,6 +158,27 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 			ErrTierEscalated, request.RiskTier, classification.Tier)
 	}
 
+	// Preflight: create log file and capture rollback state before locking EXECUTING.
+	logPath, err := e.createLogFile(opts.LogDir, request.ID)
+	if err != nil {
+		return nil, fmt.Errorf("creating log file: %w", err)
+	}
+
+	if opts.CaptureRollback && (request.Rollback == nil || request.Rollback.Path == "") {
+		data, err := CaptureRollbackState(ctx, request, RollbackCaptureOptions{
+			MaxSizeBytes: int64(opts.MaxRollbackSizeMB) * 1024 * 1024,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("capturing rollback state: %w", err)
+		}
+		if data != nil && data.RollbackPath != "" {
+			request.Rollback = &db.Rollback{Path: data.RollbackPath}
+			if err := e.db.UpdateRequestRollbackPath(opts.RequestID, data.RollbackPath); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed to record rollback path: %v\n", err)
+			}
+		}
+	}
+
 	// Gate 5: First executor wins - transition to EXECUTING
 	if err := e.db.UpdateRequestStatus(opts.RequestID, db.StatusExecuting); err != nil {
 		// If another executor already started, we'll get an error
@@ -142,14 +186,6 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 			return nil, ErrAlreadyExecuting
 		}
 		return nil, fmt.Errorf("updating status to executing: %w", err)
-	}
-
-	// Create log file
-	logPath, err := e.createLogFile(opts.LogDir, request.ID)
-	if err != nil {
-		// Rollback status
-		_ = e.db.UpdateRequestStatus(opts.RequestID, db.StatusApproved)
-		return nil, fmt.Errorf("creating log file: %w", err)
 	}
 
 	// Record executor info
@@ -177,7 +213,11 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 	execCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
 
-	cmdResult, err := RunCommand(execCtx, &request.Command, logPath)
+	var streamWriter *os.File
+	if !opts.SuppressOutput {
+		streamWriter = os.Stdout
+	}
+	cmdResult, err := RunCommand(execCtx, &request.Command, logPath, streamWriter)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			result.TimedOut = true
@@ -206,6 +246,9 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 	exec.ExitCode = &exitCode
 	exec.DurationMs = &durationMs
 	_ = e.db.UpdateRequestExecution(opts.RequestID, exec)
+
+	// Notify (best effort)
+	_ = e.notifier.NotifyRequestExecuted(request, exec, result.ExitCode)
 
 	return result, result.Error
 }

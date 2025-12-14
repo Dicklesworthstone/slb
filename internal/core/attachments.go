@@ -3,7 +3,9 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"  // Register GIF format
@@ -12,7 +14,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
@@ -23,6 +27,9 @@ type AttachmentConfig struct {
 	MaxFileSize int64
 	// MaxOutputSize is the maximum output size for context commands (default 100KB).
 	MaxOutputSize int64
+	// MaxCommandRuntime is the maximum runtime for context commands (default 10s).
+	// Zero means no timeout.
+	MaxCommandRuntime time.Duration
 	// MaxImageSize is the maximum dimension for images (default 4096x4096).
 	MaxImageSize int
 	// AllowedFileTypes restricts file types (empty means all allowed).
@@ -32,10 +39,11 @@ type AttachmentConfig struct {
 // DefaultAttachmentConfig returns default configuration.
 func DefaultAttachmentConfig() AttachmentConfig {
 	return AttachmentConfig{
-		MaxFileSize:      1024 * 1024,      // 1MB
-		MaxOutputSize:    100 * 1024,       // 100KB
-		MaxImageSize:     4096,             // 4096px
-		AllowedFileTypes: []string{},      // Allow all
+		MaxFileSize:       1024 * 1024, // 1MB
+		MaxOutputSize:     100 * 1024,  // 100KB
+		MaxCommandRuntime: 10 * time.Second,
+		MaxImageSize:      4096,       // 4096px
+		AllowedFileTypes:  []string{}, // Allow all
 	}
 }
 
@@ -205,52 +213,152 @@ func LoadScreenshot(path string, config *AttachmentConfig) (*db.Attachment, erro
 	}, nil
 }
 
+type cappedBuffer struct {
+	max       int64
+	truncated bool
+	buf       bytes.Buffer
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	if b == nil {
+		return len(p), nil
+	}
+	if b.max <= 0 {
+		if _, err := b.buf.Write(p); err != nil {
+			return 0, err
+		}
+		return len(p), nil
+	}
+
+	remaining := b.max - int64(b.buf.Len())
+	if remaining <= 0 {
+		b.truncated = true
+		return len(p), nil
+	}
+
+	if int64(len(p)) > remaining {
+		if _, err := b.buf.Write(p[:remaining]); err != nil {
+			return 0, err
+		}
+		b.truncated = true
+		return len(p), nil
+	}
+
+	if _, err := b.buf.Write(p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (b *cappedBuffer) String() string {
+	if b == nil {
+		return ""
+	}
+	return b.buf.String()
+}
+
+func (b *cappedBuffer) Truncated() bool {
+	if b == nil {
+		return false
+	}
+	return b.truncated
+}
+
 // RunContextCommand executes a command and captures output as an attachment.
-func RunContextCommand(command string, config *AttachmentConfig) (*db.Attachment, error) {
+func RunContextCommand(ctx context.Context, command string, config *AttachmentConfig) (*db.Attachment, error) {
 	if config == nil {
 		cfg := DefaultAttachmentConfig()
 		config = &cfg
 	}
 
-	// Run the command
-	cmd := exec.Command("sh", "-c", command)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
-	err := cmd.Run()
+	execCtx := ctx
+	cancel := func() {}
+	if config.MaxCommandRuntime > 0 {
+		execCtx, cancel = context.WithTimeout(ctx, config.MaxCommandRuntime)
+	}
+	defer cancel()
+
+	startTime := time.Now()
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.CommandContext(execCtx, "cmd.exe", "/C", command)
+	} else {
+		shell := strings.TrimSpace(os.Getenv("SHELL"))
+		if shell == "" {
+			shell = "/bin/sh"
+		}
+		cmd = exec.CommandContext(execCtx, shell, "-c", command)
+	}
+	cmd.Env = os.Environ()
+
+	stdout := &cappedBuffer{max: config.MaxOutputSize}
+	stderr := &cappedBuffer{max: config.MaxOutputSize}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+
+	runErr := cmd.Run()
+
+	duration := time.Since(startTime)
 
 	// Combine output
 	var output strings.Builder
 	output.WriteString(stdout.String())
-	if stderr.Len() > 0 {
+	if stderr.String() != "" {
 		if output.Len() > 0 {
 			output.WriteString("\n--- stderr ---\n")
 		}
 		output.WriteString(stderr.String())
 	}
 
-	// Check output size
-	outputStr := output.String()
-	if config.MaxOutputSize > 0 && int64(len(outputStr)) > config.MaxOutputSize {
-		// Truncate with notice
-		outputStr = outputStr[:config.MaxOutputSize] + "\n... [truncated]"
-	}
-
 	exitCode := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+	timedOut := false
+	var exitErr *exec.ExitError
+	if runErr != nil {
+		if errors.Is(runErr, context.DeadlineExceeded) || errors.Is(execCtx.Err(), context.DeadlineExceeded) {
+			timedOut = true
+		}
+		if errors.As(runErr, &exitErr) {
 			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = -1
 		}
 	}
 
+	outputStr := output.String()
+	if outputStr == "" && runErr != nil {
+		outputStr = runErr.Error()
+	}
+
+	truncated := stdout.Truncated() || stderr.Truncated()
+	if config.MaxOutputSize > 0 && int64(len(outputStr)) > config.MaxOutputSize {
+		truncated = true
+		outputStr = outputStr[:config.MaxOutputSize] + "\n... [truncated]"
+	}
+
+	meta := map[string]any{
+		"source":      command,
+		"exit_code":   exitCode,
+		"duration_ms": duration.Milliseconds(),
+	}
+	if timedOut {
+		meta["timed_out"] = true
+	}
+	if truncated {
+		meta["truncated"] = true
+	}
+	if runErr != nil && (timedOut || exitCode == -1) {
+		meta["error"] = runErr.Error()
+	}
+
 	return &db.Attachment{
-		Type:    db.AttachmentTypeContext,
-		Content: outputStr,
-		Metadata: map[string]any{
-			"source":    command,
-			"exit_code": exitCode,
-		},
+		Type:     db.AttachmentTypeContext,
+		Content:  outputStr,
+		Metadata: meta,
 	}, nil
 }
 

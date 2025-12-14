@@ -29,7 +29,7 @@ type CommandResult struct {
 
 // RunCommand executes a command and captures output to both terminal and log file.
 // The command runs in the current shell environment, inheriting all env vars.
-func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string) (*CommandResult, error) {
+func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, stream io.Writer) (*CommandResult, error) {
 	startTime := time.Now()
 
 	// Open log file for writing
@@ -88,8 +88,10 @@ func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string) (*Com
 	// Always capture to buffer
 	writers = append(writers, &outputBuf)
 
-	// Stream to stdout/stderr
-	writers = append(writers, os.Stdout)
+	// Stream to caller-provided writer (optional)
+	if stream != nil {
+		writers = append(writers, stream)
+	}
 
 	// Write to log file
 	if logFile != nil {
@@ -163,4 +165,3 @@ func ComputeCommandHash(spec db.CommandSpec) string {
 	hash := sha256.Sum256(buf.Bytes())
 	return hex.EncodeToString(hash[:])
 }
-
