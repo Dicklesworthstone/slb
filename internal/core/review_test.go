@@ -351,6 +351,79 @@ func TestSubmitReview_DifferentModelRequired_DifferentModelAccepted(t *testing.T
 	}
 }
 
+func TestSubmitReview_SessionKeyMismatch_Rejected(t *testing.T) {
+	dbConn, _, req := setupReviewTest(t)
+	defer dbConn.Close()
+
+	// Create a reviewer session with different model (would normally be accepted)
+	reviewerSess := &db.Session{
+		AgentName:   "GreenLake",
+		Program:     "claude-code",
+		Model:       "opus-4.5",
+		ProjectPath: "/test/project",
+	}
+	if err := dbConn.CreateSession(reviewerSess); err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+
+	rs := NewReviewService(dbConn, DefaultReviewConfig())
+
+	// Try to submit review with WRONG session key
+	_, err := rs.SubmitReview(ReviewOptions{
+		SessionID:  reviewerSess.ID,
+		SessionKey: "wrong-session-key-not-matching-stored-key",
+		RequestID:  req.ID,
+		Decision:   db.DecisionApprove,
+	})
+	if err == nil {
+		t.Fatal("Expected error for mismatched session key")
+	}
+	if err != ErrSessionKeyMismatch {
+		t.Errorf("Expected ErrSessionKeyMismatch, got %v", err)
+	}
+
+	// Verify no review was created
+	reviews, err := dbConn.ListReviewsForRequest(req.ID)
+	if err != nil {
+		t.Fatalf("ListReviewsForRequest() error = %v", err)
+	}
+	if len(reviews) != 0 {
+		t.Errorf("Expected no reviews to be created, got %d", len(reviews))
+	}
+}
+
+func TestSubmitReview_MissingSessionKey_Rejected(t *testing.T) {
+	dbConn, _, req := setupReviewTest(t)
+	defer dbConn.Close()
+
+	// Create a reviewer session
+	reviewerSess := &db.Session{
+		AgentName:   "GreenLake",
+		Program:     "claude-code",
+		Model:       "opus-4.5",
+		ProjectPath: "/test/project",
+	}
+	if err := dbConn.CreateSession(reviewerSess); err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+
+	rs := NewReviewService(dbConn, DefaultReviewConfig())
+
+	// Try to submit review with EMPTY session key
+	_, err := rs.SubmitReview(ReviewOptions{
+		SessionID:  reviewerSess.ID,
+		SessionKey: "", // Empty!
+		RequestID:  req.ID,
+		Decision:   db.DecisionApprove,
+	})
+	if err == nil {
+		t.Fatal("Expected error for missing session key")
+	}
+	if err != ErrMissingSessionKey {
+		t.Errorf("Expected ErrMissingSessionKey, got %v", err)
+	}
+}
+
 func TestGetDifferentModelStatus(t *testing.T) {
 	dbConn, err := db.Open(":memory:")
 	if err != nil {
