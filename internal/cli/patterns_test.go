@@ -435,3 +435,32 @@ func TestPatternsCommand_Help(t *testing.T) {
 		t.Error("expected help to mention 'add' subcommand")
 	}
 }
+
+func TestParseTier_ValidTiers(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"critical", "critical"},
+		{"dangerous", "dangerous"},
+		{"caution", "caution"},
+		{"safe", "safe"},
+		{"CRITICAL", "critical"},
+		{"Dangerous", "dangerous"},
+		{"invalid", ""},
+		{"", ""},
+	}
+
+	for _, tt := range tests {
+		name := tt.input
+		if name == "" {
+			name = "empty"
+		}
+		t.Run(name, func(t *testing.T) {
+			result := parseTier(tt.input)
+			if string(result) != tt.expected {
+				t.Errorf("parseTier(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}

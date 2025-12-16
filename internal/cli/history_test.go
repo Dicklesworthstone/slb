@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
@@ -360,5 +361,78 @@ func TestApplyHistoryFilters(t *testing.T) {
 	}
 
 	// Reset flags
+	resetHistoryFlags()
+}
+
+func TestApplyHistoryFilters_SinceDateRFC3339(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-48 * time.Hour)
+	recent := now.Add(-1 * time.Hour)
+
+	requests := []*db.Request{
+		{ID: "1", Status: db.StatusPending, CreatedAt: old},
+		{ID: "2", Status: db.StatusPending, CreatedAt: recent},
+	}
+
+	// Filter to only recent (since 24 hours ago)
+	flagHistoryStatus = ""
+	flagHistoryAgent = ""
+	flagHistoryTier = ""
+	flagHistorySince = now.Add(-24 * time.Hour).Format(time.RFC3339)
+
+	result := applyHistoryFilters(requests)
+	if len(result) != 1 {
+		t.Errorf("expected 1 result with since filter, got %d", len(result))
+	}
+	if len(result) > 0 && result[0].ID != "2" {
+		t.Errorf("expected request 2, got %s", result[0].ID)
+	}
+
+	resetHistoryFlags()
+}
+
+func TestApplyHistoryFilters_SinceDateOnly(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-48 * time.Hour)
+	recent := now.Add(-1 * time.Hour)
+
+	requests := []*db.Request{
+		{ID: "1", Status: db.StatusPending, CreatedAt: old},
+		{ID: "2", Status: db.StatusPending, CreatedAt: recent},
+	}
+
+	// Filter using date-only format
+	flagHistoryStatus = ""
+	flagHistoryAgent = ""
+	flagHistoryTier = ""
+	flagHistorySince = now.Format("2006-01-02")
+
+	result := applyHistoryFilters(requests)
+	// Both should pass since they're on or after today's date
+	// Actually, the old one is 2 days ago so it should fail
+	if len(result) != 1 {
+		t.Errorf("expected 1 result with date-only since filter, got %d", len(result))
+	}
+
+	resetHistoryFlags()
+}
+
+func TestApplyHistoryFilters_InvalidSinceDate(t *testing.T) {
+	requests := []*db.Request{
+		{ID: "1", Status: db.StatusPending, CreatedAt: time.Now()},
+	}
+
+	// Invalid date should be ignored
+	flagHistoryStatus = ""
+	flagHistoryAgent = ""
+	flagHistoryTier = ""
+	flagHistorySince = "invalid-date"
+
+	result := applyHistoryFilters(requests)
+	// Should return all since invalid date is ignored
+	if len(result) != 1 {
+		t.Errorf("expected 1 result with invalid since filter (ignored), got %d", len(result))
+	}
+
 	resetHistoryFlags()
 }

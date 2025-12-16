@@ -606,6 +606,34 @@ func TestSessionCommand_Help(t *testing.T) {
 	}
 }
 
+func TestProjectPath_WithFlag(t *testing.T) {
+	resetSessionFlags()
+	flagProject = "/test/path"
+
+	result, err := projectPath()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "/test/path" {
+		t.Errorf("expected '/test/path', got %q", result)
+	}
+}
+
+func TestProjectPath_FallbackToCwd(t *testing.T) {
+	resetSessionFlags()
+	flagProject = ""
+
+	result, err := projectPath()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cwd, _ := os.Getwd()
+	if result != cwd {
+		t.Errorf("expected cwd %q, got %q", cwd, result)
+	}
+}
+
 // Test that session commands work with the --db flag
 func TestSessionCommands_WithDBFlag(t *testing.T) {
 	h := testutil.NewHarness(t)
