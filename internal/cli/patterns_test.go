@@ -436,6 +436,23 @@ func TestPatternsCommand_Help(t *testing.T) {
 	}
 }
 
+func TestPatternsListCommand_TextOutput(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetPatternsFlags()
+
+	cmd := newTestPatternsCmd(h.DBPath)
+	// No -j flag, so text output
+	stdout, err := executeCommandCapture(t, cmd, "patterns", "list")
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should return text output with patterns
+	// The output might be empty if no patterns, but function should run without error
+	_ = stdout // Just verify no error occurs
+}
+
 func TestParseTier_ValidTiers(t *testing.T) {
 	tests := []struct {
 		input    string
