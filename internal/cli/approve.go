@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
@@ -13,9 +14,10 @@ import (
 )
 
 var (
-	flagApproveSessionID  string
-	flagApproveSessionKey string
-	flagApproveComments   string
+	flagApproveSessionID    string
+	flagApproveSessionKey   string
+	flagApproveComments     string
+	flagApproveTargetProject string
 
 	// Structured response flags
 	flagApproveReasonResponse string
@@ -28,6 +30,7 @@ func init() {
 	approveCmd.Flags().StringVarP(&flagApproveSessionID, "session-id", "s", "", "reviewer session ID (required)")
 	approveCmd.Flags().StringVarP(&flagApproveSessionKey, "session-key", "k", "", "session HMAC key for signing (required)")
 	approveCmd.Flags().StringVarP(&flagApproveComments, "comments", "m", "", "additional comments")
+	approveCmd.Flags().StringVar(&flagApproveTargetProject, "target-project", "", "target project path for cross-project approvals")
 
 	// Structured response flags for justification fields
 	approveCmd.Flags().StringVar(&flagApproveReasonResponse, "reason-response", "", "response to the reason justification")
@@ -47,10 +50,14 @@ The approval is cryptographically signed with your session key to ensure
 authenticity. Your session must be active, and you cannot approve your own
 requests (unless you are a trusted self-approve agent).
 
+For cross-project reviews, use --target-project to specify which project's
+database contains the request you want to approve.
+
 	Examples:
 	  slb approve abc123 -s $SESSION_ID -k $SESSION_KEY
 	  slb approve abc123 -s $SESSION_ID -k $SESSION_KEY -m "Looks safe"
-	  slb approve abc123 -s $SESSION_ID -k $SESSION_KEY --reason-response "Valid use case"`,
+	  slb approve abc123 -s $SESSION_ID -k $SESSION_KEY --reason-response "Valid use case"
+	  slb approve abc123 -s $SESSION_ID -k $SESSION_KEY --target-project /path/to/other/project`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		requestID := args[0]
@@ -63,13 +70,21 @@ requests (unless you are a trusted self-approve agent).
 			return fmt.Errorf("--session-key is required")
 		}
 
+		// Determine project and database path
 		project, err := projectPath()
-		if err != nil {
+		if err != nil && flagApproveTargetProject == "" {
 			return err
 		}
 
+		// Use target project if specified (for cross-project approvals)
+		dbPath := GetDB()
+		if flagApproveTargetProject != "" {
+			project = flagApproveTargetProject
+			dbPath = filepath.Join(flagApproveTargetProject, ".slb", "state.db")
+		}
+
 		// Open database
-		dbConn, err := db.OpenAndMigrate(GetDB())
+		dbConn, err := db.OpenAndMigrate(dbPath)
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}

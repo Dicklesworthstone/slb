@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/core"
@@ -11,10 +12,11 @@ import (
 )
 
 var (
-	flagRejectSessionID  string
-	flagRejectSessionKey string
-	flagRejectReason     string
-	flagRejectComments   string
+	flagRejectSessionID    string
+	flagRejectSessionKey   string
+	flagRejectReason       string
+	flagRejectComments     string
+	flagRejectTargetProject string
 )
 
 func init() {
@@ -22,6 +24,7 @@ func init() {
 	rejectCmd.Flags().StringVarP(&flagRejectSessionKey, "session-key", "k", "", "session HMAC key for signing (required)")
 	rejectCmd.Flags().StringVarP(&flagRejectReason, "reason", "r", "", "reason for rejection (required)")
 	rejectCmd.Flags().StringVarP(&flagRejectComments, "comments", "m", "", "additional comments")
+	rejectCmd.Flags().StringVar(&flagRejectTargetProject, "target-project", "", "target project path for cross-project rejections")
 
 	rootCmd.AddCommand(rejectCmd)
 }
@@ -37,9 +40,13 @@ what was wrong and potentially submit a corrected request.
 The rejection is cryptographically signed with your session key to ensure
 authenticity.
 
+For cross-project reviews, use --target-project to specify which project's
+database contains the request you want to reject.
+
 	Examples:
 	  slb reject abc123 -s $SESSION_ID -k $SESSION_KEY -r "Command too dangerous"
-	  slb reject abc123 -s $SESSION_ID -k $SESSION_KEY -r "Justification insufficient" -m "Please add more context"`,
+	  slb reject abc123 -s $SESSION_ID -k $SESSION_KEY -r "Justification insufficient" -m "Please add more context"
+	  slb reject abc123 -s $SESSION_ID -k $SESSION_KEY -r "Too risky" --target-project /path/to/other/project`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		requestID := args[0]
@@ -55,13 +62,21 @@ authenticity.
 			return fmt.Errorf("--reason is required for rejections")
 		}
 
+		// Determine project and database path
 		project, err := projectPath()
-		if err != nil {
+		if err != nil && flagRejectTargetProject == "" {
 			return err
 		}
 
+		// Use target project if specified (for cross-project rejections)
+		dbPath := GetDB()
+		if flagRejectTargetProject != "" {
+			project = flagRejectTargetProject
+			dbPath = filepath.Join(flagRejectTargetProject, ".slb", "state.db")
+		}
+
 		// Open database
-		dbConn, err := db.OpenAndMigrate(GetDB())
+		dbConn, err := db.OpenAndMigrate(dbPath)
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}

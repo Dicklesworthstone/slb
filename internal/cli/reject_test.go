@@ -24,7 +24,20 @@ func newTestRejectCmd(dbPath string) *cobra.Command {
 	root.PersistentFlags().StringVarP(&flagProject, "project", "C", "", "project directory")
 	root.PersistentFlags().StringVarP(&flagConfig, "config", "c", "", "config file")
 
-	root.AddCommand(rejectCmd)
+	// Create a fresh reject command to avoid flag conflicts
+	reject := &cobra.Command{
+		Use:   "reject <request-id>",
+		Short: "Reject a pending request",
+		Args:  cobra.ExactArgs(1),
+		RunE:  rejectCmd.RunE,
+	}
+	reject.Flags().StringVarP(&flagRejectSessionID, "session-id", "s", "", "reviewer session ID (required)")
+	reject.Flags().StringVarP(&flagRejectSessionKey, "session-key", "k", "", "session HMAC key for signing (required)")
+	reject.Flags().StringVarP(&flagRejectReason, "reason", "r", "", "reason for rejection (required)")
+	reject.Flags().StringVarP(&flagRejectComments, "comments", "m", "", "additional comments")
+	reject.Flags().StringVar(&flagRejectTargetProject, "target-project", "", "target project path for cross-project rejections")
+
+	root.AddCommand(reject)
 
 	return root
 }
@@ -39,6 +52,7 @@ func resetRejectFlags() {
 	flagRejectSessionKey = ""
 	flagRejectReason = ""
 	flagRejectComments = ""
+	flagRejectTargetProject = ""
 }
 
 func TestRejectCommand_RequiresRequestID(t *testing.T) {
@@ -323,5 +337,90 @@ func TestRejectCommand_Help(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "--reason") {
 		t.Error("expected help to mention '--reason' flag")
+	}
+}
+
+// TestRejectCommand_CrossProject tests rejecting a request from another project
+// using the --target-project flag.
+func TestRejectCommand_CrossProject(t *testing.T) {
+	// Create two harnesses representing two different projects
+	targetH := testutil.NewHarness(t) // target project where request is created
+	resetRejectFlags()
+
+	// Create sessions in the target project
+	requestorSess := testutil.MakeSession(t, targetH.DB,
+		testutil.WithProject(targetH.ProjectDir),
+		testutil.WithAgent("Requestor"),
+		testutil.WithModel("model-a"),
+	)
+	reviewerSess := testutil.MakeSession(t, targetH.DB,
+		testutil.WithProject(targetH.ProjectDir),
+		testutil.WithAgent("Reviewer"),
+		testutil.WithModel("model-b"),
+	)
+
+	// Create request in target project
+	req := testutil.MakeRequest(t, targetH.DB, requestorSess,
+		testutil.WithCommand("rm -rf ./build", targetH.ProjectDir, true),
+		testutil.WithRisk(db.RiskTierDangerous),
+	)
+	targetH.DB.Exec(`UPDATE requests SET min_approvals = 1, require_different_model = false WHERE id = ?`, req.ID)
+
+	// Now reject from a different "current" directory using --target-project
+	currentH := testutil.NewHarness(t) // current project where reviewer is working
+
+	cmd := newTestRejectCmd(currentH.DBPath) // Uses current project's DB by default
+	stdout, err := executeCommandCapture(t, cmd, "reject", req.ID,
+		"-s", reviewerSess.ID,
+		"-k", reviewerSess.SessionKey,
+		"-r", "Command too risky for cross-project operation",
+		"--target-project", targetH.ProjectDir, // Point to target project
+		"-j",
+	)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("failed to parse JSON: %v\nstdout: %s", err, stdout)
+	}
+
+	// Verify result
+	if result["request_id"] != req.ID {
+		t.Errorf("expected request_id=%s, got %v", req.ID, result["request_id"])
+	}
+	if result["decision"] != "reject" {
+		t.Errorf("expected decision=reject, got %v", result["decision"])
+	}
+	if result["request_status_changed"] != true {
+		t.Errorf("expected request_status_changed=true, got %v", result["request_status_changed"])
+	}
+
+	// Verify the request in target project DB is actually rejected
+	updatedReq, err := targetH.DB.GetRequest(req.ID)
+	if err != nil {
+		t.Fatalf("failed to get updated request: %v", err)
+	}
+	if updatedReq.Status != db.StatusRejected {
+		t.Errorf("expected status=rejected in target DB, got %s", updatedReq.Status)
+	}
+}
+
+// TestRejectCommand_Help_IncludesTargetProject verifies help mentions --target-project.
+func TestRejectCommand_Help_IncludesTargetProject(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetRejectFlags()
+
+	cmd := newTestRejectCmd(h.DBPath)
+	stdout, _, err := executeCommand(cmd, "reject", "--help")
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(stdout, "--target-project") {
+		t.Error("expected help to mention '--target-project' flag")
 	}
 }

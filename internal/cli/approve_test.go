@@ -26,7 +26,23 @@ func newTestApproveCmd(dbPath string) *cobra.Command {
 	root.PersistentFlags().StringVarP(&flagProject, "project", "C", "", "project directory")
 	root.PersistentFlags().StringVarP(&flagConfig, "config", "c", "", "config file")
 
-	root.AddCommand(approveCmd)
+	// Create a fresh approve command to avoid flag conflicts
+	approve := &cobra.Command{
+		Use:   "approve <request-id>",
+		Short: "Approve a pending request",
+		Args:  cobra.ExactArgs(1),
+		RunE:  approveCmd.RunE,
+	}
+	approve.Flags().StringVarP(&flagApproveSessionID, "session-id", "s", "", "reviewer session ID (required)")
+	approve.Flags().StringVarP(&flagApproveSessionKey, "session-key", "k", "", "session HMAC key for signing (required)")
+	approve.Flags().StringVarP(&flagApproveComments, "comments", "m", "", "additional comments")
+	approve.Flags().StringVar(&flagApproveTargetProject, "target-project", "", "target project path for cross-project approvals")
+	approve.Flags().StringVar(&flagApproveReasonResponse, "reason-response", "", "response to the reason justification")
+	approve.Flags().StringVar(&flagApproveEffectResponse, "effect-response", "", "response to the expected effect")
+	approve.Flags().StringVar(&flagApproveGoalResponse, "goal-response", "", "response to the goal")
+	approve.Flags().StringVar(&flagApproveSafetyResponse, "safety-response", "", "response to the safety argument")
+
+	root.AddCommand(approve)
 
 	return root
 }
@@ -40,6 +56,7 @@ func resetApproveFlags() {
 	flagApproveSessionID = ""
 	flagApproveSessionKey = ""
 	flagApproveComments = ""
+	flagApproveTargetProject = ""
 	flagApproveReasonResponse = ""
 	flagApproveEffectResponse = ""
 	flagApproveGoalResponse = ""
@@ -394,5 +411,93 @@ func TestBuildAgentMailNotifier_DefaultsToNoopWithNoConfig(t *testing.T) {
 	if !isNoop {
 		// This is acceptable - config might come from environment or defaults
 		// Just verify we got a valid notifier
+	}
+}
+
+// TestApproveCommand_CrossProject tests approving a request from another project
+// using the --target-project flag.
+func TestApproveCommand_CrossProject(t *testing.T) {
+	// Create two harnesses representing two different projects
+	targetH := testutil.NewHarness(t) // target project where request is created
+	resetApproveFlags()
+
+	// Create sessions in the target project
+	requestorSess := testutil.MakeSession(t, targetH.DB,
+		testutil.WithProject(targetH.ProjectDir),
+		testutil.WithAgent("Requestor"),
+		testutil.WithModel("model-a"),
+	)
+	reviewerSess := testutil.MakeSession(t, targetH.DB,
+		testutil.WithProject(targetH.ProjectDir),
+		testutil.WithAgent("Reviewer"),
+		testutil.WithModel("model-b"),
+	)
+
+	// Create request in target project
+	req := testutil.MakeRequest(t, targetH.DB, requestorSess,
+		testutil.WithCommand("rm -rf ./build", targetH.ProjectDir, true),
+		testutil.WithRisk(db.RiskTierDangerous),
+	)
+	targetH.DB.Exec(`UPDATE requests SET min_approvals = 1, require_different_model = false WHERE id = ?`, req.ID)
+
+	// Now approve from a different "current" directory using --target-project
+	// Use a separate harness to simulate being in a different project
+	currentH := testutil.NewHarness(t) // current project where reviewer is working
+
+	cmd := newTestApproveCmd(currentH.DBPath) // Uses current project's DB by default
+	stdout, err := executeCommandCapture(t, cmd, "approve", req.ID,
+		"-s", reviewerSess.ID,
+		"-k", reviewerSess.SessionKey,
+		"--target-project", targetH.ProjectDir, // Point to target project
+		"-j",
+	)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("failed to parse JSON: %v\nstdout: %s", err, stdout)
+	}
+
+	// Verify result
+	if result["request_id"] != req.ID {
+		t.Errorf("expected request_id=%s, got %v", req.ID, result["request_id"])
+	}
+	if result["decision"] != "approve" {
+		t.Errorf("expected decision=approve, got %v", result["decision"])
+	}
+	if result["request_status_changed"] != true {
+		t.Errorf("expected request_status_changed=true, got %v", result["request_status_changed"])
+	}
+
+	// Verify the request in target project DB is actually approved
+	updatedReq, err := targetH.DB.GetRequest(req.ID)
+	if err != nil {
+		t.Fatalf("failed to get updated request: %v", err)
+	}
+	if updatedReq.Status != db.StatusApproved {
+		t.Errorf("expected status=approved in target DB, got %s", updatedReq.Status)
+	}
+}
+
+// TestApproveCommand_Help_IncludesTargetProject verifies help mentions --target-project.
+func TestApproveCommand_Help_IncludesTargetProject(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetApproveFlags()
+
+	cmd := newTestApproveCmd(h.DBPath)
+	stdout, _, err := executeCommand(cmd, "approve", "--help")
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(stdout, "--target-project") {
+		t.Error("expected help to mention '--target-project' flag")
+	}
+	if !strings.Contains(stdout, "cross-project") {
+		t.Error("expected help to mention 'cross-project'")
 	}
 }
