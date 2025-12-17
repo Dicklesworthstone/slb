@@ -1,7 +1,7 @@
 # SLB Makefile
 # Simultaneous Launch Button - Two-person rule for dangerous commands
 
-.PHONY: all build build-all install dev run watch test test-unit test-integration test-coverage lint fmt vet check release snapshot clean help
+.PHONY: all build build-all install dev run watch test test-unit test-integration test-race test-coverage test-coverage-check lint fmt vet check release snapshot clean help
 
 # Default target
 all: check build
@@ -83,12 +83,29 @@ test-integration:
 	@echo "Running integration tests..."
 	@go test -v -run Integration ./...
 
+## test-race: Run tests with race detector
+test-race:
+	@echo "Running tests with race detector..."
+	@go test -v -race ./...
+
 ## test-coverage: Generate coverage report
 test-coverage:
 	@echo "Generating coverage report..."
 	@go test -coverprofile=coverage.out ./...
 	@go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report: coverage.html"
+
+## test-coverage-check: Check coverage meets threshold (80%)
+test-coverage-check:
+	@echo "Checking coverage threshold..."
+	@go test -coverprofile=coverage.out ./...
+	@COVERAGE=$$(go tool cover -func=coverage.out | grep total | awk '{print $$3}' | sed 's/%//'); \
+	echo "Coverage: $${COVERAGE}%"; \
+	if [ $$(echo "$${COVERAGE} < 80" | bc -l) -eq 1 ]; then \
+		echo "Coverage $${COVERAGE}% is below 80% threshold"; \
+		exit 1; \
+	fi; \
+	echo "Coverage $${COVERAGE}% meets 80% threshold"
 
 # ============================================================================
 # Quality targets

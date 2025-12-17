@@ -1,0 +1,53 @@
+# Codecov configuration for SLB
+# https://docs.codecov.com/docs/codecov-yaml
+
+coverage:
+  # Overall project coverage targets
+  status:
+    project:
+      default:
+        target: 80%    # Require 80% overall coverage
+        threshold: 2%  # Allow 2% coverage drop before failing
+        informational: false
+
+    # Coverage requirements for new code in PRs
+    patch:
+      default:
+        target: 80%    # New code should have 80% coverage
+        threshold: 5%  # More lenient for patches
+        informational: false
+
+  # Round coverage to one decimal place
+  precision: 1
+  range: "60...100"
+
+# Ignore certain paths from coverage
+ignore:
+  - "**/*_test.go"
+  - "**/testutil/**"
+  - "**/mocks/**"
+  - "cmd/**"  # Entry point - tested via E2E
+
+# Comment configuration for PRs
+comment:
+  layout: "header, diff, flags, components"
+  behavior: default
+  require_changes: false
+  require_base: false
+  require_head: true
+
+# Flags for different test types
+flags:
+  unit:
+    paths:
+      - internal/
+    carryforward: true
+
+  e2e:
+    paths:
+      - tests/e2e/
+    carryforward: true
+
+# GitHub checks integration
+github_checks:
+  annotations: true
