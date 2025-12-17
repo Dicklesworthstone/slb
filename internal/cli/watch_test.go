@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -903,20 +904,723 @@ func TestPollRequests_UsesDisplayRedacted(t *testing.T) {
 }
 
 // =============================================================================
-// NOTE: autoApproveCaution integration tests
+// pollRequests Additional Tests
 // =============================================================================
+
+// NOTE: The status change code path in pollRequests (lines 280-288) is
+// unreachable with the current implementation because:
+// 1. ListPendingRequestsAllProjects() only returns pending requests
+// 2. statusToEventType(db.StatusPending) returns ""
+// 3. Therefore, status transitions cannot be detected via polling
 //
-// The autoApproveCaution function requires complex setup with global state
-// (flagDB, flagWatchSessionID) which makes it difficult to test in isolation.
-//
-// The critical safety logic is in shouldAutoApproveCaution (100% coverage above).
-// The autoApproveCaution function is a thin wrapper that:
-// 1. Opens database connection
-// 2. Gets request
-// 3. Calls shouldAutoApproveCaution (fully tested)
-// 4. Creates review if approved
-// 5. Updates status if threshold met
-//
-// Integration testing this would require refactoring to accept dependencies
-// as parameters rather than using global state. This is deferred to future work.
+// This is a documented limitation. Status changes are detected via daemon IPC
+// (runWatchDaemon) which uses real-time event streaming instead.
+
+func TestPollRequests_EmptyDisplayRedactedFallback(t *testing.T) {
+	// Create test database
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	dbConn, err := db.OpenAndMigrate(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer dbConn.Close()
+
+	session := &db.Session{
+		ID:          "test-session-raw",
+		AgentName:   "test-agent",
+		Program:     "test",
+		Model:       "test",
+		ProjectPath: tmpDir,
+		StartedAt:   time.Now(),
+	}
+	if err := dbConn.CreateSession(session); err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	// Create request with empty DisplayRedacted - should fall back to Raw
+	request := &db.Request{
+		ID:                 "req-raw-fallback-1",
+		RequestorSessionID: session.ID,
+		Status:             db.StatusPending,
+		RiskTier:           db.RiskTierCaution,
+		MinApprovals:       1,
+		RequestorAgent:     "test-agent",
+		Command: db.CommandSpec{
+			Raw:             "echo raw command",
+			DisplayRedacted: "", // Empty - should fall back to Raw
+			Hash:            "raw123",
+		},
+		ProjectPath: tmpDir,
+		CreatedAt:   time.Now(),
+	}
+	if err := dbConn.CreateRequest(request); err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	seen := make(map[string]db.RequestStatus)
+
+	ctx := context.Background()
+	if err := pollRequests(ctx, dbConn, enc, seen); err != nil {
+		t.Fatalf("pollRequests failed: %v", err)
+	}
+
+	var event daemon.RequestStreamEvent
+	if err := json.Unmarshal([]byte(buf.String()), &event); err != nil {
+		t.Fatalf("failed to parse event: %v", err)
+	}
+
+	// Should use Raw when DisplayRedacted is empty
+	if event.Command != request.Command.Raw {
+		t.Errorf("expected command to fall back to Raw %q, got %q", request.Command.Raw, event.Command)
+	}
+}
+
+func TestPollRequests_ContextCancellation(t *testing.T) {
+	// Create test database
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	dbConn, err := db.OpenAndMigrate(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer dbConn.Close()
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	seen := make(map[string]db.RequestStatus)
+
+	// Create already-cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Should return without error even with cancelled context
+	// (context is only used for auto-approve, which won't trigger with no requests)
+	err = pollRequests(ctx, dbConn, enc, seen)
+	if err != nil {
+		t.Fatalf("pollRequests should handle empty request list gracefully: %v", err)
+	}
+}
+
+func TestPollRequests_AutoApproveCaution(t *testing.T) {
+	// Create test database
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	dbConn, err := db.OpenAndMigrate(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+
+	// Create a session for the requestor
+	session := &db.Session{
+		ID:          "test-session-poll-auto",
+		AgentName:   "test-agent",
+		Program:     "test",
+		Model:       "test",
+		ProjectPath: tmpDir,
+		StartedAt:   time.Now(),
+	}
+	if err := dbConn.CreateSession(session); err != nil {
+		dbConn.Close()
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	// Create the auto-approve session (needed for foreign key constraint)
+	autoSession := &db.Session{
+		ID:          "auto-approve",
+		AgentName:   "auto-reviewer",
+		Program:     "slb-watch",
+		Model:       "auto",
+		ProjectPath: tmpDir,
+		StartedAt:   time.Now(),
+	}
+	if err := dbConn.CreateSession(autoSession); err != nil {
+		dbConn.Close()
+		t.Fatalf("failed to create auto-approve session: %v", err)
+	}
+
+	// Create a CAUTION tier request
+	request := &db.Request{
+		ID:                 "req-poll-auto-approve",
+		RequestorSessionID: session.ID,
+		Status:             db.StatusPending,
+		RiskTier:           db.RiskTierCaution,
+		MinApprovals:       1,
+		RequestorAgent:     "test-agent",
+		Command: db.CommandSpec{
+			Raw:  "echo caution",
+			Hash: "caution123",
+		},
+		ProjectPath: tmpDir,
+		CreatedAt:   time.Now(),
+	}
+	if err := dbConn.CreateRequest(request); err != nil {
+		dbConn.Close()
+		t.Fatalf("failed to create request: %v", err)
+	}
+	dbConn.Close()
+
+	// Save and restore global flags
+	origDB := flagDB
+	origSession := flagWatchSessionID
+	origAutoApprove := flagWatchAutoApproveCaution
+	defer func() {
+		flagDB = origDB
+		flagWatchSessionID = origSession
+		flagWatchAutoApproveCaution = origAutoApprove
+	}()
+	flagDB = dbPath
+	flagWatchSessionID = "" // Use default auto-approve
+	flagWatchAutoApproveCaution = true
+
+	// Reopen database for polling
+	dbConn, err = db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to reopen database: %v", err)
+	}
+	defer dbConn.Close()
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	seen := make(map[string]db.RequestStatus)
+
+	err = pollRequests(context.Background(), dbConn, enc, seen)
+	if err != nil {
+		t.Fatalf("pollRequests failed: %v", err)
+	}
+
+	// Check output includes the pending event
+	output := buf.String()
+	if !strings.Contains(output, "pending") {
+		t.Errorf("expected pending event in output, got: %s", output)
+	}
+	if !strings.Contains(output, "req-poll-auto-approve") {
+		t.Errorf("expected request ID in output, got: %s", output)
+	}
+
+	// Verify auto-approval happened
+	updatedReq, err := dbConn.GetRequest(request.ID)
+	if err != nil {
+		t.Fatalf("failed to get request: %v", err)
+	}
+	if updatedReq.Status != db.StatusApproved {
+		t.Errorf("expected request to be approved, got %s", updatedReq.Status)
+	}
+}
+
+func TestPollRequests_AutoApproveCautionError(t *testing.T) {
+	// Create test database
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	dbConn, err := db.OpenAndMigrate(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+
+	// Create a session for the requestor
+	session := &db.Session{
+		ID:          "test-session-poll-error",
+		AgentName:   "test-agent",
+		Program:     "test",
+		Model:       "test",
+		ProjectPath: tmpDir,
+		StartedAt:   time.Now(),
+	}
+	if err := dbConn.CreateSession(session); err != nil {
+		dbConn.Close()
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	// NOTE: Intentionally NOT creating auto-approve session to trigger FK error
+
+	// Create a CAUTION tier request
+	request := &db.Request{
+		ID:                 "req-poll-auto-error",
+		RequestorSessionID: session.ID,
+		Status:             db.StatusPending,
+		RiskTier:           db.RiskTierCaution,
+		MinApprovals:       1,
+		RequestorAgent:     "test-agent",
+		Command: db.CommandSpec{
+			Raw:  "echo caution error",
+			Hash: "caution-error123",
+		},
+		ProjectPath: tmpDir,
+		CreatedAt:   time.Now(),
+	}
+	if err := dbConn.CreateRequest(request); err != nil {
+		dbConn.Close()
+		t.Fatalf("failed to create request: %v", err)
+	}
+	dbConn.Close()
+
+	// Save and restore global flags
+	origDB := flagDB
+	origSession := flagWatchSessionID
+	origAutoApprove := flagWatchAutoApproveCaution
+	defer func() {
+		flagDB = origDB
+		flagWatchSessionID = origSession
+		flagWatchAutoApproveCaution = origAutoApprove
+	}()
+	flagDB = dbPath
+	flagWatchSessionID = "" // Use default auto-approve
+	flagWatchAutoApproveCaution = true
+
+	// Reopen database for polling
+	dbConn, err = db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to reopen database: %v", err)
+	}
+	defer dbConn.Close()
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	seen := make(map[string]db.RequestStatus)
+
+	// Should not return error even if auto-approve fails (error is emitted as event)
+	err = pollRequests(context.Background(), dbConn, enc, seen)
+	if err != nil {
+		t.Fatalf("pollRequests should not fail on auto-approve error: %v", err)
+	}
+
+	// Check output includes both the pending event and the auto_approve_error event
+	output := buf.String()
+	if !strings.Contains(output, "pending") {
+		t.Errorf("expected pending event in output, got: %s", output)
+	}
+	if !strings.Contains(output, "auto_approve_error") {
+		t.Errorf("expected auto_approve_error event in output, got: %s", output)
+	}
+}
+
 // =============================================================================
+// autoApproveCaution Integration Tests
+// =============================================================================
+
+func TestAutoApproveCaution_InvalidDatabase(t *testing.T) {
+	// Save and restore global flags
+	origDB := flagDB
+	defer func() { flagDB = origDB }()
+
+	// Point to a non-existent database path
+	flagDB = "/nonexistent/path/to/database.db"
+
+	ctx := context.Background()
+	err := autoApproveCaution(ctx, "req-123")
+	if err == nil {
+		t.Error("expected error for invalid database path")
+	}
+	if !contains(err.Error(), "database") && !contains(err.Error(), "opening") {
+		t.Errorf("expected error about database, got: %v", err)
+	}
+}
+
+func TestAutoApproveCaution_RequestNotFound(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	dbConn, err := db.OpenAndMigrate(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	dbConn.Close() // We just need the file to exist
+
+	// Save and restore global flags
+	origDB := flagDB
+	defer func() { flagDB = origDB }()
+
+	flagDB = dbPath
+
+	ctx := context.Background()
+	err = autoApproveCaution(ctx, "nonexistent-request")
+	if err == nil {
+		t.Error("expected error for nonexistent request")
+	}
+	if !contains(err.Error(), "request") && !contains(err.Error(), "getting") {
+		t.Errorf("expected error about getting request, got: %v", err)
+	}
+}
+
+func TestAutoApproveCaution_AlreadyResolved(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	dbConn, err := db.OpenAndMigrate(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer dbConn.Close()
+
+	// Create a session
+	session := &db.Session{
+		ID:          "test-session-resolved",
+		AgentName:   "test-agent",
+		Program:     "test",
+		Model:       "test",
+		ProjectPath: tmpDir,
+		StartedAt:   time.Now(),
+	}
+	if err := dbConn.CreateSession(session); err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	// Create an already-approved request
+	request := &db.Request{
+		ID:                 "req-already-approved",
+		RequestorSessionID: session.ID,
+		Status:             db.StatusApproved, // Already resolved
+		RiskTier:           db.RiskTierCaution,
+		MinApprovals:       1,
+		RequestorAgent:     "test-agent",
+		Command: db.CommandSpec{
+			Raw:  "echo approved",
+			Hash: "approved123",
+		},
+		ProjectPath: tmpDir,
+		CreatedAt:   time.Now(),
+	}
+	if err := dbConn.CreateRequest(request); err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	// Save and restore global flags
+	origDB := flagDB
+	defer func() { flagDB = origDB }()
+	flagDB = dbPath
+
+	ctx := context.Background()
+	err = autoApproveCaution(ctx, request.ID)
+	// Should return nil (not an error) for already-resolved requests
+	if err != nil {
+		t.Errorf("expected no error for already-resolved request, got: %v", err)
+	}
+}
+
+func TestAutoApproveCaution_WrongTier(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	dbConn, err := db.OpenAndMigrate(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer dbConn.Close()
+
+	// Create a session
+	session := &db.Session{
+		ID:          "test-session-wrong-tier",
+		AgentName:   "test-agent",
+		Program:     "test",
+		Model:       "test",
+		ProjectPath: tmpDir,
+		StartedAt:   time.Now(),
+	}
+	if err := dbConn.CreateSession(session); err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	// Create a dangerous tier request (should NOT be auto-approved)
+	request := &db.Request{
+		ID:                 "req-dangerous-tier",
+		RequestorSessionID: session.ID,
+		Status:             db.StatusPending,
+		RiskTier:           db.RiskTierDangerous, // Wrong tier
+		MinApprovals:       1,
+		RequestorAgent:     "test-agent",
+		Command: db.CommandSpec{
+			Raw:  "rm -rf /",
+			Hash: "dangerous123",
+		},
+		ProjectPath: tmpDir,
+		CreatedAt:   time.Now(),
+	}
+	if err := dbConn.CreateRequest(request); err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	// Save and restore global flags
+	origDB := flagDB
+	defer func() { flagDB = origDB }()
+	flagDB = dbPath
+
+	ctx := context.Background()
+	err = autoApproveCaution(ctx, request.ID)
+	if err == nil {
+		t.Error("expected error when trying to auto-approve dangerous tier")
+	}
+	if !contains(err.Error(), "denied") {
+		t.Errorf("expected error about denial, got: %v", err)
+	}
+}
+
+func TestAutoApproveCaution_SuccessfulApproval(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	dbConn, err := db.OpenAndMigrate(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+
+	// Create a session for the requestor
+	session := &db.Session{
+		ID:          "test-session-success",
+		AgentName:   "test-agent",
+		Program:     "test",
+		Model:       "test",
+		ProjectPath: tmpDir,
+		StartedAt:   time.Now(),
+	}
+	if err := dbConn.CreateSession(session); err != nil {
+		dbConn.Close()
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	// Create the auto-approve session (needed for foreign key constraint)
+	autoApproveSession := &db.Session{
+		ID:          "auto-approve",
+		AgentName:   "auto-reviewer",
+		Program:     "slb-watch",
+		Model:       "auto",
+		ProjectPath: tmpDir,
+		StartedAt:   time.Now(),
+	}
+	if err := dbConn.CreateSession(autoApproveSession); err != nil {
+		dbConn.Close()
+		t.Fatalf("failed to create auto-approve session: %v", err)
+	}
+
+	// Create a CAUTION tier pending request
+	request := &db.Request{
+		ID:                 "req-auto-success",
+		RequestorSessionID: session.ID,
+		Status:             db.StatusPending,
+		RiskTier:           db.RiskTierCaution,
+		MinApprovals:       1, // Only 1 approval needed
+		RequestorAgent:     "test-agent",
+		Command: db.CommandSpec{
+			Raw:  "echo hello",
+			Hash: "caution123",
+		},
+		ProjectPath: tmpDir,
+		CreatedAt:   time.Now(),
+	}
+	if err := dbConn.CreateRequest(request); err != nil {
+		dbConn.Close()
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	// Close the setup connection before calling autoApproveCaution
+	// which opens its own connection
+	dbConn.Close()
+
+	// Save and restore global flags
+	origDB := flagDB
+	origSession := flagWatchSessionID
+	defer func() {
+		flagDB = origDB
+		flagWatchSessionID = origSession
+	}()
+	flagDB = dbPath
+	flagWatchSessionID = "" // Test the default session fallback
+
+	ctx := context.Background()
+	err = autoApproveCaution(ctx, request.ID)
+	if err != nil {
+		t.Fatalf("expected successful auto-approval, got error: %v", err)
+	}
+
+	// Reopen to verify
+	dbConn, err = db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to reopen database: %v", err)
+	}
+	defer dbConn.Close()
+
+	// Verify the request was approved
+	updatedReq, err := dbConn.GetRequest(request.ID)
+	if err != nil {
+		t.Fatalf("failed to get updated request: %v", err)
+	}
+	if updatedReq.Status != db.StatusApproved {
+		t.Errorf("expected request status to be approved, got %s", updatedReq.Status)
+	}
+
+	// Verify a review was created
+	reviews, err := dbConn.ListReviewsForRequest(request.ID)
+	if err != nil {
+		t.Fatalf("failed to list reviews: %v", err)
+	}
+	if len(reviews) != 1 {
+		t.Errorf("expected 1 review, got %d", len(reviews))
+	}
+	if reviews[0].Decision != db.DecisionApprove {
+		t.Errorf("expected approve decision, got %s", reviews[0].Decision)
+	}
+	if reviews[0].ReviewerSessionID != "auto-approve" {
+		t.Errorf("expected session 'auto-approve', got %s", reviews[0].ReviewerSessionID)
+	}
+}
+
+func TestAutoApproveCaution_WithCustomSession(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	dbConn, err := db.OpenAndMigrate(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer dbConn.Close()
+
+	session := &db.Session{
+		ID:          "test-session-custom",
+		AgentName:   "test-agent",
+		Program:     "test",
+		Model:       "test",
+		ProjectPath: tmpDir,
+		StartedAt:   time.Now(),
+	}
+	if err := dbConn.CreateSession(session); err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	// Create the reviewer session (needed for foreign key constraint)
+	reviewerSession := &db.Session{
+		ID:          "custom-watch-session",
+		AgentName:   "auto-reviewer",
+		Program:     "slb-watch",
+		Model:       "auto",
+		ProjectPath: tmpDir,
+		StartedAt:   time.Now(),
+	}
+	if err := dbConn.CreateSession(reviewerSession); err != nil {
+		t.Fatalf("failed to create reviewer session: %v", err)
+	}
+
+	request := &db.Request{
+		ID:                 "req-custom-session",
+		RequestorSessionID: session.ID,
+		Status:             db.StatusPending,
+		RiskTier:           db.RiskTierCaution,
+		MinApprovals:       1,
+		RequestorAgent:     "test-agent",
+		Command: db.CommandSpec{
+			Raw:  "echo custom",
+			Hash: "custom123",
+		},
+		ProjectPath: tmpDir,
+		CreatedAt:   time.Now(),
+	}
+	if err := dbConn.CreateRequest(request); err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	origDB := flagDB
+	origSession := flagWatchSessionID
+	defer func() {
+		flagDB = origDB
+		flagWatchSessionID = origSession
+	}()
+	flagDB = dbPath
+	flagWatchSessionID = "custom-watch-session" // Custom session ID
+
+	ctx := context.Background()
+	err = autoApproveCaution(ctx, request.ID)
+	if err != nil {
+		t.Fatalf("expected successful auto-approval, got error: %v", err)
+	}
+
+	// Verify the custom session was used
+	reviews, err := dbConn.ListReviewsForRequest(request.ID)
+	if err != nil {
+		t.Fatalf("failed to list reviews: %v", err)
+	}
+	if reviews[0].ReviewerSessionID != "custom-watch-session" {
+		t.Errorf("expected custom session, got %s", reviews[0].ReviewerSessionID)
+	}
+}
+
+func TestAutoApproveCaution_MultipleApprovalsNeeded(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	dbConn, err := db.OpenAndMigrate(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer dbConn.Close()
+
+	session := &db.Session{
+		ID:          "test-session-multi",
+		AgentName:   "test-agent",
+		Program:     "test",
+		Model:       "test",
+		ProjectPath: tmpDir,
+		StartedAt:   time.Now(),
+	}
+	if err := dbConn.CreateSession(session); err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	// Create the reviewer session (needed for foreign key constraint)
+	reviewerSession := &db.Session{
+		ID:          "multi-approval-session",
+		AgentName:   "auto-reviewer",
+		Program:     "slb-watch",
+		Model:       "auto",
+		ProjectPath: tmpDir,
+		StartedAt:   time.Now(),
+	}
+	if err := dbConn.CreateSession(reviewerSession); err != nil {
+		t.Fatalf("failed to create reviewer session: %v", err)
+	}
+
+	// Request needs 2 approvals
+	request := &db.Request{
+		ID:                 "req-multi-approvals",
+		RequestorSessionID: session.ID,
+		Status:             db.StatusPending,
+		RiskTier:           db.RiskTierCaution,
+		MinApprovals:       2, // Needs 2 approvals
+		RequestorAgent:     "test-agent",
+		Command: db.CommandSpec{
+			Raw:  "echo multi",
+			Hash: "multi123",
+		},
+		ProjectPath: tmpDir,
+		CreatedAt:   time.Now(),
+	}
+	if err := dbConn.CreateRequest(request); err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	origDB := flagDB
+	origSession := flagWatchSessionID
+	defer func() {
+		flagDB = origDB
+		flagWatchSessionID = origSession
+	}()
+	flagDB = dbPath
+	flagWatchSessionID = "multi-approval-session" // Unique session to avoid conflicts
+
+	ctx := context.Background()
+	err = autoApproveCaution(ctx, request.ID)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	// Request should still be pending (only 1 of 2 approvals)
+	updatedReq, err := dbConn.GetRequest(request.ID)
+	if err != nil {
+		t.Fatalf("failed to get updated request: %v", err)
+	}
+	if updatedReq.Status != db.StatusPending {
+		t.Errorf("expected request to remain pending (needs 2 approvals), got %s", updatedReq.Status)
+	}
+
+	// But review should be created
+	reviews, err := dbConn.ListReviewsForRequest(request.ID)
+	if err != nil {
+		t.Fatalf("failed to list reviews: %v", err)
+	}
+	if len(reviews) != 1 {
+		t.Errorf("expected 1 review, got %d", len(reviews))
+	}
+}

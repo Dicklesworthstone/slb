@@ -465,3 +465,65 @@ func TestDaemonProjectPath_PrecedenceOrder(t *testing.T) {
 		t.Errorf("should fallback to cwd, got %q, want %q", result, cwd)
 	}
 }
+
+// =============================================================================
+// followFile Tests
+// =============================================================================
+
+// TestFollowFile_FileNotFound tests error handling when file doesn't exist.
+func TestFollowFile_FileNotFound(t *testing.T) {
+	var buf strings.Builder
+	err := followFile("/nonexistent/path/to/file.log", &buf)
+	if err == nil {
+		t.Error("expected error for nonexistent file")
+	}
+	if !strings.Contains(err.Error(), "opening") {
+		t.Errorf("expected error about opening file, got: %v", err)
+	}
+}
+
+// TestFollowFile_PermissionDenied tests error handling when file can't be read.
+func TestFollowFile_PermissionDenied(t *testing.T) {
+	h := testutil.NewHarness(t)
+
+	// Create a file with no read permissions
+	testFile := filepath.Join(h.ProjectDir, "noperm.log")
+	if err := os.WriteFile(testFile, []byte("test"), 0000); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+	defer os.Chmod(testFile, 0644) // Cleanup
+
+	var buf strings.Builder
+	err := followFile(testFile, &buf)
+	if err == nil {
+		// On some systems (containers with root), this might succeed
+		t.Skip("permission denied test skipped (likely running as root)")
+	}
+	if !strings.Contains(err.Error(), "opening") {
+		t.Errorf("expected error about opening file, got: %v", err)
+	}
+}
+
+// TestDaemonLogPath_HomeUnset tests behavior when HOME environment is cleared.
+func TestDaemonLogPath_HomeUnset(t *testing.T) {
+	// Save original HOME
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+
+	// Clear HOME - os.UserHomeDir() may still work via passwd lookup
+	os.Unsetenv("HOME")
+
+	result, err := daemonLogPath()
+	// This might succeed or fail depending on OS
+	if err != nil {
+		// Error is acceptable when HOME is unset
+		if !strings.Contains(err.Error(), "home") {
+			t.Errorf("expected error about home directory, got: %v", err)
+		}
+	} else {
+		// If it succeeds, result should still be valid
+		if !strings.Contains(result, "daemon.log") {
+			t.Errorf("expected valid path ending in daemon.log, got: %s", result)
+		}
+	}
+}
