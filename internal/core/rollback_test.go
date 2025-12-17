@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
@@ -379,4 +380,154 @@ func TestBytesTrimSpace(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCleanupOldRollbackCaptures(t *testing.T) {
+	t.Run("zero retention does nothing", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		err := cleanupOldRollbackCaptures(tmpDir, 0, time.Now())
+		if err != nil {
+			t.Errorf("cleanupOldRollbackCaptures error = %v", err)
+		}
+	})
+
+	t.Run("negative retention does nothing", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		err := cleanupOldRollbackCaptures(tmpDir, -1*time.Hour, time.Now())
+		if err != nil {
+			t.Errorf("cleanupOldRollbackCaptures error = %v", err)
+		}
+	})
+
+	t.Run("nonexistent directory returns nil", func(t *testing.T) {
+		err := cleanupOldRollbackCaptures("/nonexistent/path/xyz", time.Hour, time.Now())
+		if err != nil {
+			t.Errorf("expected nil error for nonexistent directory, got %v", err)
+		}
+	})
+
+	t.Run("ignores non-req directories", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		// Create a directory that doesn't start with "req-"
+		otherDir := filepath.Join(tmpDir, "other-dir")
+		if err := os.MkdirAll(otherDir, 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+
+		// Set modification time to be old
+		oldTime := time.Now().Add(-2 * time.Hour)
+		if err := os.Chtimes(otherDir, oldTime, oldTime); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+
+		err := cleanupOldRollbackCaptures(tmpDir, time.Hour, time.Now())
+		if err != nil {
+			t.Errorf("cleanupOldRollbackCaptures error = %v", err)
+		}
+
+		// Directory should still exist
+		if _, err := os.Stat(otherDir); os.IsNotExist(err) {
+			t.Error("expected non-req directory to not be deleted")
+		}
+	})
+
+	t.Run("ignores files", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		// Create a file named req-something
+		reqFile := filepath.Join(tmpDir, "req-file")
+		if err := os.WriteFile(reqFile, []byte("test"), 0644); err != nil {
+			t.Fatalf("write file: %v", err)
+		}
+
+		err := cleanupOldRollbackCaptures(tmpDir, time.Hour, time.Now())
+		if err != nil {
+			t.Errorf("cleanupOldRollbackCaptures error = %v", err)
+		}
+
+		// File should still exist
+		if _, err := os.Stat(reqFile); os.IsNotExist(err) {
+			t.Error("expected file to not be deleted")
+		}
+	})
+
+	t.Run("deletes old req- directories", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		// Create an old req- directory
+		oldReqDir := filepath.Join(tmpDir, "req-old-request")
+		if err := os.MkdirAll(oldReqDir, 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+
+		// Set modification time to be old
+		oldTime := time.Now().Add(-2 * time.Hour)
+		if err := os.Chtimes(oldReqDir, oldTime, oldTime); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+
+		err := cleanupOldRollbackCaptures(tmpDir, time.Hour, time.Now())
+		if err != nil {
+			t.Errorf("cleanupOldRollbackCaptures error = %v", err)
+		}
+
+		// Directory should be deleted
+		if _, err := os.Stat(oldReqDir); !os.IsNotExist(err) {
+			t.Error("expected old req- directory to be deleted")
+		}
+	})
+
+	t.Run("keeps recent req- directories", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		// Create a recent req- directory
+		recentReqDir := filepath.Join(tmpDir, "req-recent-request")
+		if err := os.MkdirAll(recentReqDir, 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+
+		// Modification time is already recent (just created)
+
+		err := cleanupOldRollbackCaptures(tmpDir, time.Hour, time.Now())
+		if err != nil {
+			t.Errorf("cleanupOldRollbackCaptures error = %v", err)
+		}
+
+		// Directory should still exist
+		if _, err := os.Stat(recentReqDir); os.IsNotExist(err) {
+			t.Error("expected recent req- directory to not be deleted")
+		}
+	})
+
+	t.Run("deletes only expired directories", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		// Create an old req- directory
+		oldReqDir := filepath.Join(tmpDir, "req-old")
+		if err := os.MkdirAll(oldReqDir, 0755); err != nil {
+			t.Fatalf("mkdir old: %v", err)
+		}
+		oldTime := time.Now().Add(-2 * time.Hour)
+		if err := os.Chtimes(oldReqDir, oldTime, oldTime); err != nil {
+			t.Fatalf("chtimes old: %v", err)
+		}
+
+		// Create a recent req- directory
+		recentReqDir := filepath.Join(tmpDir, "req-recent")
+		if err := os.MkdirAll(recentReqDir, 0755); err != nil {
+			t.Fatalf("mkdir recent: %v", err)
+		}
+
+		err := cleanupOldRollbackCaptures(tmpDir, time.Hour, time.Now())
+		if err != nil {
+			t.Errorf("cleanupOldRollbackCaptures error = %v", err)
+		}
+
+		// Old directory should be deleted
+		if _, err := os.Stat(oldReqDir); !os.IsNotExist(err) {
+			t.Error("expected old req- directory to be deleted")
+		}
+
+		// Recent directory should still exist
+		if _, err := os.Stat(recentReqDir); os.IsNotExist(err) {
+			t.Error("expected recent req- directory to not be deleted")
+		}
+	})
 }

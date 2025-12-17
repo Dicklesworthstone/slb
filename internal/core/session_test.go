@@ -238,3 +238,168 @@ func TestGarbageCollectStaleSessions_EndsOnlyProjectSessions(t *testing.T) {
 		t.Fatalf("expected staleB (other project) to remain active")
 	}
 }
+
+func TestResumeSession_ValidationErrors(t *testing.T) {
+	dbConn, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("db.Open(:memory:) error = %v", err)
+	}
+	defer dbConn.Close()
+
+	t.Run("empty agent name returns error", func(t *testing.T) {
+		_, err := ResumeSession(dbConn, ResumeOptions{
+			AgentName:       "",
+			Program:         "codex-cli",
+			Model:           "gpt-5.2",
+			ProjectPath:     "/test/project",
+			CreateIfMissing: true,
+		})
+		if err == nil {
+			t.Error("expected error for empty agent name")
+		}
+	})
+
+	t.Run("empty project path returns error", func(t *testing.T) {
+		_, err := ResumeSession(dbConn, ResumeOptions{
+			AgentName:       "BlueSnow",
+			Program:         "codex-cli",
+			Model:           "gpt-5.2",
+			ProjectPath:     "",
+			CreateIfMissing: true,
+		})
+		if err == nil {
+			t.Error("expected error for empty project path")
+		}
+	})
+}
+
+func TestResumeSession_ForceEndMismatch(t *testing.T) {
+	dbConn, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("db.Open(:memory:) error = %v", err)
+	}
+	defer dbConn.Close()
+
+	// Create an existing session with a different program.
+	existing := &db.Session{
+		AgentName:   "BlueSnow",
+		Program:     "claude-code",
+		Model:       "opus-4.5",
+		ProjectPath: "/test/project",
+	}
+	if err := dbConn.CreateSession(existing); err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+
+	// Resume with ForceEndMismatch=true should end old session and create new one.
+	sess, err := ResumeSession(dbConn, ResumeOptions{
+		AgentName:        "BlueSnow",
+		Program:          "codex-cli",
+		Model:            "gpt-5.2",
+		ProjectPath:      "/test/project",
+		CreateIfMissing:  true,
+		ForceEndMismatch: true,
+	})
+	if err != nil {
+		t.Fatalf("ResumeSession() error = %v", err)
+	}
+
+	// Verify old session was ended.
+	oldSess, err := dbConn.GetSession(existing.ID)
+	if err != nil {
+		t.Fatalf("GetSession(existing) error = %v", err)
+	}
+	if oldSess.EndedAt == nil {
+		t.Fatalf("expected old session to be ended")
+	}
+
+	// Verify new session has the requested program.
+	if sess.Program != "codex-cli" {
+		t.Fatalf("expected new session program to be codex-cli, got %s", sess.Program)
+	}
+	if sess.ID == existing.ID {
+		t.Fatalf("expected new session to have different ID")
+	}
+}
+
+func TestGarbageCollectStaleSessions_ValidationErrors(t *testing.T) {
+	dbConn, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("db.Open(:memory:) error = %v", err)
+	}
+	defer dbConn.Close()
+
+	t.Run("nil dbConn returns error", func(t *testing.T) {
+		_, err := GarbageCollectStaleSessions(nil, SessionGCOptions{
+			ProjectPath: "/test/project",
+			Threshold:   30 * time.Minute,
+		})
+		if err == nil {
+			t.Error("expected error for nil dbConn")
+		}
+	})
+
+	t.Run("empty project path returns error", func(t *testing.T) {
+		_, err := GarbageCollectStaleSessions(dbConn, SessionGCOptions{
+			ProjectPath: "",
+			Threshold:   30 * time.Minute,
+		})
+		if err == nil {
+			t.Error("expected error for empty project path")
+		}
+	})
+
+	t.Run("zero threshold returns error", func(t *testing.T) {
+		_, err := GarbageCollectStaleSessions(dbConn, SessionGCOptions{
+			ProjectPath: "/test/project",
+			Threshold:   0,
+		})
+		if err == nil {
+			t.Error("expected error for zero threshold")
+		}
+	})
+
+	t.Run("negative threshold returns error", func(t *testing.T) {
+		_, err := GarbageCollectStaleSessions(dbConn, SessionGCOptions{
+			ProjectPath: "/test/project",
+			Threshold:   -1 * time.Minute,
+		})
+		if err == nil {
+			t.Error("expected error for negative threshold")
+		}
+	})
+}
+
+func TestGarbageCollectStaleSessions_NoStaleSessions(t *testing.T) {
+	dbConn, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("db.Open(:memory:) error = %v", err)
+	}
+	defer dbConn.Close()
+
+	// Create a fresh session.
+	fresh := &db.Session{
+		AgentName:   "BlueSnow",
+		Program:     "codex-cli",
+		Model:       "gpt-5.2",
+		ProjectPath: "/test/project",
+	}
+	if err := dbConn.CreateSession(fresh); err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+
+	res, err := GarbageCollectStaleSessions(dbConn, SessionGCOptions{
+		ProjectPath: "/test/project",
+		Threshold:   30 * time.Minute,
+		DryRun:      false,
+	})
+	if err != nil {
+		t.Fatalf("GarbageCollectStaleSessions() error = %v", err)
+	}
+	if len(res.Sessions) != 0 {
+		t.Fatalf("expected no stale sessions, got %d", len(res.Sessions))
+	}
+	if len(res.EndedIDs) != 0 {
+		t.Fatalf("expected no ended sessions, got %d", len(res.EndedIDs))
+	}
+}

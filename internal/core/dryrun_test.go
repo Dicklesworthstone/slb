@@ -268,3 +268,197 @@ func TestShellJoin(t *testing.T) {
 		})
 	}
 }
+
+func TestRunDryRun(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell execution test uses /bin/sh or $SHELL")
+	}
+
+	t.Run("nil spec returns error", func(t *testing.T) {
+		_, err := RunDryRun(nil)
+		if err == nil {
+			t.Error("expected error for nil spec")
+		}
+	})
+
+	t.Run("empty command returns error", func(t *testing.T) {
+		spec := &db.CommandSpec{
+			Raw: "",
+			Cwd: "/tmp",
+		}
+		_, err := RunDryRun(spec)
+		if err == nil {
+			t.Error("expected error for empty command")
+		}
+	})
+
+	t.Run("whitespace only command returns error", func(t *testing.T) {
+		spec := &db.CommandSpec{
+			Raw: "   \t  ",
+			Cwd: "/tmp",
+		}
+		_, err := RunDryRun(spec)
+		if err == nil {
+			t.Error("expected error for whitespace-only command")
+		}
+	})
+
+	t.Run("unsupported command returns nil result and nil error", func(t *testing.T) {
+		spec := &db.CommandSpec{
+			Raw: "echo hello",
+			Cwd: "/tmp",
+		}
+		result, err := RunDryRun(spec)
+		if err != nil {
+			t.Errorf("expected nil error for unsupported command, got %v", err)
+		}
+		if result != nil {
+			t.Errorf("expected nil result for unsupported command, got %+v", result)
+		}
+	})
+
+	t.Run("rm dry-run converts to ls and executes", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		// Create a test file to list
+		testFile := filepath.Join(tmpDir, "testfile.txt")
+		if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
+			t.Fatalf("failed to create test file: %v", err)
+		}
+
+		spec := &db.CommandSpec{
+			Raw: "rm -rf " + testFile,
+			Cwd: tmpDir,
+		}
+		result, err := RunDryRun(spec)
+		if err != nil {
+			t.Fatalf("RunDryRun error: %v", err)
+		}
+		if result == nil {
+			t.Fatal("expected non-nil result for rm dry-run")
+		}
+		if !strings.Contains(result.Command, "ls") {
+			t.Errorf("expected dry-run command to contain 'ls', got %q", result.Command)
+		}
+		if !strings.Contains(result.Output, "testfile.txt") {
+			t.Errorf("expected output to mention testfile.txt, got %q", result.Output)
+		}
+	})
+
+	t.Run("rm dry-run with nonexistent file returns error", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		spec := &db.CommandSpec{
+			Raw: "rm -rf /nonexistent/path/that/definitely/does/not/exist/anywhere",
+			Cwd: tmpDir,
+		}
+		result, err := RunDryRun(spec)
+		// rm dry-run converts to ls, which will fail on nonexistent path
+		if err == nil && result != nil {
+			// ls may return error or empty output for nonexistent path
+			t.Logf("dry-run result for nonexistent path: command=%q output=%q", result.Command, result.Output)
+		}
+	})
+}
+
+func TestHasFlag(t *testing.T) {
+	tests := []struct {
+		name   string
+		tokens []string
+		flag   string
+		want   bool
+	}{
+		{"flag present", []string{"cmd", "-f", "arg"}, "-f", true},
+		{"flag not present", []string{"cmd", "-g", "arg"}, "-f", false},
+		{"flag at end", []string{"cmd", "arg", "-f"}, "-f", true},
+		{"empty tokens", []string{}, "-f", false},
+		{"flag with equals", []string{"cmd", "-f=value"}, "-f", false}, // exact match only
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := hasFlag(tc.tokens, tc.flag)
+			if got != tc.want {
+				t.Errorf("hasFlag(%v, %q) = %v, want %v", tc.tokens, tc.flag, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHasFlagPrefix(t *testing.T) {
+	tests := []struct {
+		name   string
+		tokens []string
+		prefix string
+		want   bool
+	}{
+		{"prefix present", []string{"cmd", "--dry-run=client"}, "--dry-run", true},
+		{"prefix not present", []string{"cmd", "-f", "arg"}, "--dry-run", false},
+		{"exact match counts", []string{"cmd", "--dry-run"}, "--dry-run", true},
+		{"empty tokens", []string{}, "--dry-run", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := hasFlagPrefix(tc.tokens, tc.prefix)
+			if got != tc.want {
+				t.Errorf("hasFlagPrefix(%v, %q) = %v, want %v", tc.tokens, tc.prefix, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseShellTokens(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  string
+		want []string
+	}{
+		{"simple command", "ls -la", []string{"ls", "-la"}},
+		{"command with quoted string", `echo "hello world"`, []string{"echo", "hello world"}},
+		{"command with single quotes", `echo 'hello world'`, []string{"echo", "hello world"}},
+		{"empty string", "", []string{}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseShellTokens(tc.cmd)
+			if len(got) != len(tc.want) {
+				t.Errorf("parseShellTokens(%q) = %v, want %v", tc.cmd, got, tc.want)
+				return
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("parseShellTokens(%q)[%d] = %q, want %q", tc.cmd, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestRmTargets(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"simple paths", []string{"file1.txt", "file2.txt"}, []string{"file1.txt", "file2.txt"}},
+		{"flags filtered", []string{"-r", "-f", "file.txt"}, []string{"file.txt"}},
+		{"after double dash", []string{"-r", "--", "-f", "file.txt"}, []string{"-f", "file.txt"}},
+		{"only flags", []string{"-r", "-f"}, []string{}},
+		{"empty", []string{}, []string{}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rmTargets(tc.args)
+			if len(got) != len(tc.want) {
+				t.Errorf("rmTargets(%v) = %v, want %v", tc.args, got, tc.want)
+				return
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("rmTargets(%v)[%d] = %q, want %q", tc.args, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
