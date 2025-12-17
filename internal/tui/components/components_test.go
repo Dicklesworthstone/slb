@@ -68,21 +68,45 @@ func TestAgentCardRender(t *testing.T) {
 			selected: false,
 		},
 		{
+			name:     "idle agent full",
+			agent:    AgentInfo{Name: "Agent2b", Program: "codex", Model: "gpt5", Status: AgentStatusIdle},
+			compact:  false,
+			selected: false,
+		},
+		{
 			name:     "stale agent selected",
 			agent:    AgentInfo{Name: "Agent3", Program: "test", Model: "test", Status: AgentStatusStale},
 			compact:  false,
 			selected: true,
 		},
 		{
-			name:     "ended agent",
+			name:     "stale agent compact",
+			agent:    AgentInfo{Name: "Agent3b", Program: "test", Model: "test", Status: AgentStatusStale},
+			compact:  true,
+			selected: false,
+		},
+		{
+			name:     "ended agent compact",
 			agent:    AgentInfo{Name: "Agent4", Program: "test", Model: "test", Status: AgentStatusEnded},
 			compact:  true,
 			selected: true,
 		},
 		{
+			name:     "ended agent full",
+			agent:    AgentInfo{Name: "Agent4b", Program: "test", Model: "test", Status: AgentStatusEnded},
+			compact:  false,
+			selected: false,
+		},
+		{
 			name:     "unknown status",
 			agent:    AgentInfo{Name: "Agent5", Program: "test", Model: "test", Status: "unknown"},
 			compact:  false,
+			selected: false,
+		},
+		{
+			name:     "unknown status compact",
+			agent:    AgentInfo{Name: "Agent5b", Program: "test", Model: "test", Status: "unknown"},
+			compact:  true,
 			selected: false,
 		},
 	}
