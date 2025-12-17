@@ -106,3 +106,228 @@ func TestExtractCommandName(t *testing.T) {
 		})
 	}
 }
+
+func TestExtractXargsCommand(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "xargs with rm command",
+			input:    "xargs rm -rf",
+			expected: "rm -rf",
+		},
+		{
+			name:     "xargs with complex command",
+			input:    "xargs kubectl delete pod",
+			expected: "kubectl delete pod",
+		},
+		{
+			name:     "xargs with single command",
+			input:    "xargs echo",
+			expected: "echo",
+		},
+		{
+			name:     "xargs with flags",
+			input:    "xargs -0 rm -rf",
+			expected: "-0 rm -rf",
+		},
+		{
+			name:     "xargs with -I replacement",
+			input:    "xargs -I {} mv {} /tmp",
+			expected: "-I {} mv {} /tmp",
+		},
+		{
+			name:     "not xargs returns empty",
+			input:    "rm -rf /tmp",
+			expected: "",
+		},
+		{
+			name:     "empty string returns empty",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "just xargs returns empty (no command after)",
+			input:    "xargs",
+			expected: "",
+		},
+		{
+			name:     "xargs with extra spaces",
+			input:    "xargs   rm   -rf",
+			expected: "rm   -rf",
+		},
+		{
+			name:     "xargs in middle of pipe",
+			input:    "find . -name '*.log' | xargs rm",
+			expected: "rm",
+		},
+		{
+			name:     "grep with xargs in string matches (regex limitation)",
+			input:    "grep xargs file.txt",
+			expected: "file.txt", // Note: regex matches "xargs" anywhere in string
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := ExtractXargsCommand(tc.input)
+			if result != tc.expected {
+				t.Errorf("ExtractXargsCommand(%q) = %q, want %q", tc.input, result, tc.expected)
+			}
+		})
+	}
+}
+
+func TestNormalizeSegmentShellC(t *testing.T) {
+	tests := []struct {
+		name              string
+		input             string
+		wantNormalized    string
+		wantParseError    bool
+		wantWrapperPrefix string
+	}{
+		{
+			name:              "bash -c with single quotes",
+			input:             "bash -c 'rm -rf /tmp'",
+			wantNormalized:    "rm -rf /tmp",
+			wantParseError:    false,
+			wantWrapperPrefix: "bash -c",
+		},
+		{
+			name:              "sh -c with double quotes",
+			input:             `sh -c "echo hello"`,
+			wantNormalized:    "echo hello",
+			wantParseError:    false,
+			wantWrapperPrefix: "sh -c",
+		},
+		{
+			name:              "zsh -c nested sudo",
+			input:             "zsh -c 'sudo rm -rf /var/log'",
+			wantNormalized:    "rm -rf /var/log",
+			wantParseError:    false,
+			wantWrapperPrefix: "zsh -c",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			normalized, wrappers, parseErr := normalizeSegment(tc.input)
+			if normalized != tc.wantNormalized {
+				t.Errorf("normalized = %q, want %q", normalized, tc.wantNormalized)
+			}
+			if parseErr != tc.wantParseError {
+				t.Errorf("parseErr = %v, want %v", parseErr, tc.wantParseError)
+			}
+			if len(wrappers) == 0 || wrappers[0] != tc.wantWrapperPrefix {
+				t.Errorf("wrappers = %v, want prefix %q", wrappers, tc.wantWrapperPrefix)
+			}
+		})
+	}
+}
+
+func TestNormalizeSegmentWrapperStripping(t *testing.T) {
+	tests := []struct {
+		name           string
+		input          string
+		wantNormalized string
+		wantWrappers   []string
+	}{
+		{
+			name:           "sudo prefix",
+			input:          "sudo rm -rf /tmp",
+			wantNormalized: "rm -rf /tmp",
+			wantWrappers:   []string{"sudo"},
+		},
+		{
+			name:           "multiple wrappers",
+			input:          "sudo nice ionice rm -rf /tmp",
+			wantNormalized: "rm -rf /tmp",
+			wantWrappers:   []string{"sudo", "nice", "ionice"},
+		},
+		{
+			name:           "doas prefix",
+			input:          "doas kubectl delete pod nginx",
+			wantNormalized: "kubectl delete pod nginx",
+			wantWrappers:   []string{"doas"},
+		},
+		{
+			name:           "time prefix",
+			input:          "time make build",
+			wantNormalized: "make build",
+			wantWrappers:   []string{"time"},
+		},
+		{
+			name:           "nohup prefix",
+			input:          "nohup ./long-running-script.sh",
+			wantNormalized: "./long-running-script.sh",
+			wantWrappers:   []string{"nohup"},
+		},
+		{
+			name:           "no wrapper",
+			input:          "ls -la",
+			wantNormalized: "ls -la",
+			wantWrappers:   []string{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			normalized, wrappers, _ := normalizeSegment(tc.input)
+			if normalized != tc.wantNormalized {
+				t.Errorf("normalized = %q, want %q", normalized, tc.wantNormalized)
+			}
+			if len(wrappers) != len(tc.wantWrappers) {
+				t.Errorf("wrappers = %v, want %v", wrappers, tc.wantWrappers)
+			}
+			for i, w := range tc.wantWrappers {
+				if i >= len(wrappers) || wrappers[i] != w {
+					t.Errorf("wrappers[%d] = %q, want %q", i, wrappers[i], w)
+				}
+			}
+		})
+	}
+}
+
+func TestIsWrapper(t *testing.T) {
+	wrappers := []string{"sudo", "doas", "env", "command", "builtin", "time", "nice", "ionice", "nohup", "strace", "ltrace"}
+	for _, w := range wrappers {
+		if !isWrapper(w) {
+			t.Errorf("isWrapper(%q) = false, want true", w)
+		}
+	}
+
+	nonWrappers := []string{"rm", "kubectl", "docker", "git", "make", ""}
+	for _, w := range nonWrappers {
+		if isWrapper(w) {
+			t.Errorf("isWrapper(%q) = true, want false", w)
+		}
+	}
+}
+
+func TestIsEnvAssignment(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"FOO=bar", true},
+		{"_VAR=value", true},
+		{"VAR123=test", true},
+		{"A=b", true},
+		{"=value", false},
+		{"123VAR=test", false},
+		{"FOO", false},
+		{"foo bar", false},
+		{"", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got := isEnvAssignment(tc.input)
+			if got != tc.want {
+				t.Errorf("isEnvAssignment(%q) = %v, want %v", tc.input, got, tc.want)
+			}
+		})
+	}
+}
