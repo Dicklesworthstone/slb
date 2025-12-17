@@ -139,3 +139,132 @@ func TestRunCommand_StreamOptional(t *testing.T) {
 		t.Fatalf("RunCommand(nil stream) error: %v", err)
 	}
 }
+
+func TestCombineStdoutStderr(t *testing.T) {
+	tests := []struct {
+		name           string
+		stdout         string
+		stderr         string
+		wantEmpty      bool
+		wantContains   []string
+		wantNotContain []string
+	}{
+		{
+			name:      "both empty",
+			stdout:    "",
+			stderr:    "",
+			wantEmpty: true,
+		},
+		{
+			name:         "only stdout",
+			stdout:       "hello world",
+			stderr:       "",
+			wantContains: []string{"hello world"},
+		},
+		{
+			name:         "only stderr",
+			stdout:       "",
+			stderr:       "error occurred",
+			wantContains: []string{"error occurred"},
+		},
+		{
+			name:         "both stdout and stderr",
+			stdout:       "output line",
+			stderr:       "error line",
+			wantContains: []string{"output line", "--- stderr ---", "error line"},
+		},
+		{
+			name:           "strips trailing newlines from stdout",
+			stdout:         "hello\n\n\n",
+			stderr:         "",
+			wantContains:   []string{"hello"},
+			wantNotContain: []string{"\n\n"},
+		},
+		{
+			name:           "strips trailing newlines from stderr",
+			stdout:         "",
+			stderr:         "error\n\n",
+			wantContains:   []string{"error"},
+			wantNotContain: []string{"\n\n"},
+		},
+		{
+			name:         "combined with trailing newlines stripped",
+			stdout:       "out\n",
+			stderr:       "err\n",
+			wantContains: []string{"out", "err", "--- stderr ---"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := combineStdoutStderr(tc.stdout, tc.stderr)
+			if tc.wantEmpty && result != "" {
+				t.Errorf("expected empty result, got %q", result)
+			}
+			for _, s := range tc.wantContains {
+				if !strings.Contains(result, s) {
+					t.Errorf("result %q should contain %q", result, s)
+				}
+			}
+			for _, s := range tc.wantNotContain {
+				if strings.Contains(result, s) {
+					t.Errorf("result %q should not contain %q", result, s)
+				}
+			}
+		})
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty string", "", "''"},
+		{"simple word", "hello", "hello"},
+		{"word with no special chars", "filename.txt", "filename.txt"},
+		{"word with space", "hello world", "'hello world'"},
+		{"word with tab", "hello\tworld", "'hello\tworld'"},
+		{"word with single quote", "it's", "'it'\\''s'"},
+		{"word with double quote", `say "hi"`, `'say "hi"'`},
+		{"word with dollar sign", "$HOME", "'$HOME'"},
+		{"word with ampersand", "foo & bar", "'foo & bar'"},
+		{"word with semicolon", "cmd1; cmd2", "'cmd1; cmd2'"},
+		{"word with pipe", "cmd | grep", "'cmd | grep'"},
+		{"word with asterisk", "*.txt", "'*.txt'"},
+		{"word with parentheses", "foo(bar)", "'foo(bar)'"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shellQuote(tc.in)
+			if got != tc.want {
+				t.Errorf("shellQuote(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestShellJoin(t *testing.T) {
+	tests := []struct {
+		name   string
+		tokens []string
+		want   string
+	}{
+		{"empty slice", []string{}, ""},
+		{"single token", []string{"hello"}, "hello"},
+		{"multiple simple tokens", []string{"ls", "-la", "/tmp"}, "ls -la /tmp"},
+		{"tokens with spaces", []string{"echo", "hello world"}, "echo 'hello world'"},
+		{"mixed tokens", []string{"grep", "-r", "foo bar", "/path"}, "grep -r 'foo bar' /path"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shellJoin(tc.tokens)
+			if got != tc.want {
+				t.Errorf("shellJoin(%v) = %q, want %q", tc.tokens, got, tc.want)
+			}
+		})
+	}
+}
