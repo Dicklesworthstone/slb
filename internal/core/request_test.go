@@ -3,6 +3,7 @@ package core
 import (
 	"testing"
 
+	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 )
 
@@ -334,4 +335,36 @@ func TestCreateRequest_UnmatchedCommand(t *testing.T) {
 
 func containsSubstring(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > 0 && (s[:len(substr)] == substr || containsSubstring(s[1:], substr)))
+}
+
+func TestCreateRequest_RateLimitActionQueue(t *testing.T) {
+	database := testutil.NewTestDB(t)
+	session := testutil.MakeSession(t, database)
+
+	// Create enough requests to hit limit
+	for i := 0; i < 5; i++ {
+		err := database.CreateRequest(&db.Request{
+			RequestorSessionID: session.ID,
+			Status:             db.StatusPending,
+		})
+		if err != nil {
+			t.Fatalf("failed to create pending request: %v", err)
+		}
+	}
+
+	config := DefaultRateLimitConfig()
+	config.MaxPendingPerSession = 5
+	config.Action = RateLimitActionQueue // Should block (Allowed=false)
+
+	limiter := NewRateLimiter(database, config)
+	creator := NewRequestCreator(database, limiter, nil, nil)
+
+	_, err := creator.CreateRequest(CreateRequestOptions{
+		SessionID: session.ID,
+		Command:   "rm -rf /tmp/test",
+	})
+
+	if err == nil {
+		t.Error("expected error for rate limit queue action")
+	}
 }

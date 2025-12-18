@@ -83,6 +83,7 @@ func (e *PatternEngine) LoadDefaultPatterns() {
 		// rm -rf on system paths (not /tmp, not relative paths)
 		`^rm\s+(-[rf]+\s+)+/(etc|usr|var|boot|home|root|bin|sbin|lib)`,
 		`^rm\s+(-[rf]+\s+)+/[^t]`, // rm -rf /anything except /t*
+		`^rm\s+(-[rf]+\s+)+/($|\s)`, // rm -rf / (root)
 		`^rm\s+(-[rf]+\s+)+~`,     // rm -rf ~
 		// SQL data destruction
 		`DROP\s+DATABASE`,

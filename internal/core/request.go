@@ -160,8 +160,13 @@ func (rc *RequestCreator) CreateRequest(opts CreateRequestOptions) (*CreateReque
 
 	// Step 3: Check rate limits
 	// CheckRateLimit returns an error when Action=reject and limits are exceeded
-	if _, err := rc.rateLimiter.CheckRateLimit(opts.SessionID); err != nil {
+	limitResult, err := rc.rateLimiter.CheckRateLimit(opts.SessionID)
+	if err != nil {
 		return nil, err
+	}
+	if !limitResult.Allowed {
+		// Enforce block for actions that return Allowed=false (like queue, if not handled)
+		return nil, fmt.Errorf("rate limit exceeded (action=%s): %s", limitResult.Action, limitResult.Message)
 	}
 
 	// Step 4: Classify command

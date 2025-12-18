@@ -26,7 +26,7 @@ func TestRiskTierClassification_CommandMatrix(t *testing.T) {
 		needsApproval  bool
 	}{
 		// CRITICAL tier (2 approvals required)
-		{"rm -rf root", "rm -rf /", db.RiskTierDangerous, 1, true}, // Note: bare / detected as dangerous only
+		{"rm -rf root", "rm -rf /", db.RiskTierCritical, 2, true},
 		{"rm -rf /etc", "rm -rf /etc", db.RiskTierCritical, 2, true},
 		{"rm -rf /*", "rm -rf /*", db.RiskTierCritical, 2, true},
 		{"kubectl delete namespace prod", "kubectl delete namespace production", db.RiskTierCritical, 2, true},
@@ -221,7 +221,7 @@ func TestRiskTierClassification_NoFalseNegatives(t *testing.T) {
 		cmd         string
 		minApproval int
 	}{
-		{"rm -rf /", 1},           // dangerous tier
+		{"rm -rf /", 2},           // dangerous tier
 		{"rm -rf /*", 2},          // critical - wildcard catch
 		{"rm -rf /etc", 2},        // critical - system path
 		{"rm -rf /var", 2},        // critical - system path

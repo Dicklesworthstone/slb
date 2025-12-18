@@ -174,7 +174,7 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 		if data != nil && data.RollbackPath != "" {
 			request.Rollback = &db.Rollback{Path: data.RollbackPath}
 			if err := e.db.UpdateRequestRollbackPath(opts.RequestID, data.RollbackPath); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: failed to record rollback path: %v\n", err)
+				return nil, fmt.Errorf("recording rollback path: %w", err)
 			}
 		}
 	}
@@ -256,7 +256,7 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 // createLogFile creates the log file for command output.
 func (e *Executor) createLogFile(logDir, requestID string) (string, error) {
 	// Ensure log directory exists
-	if err := os.MkdirAll(logDir, 0755); err != nil {
+	if err := os.MkdirAll(logDir, 0700); err != nil {
 		return "", fmt.Errorf("creating log dir: %w", err)
 	}
 
@@ -265,7 +265,7 @@ func (e *Executor) createLogFile(logDir, requestID string) (string, error) {
 	logName := fmt.Sprintf("%s_%s.log", timestamp, requestID[:8])
 	logPath := filepath.Join(logDir, logName)
 
-	f, err := os.Create(logPath)
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return "", fmt.Errorf("creating log file: %w", err)
 	}

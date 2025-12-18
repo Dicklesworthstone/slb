@@ -136,7 +136,7 @@ func CaptureRollbackState(ctx context.Context, req *db.Request, opts RollbackCap
 	_ = cleanupOldRollbackCaptures(baseDir, opts.Retention, opts.Now())
 
 	rollbackDir := filepath.Join(baseDir, "req-"+req.ID)
-	if err := os.MkdirAll(rollbackDir, 0755); err != nil {
+	if err := os.MkdirAll(rollbackDir, 0700); err != nil {
 		return nil, fmt.Errorf("creating rollback dir: %w", err)
 	}
 
@@ -260,7 +260,7 @@ func writeRollbackMetadata(dir string, data *RollbackData) error {
 	if err != nil {
 		return fmt.Errorf("marshal rollback metadata: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, rollbackMetadataFilename), b, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, rollbackMetadataFilename), b, 0600); err != nil {
 		return fmt.Errorf("writing rollback metadata: %w", err)
 	}
 	return nil
@@ -503,6 +503,16 @@ func addPathToTar(tw *tar.Writer, fsPath, tarName string, info fs.FileInfo) erro
 			return fmt.Errorf("open %s: %w", fsPath, err)
 		}
 		defer f.Close()
+
+		// TOCTOU check: verify opened file matches lstat info
+		stat, err := f.Stat()
+		if err != nil {
+			return fmt.Errorf("fstat %s: %w", fsPath, err)
+		}
+		if !os.SameFile(info, stat) {
+			return fmt.Errorf("file changed during rollback capture (possible TOCTOU attack): %s", fsPath)
+		}
+
 		if _, err := io.Copy(tw, f); err != nil {
 			return fmt.Errorf("write tar body: %w", err)
 		}
@@ -739,18 +749,18 @@ func captureGitRollback(ctx context.Context, rollbackDir string, req *db.Request
 	untracked, _ := runCmdString(captureCtx, repoRoot, "git", "ls-files", "--others", "--exclude-standard")
 
 	gitDir := filepath.Join(rollbackDir, rollbackGitDirName)
-	if err := os.MkdirAll(gitDir, 0755); err != nil {
+	if err := os.MkdirAll(gitDir, 0700); err != nil {
 		return nil, fmt.Errorf("creating git rollback dir: %w", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(gitDir, rollbackGitHeadFilename), []byte(strings.TrimSpace(head)+"\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(gitDir, rollbackGitHeadFilename), []byte(strings.TrimSpace(head)+"\n"), 0600); err != nil {
 		return nil, fmt.Errorf("writing git head: %w", err)
 	}
-	_ = os.WriteFile(filepath.Join(gitDir, rollbackGitBranchFilename), []byte(strings.TrimSpace(branch)+"\n"), 0644)
-	_ = os.WriteFile(filepath.Join(gitDir, rollbackGitStatusFilename), []byte(status), 0644)
-	_ = os.WriteFile(filepath.Join(gitDir, rollbackGitDiffFilename), []byte(diff), 0644)
-	_ = os.WriteFile(filepath.Join(gitDir, rollbackGitCachedFilename), []byte(cached), 0644)
-	_ = os.WriteFile(filepath.Join(gitDir, rollbackGitUntrackedFilename), []byte(untracked), 0644)
+	_ = os.WriteFile(filepath.Join(gitDir, rollbackGitBranchFilename), []byte(strings.TrimSpace(branch)+"\n"), 0600)
+	_ = os.WriteFile(filepath.Join(gitDir, rollbackGitStatusFilename), []byte(status), 0600)
+	_ = os.WriteFile(filepath.Join(gitDir, rollbackGitDiffFilename), []byte(diff), 0600)
+	_ = os.WriteFile(filepath.Join(gitDir, rollbackGitCachedFilename), []byte(cached), 0600)
+	_ = os.WriteFile(filepath.Join(gitDir, rollbackGitUntrackedFilename), []byte(untracked), 0600)
 
 	return &GitRollbackData{
 		RepoRoot:      repoRoot,
@@ -862,7 +872,7 @@ func captureKubernetesRollback(ctx context.Context, rollbackDir string, req *db.
 		if err != nil {
 			return nil, fmt.Errorf("kubectl get %s/%s: %w", r.Kind, r.Name, err)
 		}
-		if err := os.WriteFile(fullPath, []byte(out), 0644); err != nil {
+		if err := os.WriteFile(fullPath, []byte(out), 0600); err != nil {
 			return nil, fmt.Errorf("writing manifest: %w", err)
 		}
 		manifests = append(manifests, filepath.ToSlash(filepath.Join(rollbackKubernetesDirName, filename)))
