@@ -36,7 +36,7 @@ func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, strea
 	var logFile *os.File
 	if logPath != "" {
 		var err error
-		logFile, err = os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		logFile, err = os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 		if err != nil {
 			return nil, fmt.Errorf("opening log file: %w", err)
 		}

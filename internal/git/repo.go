@@ -59,7 +59,7 @@ func runGit(repoPath string, args ...string) (string, error) {
 }
 
 func ensureGitRepo(repoPath string) error {
-	if err := os.MkdirAll(repoPath, 0750); err != nil {
+	if err := os.MkdirAll(repoPath, 0700); err != nil {
 		return fmt.Errorf("creating repo directory: %w", err)
 	}
 

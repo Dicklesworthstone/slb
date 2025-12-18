@@ -161,7 +161,7 @@ To get the command hash for --ack, run:
 
 		// Create log file
 		logDir := flagEmergencyLogDir
-		if err := os.MkdirAll(logDir, 0755); err != nil {
+		if err := os.MkdirAll(logDir, 0700); err != nil {
 			return fmt.Errorf("creating log dir: %w", err)
 		}
 
@@ -169,7 +169,7 @@ To get the command hash for --ack, run:
 		logPath := fmt.Sprintf("%s/emergency_%s.log", logDir, timestamp)
 
 		// Log the emergency execution
-		logFile, err := os.Create(logPath)
+		logFile, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 		if err != nil {
 			return fmt.Errorf("creating log file: %w", err)
 		}

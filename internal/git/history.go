@@ -55,7 +55,7 @@ func (r *HistoryRepo) Init() error {
 		"executions",
 		"patterns",
 	} {
-		if err := os.MkdirAll(filepath.Join(r.Path, dir), 0750); err != nil {
+		if err := os.MkdirAll(filepath.Join(r.Path, dir), 0700); err != nil {
 			return fmt.Errorf("creating history subdir %s: %w", dir, err)
 		}
 	}
@@ -161,7 +161,7 @@ func (r *HistoryRepo) writeJSON(relPath string, v any) (string, error) {
 	}
 
 	absPath := filepath.Join(r.Path, relPath)
-	if err := os.MkdirAll(filepath.Dir(absPath), 0750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(absPath), 0700); err != nil {
 		return "", fmt.Errorf("creating history directory: %w", err)
 	}
 
@@ -171,7 +171,7 @@ func (r *HistoryRepo) writeJSON(relPath string, v any) (string, error) {
 	}
 	data = append(data, '\n')
 
-	if err := os.WriteFile(absPath, data, 0644); err != nil {
+	if err := os.WriteFile(absPath, data, 0600); err != nil {
 		return "", fmt.Errorf("write file: %w", err)
 	}
 

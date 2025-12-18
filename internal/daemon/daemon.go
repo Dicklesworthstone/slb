@@ -137,7 +137,7 @@ func RunDaemon(ctx context.Context, opts ServerOptions) error {
 	}()
 
 	// Ensure socket directory exists.
-	if err := os.MkdirAll(filepath.Dir(opts.SocketPath), 0750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(opts.SocketPath), 0700); err != nil {
 		return fmt.Errorf("creating socket directory: %w", err)
 	}
 
@@ -277,11 +277,11 @@ func writePIDFile(path string, pid int) error {
 	if pid <= 0 {
 		return fmt.Errorf("pid must be > 0")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return fmt.Errorf("creating pid file dir: %w", err)
 	}
 	data := []byte(fmt.Sprintf("%d\n", pid))
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := os.WriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("write pid file: %w", err)
 	}
 	return nil

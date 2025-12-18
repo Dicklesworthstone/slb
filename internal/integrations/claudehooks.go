@@ -54,7 +54,7 @@ func InstallClaudeHooks(projectPath string, merge bool) (path string, merged boo
 	dir := filepath.Join(projectPath, ".claude")
 	path = filepath.Join(dir, "hooks.json")
 
-	if err := os.MkdirAll(dir, 0750); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", false, fmt.Errorf("creating .claude directory: %w", err)
 	}
 

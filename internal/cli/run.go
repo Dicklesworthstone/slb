@@ -153,13 +153,16 @@ Examples:
 				return writeError(out, "poll_failed", command, err)
 			}
 
-			// Check for terminal or approved states
-			if request.Status == db.StatusApproved {
+			// Evaluate status
+			decision := evaluateRequestForExecution(request.Status)
+
+			if decision.ShouldExecute {
 				break
 			}
-			if request.Status.IsTerminal() {
+
+			if !decision.ShouldContinuePolling {
 				return writeError(out, string(request.Status), command,
-					fmt.Errorf("request %s: %s", request.ID, request.Status))
+					fmt.Errorf("request %s: %s", request.ID, decision.Reason))
 			}
 
 			time.Sleep(500 * time.Millisecond)
@@ -302,7 +305,7 @@ func createRunLogFile(project, prefix string) (string, error) {
 	if project != "" {
 		baseDir = filepath.Join(project, ".slb", "logs")
 	}
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
+	if err := os.MkdirAll(baseDir, 0700); err != nil {
 		return "", fmt.Errorf("creating log dir: %w", err)
 	}
 
@@ -310,7 +313,7 @@ func createRunLogFile(project, prefix string) (string, error) {
 	logName := fmt.Sprintf("%s_%s.log", timestamp, prefix)
 	logPath := filepath.Join(baseDir, logName)
 
-	f, err := os.Create(logPath)
+	f, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return "", fmt.Errorf("creating log file: %w", err)
 	}

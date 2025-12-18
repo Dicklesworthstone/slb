@@ -49,8 +49,15 @@ func OpenWithOptions(path string, opts OpenOptions) (*DB, error) {
 	// Ensure parent directory exists if creating
 	if opts.CreateIfNotExists {
 		dir := filepath.Dir(path)
-		if err := os.MkdirAll(dir, 0750); err != nil {
+		if err := os.MkdirAll(dir, 0700); err != nil {
 			return nil, fmt.Errorf("creating database directory: %w", err)
+		}
+
+		// Ensure the file exists with restrictive permissions before SQLite opens it
+		// (SQLite usually respects umask, but being explicit is safer)
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+		if err == nil {
+			f.Close()
 		}
 	}
 

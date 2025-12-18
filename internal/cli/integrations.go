@@ -70,7 +70,7 @@ var cursorRulesCmd = &cobra.Command{
 			return nil
 		}
 
-		if err := os.WriteFile(path, []byte(next), 0644); err != nil {
+		if err := os.WriteFile(path, []byte(next), 0600); err != nil {
 			return fmt.Errorf("writing %s: %w", path, err)
 		}
 
