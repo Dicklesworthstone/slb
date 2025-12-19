@@ -184,7 +184,7 @@ Examples:
 		}
 
 		// Step 5: Execute the approved command
-		exitCode, err := runApprovedRequest(out, dbConn, cfg, project, request.ID)
+		exitCode, err := runApprovedRequest(cmd.Context(), out, dbConn, cfg, project, request.ID)
 		if err != nil {
 			return err
 		}
@@ -213,7 +213,7 @@ func runSafeCommand(cmd *cobra.Command, out *output.Writer, command, cwd, projec
 		streamWriter = os.Stdout
 	}
 
-	result, execErr := core.RunCommand(context.Background(), spec, logPath, streamWriter)
+	result, execErr := core.RunCommand(cmd.Context(), spec, logPath, streamWriter)
 
 	exitCode := 0
 	durationMs := int64(0)
@@ -254,10 +254,10 @@ func runSafeCommand(cmd *cobra.Command, out *output.Writer, command, cwd, projec
 	return 0, nil
 }
 
-func runApprovedRequest(out *output.Writer, dbConn *db.DB, cfg config.Config, project, requestID string) (int, error) {
+func runApprovedRequest(ctx context.Context, out *output.Writer, dbConn *db.DB, cfg config.Config, project, requestID string) (int, error) {
 	executor := core.NewExecutor(dbConn, nil).WithNotifier(buildAgentMailNotifier(project))
 
-	execResult, execErr := executor.ExecuteApprovedRequest(context.Background(), core.ExecuteOptions{
+	execResult, execErr := executor.ExecuteApprovedRequest(ctx, core.ExecuteOptions{
 		RequestID:         requestID,
 		SessionID:         flagSessionID,
 		LogDir:            ".slb/logs",

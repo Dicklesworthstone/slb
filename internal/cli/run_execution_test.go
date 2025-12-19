@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 func TestRunSafeCommand_Success(t *testing.T) {
 	// Setup
 	cmd := &cobra.Command{Use: "test"}
+	cmd.SetContext(context.Background())
 	outBuf := &bytes.Buffer{}
 	out := output.New(output.FormatText, output.WithOutput(outBuf))
 	
@@ -45,6 +47,7 @@ func TestRunSafeCommand_Success(t *testing.T) {
 func TestRunSafeCommand_Failure(t *testing.T) {
 	// Setup
 	cmd := &cobra.Command{Use: "test"}
+	cmd.SetContext(context.Background())
 	outBuf := &bytes.Buffer{}
 	out := output.New(output.FormatText, output.WithOutput(outBuf))
 	
@@ -64,6 +67,7 @@ func TestRunSafeCommand_Failure(t *testing.T) {
 
 func TestWriteError_Text(t *testing.T) {
 	cmd := &cobra.Command{Use: "test"}
+	cmd.SetContext(context.Background())
 	outBuf := &bytes.Buffer{}
 	out := output.New(output.FormatText, output.WithOutput(outBuf))
 	
@@ -86,6 +90,7 @@ func TestWriteError_Text(t *testing.T) {
 
 func TestWriteError_JSON(t *testing.T) {
 	cmd := &cobra.Command{Use: "test"}
+	cmd.SetContext(context.Background())
 	outBuf := &bytes.Buffer{}
 	out := output.New(output.FormatJSON, output.WithOutput(outBuf))
 	
@@ -137,7 +142,7 @@ func TestRunApprovedRequest_Success(t *testing.T) {
 	cfg := config.DefaultConfig()
 	
 	flagOutput = "text"
-	exitCode, err := runApprovedRequest(out, h.DB, cfg, h.ProjectDir, req.ID)
+	exitCode, err := runApprovedRequest(context.Background(), out, h.DB, cfg, h.ProjectDir, req.ID)
 	
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -158,6 +163,7 @@ func TestRunApprovedRequest_Success(t *testing.T) {
 
 func TestRunSafeCommand_LogFailure(t *testing.T) {
 	cmd := &cobra.Command{Use: "test"}
+	cmd.SetContext(context.Background())
 	outBuf := &bytes.Buffer{}
 	out := output.New(output.FormatText, output.WithOutput(outBuf))
 	
@@ -194,7 +200,7 @@ func TestRunApprovedRequest_ValidationFailure(t *testing.T) {
 	cfg := config.DefaultConfig()
 	
 	flagOutput = "text"
-	exitCode, err := runApprovedRequest(out, h.DB, cfg, h.ProjectDir, req.ID)
+	exitCode, err := runApprovedRequest(context.Background(), out, h.DB, cfg, h.ProjectDir, req.ID)
 	
 	if err != nil {
 		// It might return error if write fails?
@@ -223,7 +229,7 @@ func TestRunApprovedRequest_ExecutionFailure(t *testing.T) {
 	cfg := config.DefaultConfig()
 	
 	flagOutput = "text"
-	exitCode, err := runApprovedRequest(out, h.DB, cfg, h.ProjectDir, req.ID)
+	exitCode, err := runApprovedRequest(context.Background(), out, h.DB, cfg, h.ProjectDir, req.ID)
 	
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
