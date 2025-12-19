@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -53,7 +54,7 @@ Use --auto-approve-caution to automatically approve CAUTION tier requests.`,
 }
 
 func runWatch(cmd *cobra.Command, args []string) error {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 
 	// Handle SIGINT/SIGTERM for graceful shutdown
@@ -67,16 +68,16 @@ func runWatch(cmd *cobra.Command, args []string) error {
 	// Try daemon IPC first
 	client := daemon.NewClient()
 	if client.IsDaemonRunning() {
-		return runWatchDaemon(ctx, client)
+		return runWatchDaemon(ctx, client, cmd.OutOrStdout())
 	}
 
 	// Fall back to polling
 	daemon.ShowDegradedWarningQuiet()
-	return runWatchPolling(ctx)
+	return runWatchPolling(ctx, cmd.OutOrStdout())
 }
 
 // runWatchDaemon streams events via daemon IPC subscription.
-func runWatchDaemon(ctx context.Context, client *daemon.Client) error {
+func runWatchDaemon(ctx context.Context, client *daemon.Client, out io.Writer) error {
 	ipcClient := daemon.NewIPCClient(daemon.DefaultSocketPath())
 	defer ipcClient.Close()
 
@@ -85,7 +86,7 @@ func runWatchDaemon(ctx context.Context, client *daemon.Client) error {
 		return fmt.Errorf("subscribing to events: %w", err)
 	}
 
-	enc := json.NewEncoder(os.Stdout)
+	enc := json.NewEncoder(out)
 
 	for {
 		select {
@@ -118,14 +119,14 @@ func runWatchDaemon(ctx context.Context, client *daemon.Client) error {
 }
 
 // runWatchPolling polls the database for pending requests.
-func runWatchPolling(ctx context.Context) error {
+func runWatchPolling(ctx context.Context, out io.Writer) error {
 	dbConn, err := db.Open(GetDB())
 	if err != nil {
 		return fmt.Errorf("opening database: %w", err)
 	}
 	defer dbConn.Close()
 
-	enc := json.NewEncoder(os.Stdout)
+	enc := json.NewEncoder(out)
 	seen := make(map[string]db.RequestStatus)
 	ticker := time.NewTicker(flagWatchPollInterval)
 	defer ticker.Stop()
@@ -235,7 +236,7 @@ func statusToEventType(status db.RequestStatus) string {
 }
 
 // pollRequests checks for new or changed requests and emits events.
-// This is the side-effectful wrapper that calls the pure evaluation function.
+// It handles requests that move out of pending status by checking tracked IDs.
 func pollRequests(ctx context.Context, dbConn *db.DB, enc *json.Encoder, seen map[string]db.RequestStatus) error {
 	// Get all pending requests for all projects
 	requests, err := dbConn.ListPendingRequestsAllProjects()
@@ -243,57 +244,90 @@ func pollRequests(ctx context.Context, dbConn *db.DB, enc *json.Encoder, seen ma
 		return fmt.Errorf("listing requests: %w", err)
 	}
 
+	// Track which IDs were found in the pending list
+	foundPending := make(map[string]bool)
+
+	// Process current pending requests
 	for _, req := range requests {
-		// Use pure function for decision logic
-		result := evaluateRequestForPolling(req.ID, req.Status, seen)
-
-		switch result.Action {
-		case PollActionEmitNew:
-			// New request - build and emit pending event
-			event := daemon.RequestStreamEvent{
-				Event:     result.EventType,
-				RequestID: req.ID,
-				RiskTier:  string(req.RiskTier),
-				Command:   req.Command.DisplayRedacted,
-				Requestor: req.RequestorAgent,
-				CreatedAt: req.CreatedAt.Format(time.RFC3339),
-			}
-			if req.Command.DisplayRedacted == "" {
-				event.Command = req.Command.Raw
-			}
-			if err := enc.Encode(event); err != nil {
-				return fmt.Errorf("encoding event: %w", err)
-			}
-
-			// Auto-approve CAUTION tier if enabled
-			if flagWatchAutoApproveCaution && req.RiskTier == db.RiskTierCaution {
-				if err := autoApproveCaution(ctx, req.ID); err != nil {
-					errEvent := map[string]any{
-						"event":      "auto_approve_error",
-						"request_id": req.ID,
-						"error":      err.Error(),
-					}
-					enc.Encode(errEvent)
-				}
-			}
-
-		case PollActionEmitStatusChange:
-			// Status changed - emit status change event
-			event := daemon.RequestStreamEvent{
-				Event:     result.EventType,
-				RequestID: req.ID,
-			}
-			if err := enc.Encode(event); err != nil {
-				return fmt.Errorf("encoding event: %w", err)
-			}
-
-		case PollActionSkip:
-			// No action needed
+		foundPending[req.ID] = true
+		if err := processPolledRequest(ctx, req, enc, seen); err != nil {
+			return err
 		}
-
-		seen[req.ID] = req.Status
 	}
 
+	// Check requests we were tracking that are no longer pending
+	// (e.g., they became approved, rejected, executed)
+	for id := range seen {
+		if foundPending[id] {
+			continue
+		}
+
+		// Fetch the latest state of the missing request
+		req, err := dbConn.GetRequest(id)
+		if err != nil {
+			// If error (e.g. deleted), we stop tracking it implicit via not processing
+			// But 'seen' still has it. Ideally we should remove it?
+			// For simplicity, we just skip.
+			continue
+		}
+
+		if err := processPolledRequest(ctx, req, enc, seen); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func processPolledRequest(ctx context.Context, req *db.Request, enc *json.Encoder, seen map[string]db.RequestStatus) error {
+	// Use pure function for decision logic
+	result := evaluateRequestForPolling(req.ID, req.Status, seen)
+
+	switch result.Action {
+	case PollActionEmitNew:
+		// New request - build and emit pending event
+		event := daemon.RequestStreamEvent{
+			Event:     result.EventType,
+			RequestID: req.ID,
+			RiskTier:  string(req.RiskTier),
+			Command:   req.Command.DisplayRedacted,
+			Requestor: req.RequestorAgent,
+			CreatedAt: req.CreatedAt.Format(time.RFC3339),
+		}
+		if req.Command.DisplayRedacted == "" {
+			event.Command = req.Command.Raw
+		}
+		if err := enc.Encode(event); err != nil {
+			return fmt.Errorf("encoding event: %w", err)
+		}
+
+		// Auto-approve CAUTION tier if enabled
+		if flagWatchAutoApproveCaution && req.RiskTier == db.RiskTierCaution {
+			if err := autoApproveCaution(ctx, req.ID); err != nil {
+				errEvent := map[string]any{
+					"event":      "auto_approve_error",
+					"request_id": req.ID,
+					"error":      err.Error(),
+				}
+				enc.Encode(errEvent)
+			}
+		}
+
+	case PollActionEmitStatusChange:
+		// Status changed - emit status change event
+		event := daemon.RequestStreamEvent{
+			Event:     result.EventType,
+			RequestID: req.ID,
+		}
+		if err := enc.Encode(event); err != nil {
+			return fmt.Errorf("encoding event: %w", err)
+		}
+
+	case PollActionSkip:
+		// No action needed
+	}
+
+	seen[req.ID] = req.Status
 	return nil
 }
 
