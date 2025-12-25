@@ -84,16 +84,17 @@ func (e *PatternEngine) LoadDefaultPatterns() {
 		// rm -rf on system paths (not /tmp, not relative paths)
 		`^rm\s+(-[rf]+\s+)+/(boot|dev|etc|home|lib|lib64|media|mnt|opt|proc|root|run|sbin|srv|sys|usr|var)`,
 		`^rm\s+(-[rf]+\s+)+/($|\s)`, // rm -rf / (root)
-		`^rm\s+(-[rf]+\s+)+~`,     // rm -rf ~
+		`^rm\s+(-[rf]+\s+)+/\*`,     // rm -rf /* (root wildcard)
+		`^rm\s+(-[rf]+\s+)+~`,       // rm -rf ~
 		// SQL data destruction
 		`DROP\s+DATABASE`,
 		`DROP\s+SCHEMA`,
 		`TRUNCATE\s+TABLE`,
 		`DELETE\s+FROM\s+[\w.` + "`" + `"\[\]]+\s*(;|$|--|/\*)`,
 		// Infrastructure destruction - terraform destroy without -target is critical
-		`^terraform\s+destroy\s*$`,              // terraform destroy with no args
-		`^terraform\s+destroy\s+-auto-approve`,  // terraform destroy -auto-approve
-		`^terraform\s+destroy\s+[^-]`,           // terraform destroy <resource> (no flag)
+		`^terraform\s+destroy\s*$`,             // terraform destroy with no args
+		`^terraform\s+destroy\s+-auto-approve`, // terraform destroy -auto-approve
+		`^terraform\s+destroy\s+[^-]`,          // terraform destroy <resource> (no flag)
 		`^kubectl\s+delete\s+(node|nodes|namespace|namespaces|pv|persistentvolume|pvc|persistentvolumeclaim)\b`,
 		`^helm\s+uninstall.*--all`,
 		`^docker\s+system\s+prune\s+-a`,
@@ -104,10 +105,10 @@ func (e *PatternEngine) LoadDefaultPatterns() {
 		`^aws\s+.*terminate-instances`,
 		`^gcloud.*delete.*--quiet`,
 		// Disk/filesystem destruction
-		`\bdd\b.*of=/dev/`,          // dd writing to device
-		`^mkfs`,                      // mkfs.* commands
-		`^fdisk`,                     // partition manipulation
-		`^parted`,                    // partition manipulation
+		`\bdd\b.*of=/dev/`, // dd writing to device
+		`^mkfs`,            // mkfs.* commands
+		`^fdisk`,           // partition manipulation
+		`^parted`,          // partition manipulation
 		// System file permission changes
 		`^chmod\s+.*/(etc|usr|var|boot|bin|sbin)`,
 		`^chown\s+.*/(etc|usr|var|boot|bin|sbin)`,
@@ -305,7 +306,8 @@ func (e *PatternEngine) classifyCompoundCommand(normalized *NormalizedCommand, c
 		} else if match := e.matchPatterns(segment, e.caution); match != nil {
 			segmentMatch.Tier = RiskTierCaution
 			segmentMatch.MatchedPattern = match.Pattern
-			if highestTier == "" {
+			// Caution is higher risk than Safe (and no-match), so upgrade
+			if highestTier == "" || highestTier == RiskTier(RiskSafe) {
 				highestTier = RiskTierCaution
 			}
 		}

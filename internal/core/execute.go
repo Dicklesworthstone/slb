@@ -260,9 +260,13 @@ func (e *Executor) createLogFile(logDir, requestID string) (string, error) {
 		return "", fmt.Errorf("creating log dir: %w", err)
 	}
 
-	// Create timestamped log file
+	// Create timestamped log file with truncated request ID
 	timestamp := time.Now().Format("20060102-150405")
-	logName := fmt.Sprintf("%s_%s.log", timestamp, requestID[:8])
+	idSuffix := requestID
+	if len(idSuffix) > 8 {
+		idSuffix = idSuffix[:8]
+	}
+	logName := fmt.Sprintf("%s_%s.log", timestamp, idSuffix)
 	logPath := filepath.Join(logDir, logName)
 
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)

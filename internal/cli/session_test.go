@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
@@ -457,8 +458,9 @@ func TestSessionGC_DryRun(t *testing.T) {
 
 	// Create a "stale" session by manipulating the DB directly
 	sess := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir))
-	// Backdate the session
-	_, err := h.DB.Exec(`UPDATE sessions SET last_active_at = datetime('now', '-2 hours') WHERE id = ?`, sess.ID)
+	// Backdate the session using RFC3339 format (required by sessions.go parsing)
+	backdatedTime := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
+	_, err := h.DB.Exec(`UPDATE sessions SET last_active_at = ? WHERE id = ?`, backdatedTime, sess.ID)
 	if err != nil {
 		t.Fatalf("failed to backdate session: %v", err)
 	}

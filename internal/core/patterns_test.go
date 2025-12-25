@@ -683,7 +683,7 @@ func TestCompilePatterns_InvalidPattern(t *testing.T) {
 	// compilePatterns should skip invalid regex patterns
 	patterns := compilePatterns(RiskTierDangerous, []string{
 		"valid-pattern",
-		"[invalid-regex",  // Invalid regex - unclosed bracket
+		"[invalid-regex", // Invalid regex - unclosed bracket
 		"another-valid-.*",
 	}, "test")
 
@@ -774,6 +774,35 @@ func TestClassifyCompoundCommands(t *testing.T) {
 		result := engine.ClassifyCommand("git stash", "")
 		if result.Tier != RiskTier(RiskSafe) && result.NeedsApproval {
 			t.Errorf("expected safe tier or no approval needed, got tier=%q needsApproval=%v", result.Tier, result.NeedsApproval)
+		}
+	})
+
+	t.Run("safe segment followed by caution segment should be caution", func(t *testing.T) {
+		// kubectl delete pod nginx-123 matches SAFE pattern
+		// npm uninstall foo matches CAUTION pattern
+		// Higher risk tier (caution) should win
+		result := engine.ClassifyCommand("kubectl delete pod nginx-123 && npm uninstall foo", "")
+		if result.Tier != RiskTierCaution {
+			t.Errorf("expected caution tier when safe followed by caution, got %q", result.Tier)
+		}
+		if !result.NeedsApproval {
+			t.Error("expected caution to need approval")
+		}
+		if result.IsSafe {
+			t.Error("compound with caution segment should not be marked safe")
+		}
+	})
+
+	t.Run("safe segment followed by dangerous segment should be dangerous", func(t *testing.T) {
+		// git stash matches SAFE pattern
+		// rm -rf ./build matches DANGEROUS pattern
+		// Higher risk tier (dangerous) should win
+		result := engine.ClassifyCommand("git stash && rm -rf ./build", "")
+		if result.Tier != RiskTierDangerous && result.Tier != RiskTierCritical {
+			t.Errorf("expected dangerous or critical tier when safe followed by dangerous, got %q", result.Tier)
+		}
+		if result.IsSafe {
+			t.Error("compound with dangerous segment should not be marked safe")
 		}
 	})
 }
