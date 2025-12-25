@@ -96,7 +96,7 @@ brews:
   - repository:
       owner: Dicklesworthstone
       name: homebrew-tap
-    folder: Formula
+      directory: Formula
     homepage: https://github.com/Dicklesworthstone/slb
     description: "Simultaneous Launch Button - Two-person rule for dangerous commands"
     license: MIT
