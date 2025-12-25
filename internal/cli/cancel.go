@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/output"
 	"github.com/spf13/cobra"
@@ -46,9 +47,9 @@ Use --session-id/-s to specify your session if not using environment.`,
 			return fmt.Errorf("cannot cancel request: you are not the requestor (session mismatch)")
 		}
 
-		// Verify the request is still pending
-		if request.Status != db.StatusPending {
-			return fmt.Errorf("cannot cancel request: status is %s (must be pending)", request.Status)
+		// Verify the request can be cancelled (pending or approved, but not yet executing)
+		if !core.CanCancel(request.Status) {
+			return fmt.Errorf("cannot cancel request: status is %s (must be pending or approved)", request.Status)
 		}
 
 		// Cancel the request

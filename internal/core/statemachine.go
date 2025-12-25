@@ -35,6 +35,10 @@ var validTransitions = map[db.RequestStatus][]db.RequestStatus{
 	db.StatusTimeout: {
 		db.StatusEscalated,
 	},
+	db.StatusEscalated: {
+		db.StatusApproved, // Human can approve after escalation
+		db.StatusRejected, // Human can reject after escalation
+	},
 }
 
 // TerminalStates are states from which no further transitions are allowed.

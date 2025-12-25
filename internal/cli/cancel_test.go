@@ -148,7 +148,7 @@ func TestCancelCommand_CannotCancelOthersRequest(t *testing.T) {
 	}
 }
 
-func TestCancelCommand_CannotCancelNonPending(t *testing.T) {
+func TestCancelCommand_CanCancelApproved(t *testing.T) {
 	h := testutil.NewHarness(t)
 	resetCancelFlags()
 
@@ -158,8 +158,42 @@ func TestCancelCommand_CannotCancelNonPending(t *testing.T) {
 	)
 	req := testutil.MakeRequest(t, h.DB, sess)
 
-	// Mark request as approved
+	// Mark request as approved (but not yet executing)
 	h.DB.UpdateRequestStatus(req.ID, db.StatusApproved)
+
+	cmd := newTestCancelCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, cmd, "cancel", req.ID,
+		"-s", sess.ID,
+		"-j",
+	)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v (should be able to cancel approved request)", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("failed to parse JSON: %v\nstdout: %s", err, stdout)
+	}
+	if result["status"] != "cancelled" {
+		t.Errorf("expected status=cancelled, got %v", result["status"])
+	}
+}
+
+func TestCancelCommand_CannotCancelExecuted(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetCancelFlags()
+
+	sess := testutil.MakeSession(t, h.DB,
+		testutil.WithProject(h.ProjectDir),
+		testutil.WithAgent("TestAgent"),
+	)
+	req := testutil.MakeRequest(t, h.DB, sess)
+
+	// Mark request as approved, then executing, then executed (terminal state)
+	h.DB.UpdateRequestStatus(req.ID, db.StatusApproved)
+	h.DB.UpdateRequestStatus(req.ID, db.StatusExecuting)
+	h.DB.UpdateRequestStatus(req.ID, db.StatusExecuted)
 
 	cmd := newTestCancelCmd(h.DBPath)
 	_, err := executeCommandCapture(t, cmd, "cancel", req.ID,
@@ -168,9 +202,9 @@ func TestCancelCommand_CannotCancelNonPending(t *testing.T) {
 	)
 
 	if err == nil {
-		t.Fatal("expected error when trying to cancel non-pending request")
+		t.Fatal("expected error when trying to cancel executed request")
 	}
-	if !strings.Contains(err.Error(), "must be pending") && !strings.Contains(err.Error(), "status is approved") {
+	if !strings.Contains(err.Error(), "must be pending or approved") && !strings.Contains(err.Error(), "status is executed") {
 		t.Errorf("unexpected error: %v", err)
 	}
 }

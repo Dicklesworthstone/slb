@@ -363,6 +363,9 @@ func canTransition(from, to RequestStatus) bool {
 		return to == StatusExecuted || to == StatusExecutionFailed || to == StatusTimedOut || to == StatusApproved
 	case StatusTimeout:
 		return to == StatusEscalated
+	case StatusEscalated:
+		// Human intervention: can approve or reject after escalation
+		return to == StatusApproved || to == StatusRejected
 	default:
 		return false
 	}
