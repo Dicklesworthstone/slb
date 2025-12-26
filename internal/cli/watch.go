@@ -224,7 +224,7 @@ func statusToEventType(status db.RequestStatus) string {
 		return "request_approved"
 	case db.StatusRejected:
 		return "request_rejected"
-	case db.StatusExecuted, db.StatusExecutionFailed:
+	case db.StatusExecuted, db.StatusExecutionFailed, db.StatusTimedOut:
 		return "request_executed"
 	case db.StatusTimeout:
 		return "request_timeout"

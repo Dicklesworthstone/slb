@@ -59,7 +59,12 @@ func (c *CommandBox) Render() string {
 
 	// Truncate if needed
 	if c.MaxWidth > 0 && len(displayCmd) > c.MaxWidth {
-		displayCmd = displayCmd[:c.MaxWidth-3] + "..."
+		if c.MaxWidth > 3 {
+			displayCmd = displayCmd[:c.MaxWidth-3] + "..."
+		} else {
+			// For very small max widths, just truncate without ellipsis
+			displayCmd = displayCmd[:c.MaxWidth]
+		}
 	}
 
 	// Command style
