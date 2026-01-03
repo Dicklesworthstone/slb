@@ -331,3 +331,123 @@ func TestIsEnvAssignment(t *testing.T) {
 		})
 	}
 }
+
+func TestSplitCompoundShellAware(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected []string
+	}{
+		{
+			name:     "simple &&",
+			input:    "echo foo && rm -rf /tmp",
+			expected: []string{"echo foo", "rm -rf /tmp"},
+		},
+		{
+			name:     "simple semicolon",
+			input:    "cd /tmp; rm -rf .",
+			expected: []string{"cd /tmp", "rm -rf ."},
+		},
+		{
+			name:     "simple ||",
+			input:    "test -f foo || echo missing",
+			expected: []string{"test -f foo", "echo missing"},
+		},
+		{
+			name:     "background &",
+			input:    "sleep 10 & echo started",
+			expected: []string{"sleep 10", "echo started"},
+		},
+		{
+			name:     "&& inside double quotes",
+			input:    `echo "foo && bar"`,
+			expected: []string{`echo "foo && bar"`},
+		},
+		{
+			name:     "&& inside single quotes",
+			input:    `echo 'foo && bar'`,
+			expected: []string{`echo 'foo && bar'`},
+		},
+		{
+			name:     "semicolon inside quotes",
+			input:    `psql -c "DELETE FROM users; DROP TABLE users;"`,
+			expected: []string{`psql -c "DELETE FROM users; DROP TABLE users;"`},
+		},
+		{
+			name:     "mixed: quoted && and real &&",
+			input:    `echo "foo && bar" && rm -rf /tmp`,
+			expected: []string{`echo "foo && bar"`, "rm -rf /tmp"},
+		},
+		{
+			name:     "escaped quote",
+			input:    `echo "foo\"bar" && rm -rf /tmp`,
+			expected: []string{`echo "foo\"bar"`, "rm -rf /tmp"},
+		},
+		{
+			name:     "multiple segments",
+			input:    "cd /tmp && rm -rf . && echo done",
+			expected: []string{"cd /tmp", "rm -rf .", "echo done"},
+		},
+		{
+			name:     "empty command",
+			input:    "",
+			expected: []string{},
+		},
+		{
+			name:     "no separators",
+			input:    "ls -la",
+			expected: []string{"ls -la"},
+		},
+		{
+			name:     "nested quotes",
+			input:    `bash -c 'echo "hello && world"' && rm -rf /tmp`,
+			expected: []string{`bash -c 'echo "hello && world"'`, "rm -rf /tmp"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := splitCompoundShellAware(tc.input)
+			if len(result) != len(tc.expected) {
+				t.Fatalf("got %d segments %v, want %d segments %v", len(result), result, len(tc.expected), tc.expected)
+			}
+			for i, seg := range result {
+				if seg != tc.expected[i] {
+					t.Errorf("segment[%d] = %q, want %q", i, seg, tc.expected[i])
+				}
+			}
+		})
+	}
+}
+
+func TestCompoundCommandWithQuotes(t *testing.T) {
+	// This test verifies the security fix: commands with quotes should still
+	// split properly when the && is OUTSIDE the quotes.
+	t.Run("dangerous command hidden after quoted echo", func(t *testing.T) {
+		res := NormalizeCommand(`echo "foo" && rm -rf /etc`)
+		if !res.IsCompound {
+			t.Fatalf("expected IsCompound=true, got false")
+		}
+		if len(res.Segments) != 2 {
+			t.Fatalf("expected 2 segments, got %d: %v", len(res.Segments), res.Segments)
+		}
+		// The dangerous rm command should be extracted as a separate segment
+		foundRm := false
+		for _, seg := range res.Segments {
+			if strings.HasPrefix(seg, "rm -rf") {
+				foundRm = true
+			}
+		}
+		if !foundRm {
+			t.Fatalf("expected to find 'rm -rf' segment in %v", res.Segments)
+		}
+	})
+
+	t.Run("SQL inside quotes not split", func(t *testing.T) {
+		res := NormalizeCommand(`psql -c "DELETE FROM users; DROP TABLE users;"`)
+		// Should not be split because semicolons are inside quotes
+		if res.IsCompound {
+			t.Fatalf("expected IsCompound=false for SQL in quotes, got true with segments: %v", res.Segments)
+		}
+	})
+}

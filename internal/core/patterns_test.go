@@ -237,6 +237,39 @@ func TestCompoundCommandSafePrecedence(t *testing.T) {
 	}
 }
 
+func TestCompoundCommandQuotesBypassFix(t *testing.T) {
+	engine := NewPatternEngine()
+
+	// SECURITY FIX: Commands with quotes should still be split when && is OUTSIDE quotes.
+	// This tests the fix for the vulnerability where `echo "foo" && rm -rf /etc` was
+	// incorrectly treated as a non-compound command because of the quote count heuristic.
+
+	t.Run("dangerous rm -rf /etc hidden after quoted echo", func(t *testing.T) {
+		res := engine.ClassifyCommand(`echo "foo" && rm -rf /etc`, "")
+		if res.Tier != RiskTierCritical {
+			t.Fatalf("Tier=%q, want critical (rm -rf /etc is critical)", res.Tier)
+		}
+		if !res.NeedsApproval {
+			t.Error("NeedsApproval should be true")
+		}
+	})
+
+	t.Run("dangerous git push --force hidden after quoted echo", func(t *testing.T) {
+		res := engine.ClassifyCommand(`echo "done" && git push --force`, "")
+		if res.Tier != RiskTierCritical {
+			t.Fatalf("Tier=%q, want critical (git push --force is critical)", res.Tier)
+		}
+	})
+
+	t.Run("SQL inside quotes should NOT split", func(t *testing.T) {
+		res := engine.ClassifyCommand(`psql -c "DELETE FROM users; DROP TABLE users;"`, "")
+		// The fallback SQL detection should still catch this
+		if res.Tier != RiskTierCritical {
+			t.Fatalf("Tier=%q, want critical (DELETE + DROP is critical)", res.Tier)
+		}
+	})
+}
+
 func TestSudoStripping(t *testing.T) {
 	engine := NewPatternEngine()
 

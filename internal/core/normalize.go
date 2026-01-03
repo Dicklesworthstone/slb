@@ -63,6 +63,83 @@ var subshellPattern = regexp.MustCompile("\\$\\([^)]+\\)|`[^`]+`|\\([^)]+\\)")
 
 var envAssignPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 
+// splitCompoundShellAware splits a command on compound separators (;, &&, ||, &)
+// while respecting shell quoting rules. Separators inside quotes are not split.
+func splitCompoundShellAware(cmd string) []string {
+	var segments []string
+	var current strings.Builder
+	inSingleQuote := false
+	inDoubleQuote := false
+	escaped := false
+	runes := []rune(cmd)
+
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+
+		// Handle escape sequences
+		if escaped {
+			current.WriteRune(r)
+			escaped = false
+			continue
+		}
+
+		if r == '\\' && !inSingleQuote {
+			current.WriteRune(r)
+			escaped = true
+			continue
+		}
+
+		// Handle quote state changes
+		if r == '\'' && !inDoubleQuote {
+			inSingleQuote = !inSingleQuote
+			current.WriteRune(r)
+			continue
+		}
+
+		if r == '"' && !inSingleQuote {
+			inDoubleQuote = !inDoubleQuote
+			current.WriteRune(r)
+			continue
+		}
+
+		// Check for compound separators only when outside quotes
+		if !inSingleQuote && !inDoubleQuote {
+			// Check for && or ||
+			if i+1 < len(runes) {
+				if (r == '&' && runes[i+1] == '&') || (r == '|' && runes[i+1] == '|') {
+					seg := strings.TrimSpace(current.String())
+					if seg != "" {
+						segments = append(segments, seg)
+					}
+					current.Reset()
+					i++ // Skip the second character of && or ||
+					continue
+				}
+			}
+
+			// Check for ; or single &
+			if r == ';' || r == '&' {
+				seg := strings.TrimSpace(current.String())
+				if seg != "" {
+					segments = append(segments, seg)
+				}
+				current.Reset()
+				continue
+			}
+		}
+
+		current.WriteRune(r)
+	}
+
+	// Add the last segment
+	seg := strings.TrimSpace(current.String())
+	if seg != "" {
+		segments = append(segments, seg)
+	}
+
+	return segments
+}
+
 // NormalizeCommand parses and normalizes a command for pattern matching.
 func NormalizeCommand(cmd string) *NormalizedCommand {
 	result := &NormalizedCommand{
@@ -80,17 +157,11 @@ func NormalizeCommand(cmd string) *NormalizedCommand {
 	// Check for subshells
 	result.HasSubshell = subshellPattern.MatchString(cmd)
 
-	// Split on compound separators
-	segments := compoundSeparators.Split(cmd, -1)
+	// Split on compound separators using shell-aware parsing.
+	// We use proper tokenization to determine if separators are inside quotes.
+	segments := splitCompoundShellAware(cmd)
 	if len(segments) > 1 {
-		// If separators are inside quoted SQL strings (e.g., psql -c "DELETE ...;")
-		// keep as single segment to preserve context.
-		if strings.Count(cmd, "\"") >= 2 {
-			segments = []string{cmd}
-			result.IsCompound = false
-		} else {
-			result.IsCompound = true
-		}
+		result.IsCompound = true
 	}
 
 	// Also check for pipes (not technically compound, but multiple commands)
