@@ -12,9 +12,11 @@ import (
 )
 
 var (
-	flagPatternTier     string
-	flagPatternReason   string
-	flagPatternExitCode bool
+	flagPatternTier       string
+	flagPatternReason     string
+	flagPatternExitCode   bool
+	flagPatternFormat     string
+	flagPatternOutputFile string
 )
 
 func init() {
@@ -25,6 +27,10 @@ func init() {
 	// patterns test/check flags
 	patternsTestCmd.Flags().BoolVar(&flagPatternExitCode, "exit-code", false, "return non-zero exit code if approval needed")
 
+	// patterns export flags
+	patternsExportCmd.Flags().StringVarP(&flagPatternFormat, "format", "f", "json", "export format: json, yaml, claude-hook")
+	patternsExportCmd.Flags().StringVarP(&flagPatternOutputFile, "output", "o", "", "output file (default: stdout)")
+
 	// Add subcommands
 	patternsCmd.AddCommand(patternsListCmd)
 	patternsCmd.AddCommand(patternsTestCmd)
@@ -32,6 +38,8 @@ func init() {
 	patternsCmd.AddCommand(patternsRemoveCmd)
 	patternsCmd.AddCommand(patternsRequestRemovalCmd)
 	patternsCmd.AddCommand(patternsSuggestCmd)
+	patternsCmd.AddCommand(patternsExportCmd)
+	patternsCmd.AddCommand(patternsVersionCmd)
 
 	// Add alias: slb check "<command>" is alias for slb patterns test "<command>"
 	rootCmd.AddCommand(patternsCmd)
@@ -275,6 +283,94 @@ Use --tier to specify the suggested tier.`,
 			"tier":    flagPatternTier,
 			"reason":  flagPatternReason,
 			"message": "Pattern suggested. Awaiting human review in TUI.",
+		})
+	},
+}
+
+var patternsExportCmd = &cobra.Command{
+	Use:   "export",
+	Short: "Export patterns for external tools",
+	Long: `Export all patterns in a format suitable for external tools.
+
+Available formats:
+  json        - Full JSON export with metadata (default)
+  yaml        - YAML format
+  claude-hook - Python code for Claude Code hooks
+
+Examples:
+  slb patterns export                         # JSON to stdout
+  slb patterns export --format=claude-hook    # Python to stdout
+  slb patterns export -o patterns.json        # JSON to file
+  slb patterns export -f claude-hook -o hook.py  # Python to file`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		engine := core.GetDefaultEngine()
+
+		var content string
+		var err error
+
+		switch strings.ToLower(flagPatternFormat) {
+		case "json":
+			content, err = engine.ExportJSON()
+			if err != nil {
+				return fmt.Errorf("failed to export JSON: %w", err)
+			}
+		case "claude-hook", "claude", "hook", "python":
+			content = engine.ExportClaudeHook()
+		case "yaml":
+			// Export as JSON then convert to YAML-ish format
+			export := engine.Export()
+			data, err := json.MarshalIndent(export, "", "  ")
+			if err != nil {
+				return fmt.Errorf("failed to export: %w", err)
+			}
+			content = string(data)
+		default:
+			return fmt.Errorf("unknown format: %s (use json, yaml, or claude-hook)", flagPatternFormat)
+		}
+
+		// Output to file or stdout
+		if flagPatternOutputFile != "" {
+			if err := os.WriteFile(flagPatternOutputFile, []byte(content), 0644); err != nil {
+				return fmt.Errorf("failed to write file: %w", err)
+			}
+			// Confirm to user
+			out := output.New(output.Format(GetOutput()))
+			return out.Write(map[string]any{
+				"status":  "exported",
+				"format":  flagPatternFormat,
+				"file":    flagPatternOutputFile,
+				"hash":    engine.ComputeHash(),
+				"count":   engine.Export().Metadata.PatternCount,
+			})
+		}
+
+		// Print to stdout
+		fmt.Print(content)
+		return nil
+	},
+}
+
+var patternsVersionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "Show pattern version and hash",
+	Long: `Show the current pattern version and SHA256 hash.
+
+The hash changes when patterns are added/removed, enabling change detection.
+Use this to verify if hook patterns need to be regenerated.
+
+Examples:
+  slb patterns version        # Show version info
+  slb patterns version -j     # JSON output`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		engine := core.GetDefaultEngine()
+		export := engine.Export()
+
+		out := output.New(output.Format(GetOutput()))
+		return out.Write(map[string]any{
+			"version":       export.Version,
+			"sha256":        export.SHA256,
+			"pattern_count": export.Metadata.PatternCount,
+			"tier_counts":   export.Metadata.TierCounts,
 		})
 	},
 }

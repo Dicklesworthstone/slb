@@ -80,7 +80,23 @@ func newTestPatternsCmd(dbPath string) *cobra.Command {
 		RunE:  patternsTestCmd.RunE,
 	}
 
-	patCmd.AddCommand(listCmd, testCmd, addCmd, removeCmd, requestRemovalCmd, suggestCmd)
+	// Export command
+	exportCmd := &cobra.Command{
+		Use:   "export",
+		Short: "Export patterns for external tools",
+		RunE:  patternsExportCmd.RunE,
+	}
+	exportCmd.Flags().StringVarP(&flagPatternFormat, "format", "f", "json", "export format")
+	exportCmd.Flags().StringVarP(&flagPatternOutputFile, "output", "o", "", "output file")
+
+	// Version command
+	versionCmd := &cobra.Command{
+		Use:   "version",
+		Short: "Show pattern version and hash",
+		RunE:  patternsVersionCmd.RunE,
+	}
+
+	patCmd.AddCommand(listCmd, testCmd, addCmd, removeCmd, requestRemovalCmd, suggestCmd, exportCmd, versionCmd)
 	root.AddCommand(patCmd, checkCmdTest)
 
 	return root
@@ -94,6 +110,8 @@ func resetPatternsFlags() {
 	flagPatternTier = ""
 	flagPatternReason = ""
 	flagPatternExitCode = false
+	flagPatternFormat = "json"
+	flagPatternOutputFile = ""
 }
 
 func TestPatternsListCommand_ListsPatterns(t *testing.T) {
@@ -516,5 +534,170 @@ func TestParseTier_ValidTiers(t *testing.T) {
 				t.Errorf("parseTier(%q) = %q, want %q", tt.input, result, tt.expected)
 			}
 		})
+	}
+}
+
+// Tests for export and version commands
+
+func TestPatternsExportCommand_JSON(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetPatternsFlags()
+
+	cmd := newTestPatternsCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, cmd, "patterns", "export", "--format=json")
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should return valid JSON with expected structure
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("failed to parse JSON: %v\nstdout: %s", err, stdout)
+	}
+
+	// Check required fields
+	if _, ok := result["version"]; !ok {
+		t.Error("expected 'version' field in export")
+	}
+	if _, ok := result["sha256"]; !ok {
+		t.Error("expected 'sha256' field in export")
+	}
+	if _, ok := result["tiers"]; !ok {
+		t.Error("expected 'tiers' field in export")
+	}
+	if _, ok := result["metadata"]; !ok {
+		t.Error("expected 'metadata' field in export")
+	}
+
+	// Check tiers structure
+	tiers, ok := result["tiers"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected tiers to be a map, got %T", result["tiers"])
+	}
+
+	expectedTiers := []string{"safe", "caution", "dangerous", "critical"}
+	for _, tier := range expectedTiers {
+		if _, ok := tiers[tier]; !ok {
+			t.Errorf("expected tier %q in export", tier)
+		}
+	}
+}
+
+func TestPatternsExportCommand_ClaudeHook(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetPatternsFlags()
+
+	cmd := newTestPatternsCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, cmd, "patterns", "export", "--format=claude-hook")
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should contain Python code markers
+	if !strings.Contains(stdout, "import re") {
+		t.Error("expected 'import re' in Claude hook export")
+	}
+	if !strings.Contains(stdout, "SAFE_PATTERNS") {
+		t.Error("expected 'SAFE_PATTERNS' in Claude hook export")
+	}
+	if !strings.Contains(stdout, "DANGEROUS_PATTERNS") {
+		t.Error("expected 'DANGEROUS_PATTERNS' in Claude hook export")
+	}
+	if !strings.Contains(stdout, "CRITICAL_PATTERNS") {
+		t.Error("expected 'CRITICAL_PATTERNS' in Claude hook export")
+	}
+	if !strings.Contains(stdout, "def classify(command:") {
+		t.Error("expected 'def classify' function in Claude hook export")
+	}
+	if !strings.Contains(stdout, "SHA256:") {
+		t.Error("expected SHA256 hash in Claude hook export header")
+	}
+}
+
+func TestPatternsExportCommand_InvalidFormat(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetPatternsFlags()
+
+	cmd := newTestPatternsCmd(h.DBPath)
+	_, err := executeCommandCapture(t, cmd, "patterns", "export", "--format=invalid")
+
+	if err == nil {
+		t.Fatal("expected error for invalid format")
+	}
+	if !strings.Contains(err.Error(), "unknown format") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestPatternsVersionCommand(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetPatternsFlags()
+
+	cmd := newTestPatternsCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, cmd, "patterns", "version", "-j")
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("failed to parse JSON: %v\nstdout: %s", err, stdout)
+	}
+
+	// Check required fields
+	if _, ok := result["version"]; !ok {
+		t.Error("expected 'version' field")
+	}
+	if _, ok := result["sha256"]; !ok {
+		t.Error("expected 'sha256' field")
+	}
+	if _, ok := result["pattern_count"]; !ok {
+		t.Error("expected 'pattern_count' field")
+	}
+	if _, ok := result["tier_counts"]; !ok {
+		t.Error("expected 'tier_counts' field")
+	}
+
+	// Verify pattern_count is positive
+	count, ok := result["pattern_count"].(float64)
+	if !ok || count <= 0 {
+		t.Errorf("expected positive pattern_count, got %v", result["pattern_count"])
+	}
+
+	// Verify sha256 is a valid hex string
+	sha256, ok := result["sha256"].(string)
+	if !ok || len(sha256) != 64 {
+		t.Errorf("expected 64-char sha256 hash, got %q", sha256)
+	}
+}
+
+func TestPatternsVersionCommand_DeterministicHash(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetPatternsFlags()
+
+	// Run version command twice
+	cmd1 := newTestPatternsCmd(h.DBPath)
+	stdout1, err := executeCommandCapture(t, cmd1, "patterns", "version", "-j")
+	if err != nil {
+		t.Fatalf("first run error: %v", err)
+	}
+
+	resetPatternsFlags()
+	cmd2 := newTestPatternsCmd(h.DBPath)
+	stdout2, err := executeCommandCapture(t, cmd2, "patterns", "version", "-j")
+	if err != nil {
+		t.Fatalf("second run error: %v", err)
+	}
+
+	var result1, result2 map[string]any
+	json.Unmarshal([]byte(stdout1), &result1)
+	json.Unmarshal([]byte(stdout2), &result2)
+
+	// Hash should be identical for same patterns
+	if result1["sha256"] != result2["sha256"] {
+		t.Errorf("hash not deterministic: %v != %v", result1["sha256"], result2["sha256"])
 	}
 }

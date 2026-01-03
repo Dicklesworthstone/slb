@@ -324,6 +324,10 @@ func (s *IPCServer) handleRequest(conn net.Conn, data []byte) *RPCResponse {
 		return s.handleSubscribe(req, conn)
 	case "verify_execute":
 		return s.handleVerifyExecute(req)
+	case "hook_query":
+		return s.handleHookQuery(req)
+	case "hook_health":
+		return s.handleHookHealth(req)
 	default:
 		return &RPCResponse{
 			Error: &Error{Code: ErrCodeMethodNotFound, Message: "method not found: " + req.Method},
