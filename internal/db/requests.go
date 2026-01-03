@@ -749,6 +749,47 @@ func scanRequests(rows *sql.Rows) ([]*Request, error) {
 			}
 		}
 
+		// Execution info
+		if execLogPath.Valid || execExitCode.Valid || execAt.Valid {
+			r.Execution = &Execution{
+				LogPath: execLogPath.String,
+			}
+			if execExitCode.Valid {
+				var exitCode int
+				fmt.Sscanf(execExitCode.String, "%d", &exitCode)
+				r.Execution.ExitCode = &exitCode
+			}
+			if execDurationMs.Valid {
+				var durationMs int64
+				fmt.Sscanf(execDurationMs.String, "%d", &durationMs)
+				r.Execution.DurationMs = &durationMs
+			}
+			if execAt.Valid {
+				t, _ := time.Parse(time.RFC3339, execAt.String)
+				r.Execution.ExecutedAt = &t
+			}
+			if execBySessionID.Valid {
+				r.Execution.ExecutedBySessionID = execBySessionID.String
+			}
+			if execByAgent.Valid {
+				r.Execution.ExecutedByAgent = execByAgent.String
+			}
+			if execByModel.Valid {
+				r.Execution.ExecutedByModel = execByModel.String
+			}
+		}
+
+		// Rollback info
+		if rollbackPath.Valid || rollbackAt.Valid {
+			r.Rollback = &Rollback{
+				Path: rollbackPath.String,
+			}
+			if rollbackAt.Valid {
+				t, _ := time.Parse(time.RFC3339, rollbackAt.String)
+				r.Rollback.RolledBackAt = &t
+			}
+		}
+
 		// Timestamps
 		if createdAt.Valid {
 			r.CreatedAt, _ = time.Parse(time.RFC3339, createdAt.String)

@@ -23,7 +23,7 @@ var (
 	}
 
 	defaultDangerousPatterns = []string{
-		`^rm\s+-rf`,
+		`^rm\s+-[rf]{2}`, // -rf or -fr (order-independent)
 		`^rm\s+-r`,
 		`^git\s+reset\s+--hard`,
 		`^git\s+clean\s+-fd`,
