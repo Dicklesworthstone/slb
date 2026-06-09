@@ -114,21 +114,21 @@ func TestClassifyCommand(t *testing.T) {
 		{
 			name:              "git status",
 			cmd:               "git status",
-			wantTier:          "",
+			wantTier:          RiskTier(RiskSafe),
 			wantApprovals:     0,
 			wantNeedsApproval: false,
 		},
 		{
 			name:              "ls",
 			cmd:               "ls -la",
-			wantTier:          "",
+			wantTier:          RiskTier(RiskSafe),
 			wantApprovals:     0,
 			wantNeedsApproval: false,
 		},
 		{
 			name:              "cat file",
 			cmd:               "cat README.md",
-			wantTier:          "",
+			wantTier:          RiskTier(RiskSafe),
 			wantApprovals:     0,
 			wantNeedsApproval: false,
 		},
@@ -453,6 +453,18 @@ func TestCompoundCommandMatchedSegments(t *testing.T) {
 	}
 }
 
+func TestCompoundCommandUnmatchedDefaultsToExplicitSafe(t *testing.T) {
+	engine := NewPatternEngine()
+
+	res := engine.ClassifyCommand("git status && echo ok", "")
+	if res.Tier != RiskTier(RiskSafe) || res.NeedsApproval || !res.IsSafe {
+		t.Fatalf("Tier=%q NeedsApproval=%v IsSafe=%v, want safe/false/true", res.Tier, res.NeedsApproval, res.IsSafe)
+	}
+	if res.MatchedPattern != defaultAllowPattern {
+		t.Fatalf("MatchedPattern=%q, want %q", res.MatchedPattern, defaultAllowPattern)
+	}
+}
+
 func TestUpgradeTier(t *testing.T) {
 	tests := []struct {
 		name string
@@ -656,24 +668,34 @@ func TestClassifyCommandEdgeCases(t *testing.T) {
 
 	t.Run("empty command", func(t *testing.T) {
 		result := engine.ClassifyCommand("", "")
-		// Empty command should not match any pattern
 		if result.NeedsApproval {
 			t.Errorf("empty command should not need approval")
+		}
+		if result.Tier != RiskTier(RiskSafe) || !result.IsSafe {
+			t.Errorf("empty command Tier=%q IsSafe=%v, want safe/true", result.Tier, result.IsSafe)
 		}
 	})
 
 	t.Run("whitespace only command", func(t *testing.T) {
 		result := engine.ClassifyCommand("   ", "")
-		// Whitespace should not match any pattern
 		if result.NeedsApproval && result.Tier != RiskTierCaution {
 			t.Errorf("whitespace command should not match dangerous pattern")
 		}
+		if !result.NeedsApproval && (result.Tier != RiskTier(RiskSafe) || !result.IsSafe) {
+			t.Errorf("whitespace command Tier=%q IsSafe=%v, want safe/true", result.Tier, result.IsSafe)
+		}
 	})
 
-	t.Run("unknown command falls through to no match", func(t *testing.T) {
+	t.Run("unknown command defaults to explicit safe", func(t *testing.T) {
 		result := engine.ClassifyCommand("my-custom-command --flag", "")
 		if result.NeedsApproval {
 			t.Errorf("unknown command should not need approval")
+		}
+		if result.Tier != RiskTier(RiskSafe) || !result.IsSafe {
+			t.Errorf("unknown command Tier=%q IsSafe=%v, want safe/true", result.Tier, result.IsSafe)
+		}
+		if result.MatchedPattern != defaultAllowPattern {
+			t.Errorf("unknown command MatchedPattern=%q, want %q", result.MatchedPattern, defaultAllowPattern)
 		}
 	})
 }
@@ -1050,7 +1072,7 @@ func TestExportClaudeHook_UsesSearchNotMatch(t *testing.T) {
 	// .search is the unanchored matcher; .match is anchored to
 	// position 0. The hook should use .search.
 	if strings.Contains(out, "if p.match(command):") {
-		t.Errorf("ExportClaudeHook still uses p.match(); should use p.search() (issue #4 follow-on).\n"+
+		t.Errorf("ExportClaudeHook still uses p.match(); should use p.search() (issue #4 follow-on).\n" +
 			"Anchored matching loses mid-command hits like `DROP DATABASE` inside `psql -c '...'`.")
 	}
 	if !strings.Contains(out, "if p.search(command):") {

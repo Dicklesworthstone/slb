@@ -233,16 +233,20 @@ func TestPatternsTestCommand_SafeCommand(t *testing.T) {
 		t.Fatalf("failed to parse JSON: %v\nstdout: %s", err, stdout)
 	}
 
-	// Echo may or may not be safe depending on pattern configuration
-	// Just verify the output structure has the expected fields
 	if result["command"] != "echo hello" {
 		t.Errorf("expected command='echo hello', got %v", result["command"])
 	}
-	if _, ok := result["needs_approval"]; !ok {
-		t.Error("expected needs_approval field in result")
+	if result["needs_approval"] != false {
+		t.Errorf("expected needs_approval=false, got %v", result["needs_approval"])
 	}
-	if _, ok := result["is_safe"]; !ok {
-		t.Error("expected is_safe field in result")
+	if result["is_safe"] != true {
+		t.Errorf("expected is_safe=true, got %v", result["is_safe"])
+	}
+	if result["tier"] != "safe" {
+		t.Errorf("expected tier=safe, got %v", result["tier"])
+	}
+	if result["matched_pattern"] != "unmatched_default_allow" {
+		t.Errorf("expected matched_pattern=unmatched_default_allow, got %v", result["matched_pattern"])
 	}
 }
 
@@ -264,6 +268,12 @@ func TestCheckCommand_AliasForTest(t *testing.T) {
 
 	if result["command"] != "echo hello" {
 		t.Errorf("expected command='echo hello', got %v", result["command"])
+	}
+	if result["tier"] != "safe" {
+		t.Errorf("expected tier=safe, got %v", result["tier"])
+	}
+	if result["is_safe"] != true {
+		t.Errorf("expected is_safe=true, got %v", result["is_safe"])
 	}
 }
 

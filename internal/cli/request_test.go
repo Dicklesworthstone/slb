@@ -281,14 +281,9 @@ func TestRequestCommand_SafeCommandSkipped(t *testing.T) {
 		t.Logf("Full result: %+v", result)
 		t.Errorf("expected status=skipped for safe command, got %v", result["status"])
 	}
-	// Tier should be "safe" (not a db constant since safe commands are skipped)
-	tier := result["tier"]
-	if tier == nil || tier == "" {
+	if result["tier"] != "safe" {
 		t.Logf("Full result: %+v", result)
-		// Some commands might not have tier in skipped response
-		// so we just verify the status is skipped
-	} else if tier != "safe" {
-		t.Errorf("expected tier=safe, got %v", tier)
+		t.Errorf("expected tier=safe, got %v", result["tier"])
 	}
 }
 

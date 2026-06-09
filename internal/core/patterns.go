@@ -52,6 +52,8 @@ type SegmentMatch struct {
 	MatchedPattern string
 }
 
+const defaultAllowPattern = "unmatched_default_allow"
+
 // PatternEngine handles pattern matching for risk classification.
 type PatternEngine struct {
 	mu sync.RWMutex
@@ -189,7 +191,11 @@ func (e *PatternEngine) ClassifyCommand(cmd, cwd string) *MatchResult {
 
 	// For compound commands, check each segment
 	if normalized.IsCompound && len(normalized.Segments) > 1 {
-		return e.applyParseUpgrade(e.classifyCompoundCommand(normalized, cwd), normalized.ParseError)
+		compound := e.classifyCompoundCommand(normalized, cwd)
+		if !normalized.ParseError && compound.Tier == "" {
+			markDefaultAllow(compound)
+		}
+		return e.applyParseUpgrade(compound, normalized.ParseError)
 	}
 
 	// Get the command to check - use normalized primary if available
@@ -260,7 +266,11 @@ func (e *PatternEngine) ClassifyCommand(cmd, cwd string) *MatchResult {
 		return e.applyParseUpgrade(result, normalized.ParseError)
 	}
 
-	// No match → allowed without review
+	// No match → allowed without review. Surface it as an explicit SAFE
+	// classification so robot consumers never have to interpret a null tier.
+	if !normalized.ParseError {
+		markDefaultAllow(result)
+	}
 	return e.applyParseUpgrade(result, normalized.ParseError)
 }
 
@@ -380,6 +390,16 @@ func (e *PatternEngine) matchPatterns(cmd string, patterns []*Pattern) *Pattern 
 		}
 	}
 	return nil
+}
+
+func markDefaultAllow(res *MatchResult) {
+	res.Tier = RiskTier(RiskSafe)
+	res.MinApprovals = 0
+	res.NeedsApproval = false
+	res.IsSafe = true
+	if res.MatchedPattern == "" {
+		res.MatchedPattern = defaultAllowPattern
+	}
 }
 
 // applyParseUpgrade enforces conservative behavior when normalization fails.

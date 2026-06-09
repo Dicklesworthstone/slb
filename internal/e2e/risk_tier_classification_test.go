@@ -54,13 +54,12 @@ func TestRiskTierClassification_CommandMatrix(t *testing.T) {
 		{"kubectl delete pod", "kubectl delete pod nginx-123", db.RiskTier(core.RiskSafe), 0, false},
 		{"npm cache clean", "npm cache clean", db.RiskTier(core.RiskSafe), 0, false},
 
-		// NO MATCH tier (unknown commands) - allowed without review for usability
-		// Note: tier is empty string "", NeedsApproval=false
-		{"ls", "ls -la", "", 0, false},
-		{"cat file", "cat /etc/passwd", "", 0, false},
-		{"echo", "echo hello world", "", 0, false},
-		{"pwd", "pwd", "", 0, false},
-		{"git status", "git status", "", 0, false},
+		// Unmatched allowed commands are explicit SAFE, never null tier.
+		{"ls", "ls -la", db.RiskTier(core.RiskSafe), 0, false},
+		{"cat file", "cat /etc/passwd", db.RiskTier(core.RiskSafe), 0, false},
+		{"echo", "echo hello world", db.RiskTier(core.RiskSafe), 0, false},
+		{"pwd", "pwd", db.RiskTier(core.RiskSafe), 0, false},
+		{"git status", "git status", db.RiskTier(core.RiskSafe), 0, false},
 	}
 
 	passed := 0
