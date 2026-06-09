@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -87,13 +88,27 @@ func TestRunCommand_RequiresSessionID(t *testing.T) {
 	resetRunFlags()
 
 	cmd := newTestRunCmd(h.DBPath)
-	_, _, err := executeCommand(cmd, "run", "echo hello", "-C", h.ProjectDir)
+	stdout, err := executeCommandCapture(t, cmd, "run", "echo hello", "-C", h.ProjectDir, "-j")
 
 	if err == nil {
 		t.Fatal("expected error when --session-id is missing")
 	}
 	if !strings.Contains(err.Error(), "--session-id is required") {
 		t.Errorf("unexpected error: %v", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("failed to parse JSON: %v\nstdout: %s", err, stdout)
+	}
+	if result["status"] != "missing_session_id" {
+		t.Errorf("expected status=missing_session_id, got %v", result["status"])
+	}
+	if result["command"] != "echo hello" {
+		t.Errorf("expected command echo hello, got %v", result["command"])
+	}
+	if !strings.Contains(result["error"].(string), "--session-id is required") {
+		t.Errorf("unexpected error payload: %v", result["error"])
 	}
 }
 

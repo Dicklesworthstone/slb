@@ -65,9 +65,10 @@ Examples:
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		command := args[0]
+		out := output.New(output.Format(GetOutput()))
 
 		if flagSessionID == "" {
-			return fmt.Errorf("--session-id is required")
+			return writeError(cmd, out, "missing_session_id", command, fmt.Errorf("--session-id is required"))
 		}
 
 		project, err := projectPath()
@@ -93,8 +94,6 @@ Examples:
 			return fmt.Errorf("opening database: %w", err)
 		}
 		defer dbConn.Close()
-
-		out := output.New(output.Format(GetOutput()))
 
 		// Collect attachments from flags
 		attachments, err := CollectAttachments(cmd.Context(), AttachmentFlags{

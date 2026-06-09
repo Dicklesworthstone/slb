@@ -63,9 +63,10 @@ Use --execute with --wait to execute after approval.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		command := args[0]
+		out := output.New(output.Format(GetOutput()))
 
 		if flagSessionID == "" {
-			return fmt.Errorf("--session-id is required to create a request")
+			return writeError(cmd, out, "missing_session_id", command, fmt.Errorf("--session-id is required to create a request"))
 		}
 
 		project, err := projectPath()
@@ -122,8 +123,6 @@ Use --execute with --wait to execute after approval.`,
 		if err != nil {
 			return fmt.Errorf("creating request: %w", err)
 		}
-
-		out := output.New(output.Format(GetOutput()))
 
 		// If skipped (safe command), return immediately
 		if result.Skipped {
