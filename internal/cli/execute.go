@@ -78,6 +78,10 @@ Examples:
 			return fmt.Errorf("loading config: %w", err)
 		}
 
+		if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
+			return fmt.Errorf("loading custom patterns: %w", err)
+		}
+
 		// Create executor
 		executor := core.NewExecutor(dbConn, nil).WithNotifier(buildAgentMailNotifier(req.ProjectPath))
 

@@ -140,6 +140,52 @@ func TestRunCommand_Help(t *testing.T) {
 	}
 }
 
+func TestRunCommand_YieldLoadsCustomPatternsBeforeSafeExecution(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetRunFlags()
+
+	session := testutil.MakeSession(t, h.DB,
+		testutil.WithProject(h.ProjectDir),
+		testutil.WithAgent("GrayTower"),
+	)
+	if _, err := h.DB.InsertCustomPattern(
+		"dangerous",
+		`^echo\s+SLB_RUN_CUSTOM_PATTERN_SENTINEL$`,
+		"run must honor persisted custom patterns before safe execution",
+		"test",
+	); err != nil {
+		t.Fatalf("InsertCustomPattern: %v", err)
+	}
+
+	cmd := newTestRunCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, cmd,
+		"run",
+		"echo SLB_RUN_CUSTOM_PATTERN_SENTINEL",
+		"-C", h.ProjectDir,
+		"--session-id", session.ID,
+		"--reason", "regression",
+		"--yield",
+		"-j",
+	)
+	if err != nil {
+		t.Fatalf("run --yield returned error: %v\nstdout: %s", err, stdout)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("parse run JSON: %v\nstdout: %s", err, stdout)
+	}
+	if result["status"] != "pending" {
+		t.Fatalf("expected pending request, got %v\nstdout: %s", result["status"], stdout)
+	}
+	if result["tier"] != "dangerous" {
+		t.Fatalf("expected tier=dangerous, got %v\nstdout: %s", result["tier"], stdout)
+	}
+	if result["min_approvals"] != float64(1) {
+		t.Fatalf("expected min_approvals=1, got %v\nstdout: %s", result["min_approvals"], stdout)
+	}
+}
+
 // Note: TestRunCommand_InvalidSession is skipped because the run command
 // calls os.Exit on errors, which would terminate the test process.
 // This behavior would need to be refactored to support proper testing.

@@ -105,6 +105,10 @@ Examples:
 			return writeError(cmd, out, "attachment_error", command, err)
 		}
 
+		if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
+			return writeError(cmd, out, "policy_load_failed", command, err)
+		}
+
 		// Step 1: Classify and create request using config-derived limits and notifiers
 		rl := core.NewRateLimiter(dbConn, toRateLimitConfig(cfg))
 		creator := core.NewRequestCreator(dbConn, rl, nil, toRequestCreatorConfig(cfg))
@@ -254,6 +258,10 @@ func runSafeCommand(cmd *cobra.Command, out *output.Writer, command, cwd, projec
 }
 
 func runApprovedRequest(ctx context.Context, out *output.Writer, dbConn *db.DB, cfg config.Config, project, requestID string) (int, error) {
+	if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
+		return 1, fmt.Errorf("loading custom patterns: %w", err)
+	}
+
 	executor := core.NewExecutor(dbConn, nil).WithNotifier(buildAgentMailNotifier(project))
 
 	execResult, execErr := executor.ExecuteApprovedRequest(ctx, core.ExecuteOptions{

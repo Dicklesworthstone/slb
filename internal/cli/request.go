@@ -103,6 +103,10 @@ Use --execute with --wait to execute after approval.`,
 			return fmt.Errorf("collecting attachments: %w", err)
 		}
 
+		if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
+			return fmt.Errorf("loading custom patterns: %w", err)
+		}
+
 		// Create the request using the core logic (config-driven rate limits + integrations).
 		rl := core.NewRateLimiter(dbConn, toRateLimitConfig(cfg))
 		creator := core.NewRequestCreator(dbConn, rl, nil, toRequestCreatorConfig(cfg))

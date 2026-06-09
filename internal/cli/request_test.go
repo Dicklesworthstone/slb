@@ -156,6 +156,52 @@ func TestRequestCommand_CreatesDangerousRequest(t *testing.T) {
 	}
 }
 
+func TestRequestCommand_LoadsCustomPatternForProtectedHomeInstall(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetRequestFlags()
+
+	session := testutil.MakeSession(t, h.DB,
+		testutil.WithProject(h.ProjectDir),
+		testutil.WithAgent("GrayTower"),
+	)
+	if _, err := h.DB.InsertCustomPattern(
+		"dangerous",
+		`^install\s+.*\s+/Users/josh/\.local/bin/[^[:space:]]+$`,
+		"protected HOME wrapper installs require approval",
+		"test",
+	); err != nil {
+		t.Fatalf("InsertCustomPattern: %v", err)
+	}
+
+	protectedInstall := "install -m 0755 /Users/josh/Developer/skillos/scripts/skillos_br_close_audit_gate.py /Users/josh/.local/bin/skillos-br-close-audit-gate"
+	cmd := newTestRequestCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, cmd,
+		"request",
+		protectedInstall,
+		"-C", h.ProjectDir,
+		"--session-id", session.ID,
+		"--reason", "regression",
+		"-j",
+	)
+	if err != nil {
+		t.Fatalf("request returned error: %v\nstdout: %s", err, stdout)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("parse request JSON: %v\nstdout: %s", err, stdout)
+	}
+	if result["status"] != "pending" {
+		t.Fatalf("expected pending request, got %v\nstdout: %s", result["status"], stdout)
+	}
+	if result["tier"] != "dangerous" {
+		t.Fatalf("expected tier=dangerous, got %v\nstdout: %s", result["tier"], stdout)
+	}
+	if result["min_approvals"] != float64(1) {
+		t.Fatalf("expected min_approvals=1, got %v\nstdout: %s", result["min_approvals"], stdout)
+	}
+}
+
 func TestRequestCommand_WithJustification(t *testing.T) {
 	h := testutil.NewHarness(t)
 	resetRequestFlags()
