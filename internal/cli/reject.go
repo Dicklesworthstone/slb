@@ -20,7 +20,7 @@ var (
 )
 
 func init() {
-	rejectCmd.Flags().StringVarP(&flagRejectSessionID, "session-id", "s", "", "reviewer session ID (required)")
+	rejectCmd.Flags().StringVar(&flagRejectSessionID, "session-id", "", "reviewer session ID (required)")
 	rejectCmd.Flags().StringVarP(&flagRejectSessionKey, "session-key", "k", "", "session HMAC key for signing (required)")
 	rejectCmd.Flags().StringVarP(&flagRejectReason, "reason", "r", "", "reason for rejection (required)")
 	rejectCmd.Flags().StringVarP(&flagRejectComments, "comments", "m", "", "additional comments")
@@ -44,9 +44,9 @@ For cross-project reviews, use --target-project to specify which project's
 database contains the request you want to reject.
 
 	Examples:
-	  slb reject abc123 -s $SESSION_ID -k $SESSION_KEY -r "Command too dangerous"
-	  slb reject abc123 -s $SESSION_ID -k $SESSION_KEY -r "Justification insufficient" -m "Please add more context"
-	  slb reject abc123 -s $SESSION_ID -k $SESSION_KEY -r "Too risky" --target-project /path/to/other/project`,
+	  slb reject abc123 --session-id $SESSION_ID -k $SESSION_KEY -r "Command too dangerous"
+	  slb reject abc123 --session-id $SESSION_ID -k $SESSION_KEY -r "Justification insufficient" -m "Please add more context"
+	  slb reject abc123 --session-id $SESSION_ID -k $SESSION_KEY -r "Too risky" --target-project /path/to/other/project`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		requestID := args[0]

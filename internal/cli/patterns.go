@@ -108,7 +108,7 @@ func init() {
 
 	// patterns export flags
 	patternsExportCmd.Flags().StringVarP(&flagPatternFormat, "format", "f", "json", "export format: json, yaml, claude-hook")
-	patternsExportCmd.Flags().StringVarP(&flagPatternOutputFile, "output", "o", "", "output file (default: stdout)")
+	patternsExportCmd.Flags().StringVar(&flagPatternOutputFile, "output", "", "output file (default: stdout)")
 
 	// Add subcommands
 	patternsCmd.AddCommand(patternsListCmd)
@@ -456,8 +456,8 @@ Available formats:
 Examples:
   slb patterns export                         # JSON to stdout
   slb patterns export --format=claude-hook    # Python to stdout
-  slb patterns export -o patterns.json        # JSON to file
-  slb patterns export -f claude-hook -o hook.py  # Python to file`,
+  slb patterns export --output patterns.json        # JSON to file
+  slb patterns export -f claude-hook --output hook.py  # Python to file`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: %v\n", err)

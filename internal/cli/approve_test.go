@@ -33,7 +33,7 @@ func newTestApproveCmd(dbPath string) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE:  approveCmd.RunE,
 	}
-	approve.Flags().StringVarP(&flagApproveSessionID, "session-id", "s", "", "reviewer session ID (required)")
+	approve.Flags().StringVar(&flagApproveSessionID, "session-id", "", "reviewer session ID (required)")
 	approve.Flags().StringVarP(&flagApproveSessionKey, "session-key", "k", "", "session HMAC key for signing (required)")
 	approve.Flags().StringVarP(&flagApproveComments, "comments", "m", "", "additional comments")
 	approve.Flags().StringVar(&flagApproveTargetProject, "target-project", "", "target project path for cross-project approvals")
@@ -98,7 +98,7 @@ func TestApproveCommand_RequiresSessionKey(t *testing.T) {
 	resetApproveFlags()
 
 	cmd := newTestApproveCmd(h.DBPath)
-	_, _, err := executeCommand(cmd, "approve", "some-request-id", "-s", "session-123")
+	_, _, err := executeCommand(cmd, "approve", "some-request-id", "--session-id", "session-123")
 
 	if err == nil {
 		t.Fatal("expected error when --session-key is missing")
@@ -136,7 +136,7 @@ func TestApproveCommand_ApprovesRequest(t *testing.T) {
 
 	cmd := newTestApproveCmd(h.DBPath)
 	stdout, err := executeCommandCapture(t, cmd, "approve", req.ID,
-		"-s", reviewerSess.ID,
+		"--session-id", reviewerSess.ID,
 		"-k", reviewerSess.SessionKey,
 		"-C", h.ProjectDir,
 		"-j",
@@ -187,7 +187,7 @@ func TestApproveCommand_WithComments(t *testing.T) {
 
 	cmd := newTestApproveCmd(h.DBPath)
 	stdout, err := executeCommandCapture(t, cmd, "approve", req.ID,
-		"-s", reviewerSess.ID,
+		"--session-id", reviewerSess.ID,
 		"-k", reviewerSess.SessionKey,
 		"-m", "Looks good to me",
 		"-C", h.ProjectDir,
@@ -228,7 +228,7 @@ func TestApproveCommand_SelfReviewPrevented(t *testing.T) {
 
 	cmd := newTestApproveCmd(h.DBPath)
 	_, err := executeCommandCapture(t, cmd, "approve", req.ID,
-		"-s", sess.ID,
+		"--session-id", sess.ID,
 		"-k", sess.SessionKey,
 		"-C", h.ProjectDir,
 		"-j",
@@ -259,7 +259,7 @@ func TestApproveCommand_InvalidSessionKey(t *testing.T) {
 
 	cmd := newTestApproveCmd(h.DBPath)
 	_, err := executeCommandCapture(t, cmd, "approve", req.ID,
-		"-s", reviewerSess.ID,
+		"--session-id", reviewerSess.ID,
 		"-k", "wrong-key-not-matching",
 		"-C", h.ProjectDir,
 		"-j",
@@ -284,7 +284,7 @@ func TestApproveCommand_RequestNotFound(t *testing.T) {
 
 	cmd := newTestApproveCmd(h.DBPath)
 	_, err := executeCommandCapture(t, cmd, "approve", "nonexistent-request",
-		"-s", reviewerSess.ID,
+		"--session-id", reviewerSess.ID,
 		"-k", reviewerSess.SessionKey,
 		"-C", h.ProjectDir,
 		"-j",
@@ -446,7 +446,7 @@ func TestApproveCommand_CrossProject(t *testing.T) {
 
 	cmd := newTestApproveCmd(currentH.DBPath) // Uses current project's DB by default
 	stdout, err := executeCommandCapture(t, cmd, "approve", req.ID,
-		"-s", reviewerSess.ID,
+		"--session-id", reviewerSess.ID,
 		"-k", reviewerSess.SessionKey,
 		"--target-project", targetH.ProjectDir, // Point to target project
 		"-j",

@@ -10,6 +10,7 @@ import (
 
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // executeCommand runs a cobra command with the given args and returns stdout, stderr, and error.
@@ -123,6 +124,37 @@ func TestRootCommand_GlobalFlags(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProductionCommandTree_LocalShorthandsDoNotCollideWithPersistentFlags(t *testing.T) {
+	var walk func(cmd *cobra.Command, inherited map[string]string)
+	walk = func(cmd *cobra.Command, inherited map[string]string) {
+		cmd.LocalFlags().VisitAll(func(flag *pflag.Flag) {
+			if flag.Shorthand == "" {
+				return
+			}
+			if owner, ok := inherited[flag.Shorthand]; ok {
+				t.Errorf("%s local flag --%s reuses -%s from persistent flag %s",
+					cmd.CommandPath(), flag.Name, flag.Shorthand, owner)
+			}
+		})
+
+		next := make(map[string]string, len(inherited))
+		for shorthand, owner := range inherited {
+			next[shorthand] = owner
+		}
+		cmd.PersistentFlags().VisitAll(func(flag *pflag.Flag) {
+			if flag.Shorthand != "" {
+				next[flag.Shorthand] = cmd.CommandPath() + " --" + flag.Name
+			}
+		})
+
+		for _, child := range cmd.Commands() {
+			walk(child, next)
+		}
+	}
+
+	walk(rootCmd, map[string]string{})
 }
 
 func TestVersionCommand_TextOutput(t *testing.T) {

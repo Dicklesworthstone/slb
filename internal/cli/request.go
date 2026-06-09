@@ -127,6 +127,32 @@ Use --execute with --wait to execute after approval.`,
 
 		// If skipped (safe command), return immediately
 		if result.Skipped {
+			if flagRequestExecute {
+				resp := map[string]any{
+					"status":         "refused",
+					"failure_class":  "skipped_command_not_reviewable",
+					"reason":         result.SkipReason,
+					"command":        command,
+					"actual_actions": []any{},
+					"remediation":    "Use slb run for no-approval execution, or add a matching pattern before requesting approval for protected-surface mutations.",
+				}
+				if result.Classification != nil {
+					resp["needs_approval"] = result.Classification.NeedsApproval
+					resp["is_safe"] = result.Classification.IsSafe
+					resp["min_approvals"] = result.Classification.MinApprovals
+					if result.Classification.Tier != "" {
+						resp["tier"] = string(result.Classification.Tier)
+					} else {
+						resp["tier"] = nil
+					}
+				}
+				if err := out.Write(resp); err != nil {
+					return err
+				}
+				cmd.SilenceErrors = true
+				cmd.SilenceUsage = true
+				return fmt.Errorf("cannot execute skipped command: %s", result.SkipReason)
+			}
 			return out.Write(map[string]any{
 				"status":  "skipped",
 				"reason":  result.SkipReason,

@@ -26,7 +26,7 @@ func init() {
 	hookInstallCmd.Flags().BoolVarP(&flagHookForce, "force", "f", false, "overwrite existing hooks")
 
 	// hook generate flags
-	hookGenerateCmd.Flags().StringVarP(&flagHookOutputDir, "output", "o", "", "output directory (default: ~/.slb/hooks/)")
+	hookGenerateCmd.Flags().StringVar(&flagHookOutputDir, "output", "", "output directory (default: ~/.slb/hooks/)")
 
 	// Add subcommands
 	hookCmd.AddCommand(hookGenerateCmd)

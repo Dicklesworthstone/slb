@@ -35,7 +35,7 @@ func newTestHookCmd(dbPath string) *cobra.Command {
 		Short: "Generate the Python hook script",
 		RunE:  hookGenerateCmd.RunE,
 	}
-	generateCmd.Flags().StringVarP(&flagHookOutputDir, "output", "o", "", "output directory")
+	generateCmd.Flags().StringVar(&flagHookOutputDir, "output", "", "output directory")
 
 	installCmd := &cobra.Command{
 		Use:   "install",
@@ -115,7 +115,7 @@ func TestHookGenerateCommand_GeneratesScript(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cmd := newTestHookCmd(h.DBPath)
-	stdout, err := executeCommandCapture(t, cmd, "hook", "generate", "-o", tmpDir, "-j")
+	stdout, err := executeCommandCapture(t, cmd, "hook", "generate", "--output", tmpDir, "-j")
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -171,7 +171,7 @@ func TestHookGenerateCommand_ScriptIsExecutable(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cmd := newTestHookCmd(h.DBPath)
-	_, err := executeCommandCapture(t, cmd, "hook", "generate", "-o", tmpDir, "-j")
+	_, err := executeCommandCapture(t, cmd, "hook", "generate", "--output", tmpDir, "-j")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -684,7 +684,7 @@ func TestGenerateHookScript_ContainsEssentialComponents(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cmd := newTestHookCmd(h.DBPath)
-	_, err := executeCommandCapture(t, cmd, "hook", "generate", "-o", tmpDir, "-j")
+	_, err := executeCommandCapture(t, cmd, "hook", "generate", "--output", tmpDir, "-j")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -734,7 +734,7 @@ func TestHookGenerateCommand_GeneratedScriptShapeIsCorrect(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	cmd := newTestHookCmd(h.DBPath)
-	if _, err := executeCommandCapture(t, cmd, "hook", "generate", "-o", tmpDir, "-j"); err != nil {
+	if _, err := executeCommandCapture(t, cmd, "hook", "generate", "--output", tmpDir, "-j"); err != nil {
 		t.Fatalf("hook generate: %v", err)
 	}
 	body, err := os.ReadFile(filepath.Join(tmpDir, "slb_guard.py"))
@@ -801,7 +801,7 @@ func TestHookGenerateCommand_SocketPathWalksUpToProjectRoot(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	cmd := newTestHookCmd(h.DBPath)
-	if _, err := executeCommandCapture(t, cmd, "hook", "generate", "-o", tmpDir, "-j"); err != nil {
+	if _, err := executeCommandCapture(t, cmd, "hook", "generate", "--output", tmpDir, "-j"); err != nil {
 		t.Fatalf("hook generate: %v", err)
 	}
 	body, err := os.ReadFile(filepath.Join(tmpDir, "slb_guard.py"))
@@ -844,7 +844,7 @@ func TestHookGenerateCommand_IncludesPersistedCustomPatterns(t *testing.T) {
 	tmpDir := t.TempDir()
 	hookCmd := newTestHookCmd(h.DBPath)
 	if _, err := executeCommandCapture(t, hookCmd, "hook", "generate",
-		"-o", tmpDir, "-j",
+		"--output", tmpDir, "-j",
 	); err != nil {
 		t.Fatalf("hook generate: %v", err)
 	}

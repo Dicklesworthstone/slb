@@ -31,7 +31,7 @@ func newTestRejectCmd(dbPath string) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE:  rejectCmd.RunE,
 	}
-	reject.Flags().StringVarP(&flagRejectSessionID, "session-id", "s", "", "reviewer session ID (required)")
+	reject.Flags().StringVar(&flagRejectSessionID, "session-id", "", "reviewer session ID (required)")
 	reject.Flags().StringVarP(&flagRejectSessionKey, "session-key", "k", "", "session HMAC key for signing (required)")
 	reject.Flags().StringVarP(&flagRejectReason, "reason", "r", "", "reason for rejection (required)")
 	reject.Flags().StringVarP(&flagRejectComments, "comments", "m", "", "additional comments")
@@ -90,7 +90,7 @@ func TestRejectCommand_RequiresSessionKey(t *testing.T) {
 	resetRejectFlags()
 
 	cmd := newTestRejectCmd(h.DBPath)
-	_, _, err := executeCommand(cmd, "reject", "some-request-id", "-s", "session-123")
+	_, _, err := executeCommand(cmd, "reject", "some-request-id", "--session-id", "session-123")
 
 	if err == nil {
 		t.Fatal("expected error when --session-key is missing")
@@ -106,7 +106,7 @@ func TestRejectCommand_RequiresReason(t *testing.T) {
 
 	cmd := newTestRejectCmd(h.DBPath)
 	_, _, err := executeCommand(cmd, "reject", "some-request-id",
-		"-s", "session-123",
+		"--session-id", "session-123",
 		"-k", "some-key",
 	)
 
@@ -146,7 +146,7 @@ func TestRejectCommand_RejectsRequest(t *testing.T) {
 
 	cmd := newTestRejectCmd(h.DBPath)
 	stdout, err := executeCommandCapture(t, cmd, "reject", req.ID,
-		"-s", reviewerSess.ID,
+		"--session-id", reviewerSess.ID,
 		"-k", reviewerSess.SessionKey,
 		"-r", "Command too dangerous",
 		"-C", h.ProjectDir,
@@ -201,7 +201,7 @@ func TestRejectCommand_WithComments(t *testing.T) {
 
 	cmd := newTestRejectCmd(h.DBPath)
 	stdout, err := executeCommandCapture(t, cmd, "reject", req.ID,
-		"-s", reviewerSess.ID,
+		"--session-id", reviewerSess.ID,
 		"-k", reviewerSess.SessionKey,
 		"-r", "Insufficient justification",
 		"-m", "Please add more context about why this is needed",
@@ -245,7 +245,7 @@ func TestRejectCommand_SelfReviewPrevented(t *testing.T) {
 
 	cmd := newTestRejectCmd(h.DBPath)
 	_, err := executeCommandCapture(t, cmd, "reject", req.ID,
-		"-s", sess.ID,
+		"--session-id", sess.ID,
 		"-k", sess.SessionKey,
 		"-r", "Trying to reject own request",
 		"-C", h.ProjectDir,
@@ -277,7 +277,7 @@ func TestRejectCommand_InvalidSessionKey(t *testing.T) {
 
 	cmd := newTestRejectCmd(h.DBPath)
 	_, err := executeCommandCapture(t, cmd, "reject", req.ID,
-		"-s", reviewerSess.ID,
+		"--session-id", reviewerSess.ID,
 		"-k", "wrong-key-not-matching",
 		"-r", "Some reason",
 		"-C", h.ProjectDir,
@@ -303,7 +303,7 @@ func TestRejectCommand_RequestNotFound(t *testing.T) {
 
 	cmd := newTestRejectCmd(h.DBPath)
 	_, err := executeCommandCapture(t, cmd, "reject", "nonexistent-request",
-		"-s", reviewerSess.ID,
+		"--session-id", reviewerSess.ID,
 		"-k", reviewerSess.SessionKey,
 		"-r", "Some reason",
 		"-C", h.ProjectDir,
@@ -371,7 +371,7 @@ func TestRejectCommand_CrossProject(t *testing.T) {
 
 	cmd := newTestRejectCmd(currentH.DBPath) // Uses current project's DB by default
 	stdout, err := executeCommandCapture(t, cmd, "reject", req.ID,
-		"-s", reviewerSess.ID,
+		"--session-id", reviewerSess.ID,
 		"-k", reviewerSess.SessionKey,
 		"-r", "Command too risky for cross-project operation",
 		"--target-project", targetH.ProjectDir, // Point to target project

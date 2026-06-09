@@ -232,6 +232,46 @@ func TestRequestCommand_SafeCommandSkipped(t *testing.T) {
 	}
 }
 
+func TestRequestCommand_ExecuteSkippedCommandRefusesTyped(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetRequestFlags()
+
+	sess := testutil.MakeSession(t, h.DB,
+		testutil.WithProject(h.ProjectDir),
+		testutil.WithAgent("TestAgent"),
+	)
+
+	cmd := newTestRequestCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, cmd, "request", "ls",
+		"-s", sess.ID,
+		"-C", h.ProjectDir,
+		"--execute",
+		"-j",
+	)
+
+	if err == nil {
+		t.Fatal("expected typed refusal when --execute is used on a skipped command")
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("failed to parse JSON: %v\nstdout: %s", err, stdout)
+	}
+
+	if result["status"] != "refused" {
+		t.Errorf("expected status=refused, got %v", result["status"])
+	}
+	if result["failure_class"] != "skipped_command_not_reviewable" {
+		t.Errorf("expected skipped_command_not_reviewable failure_class, got %v", result["failure_class"])
+	}
+	if actions, ok := result["actual_actions"].([]any); !ok || len(actions) != 0 {
+		t.Errorf("expected actual_actions=[], got %#v", result["actual_actions"])
+	}
+	if result["remediation"] == "" {
+		t.Error("expected remediation to be set")
+	}
+}
+
 func TestRequestCommand_InvalidSession(t *testing.T) {
 	h := testutil.NewHarness(t)
 	resetRequestFlags()

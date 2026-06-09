@@ -31,8 +31,8 @@ func newTestExecuteCmd(dbPath string) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE:  executeCmd.RunE,
 	}
-	execCmd.Flags().StringVarP(&flagExecuteSessionID, "session-id", "s", "", "executor session ID")
-	execCmd.Flags().IntVarP(&flagExecuteTimeout, "timeout", "t", 300, "timeout seconds")
+	execCmd.Flags().StringVar(&flagExecuteSessionID, "session-id", "", "executor session ID")
+	execCmd.Flags().IntVar(&flagExecuteTimeout, "timeout", 300, "timeout seconds")
 	execCmd.Flags().BoolVar(&flagExecuteBackground, "background", false, "run in background")
 	execCmd.Flags().StringVar(&flagExecuteLogDir, "log-dir", ".slb/logs", "log directory")
 
@@ -94,7 +94,7 @@ func TestExecuteCommand_RequestNotFound(t *testing.T) {
 
 	cmd := newTestExecuteCmd(h.DBPath)
 	_, err := executeCommandCapture(t, cmd, "execute", "nonexistent-request-id",
-		"-s", sess.ID,
+		"--session-id", sess.ID,
 		"-j",
 	)
 
@@ -118,7 +118,7 @@ func TestExecuteCommand_CannotExecutePending(t *testing.T) {
 
 	cmd := newTestExecuteCmd(h.DBPath)
 	_, err := executeCommandCapture(t, cmd, "execute", req.ID,
-		"-s", sess.ID,
+		"--session-id", sess.ID,
 		"-j",
 	)
 
@@ -150,7 +150,7 @@ func TestExecuteCommand_ExecutesApprovedRequest(t *testing.T) {
 
 	cmd := newTestExecuteCmd(h.DBPath)
 	stdout, err := executeCommandCapture(t, cmd, "execute", req.ID,
-		"-s", sess.ID,
+		"--session-id", sess.ID,
 		"-j",
 	)
 
@@ -231,8 +231,8 @@ func TestExecuteCommand_CustomTimeout(t *testing.T) {
 
 	cmd := newTestExecuteCmd(h.DBPath)
 	stdout, err := executeCommandCapture(t, cmd, "execute", req.ID,
-		"-s", sess.ID,
-		"-t", "10", // Short timeout
+		"--session-id", sess.ID,
+		"--timeout", "10",
 		"-j",
 	)
 

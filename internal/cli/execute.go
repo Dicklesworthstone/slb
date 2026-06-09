@@ -21,8 +21,8 @@ var (
 )
 
 func init() {
-	executeCmd.Flags().StringVarP(&flagExecuteSessionID, "session-id", "s", "", "executor session ID (required)")
-	executeCmd.Flags().IntVarP(&flagExecuteTimeout, "timeout", "t", 300, "execution timeout in seconds")
+	executeCmd.Flags().StringVar(&flagExecuteSessionID, "session-id", "", "executor session ID (required)")
+	executeCmd.Flags().IntVar(&flagExecuteTimeout, "timeout", 300, "execution timeout in seconds")
 	executeCmd.Flags().BoolVar(&flagExecuteBackground, "background", false, "run in background, return immediately")
 	executeCmd.Flags().StringVar(&flagExecuteLogDir, "log-dir", ".slb/logs", "directory for execution logs")
 	// Reuse Agent Mail notifier builder from approve/reject
@@ -46,9 +46,9 @@ Gate conditions are validated before execution:
 - Current pattern policy must not require higher tier
 
 Examples:
-  slb execute abc123 -s $SESSION_ID
-  slb execute abc123 -s $SESSION_ID --timeout 600
-  slb execute abc123 -s $SESSION_ID --background`,
+  slb execute abc123 --session-id $SESSION_ID
+  slb execute abc123 --session-id $SESSION_ID --timeout 600
+  slb execute abc123 --session-id $SESSION_ID --background`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		requestID := args[0]

@@ -88,7 +88,7 @@ func newTestPatternsCmd(dbPath string) *cobra.Command {
 		RunE:  patternsExportCmd.RunE,
 	}
 	exportCmd.Flags().StringVarP(&flagPatternFormat, "format", "f", "json", "export format")
-	exportCmd.Flags().StringVarP(&flagPatternOutputFile, "output", "o", "", "output file")
+	exportCmd.Flags().StringVar(&flagPatternOutputFile, "output", "", "output file")
 
 	// Version command
 	versionCmd := &cobra.Command{
