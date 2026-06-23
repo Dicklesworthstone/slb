@@ -45,8 +45,16 @@ Commands are classified by risk level:
   DANGEROUS  - Requires 1 approval (force pushes, schema changes)
   CAUTION    - Auto-approved after 30s with notification
   SAFE       - Skipped entirely (read-only commands)`,
-	SilenceUsage:  true,
-	SilenceErrors: true,
+	SilenceUsage: true,
+	// SilenceErrors intentionally stays false. main() exits non-zero WITHOUT
+	// printing the returned error, so silencing errors here would swallow every
+	// command failure into a bare `exit 1` with no output (issue #8 — run /
+	// request / approve appeared completely broken when they were merely
+	// rejecting bad input like a missing --session-id). With this false, cobra
+	// prints a single `Error: <msg>` line to stderr for any RunE error. Handlers
+	// that emit their own structured error (writeError) set SilenceErrors=true on
+	// their OWN command after printing, so cobra does not reprint — no double
+	// message. SilenceUsage stays true so a failure is one line, not a usage dump.
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		if flagProject == "" {
 			return nil

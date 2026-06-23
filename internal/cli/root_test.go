@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -550,6 +551,69 @@ func TestGetActor_PrecedenceOrder(t *testing.T) {
 	result = GetActor()
 	if !strings.Contains(result, "@") {
 		t.Errorf("fallback should be user@hostname format, got %s", result)
+	}
+}
+
+// TestRootDoesNotSilenceErrors is a regression guard for issue #8.
+//
+// main() exits non-zero WITHOUT printing the returned error. cobra only prints
+// a RunE error when neither the command nor any ancestor has SilenceErrors set.
+// If the production root command silences errors globally, every failing
+// subcommand (run/request/approve, all of which `return fmt.Errorf(...)` for a
+// missing --session-id BEFORE reaching their own writeError) exits 1 with no
+// output at all — making the tool look completely broken on a fresh install.
+//
+// Assert directly on the wired-up rootCmd: SilenceErrors must be false so cobra
+// surfaces the message, while SilenceUsage stays true so a failure is one line
+// rather than a full usage dump.
+func TestRootDoesNotSilenceErrors(t *testing.T) {
+	if rootCmd.SilenceErrors {
+		t.Error("rootCmd.SilenceErrors must be false: main() does not print the error, " +
+			"so silencing it here swallows every command failure into a bare exit 1 (issue #8)")
+	}
+	if !rootCmd.SilenceUsage {
+		t.Error("rootCmd.SilenceUsage should stay true so a failure prints one error line, not a usage dump")
+	}
+}
+
+// TestFailingCommandWritesErrorToStderr is the behavioral regression guard for
+// issue #8: a subcommand whose RunE returns a plain error (the missing
+// --session-id guard, which returns BEFORE any writeError) must surface a
+// non-empty error message rather than failing silently. We run the production
+// command tree with its real SilenceErrors setting and capture stderr.
+func TestFailingCommandWritesErrorToStderr(t *testing.T) {
+	// Build a throwaway command whose RunE mimics the run/request/approve
+	// session-id guard: a bare `return fmt.Errorf(...)`. Wiring it under a root
+	// configured exactly like the production rootCmd (SilenceUsage true,
+	// SilenceErrors = whatever rootCmd uses) proves cobra emits the message.
+	root := &cobra.Command{
+		Use:           "slb",
+		SilenceUsage:  rootCmd.SilenceUsage,
+		SilenceErrors: rootCmd.SilenceErrors,
+	}
+	failing := &cobra.Command{
+		Use: "boom",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return errors.New("--session-id is required")
+		},
+	}
+	root.AddCommand(failing)
+
+	stdout, stderr, err := executeCommand(root, "boom")
+	if err == nil {
+		t.Fatal("expected the failing command to return an error")
+	}
+	if strings.TrimSpace(stderr) == "" {
+		t.Fatalf("a failing command must write a non-empty error message to stderr (issue #8); "+
+			"got empty stderr (stdout=%q)", stdout)
+	}
+	if !strings.Contains(stderr, "--session-id is required") {
+		t.Errorf("stderr should contain the returned error message, got %q", stderr)
+	}
+	// Exactly one occurrence — guard against accidental double printing if both
+	// cobra and a future main()-side printer emit the same error.
+	if n := strings.Count(stderr, "--session-id is required"); n != 1 {
+		t.Errorf("error message should appear exactly once on stderr, appeared %d times: %q", n, stderr)
 	}
 }
 
