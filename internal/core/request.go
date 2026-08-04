@@ -182,14 +182,21 @@ func (rc *RequestCreator) CreateRequest(opts CreateRequestOptions) (*CreateReque
 		}, nil
 	}
 
-	// If no approval needed (no pattern match), also skip
+	// If no pattern matched, ESCALATE to dangerous rather than skip (fail
+	// closed). A command deliberately submitted through `slb run`/`slb request`
+	// is self-declared risky by its author, and text-level patterns cannot see
+	// inside arbitrary interpreter wrappers ("uv run python <script>" mutated a
+	// production database as an unmatched command; see GH issue #9). Only an
+	// explicit SAFE pattern match may skip approval. The PreToolUse hook path
+	// is unaffected: it calls ClassifyCommand directly and never reaches
+	// CreateRequest.
 	if !classification.NeedsApproval {
-		return &CreateRequestResult{
-			Request:        nil,
-			Skipped:        true,
-			SkipReason:     "Command does not match any dangerous patterns",
-			Classification: classification,
-		}, nil
+		classification.Tier = RiskTierDangerous
+		classification.MinApprovals = tierApprovals(RiskTierDangerous)
+		classification.NeedsApproval = true
+		if classification.MatchedPattern == "" {
+			classification.MatchedPattern = "unmatched_default_escalation"
+		}
 	}
 
 	// Step 6: Parse command to argv

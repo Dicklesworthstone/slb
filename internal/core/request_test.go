@@ -319,7 +319,8 @@ func TestCreateRequest_UnmatchedCommand(t *testing.T) {
 	session := testutil.MakeSession(t, database, testutil.SessionWithAgentName("agent1"))
 	creator := NewRequestCreator(database, nil, nil, nil)
 
-	// Command that doesn't match any patterns
+	// Command that doesn't match any patterns: unmatched commands ESCALATE to
+	// dangerous (queue for approval) instead of skipping — fail closed (GH #9).
 	result, err := creator.CreateRequest(CreateRequestOptions{
 		SessionID: session.ID,
 		Command:   "echo hello world",
@@ -328,8 +329,85 @@ func TestCreateRequest_UnmatchedCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !result.Skipped {
-		t.Error("expected unmatched command to be skipped")
+	if result.Skipped {
+		t.Error("expected unmatched command to escalate to a pending request, not skip")
+	}
+	if result.Request == nil || result.Request.RiskTier != RiskTierDangerous {
+		t.Error("expected unmatched command to create a dangerous-tier request")
+	}
+}
+
+func TestCreateRequest_UnmatchedCommand_EscalatesToDangerous(t *testing.T) {
+	database := testutil.NewTestDB(t)
+	session := testutil.MakeSession(t, database, testutil.SessionWithAgentName("agent1"))
+	creator := NewRequestCreator(database, nil, nil, nil)
+
+	// Adversarial cases: interpreter wrappers and unmatched commands must
+	// QUEUE for approval, never execute immediately (GH #9: "uv run python
+	// <script>" mutated a production database as an unmatched command).
+	cases := []string{
+		"uv run python /tmp/some_wrapper.py",
+		"python3 -c \"import shutil; shutil.rmtree('/srv/data')\"",
+		"node -e \"require('child_process').execSync('git push --mirror')\"",
+		"perl -e 'unlink glob \"*\"'",
+		"/usr/local/bin/definitely-not-a-known-tool --prod",
+	}
+	for _, command := range cases {
+		result, err := creator.CreateRequest(CreateRequestOptions{
+			SessionID: session.ID,
+			Command:   command,
+			Cwd:       "/project",
+			Justification: Justification{
+				Reason: "wrapped maintenance script",
+			},
+		})
+		if err != nil {
+			t.Fatalf("%q: unexpected error: %v", command, err)
+		}
+		if result.Skipped {
+			t.Fatalf("%q: expected escalation, not skip", command)
+		}
+		if result.Request == nil {
+			t.Fatalf("%q: expected request to be created", command)
+		}
+		if result.Request.RiskTier != RiskTierDangerous && result.Request.RiskTier != RiskTierCritical {
+			t.Errorf("%q: expected at least RiskTierDangerous, got %s", command, result.Request.RiskTier)
+		}
+		if result.Request.MinApprovals < 1 {
+			t.Errorf("%q: expected at least 1 approval, got %d", command, result.Request.MinApprovals)
+		}
+	}
+}
+
+func TestCreateRequest_WrappedDangerousPayload_NotSafe(t *testing.T) {
+	database := testutil.NewTestDB(t)
+	session := testutil.MakeSession(t, database, testutil.SessionWithAgentName("agent1"))
+	creator := NewRequestCreator(database, nil, nil, nil)
+
+	// Wrapped destructive payloads: the normalizer unwraps bash -c / env /
+	// nohup, and even if it could not, the fail-closed default must still
+	// queue these for approval. None may ever skip.
+	cases := []string{
+		`bash -c "rm -rf /srv/data"`,
+		`env FOO=bar bash -c "git push origin main --force"`,
+		`nohup sh -c 'DROP DATABASE prod' &`,
+		`/bin/bash -c "rm -rf ~"`,
+	}
+	for _, command := range cases {
+		result, err := creator.CreateRequest(CreateRequestOptions{
+			SessionID: session.ID,
+			Command:   command,
+			Cwd:       "/project",
+		})
+		if err != nil {
+			t.Fatalf("%q: unexpected error: %v", command, err)
+		}
+		if result.Skipped {
+			t.Fatalf("%q: wrapped destructive payload must never skip approval", command)
+		}
+		if result.Request == nil || result.Request.MinApprovals < 1 {
+			t.Fatalf("%q: expected a pending request with >=1 approval", command)
+		}
 	}
 }
 

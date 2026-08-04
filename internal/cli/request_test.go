@@ -201,8 +201,10 @@ func TestRequestCommand_SafeCommandSkipped(t *testing.T) {
 	)
 
 	cmd := newTestRequestCmd(h.DBPath)
-	// "ls" should be classified as safe and skipped
-	stdout, err := executeCommandCapture(t, cmd, "request", "ls",
+	// Since GH #9, only an explicit SAFE pattern match skips approval; use a
+	// command matching a built-in safe pattern instead of relying on the
+	// removed unmatched-command skip.
+	stdout, err := executeCommandCapture(t, cmd, "request", "rm build-output.log",
 		"-s", sess.ID,
 		"-C", h.ProjectDir,
 		"-j",

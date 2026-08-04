@@ -103,8 +103,16 @@ func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, strea
 	// Connect stdin to terminal for interactive commands
 	cmd.Stdin = os.Stdin
 
-	// Run the command
-	err := cmd.Run()
+	// Run the command; record the child PID in the log as soon as it starts so
+	// an orphaned child (caller killed mid-run before the footer is written)
+	// remains traceable (see GH issue #9).
+	err := cmd.Start()
+	if err == nil {
+		if logFile != nil {
+			fmt.Fprintf(logFile, "[started pid=%d]\n", cmd.Process.Pid)
+		}
+		err = cmd.Wait()
+	}
 
 	duration := time.Since(startTime)
 
