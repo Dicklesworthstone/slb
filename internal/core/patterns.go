@@ -43,6 +43,11 @@ type MatchResult struct {
 	ParseError bool
 	// Segments lists matched segments for compound commands.
 	MatchedSegments []SegmentMatch
+	// HasUnmatchedSegment reports that a compound command contained at least
+	// one segment that matched no pattern in any tier. A SAFE verdict earned by
+	// the other segments therefore says nothing about that one, so callers that
+	// skip approval on IsSafe must not do so when this is set (GH issue #9).
+	HasUnmatchedSegment bool
 }
 
 // SegmentMatch describes a match within a compound command.
@@ -335,6 +340,8 @@ func (e *PatternEngine) classifyCompoundCommand(normalized *NormalizedCommand, c
 
 		if segmentMatch.MatchedPattern != "" {
 			result.MatchedSegments = append(result.MatchedSegments, segmentMatch)
+		} else {
+			result.HasUnmatchedSegment = true
 		}
 	}
 

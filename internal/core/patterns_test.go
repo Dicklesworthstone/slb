@@ -453,6 +453,38 @@ func TestCompoundCommandMatchedSegments(t *testing.T) {
 	}
 }
 
+// A SAFE verdict earned by one segment says nothing about a segment that
+// matched no pattern at all, so the compound result must flag it (GH issue #9).
+func TestCompoundSafeSegmentFlagsUnmatchedSegment(t *testing.T) {
+	engine := NewPatternEngine()
+
+	for _, cmd := range []string{
+		"git stash && uv run python drop_db.py",
+		"git stash; uv run python drop_db.py",
+		"rm foo.log && uv run python drop_db.py",
+		"kubectl delete pod web-1 && /opt/bin/unknown-tool --wipe",
+		"git stash | uv run python drop_db.py",
+	} {
+		res := engine.ClassifyCommand(cmd, "")
+		if !res.HasUnmatchedSegment {
+			t.Errorf("%q: HasUnmatchedSegment=false, want true (tier %q, pattern %q)",
+				cmd, res.Tier, res.MatchedPattern)
+		}
+	}
+
+	// Compounds whose every segment matched must not raise the flag.
+	for _, cmd := range []string{
+		"rm foo.log && rm bar.log",
+		"git stash && rm build.tmp",
+		"rm -rf ./build && rm foo.log",
+	} {
+		res := engine.ClassifyCommand(cmd, "")
+		if res.HasUnmatchedSegment {
+			t.Errorf("%q: HasUnmatchedSegment=true, want false", cmd)
+		}
+	}
+}
+
 func TestUpgradeTier(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1050,7 +1082,7 @@ func TestExportClaudeHook_UsesSearchNotMatch(t *testing.T) {
 	// .search is the unanchored matcher; .match is anchored to
 	// position 0. The hook should use .search.
 	if strings.Contains(out, "if p.match(command):") {
-		t.Errorf("ExportClaudeHook still uses p.match(); should use p.search() (issue #4 follow-on).\n"+
+		t.Errorf("ExportClaudeHook still uses p.match(); should use p.search() (issue #4 follow-on).\n" +
 			"Anchored matching loses mid-command hits like `DROP DATABASE` inside `psql -c '...'`.")
 	}
 	if !strings.Contains(out, "if p.search(command):") {

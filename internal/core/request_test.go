@@ -411,6 +411,34 @@ func TestCreateRequest_WrappedDangerousPayload_NotSafe(t *testing.T) {
 	}
 }
 
+// A safe segment must not carry an unrecognised payload past the fail-closed
+// escalation (GH issue #9).
+func TestCreateRequest_SafeSegmentWithUnmatchedSegment_NotSkipped(t *testing.T) {
+	database := testutil.NewTestDB(t)
+	session := testutil.MakeSession(t, database, testutil.SessionWithAgentName("agent1"))
+	creator := NewRequestCreator(database, nil, nil, nil)
+
+	for _, command := range []string{
+		"git stash && uv run python drop_db.py",
+		"rm build.log; /opt/bin/unknown-tool --wipe",
+	} {
+		result, err := creator.CreateRequest(CreateRequestOptions{
+			SessionID: session.ID,
+			Command:   command,
+			Cwd:       "/project",
+		})
+		if err != nil {
+			t.Fatalf("%q: unexpected error: %v", command, err)
+		}
+		if result.Skipped {
+			t.Fatalf("%q: a safe segment must not launder the unmatched segment past approval", command)
+		}
+		if result.Request == nil || result.Request.MinApprovals < 1 {
+			t.Fatalf("%q: expected a pending request with >=1 approval", command)
+		}
+	}
+}
+
 func containsSubstring(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > 0 && (s[:len(substr)] == substr || containsSubstring(s[1:], substr)))
 }

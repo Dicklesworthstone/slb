@@ -172,8 +172,13 @@ func (rc *RequestCreator) CreateRequest(opts CreateRequestOptions) (*CreateReque
 	// Step 4: Classify command
 	classification := rc.patternEngine.ClassifyCommand(opts.Command, opts.Cwd)
 
-	// Step 5: If SAFE, skip
-	if classification.IsSafe {
+	// Step 5: If SAFE, skip — but only when the SAFE verdict covers the whole
+	// command. In a compound command a safe segment sets the overall tier to
+	// SAFE even when another segment matched nothing at all, so
+	// "git stash && uv run python <script>" would skip approval outright and
+	// re-open the GH issue #9 default-allow bypass. An unrecognised segment
+	// falls through to the escalation below instead.
+	if classification.IsSafe && !classification.HasUnmatchedSegment {
 		return &CreateRequestResult{
 			Request:        nil,
 			Skipped:        true,
@@ -194,7 +199,8 @@ func (rc *RequestCreator) CreateRequest(opts CreateRequestOptions) (*CreateReque
 		classification.Tier = RiskTierDangerous
 		classification.MinApprovals = tierApprovals(RiskTierDangerous)
 		classification.NeedsApproval = true
-		if classification.MatchedPattern == "" {
+		classification.IsSafe = false
+		if classification.MatchedPattern == "" || classification.HasUnmatchedSegment {
 			classification.MatchedPattern = "unmatched_default_escalation"
 		}
 	}
