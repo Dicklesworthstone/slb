@@ -477,4 +477,3 @@ func TestLoadDaemonCustomPatterns_MergesRowsIntoEngine(t *testing.T) {
 		t.Errorf("loadDaemonCustomPatterns is not idempotent: dangerous-tier count %d -> %d", before, after)
 	}
 }
-
