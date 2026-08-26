@@ -219,7 +219,7 @@ func (m Model) renderHeader() string {
 func (m Model) renderFooter() string {
 	th := theme.Current
 
-	hint := lipgloss.NewStyle().Foreground(th.Subtext).Render("[tab] focus  [↑/↓] navigate  [m] patterns  [h] history  [q] quit")
+	hint := lipgloss.NewStyle().Foreground(th.Subtext).Render("[tab] focus  [↑/↓] navigate  [enter] details  [m] patterns  [h] history  [q] quit")
 
 	right := ""
 	if !m.lastRefresh.IsZero() {

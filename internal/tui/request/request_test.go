@@ -292,9 +292,15 @@ func TestDetailModelUpdateClearCopiedMsg(t *testing.T) {
 func TestDetailModelViewBeforeReady(t *testing.T) {
 	m := NewDetailModel(testRequest(), nil)
 
+	// A detail model created mid-session may never receive the initial
+	// tea.WindowSizeMsg, so it must render its content without one instead
+	// of a placeholder that only a resize would clear.
 	view := m.View()
-	if !strings.Contains(view, "Loading") {
-		t.Error("View before ready should show loading")
+	if strings.Contains(view, "Loading") {
+		t.Error("View before ready must not show a loading placeholder")
+	}
+	if !strings.Contains(view, testRequest().Command.Raw) {
+		t.Error("View before ready should render the request content")
 	}
 }
 

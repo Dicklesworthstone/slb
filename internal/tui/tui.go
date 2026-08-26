@@ -224,6 +224,12 @@ func (m Model) forwardUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // handleNavigation handles view navigation.
+//
+// Sub-models created here are born after Bubble Tea delivered the initial
+// tea.WindowSizeMsg to the root model, so they would otherwise wait for a
+// size that only arrives on the next terminal resize. Every freshly created
+// view is therefore seeded with the root model's last known size before its
+// first render.
 func (m Model) handleNavigation(nav navigateMsg) (tea.Model, tea.Cmd) {
 	m.view = nav.view
 
@@ -232,7 +238,8 @@ func (m Model) handleNavigation(nav navigateMsg) (tea.Model, tea.Cmd) {
 		dash := dashboard.New(m.options.ProjectPath)
 		m.dashboard = &dash
 		m.setupDashboardCallbacks()
-		return m, m.dashboard.Init()
+		m, sizeCmd := m.seedViewSize()
+		return m, tea.Batch(sizeCmd, m.dashboard.Init())
 
 	case ViewRequestDetail:
 		if nav.requestID != "" {
@@ -242,7 +249,8 @@ func (m Model) handleNavigation(nav navigateMsg) (tea.Model, tea.Cmd) {
 			if detail != nil {
 				m.detail = detail
 				m.setupDetailCallbacks()
-				return m, m.detail.Init()
+				m, sizeCmd := m.seedViewSize()
+				return m, tea.Batch(sizeCmd, m.detail.Init())
 			}
 		}
 		// Fall back to dashboard if request not found
@@ -252,15 +260,33 @@ func (m Model) handleNavigation(nav navigateMsg) (tea.Model, tea.Cmd) {
 	case ViewHistory:
 		m.history = history.New(m.options.ProjectPath)
 		m.setupHistoryCallbacks()
-		return m, m.history.Init()
+		m, sizeCmd := m.seedViewSize()
+		return m, tea.Batch(sizeCmd, m.history.Init())
 
 	case ViewPatterns:
 		m.patterns = patterns.New(m.options.ProjectPath)
 		m.setupPatternsCallbacks()
-		return m, m.patterns.Init()
+		m, sizeCmd := m.seedViewSize()
+		return m, tea.Batch(sizeCmd, m.patterns.Init())
 	}
 
 	return m, nil
+}
+
+// seedViewSize replays the root model's last known terminal size into the
+// current view so a view created mid-session lays itself out immediately
+// instead of waiting for the next tea.WindowSizeMsg. It is a no-op until the
+// first real size message has been received. Any command the view returns
+// in response to the size is handed back so the caller can schedule it.
+func (m Model) seedViewSize() (Model, tea.Cmd) {
+	if m.width <= 0 || m.height <= 0 {
+		return m, nil
+	}
+	next, cmd := m.forwardUpdate(tea.WindowSizeMsg{Width: m.width, Height: m.height})
+	if nm, ok := next.(Model); ok {
+		return nm, cmd
+	}
+	return m, cmd
 }
 
 // setupDashboardCallbacks wires up dashboard navigation callbacks.

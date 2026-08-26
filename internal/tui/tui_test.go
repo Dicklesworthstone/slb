@@ -1,6 +1,9 @@
 package tui
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -607,5 +610,178 @@ func TestUpdateKeyPressOnDashboardNonNavigation(t *testing.T) {
 	um := updated.(Model)
 	if um.view != ViewDashboard {
 		t.Errorf("non-navigation key should keep dashboard view, got %d", um.view)
+	}
+}
+
+// newNavTestProject creates a project directory with a migrated SLB database
+// holding one pending request, and returns the project path and request ID.
+func newNavTestProject(t *testing.T) (string, string) {
+	t.Helper()
+
+	projectPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projectPath, ".slb"), 0o755); err != nil {
+		t.Fatalf("mkdir .slb: %v", err)
+	}
+	database, err := db.OpenAndMigrate(filepath.Join(projectPath, ".slb", "state.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+
+	sess := &db.Session{
+		ID:          "sess-nav-test",
+		AgentName:   "nav-agent",
+		Program:     "nav-program",
+		Model:       "nav-model",
+		ProjectPath: projectPath,
+	}
+	if err := database.CreateSession(sess); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	exp := time.Now().Add(30 * time.Minute)
+	req := &db.Request{
+		ID:                 "req-nav-test",
+		ProjectPath:        projectPath,
+		Command:            db.CommandSpec{Raw: "rm -rf ./data", Cwd: projectPath, Shell: true},
+		RiskTier:           db.RiskTierDangerous,
+		RequestorSessionID: sess.ID,
+		RequestorAgent:     sess.AgentName,
+		RequestorModel:     sess.Model,
+		Justification:      db.Justification{Reason: "navigation regression test"},
+		Status:             db.StatusPending,
+		MinApprovals:       1,
+		ExpiresAt:          &exp,
+	}
+	if err := database.CreateRequest(req); err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	return projectPath, req.ID
+}
+
+// runCmdInto executes a command the way the Bubble Tea runtime would and
+// feeds each resulting message back into the model. Batched commands run
+// concurrently; anything that has not produced a message within the timeout
+// (such as the periodic refresh tick) is left alone.
+func runCmdInto(t *testing.T, m Model, cmd tea.Cmd) Model {
+	t.Helper()
+	if cmd == nil {
+		return m
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		next, _ := m.Update(msg)
+		return next.(Model)
+	}
+	results := make(chan tea.Msg, len(batch))
+	launched := 0
+	for _, c := range batch {
+		if c == nil {
+			continue
+		}
+		launched++
+		go func(c tea.Cmd) { results <- c() }(c)
+	}
+	deadline := time.After(2 * time.Second)
+	for i := 0; i < launched; i++ {
+		select {
+		case got := <-results:
+			if got == nil {
+				continue
+			}
+			next, _ := m.Update(got)
+			m = next.(Model)
+		case <-deadline:
+			return m
+		}
+	}
+	return m
+}
+
+// Regression test for the "Loading..." wedge: a request detail view opened
+// with Enter after startup never receives the initial tea.WindowSizeMsg, so
+// it must be laid out from the root model's known size instead.
+func TestEnterOnPendingRequestRendersDetailWithoutResize(t *testing.T) {
+	projectPath, reqID := newNavTestProject(t)
+
+	m := NewWithOptions(Options{ProjectPath: projectPath, RefreshInterval: 5})
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = updated.(Model)
+
+	// Load dashboard data exactly as the runtime would from Init.
+	m = runCmdInto(t, m, m.Init())
+	if got := m.dashboard.SelectedRequestID(); got != reqID {
+		t.Fatalf("dashboard should select the pending request, got %q", got)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.view != ViewRequestDetail {
+		t.Fatalf("expected ViewRequestDetail, got %d", m.view)
+	}
+
+	view := m.View()
+	if strings.Contains(view, "Loading...") {
+		t.Fatal("detail view is stuck at Loading... without a resize")
+	}
+	if !strings.Contains(view, "rm -rf ./data") {
+		t.Errorf("detail view should render the request command, got:\n%s", view)
+	}
+	if m.detail.Width != 120 || m.detail.Height != 40 {
+		t.Errorf("detail model should inherit the root size, got %dx%d", m.detail.Width, m.detail.Height)
+	}
+
+	// Escape must return to a dashboard that is itself renderable, not a
+	// re-created dashboard waiting for a size message of its own.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.view != ViewDashboard {
+		t.Fatalf("expected ViewDashboard after esc, got %d", m.view)
+	}
+	if view := m.View(); strings.Contains(view, "Loading...") {
+		t.Fatal("dashboard re-created on esc is stuck at Loading...")
+	}
+}
+
+// History and patterns views are created on navigation too and share the
+// same size gate, so they must also be seeded with the known size.
+func TestNavigationSeedsSizeIntoHistoryAndPatterns(t *testing.T) {
+	projectPath, _ := newNavTestProject(t)
+
+	m := NewWithOptions(Options{ProjectPath: projectPath})
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'H'}})
+	m = updated.(Model)
+	if m.view != ViewHistory {
+		t.Fatalf("expected ViewHistory, got %d", m.view)
+	}
+	if strings.Contains(m.View(), "Loading...") {
+		t.Error("history view created on navigation is stuck at Loading...")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	m = updated.(Model)
+	if m.view != ViewPatterns {
+		t.Fatalf("expected ViewPatterns, got %d", m.view)
+	}
+	if strings.Contains(m.View(), "Loading...") {
+		t.Error("patterns view created on navigation is stuck at Loading...")
+	}
+}
+
+// Before any size is known the seeding is a no-op and navigation still works.
+func TestNavigationWithoutKnownSizeDoesNotPanic(t *testing.T) {
+	m := New()
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'H'}})
+	um := updated.(Model)
+	if um.view != ViewHistory {
+		t.Fatalf("expected ViewHistory, got %d", um.view)
+	}
+	if um.history.View() == "" {
+		t.Error("history view should still render something")
 	}
 }

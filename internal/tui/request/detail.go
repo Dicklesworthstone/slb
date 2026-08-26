@@ -268,10 +268,6 @@ type clearCopiedMsg struct{}
 
 // View renders the model.
 func (m *DetailModel) View() string {
-	if !m.ready {
-		return "Loading..."
-	}
-
 	th := theme.Current
 	var b strings.Builder
 
@@ -288,8 +284,14 @@ func (m *DetailModel) View() string {
 	b.WriteString(header)
 	b.WriteString("\n")
 
-	// Scrollable content
-	b.WriteString(m.viewport.View())
+	// Scrollable content. Before the first size message there is no viewport
+	// to scroll, so render the content directly rather than a placeholder;
+	// the viewport takes over as soon as a size is known.
+	if m.ready {
+		b.WriteString(m.viewport.View())
+	} else {
+		b.WriteString(m.renderContent())
+	}
 	b.WriteString("\n")
 
 	// Footer with keybindings
@@ -381,10 +383,11 @@ func (m *DetailModel) renderContent() string {
 		sections = append(sections, reviews)
 	}
 
-	// Join sections with dividers
+	// Join sections with dividers. Before a size is known the divider is
+	// omitted rather than computed from a zero width.
 	divider := lipgloss.NewStyle().
 		Foreground(th.Overlay0).
-		Render(strings.Repeat("─", m.Width-4))
+		Render(strings.Repeat("─", max(0, m.Width-4)))
 
 	return strings.Join(sections, "\n"+divider+"\n\n")
 }
