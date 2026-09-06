@@ -1472,7 +1472,9 @@ func TestDefaultSocketPath_FormatStable(t *testing.T) {
 	if len(base) != 21 {
 		t.Errorf("unexpected socket basename length: got %d (%q), want 21", len(base), base)
 	}
-	if got, want := filepath.Dir(sock), os.TempDir(); got != want {
+	// os.TempDir() returns $TMPDIR verbatim, which ends in "/" on macOS;
+	// filepath.Dir never has a trailing separator, so compare cleaned.
+	if got, want := filepath.Dir(sock), filepath.Clean(os.TempDir()); got != want {
 		t.Errorf("socket parent %q != os.TempDir() %q", got, want)
 	}
 }
