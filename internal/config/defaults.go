@@ -5,7 +5,7 @@ package config
 
 var (
 	defaultCriticalPatterns = []string{
-		`^rm\s+(-[rf]+\s+)+/(etc|usr|var|boot|home|root|bin|sbin|lib)`,
+		`^rm\s+(-[rf]+\s+)+["']?/+(?:\.\.?/+)*(etc|usr|var|boot|home|root|bin|sbin|lib)(?:[/\s"'*]|$)`,
 		`^rm\s+(-[rf]+\s+)+/[^t]`,
 		`^rm\s+(-[rf]+\s+)+~`,
 		`DROP\s+DATABASE`,

@@ -1038,8 +1038,10 @@ func TestExportClaudeHook_PreservesRegexMetacharacters(t *testing.T) {
 // Patterns containing a literal apostrophe must still serialize
 // safely. The fix uses non-raw single-quoted strings with backslash +
 // quote escaping for that branch; assert it produces a valid Python
-// string instead of corrupting the output. (None of the 52 builtins
-// hit this path, so we exercise it with a synthetic custom pattern.)
+// string instead of corrupting the output. (The chmod/chown system-path
+// builtins take this branch since #11 — TestExportClaudeHook_ParityWithGoClassifier
+// covers them under a real interpreter; here a synthetic pattern pins
+// the exact escaping.)
 func TestExportClaudeHook_HandlesApostrophePatterns(t *testing.T) {
 	engine := NewPatternEngine()
 	if err := engine.AddPattern(RiskTierDangerous, `^echo\s+'unsafe'`, "test", "test"); err != nil {
@@ -1088,4 +1090,194 @@ func TestExportClaudeHook_UsesSearchNotMatch(t *testing.T) {
 	if !strings.Contains(out, "if p.search(command):") {
 		t.Errorf("ExportClaudeHook does not use p.search(); generated classify() may be broken.")
 	}
+}
+
+// Regression test for issue #11: the CRITICAL chmod/chown patterns
+// matched `/etc`, `/bin`, ... as a bare substring anywhere in the
+// command, so `chmod +x /home/u/project/bin/tool` (a project's own
+// bin/ directory) and even `/opt/app/binary` (the substring "bin")
+// were classified CRITICAL. The system directory must be the first
+// component of an absolute path token, and it must end at a path
+// boundary rather than being a prefix of a longer name.
+func TestSystemPathPatterns_AnchorToPathToken(t *testing.T) {
+	engine := NewPatternEngine()
+
+	critical := []string{
+		// Real system paths must still be CRITICAL.
+		"chmod 777 /etc/passwd",
+		"chmod +x /usr/bin/mytool",
+		"chmod +x /bin/mytool",
+		"chmod 4755 /sbin/mytool",
+		"chmod 755 /var",         // bare directory, end of command
+		"chmod 755 /var/",        // trailing slash
+		"chmod 644 /boot/grub/x", // nested under system dir
+		"chmod -R 777 /etc",      // flags before mode
+		"chmod --recursive 777 /usr/lib",
+		"chmod -- 777 /etc/shadow",                   // end-of-options marker
+		"chmod 600 ./local.cfg /etc/ssh/sshd_config", // system path is not the first target
+		`chmod 777 "/etc/passwd"`,                    // double-quoted path
+		"chmod 777 '/etc/passwd'",                    // single-quoted path
+		"chmod 777 //etc/passwd",                     // doubled leading slash
+		"chmod 777 /./etc/passwd",                    // dot segment before the system dir
+		"chmod 777 /../etc/passwd",                   // parent-of-root is still root
+		"chmod 777 /usr*",                            // glob rooted at a system dir
+		"chown -R www-data /var/www",
+		"chown root: /bin/sh",
+		"chown root:root /sbin/init",
+		"CHMOD 777 /ETC/PASSWD", // case-insensitive like every builtin
+	}
+	for _, cmd := range critical {
+		res := engine.ClassifyCommand(cmd, "")
+		if res.Tier != RiskTierCritical {
+			t.Errorf("%q: Tier=%q (pattern %q), want critical", cmd, res.Tier, res.MatchedPattern)
+		}
+	}
+
+	// A system directory name appearing later in the path, or as a
+	// prefix of a longer name, is not a system path.
+	notCritical := []string{
+		"chmod +x /path/to/project/bin/mytool",
+		"chmod +x /path/to/project/binary",
+		"chmod +x ./bin/mytool",
+		"chmod +x bin/mytool",
+		"chmod +x /home/u/project/bin/x",
+		"chmod +x /opt/app/binary",
+		"chmod 644 /data/etc-configs/x",
+		"chmod 755 /usrlocal/x",
+		"chmod 755 /variables",
+		"chmod 755 /bootstrap.sh",
+		"chmod 755 /etcetera",
+		"chmod --reference=/etc/passwd ./mine", // /etc is only read, not modified
+		"chown app:app /srv/app/bin/run",
+		"chown -R app /home/app/var/cache",
+	}
+	for _, cmd := range notCritical {
+		res := engine.ClassifyCommand(cmd, "")
+		if res.Tier == RiskTierCritical {
+			t.Errorf("%q: classified critical via %q; system-dir pattern must not fire", cmd, res.MatchedPattern)
+		}
+	}
+
+	// With a cwd, relative paths are resolved before matching. A
+	// project bin/ under $HOME must not become CRITICAL, while a
+	// literal system root as cwd still is.
+	res := engine.ClassifyCommand("chmod +x ./bin/mytool", "/home/user/project")
+	if res.Tier == RiskTierCritical {
+		t.Errorf("chmod +x ./bin/mytool in /home/user/project: Tier=critical via %q", res.MatchedPattern)
+	}
+	res = engine.ClassifyCommand("chmod +x ./bin/mytool", "/")
+	if res.Tier != RiskTierCritical {
+		t.Errorf("chmod +x ./bin/mytool in /: Tier=%q, want critical (resolves to /bin/mytool)", res.Tier)
+	}
+
+	// The rm system-path rule had the same prefix problem: `/home` also
+	// matched `/homework`, `/opt` matched `/optional`, and so on.
+	for _, cmd := range []string{
+		"rm -rf /etc",
+		"rm -rf /etc/",
+		"rm -rf /usr/local",
+		"rm -rf /lib64",
+		"rm -rf /var*",
+		"rm -rf /opt",
+		"rm -rf /./usr",
+	} {
+		if res := engine.ClassifyCommand(cmd, ""); res.Tier != RiskTierCritical {
+			t.Errorf("%q: Tier=%q, want critical", cmd, res.Tier)
+		}
+	}
+	for _, cmd := range []string{
+		"rm -rf /homework/build",
+		"rm -rf /optional/cache",
+		"rm -rf /system-backup",
+		"rm -rf /libs",
+		"rm -rf /runtime",
+	} {
+		res := engine.ClassifyCommand(cmd, "")
+		if res.Tier != RiskTierDangerous {
+			t.Errorf("%q: Tier=%q (pattern %q), want dangerous (not a system dir)", cmd, res.Tier, res.MatchedPattern)
+		}
+	}
+}
+
+// Same bug class as issue #11 in the non-path CRITICAL rules: a flag
+// or keyword matched as a substring of a longer token.
+func TestSubstringPatterns_AnchorToToken(t *testing.T) {
+	engine := NewPatternEngine()
+
+	t.Run("git push -f is a flag, not a branch-name suffix", func(t *testing.T) {
+		for _, cmd := range []string{
+			"git push -f",
+			"git push -f origin main",
+			"git push origin main -f",
+			"git push -fu origin feature", // combined short flags
+			"git push -uf origin feature",
+		} {
+			if res := engine.ClassifyCommand(cmd, ""); res.Tier != RiskTierCritical {
+				t.Errorf("%q: Tier=%q, want critical", cmd, res.Tier)
+			}
+		}
+		for _, cmd := range []string{
+			"git push origin fix-f",
+			"git push origin wip-f main-f",
+			"git push origin HEAD:refs/heads/x-f",
+		} {
+			if res := engine.ClassifyCommand(cmd, ""); res.Tier == RiskTierCritical {
+				t.Errorf("%q: classified critical via %q; no force flag present", cmd, res.MatchedPattern)
+			}
+		}
+	})
+
+	t.Run("gcloud delete is a verb, not a substring of undelete", func(t *testing.T) {
+		for _, cmd := range []string{
+			"gcloud compute instances delete web-1 --quiet",
+			"gcloud sql instances delete prod --quiet --async",
+			"gcloud projects delete my-proj -q",
+		} {
+			if res := engine.ClassifyCommand(cmd, ""); res.Tier != RiskTierCritical {
+				t.Errorf("%q: Tier=%q, want critical", cmd, res.Tier)
+			}
+		}
+		for _, cmd := range []string{
+			"gcloud projects undelete my-proj --quiet",
+			"gcloud compute instances list --filter=name:delete-me --quiet",
+		} {
+			if res := engine.ClassifyCommand(cmd, ""); res.Tier == RiskTierCritical {
+				t.Errorf("%q: classified critical via %q", cmd, res.MatchedPattern)
+			}
+		}
+	})
+
+	t.Run("rm .log/.tmp/.bak SAFE rule requires every target to be such a file", func(t *testing.T) {
+		for _, cmd := range []string{
+			"rm app.log",
+			"rm -f app.log",
+			"rm -fv app.tmp",
+			"rm -- app.bak",
+			"rm logs/*.log",
+			"rm a.log b.log c.log",
+			"rm /var/log/app/old.log", // absolute path to a log file is still just a file
+		} {
+			res := engine.ClassifyCommand(cmd, "")
+			if !res.IsSafe {
+				t.Errorf("%q: Tier=%q IsSafe=false, want SAFE", cmd, res.Tier)
+			}
+		}
+		// A trailing .log argument must not launder a recursive delete
+		// of something else past review.
+		for _, cmd := range []string{
+			"rm -rf / foo.log",
+			"rm -rf /etc foo.log",
+			"rm -rf ./build foo.log",
+			"rm -r logs foo.log",
+			"rm important.db app.log",
+		} {
+			res := engine.ClassifyCommand(cmd, "")
+			if res.IsSafe || !res.NeedsApproval {
+				t.Errorf("%q: Tier=%q IsSafe=%v NeedsApproval=%v, want approval", cmd, res.Tier, res.IsSafe, res.NeedsApproval)
+			}
+		}
+		if res := engine.ClassifyCommand("rm -rf / foo.log", ""); res.Tier != RiskTierCritical {
+			t.Errorf("rm -rf / foo.log: Tier=%q, want critical", res.Tier)
+		}
+	})
 }

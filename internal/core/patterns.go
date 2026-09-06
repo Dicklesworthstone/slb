@@ -81,9 +81,13 @@ func (e *PatternEngine) LoadDefaultPatterns() {
 
 	// Safe patterns (skip review entirely)
 	e.safe = compilePatterns(RiskTier(RiskSafe), []string{
-		`^rm\s+.*\.log$`,
-		`^rm\s+.*\.tmp$`,
-		`^rm\s+.*\.bak$`,
+		// rm of throwaway files: every target must end in the extension
+		// and only non-recursive flags may precede them. The earlier
+		// `^rm\s+.*\.log$` looked at the last token alone, so a trailing
+		// `foo.log` laundered `rm -rf / foo.log` into the SAFE tier.
+		`^rm\s+(?:-[fv]+\s+|--(?:force|verbose)\s+)*(?:--\s+)?(?:\S+\.log\s+)*\S+\.log$`,
+		`^rm\s+(?:-[fv]+\s+|--(?:force|verbose)\s+)*(?:--\s+)?(?:\S+\.tmp\s+)*\S+\.tmp$`,
+		`^rm\s+(?:-[fv]+\s+|--(?:force|verbose)\s+)*(?:--\s+)?(?:\S+\.bak\s+)*\S+\.bak$`,
 		`^git\s+stash\s*$`,
 		`^kubectl\s+delete\s+pod\s`,
 		`^npm\s+cache\s+clean`,
@@ -91,8 +95,10 @@ func (e *PatternEngine) LoadDefaultPatterns() {
 
 	// Critical patterns (2+ approvals)
 	e.critical = compilePatterns(RiskTierCritical, []string{
-		// rm -rf on system paths (not /tmp, not relative paths)
-		`^rm\s+(-[rf]+\s+)+/(boot|dev|etc|home|lib|lib64|media|mnt|opt|proc|root|run|sbin|srv|sys|usr|var)`,
+		// rm -rf on system paths (not /tmp, not relative paths). The
+		// directory name must end at a path boundary so `/home` does not
+		// also cover `/homework` (issue #11 bug class).
+		`^rm\s+(-[rf]+\s+)+["']?/+(?:\.\.?/+)*(boot|dev|etc|home|lib|lib64|media|mnt|opt|proc|root|run|sbin|srv|sys|usr|var)(?:[/\s"'*]|$)`,
 		`^rm\s+(-[rf]+\s+)+/($|\s)`, // rm -rf / (root)
 		`^rm\s+(-[rf]+\s+)+/\*`,     // rm -rf /* (root wildcard)
 		`^rm\s+(-[rf]+\s+)+~`,       // rm -rf ~
@@ -108,20 +114,29 @@ func (e *PatternEngine) LoadDefaultPatterns() {
 		`^kubectl\s+delete\s+(node|nodes|namespace|namespaces|pv|persistentvolume|pvc|persistentvolumeclaim)\b`,
 		`^helm\s+uninstall.*--all`,
 		`^docker\s+system\s+prune\s+-a`,
-		// Git force push - both --force and -f (but not --force-with-lease)
+		// Git force push - both --force and -f (but not --force-with-lease).
+		// `-f` must be its own short-flag token (optionally bundled, e.g.
+		// `-fu`); a branch named `fix-f` is not a force push.
 		`^git\s+push\s+.*--force($|\s)`,
-		`^git\s+push\s+.*-f($|\s)`,
+		`^git\s+push\s+(?:.*\s)?-[a-z]*f[a-z]*($|\s)`,
 		// Cloud resource destruction
 		`^aws\s+.*terminate-instances`,
-		`^gcloud.*delete.*--quiet`,
+		// `delete` must be a whole token: `gcloud projects undelete` and a
+		// `--filter=name:delete-me` value are not deletions.
+		`^gcloud\s+(?:.*\s)?delete(?:\s.*)?\s(?:--quiet|-q)($|\s)`,
 		// Disk/filesystem destruction
 		`\bdd\b.*of=/dev/`, // dd writing to device
 		`^mkfs`,            // mkfs.* commands
 		`^fdisk`,           // partition manipulation
 		`^parted`,          // partition manipulation
-		// System file permission changes
-		`^chmod\s+.*/(etc|usr|var|boot|bin|sbin)`,
-		`^chown\s+.*/(etc|usr|var|boot|bin|sbin)`,
+		// System file permission changes. The system directory must be the
+		// first component of an absolute path token (preceded by whitespace
+		// or an opening quote, optionally via `/./` or `/../` which still
+		// resolve to root) and end at a path boundary — otherwise
+		// `/home/u/project/bin/tool` and `/opt/app/binary` both hit `/bin`
+		// (issue #11).
+		`^chmod\s+(?:.*[\s"'])?/+(?:\.\.?/+)*(etc|usr|var|boot|bin|sbin)(?:[/\s"'*]|$)`,
+		`^chown\s+(?:.*[\s"'])?/+(?:\.\.?/+)*(etc|usr|var|boot|bin|sbin)(?:[/\s"'*]|$)`,
 	}, "builtin")
 
 	// Dangerous patterns (1 approval)
@@ -760,8 +775,9 @@ func (e *PatternEngine) ExportClaudeHook() string {
 			// For patterns that contain a single apostrophe —
 			// rare but legal in custom rules — fall back to a
 			// non-raw single-quoted string with the apostrophe
-			// and any backslash escaped. None of the 52 builtins
-			// hit this path; tests cover both branches.
+			// and any backslash escaped. The chmod/chown system-path
+			// builtins (quote-aware since #11) take this branch;
+			// tests cover both.
 			if strings.ContainsAny(p.Pattern, "'") {
 				escaped := strings.ReplaceAll(p.Pattern, `\`, `\\`)
 				escaped = strings.ReplaceAll(escaped, `'`, `\'`)
