@@ -8,9 +8,65 @@ SLB is a cross-platform CLI that implements a **two-person rule** for running po
 
 ---
 
-## [Unreleased] -- changes on `main` since v0.2.0
+## [v0.4.1] -- 2026-09-07
 
-Compare: [`v0.2.0...main`](https://github.com/Dicklesworthstone/slb/compare/v0.2.0...main)
+Compare: [`v0.4.0...v0.4.1`](https://github.com/Dicklesworthstone/slb/compare/v0.4.0...v0.4.1)
+
+### Pattern Matching
+
+- **System-path and flag patterns are anchored to whole tokens** ([#11](https://github.com/Dicklesworthstone/slb/issues/11)): the CRITICAL `chmod`/`chown` rules matched `/(etc|usr|var|boot|bin|sbin)` as a bare substring anywhere in the command, so a project's own `chmod +x /home/u/proj/bin/tool` (and `/opt/app/binary`, via the `bin` prefix) needed two approvals. The system directory now has to be the first component of an absolute path token and end at a path boundary. The sibling audit of the builtin set fixed the same class elsewhere: the `rm` system-path rule (`/home` matched `/homework`, `/opt` matched `/optional`, `/lib` matched `/libs`), `git push -f` (`.*-f(\s|$)` fired on any branch ending in `-f`; the flag must now be its own short-flag token, bundled `-fu`/`-uf` still caught), `gcloud ... delete --quiet` (`delete` matched inside `undelete` and `--filter=name:delete-me`; `-q` accepted), and the SAFE `rm ... .log/.tmp/.bak` rules, which only looked at the last token so `rm -rf / foo.log` was SAFE and skipped review; every target must now end in the extension. A parity test runs the exported Python hook module under `python3` and checks it classifies these cases identically to the Go engine ([`9c3e140`](https://github.com/Dicklesworthstone/slb/commit/9c3e1405592aabe9ffbf912d6632f13ab1df1f63))
+
+### TUI
+
+- **Navigated views no longer wedge at "Loading..."** ([#10](https://github.com/Dicklesworthstone/slb/issues/10)): Bubble Tea delivers `WindowSizeMsg` once at startup, but the detail/dashboard/history/patterns views are created fresh on navigation and gated their first render on it, so pressing Enter on a pending request showed "Loading..." until the terminal was resized. The root model now replays its last known size into any view it creates; the detail view renders directly when no size is known and its divider no longer panics at zero width; the dashboard footer advertises `[enter]` ([`893b8ce`](https://github.com/Dicklesworthstone/slb/commit/893b8ce3006f95be4d8f05792c67c9f11af79cd6))
+
+### Build & Tests
+
+- `TestDefaultSocketPath_FormatStable` compares against `filepath.Clean(os.TempDir())`; on macOS `$TMPDIR` ends in `/` and the test failed on every Mac ([`59f61ee`](https://github.com/Dicklesworthstone/slb/commit/59f61ee64cc5f5837cb5d2a89cc3f72f244f5d2a))
+- `spf13/pflag` promoted to a direct module requirement ([`0e68819`](https://github.com/Dicklesworthstone/slb/commit/0e68819af96dff102004f5eadecfa57ea2502218))
+- AGENTS.md: require the OpenAI File Downloader user-agent on curl/web fetches ([`e73ce49`](https://github.com/Dicklesworthstone/slb/commit/e73ce498b377c8642af21c02d31e8c3ac64678d1))
+
+---
+
+## [v0.4.0] -- 2026-08-05
+
+Security release. Compare: [`v0.3.1...v0.4.0`](https://github.com/Dicklesworthstone/slb/compare/v0.3.1...v0.4.0)
+
+### Security
+
+- **Unmatched commands can no longer skip the two-person rule** ([#9](https://github.com/Dicklesworthstone/slb/issues/9)): `CreateRequest` had a default-allow branch, so any command matching no pattern (interpreter wrappers such as `uv run python script.py`, `bash -c ...`, `node -e ...`) was "Skipped" and executed immediately with zero approvals. Unmatched commands now **fail closed** and escalate to the dangerous tier ([`004bb40`](https://github.com/Dicklesworthstone/slb/commit/004bb4050dae657e3d433fe71463f20596a1d7b0)). Follow-up from a non-author review: in a compound command (`a && b`, `a; b`, pipelines) a SAFE segment could launder an unmatched sibling past approval, because the first safe segment alone decided the verdict; a segment matching nothing now raises the overall tier ([`2fb23f3`](https://github.com/Dicklesworthstone/slb/commit/2fb23f319f043b3dba492cd0eb523ba0f49dc06d))
+
+### CLI Fixes
+
+- Command errors are printed again instead of collapsing into a bare `exit 1` -- the root command set `SilenceErrors` while `main()` exited without printing, so every failing subcommand (including `--session-id is required`) produced zero output ([#8](https://github.com/Dicklesworthstone/slb/issues/8), [`697fb50`](https://github.com/Dicklesworthstone/slb/commit/697fb503711f1def12cf5b95e912d04e5560ff2f))
+- `execute`, `request` and `run` now load persisted custom patterns before classifying; they classified against builtins only and silently ignored every `slb patterns add` ([#7](https://github.com/Dicklesworthstone/slb/issues/7), [`c990c9a`](https://github.com/Dicklesworthstone/slb/commit/c990c9ab9792038eee5f3e4d2f60f7a5f47862e5))
+- Subcommand flags that collided with root persistent flags (`-t`, `-s`) caused a pflag panic on `slb execute --help`; shorthands dropped ([#7](https://github.com/Dicklesworthstone/slb/issues/7), [`1e9dac9`](https://github.com/Dicklesworthstone/slb/commit/1e9dac95e330d3a7a750b1d3067a9789adcfc794))
+- Nil `Classification` guarded on the skipped-request path ([#7](https://github.com/Dicklesworthstone/slb/issues/7), [`e2baefb`](https://github.com/Dicklesworthstone/slb/commit/e2baefbbd10d8a03dc9b3660fc38bf4a6b1e6bab))
+
+### Custom Patterns and Hook
+
+- `slb patterns add` reported `status:added` but never persisted anything; additions now go to the `custom_patterns` table and are reloaded on read ([#2](https://github.com/Dicklesworthstone/slb/issues/2), [`566daed`](https://github.com/Dicklesworthstone/slb/commit/566daed02f08be9b7332c11db1a85c446c9a6629)); the daemon, `hook generate/install/test/status` and `patterns version` all merge persisted customs too ([`4c7b550`](https://github.com/Dicklesworthstone/slb/commit/4c7b550efcfe389d132cc556ecb766c9e5998115), [`69ee1a5`](https://github.com/Dicklesworthstone/slb/commit/69ee1a597f19a517cd4154d4fd70d0c2b2c4d00b), [`7cceea8`](https://github.com/Dicklesworthstone/slb/commit/7cceea82fac90ef2556dc917b9a432f6e2888bd8))
+- Daemon and hook hash the nearest `.slb/` project root, not the CWD, for the socket path, so a hook fired from a sub-directory reaches the daemon ([#3](https://github.com/Dicklesworthstone/slb/issues/3), [`dad649e`](https://github.com/Dicklesworthstone/slb/commit/dad649ef50a6ae91ea8d340cb4c7b1b1184cf6c0))
+- Generated `slb_guard.py` emits the Claude Code 2026.04 `hookSpecificOutput.permissionDecision` shape and no longer double-escapes backslashes inside Python raw-string regexes (every `\s`, `\b`, `\w` in the 52 builtins was dead) ([#4](https://github.com/Dicklesworthstone/slb/issues/4), [#5](https://github.com/Dicklesworthstone/slb/issues/5), [`4d815ce`](https://github.com/Dicklesworthstone/slb/commit/4d815ce315d7d77a8b1e989c6fe066136adaa154)); fresh-eyes follow-ups pinned the hook contract in regression tests and made unknown daemon verdicts deny rather than allow ([`3204527`](https://github.com/Dicklesworthstone/slb/commit/3204527e0bd8a7073c4c6fe25b9e99e2c3d713e3), [`64ccd73`](https://github.com/Dicklesworthstone/slb/commit/64ccd739e1c0560a7cdbe8d0ee966bb3f2a27aac))
+
+---
+
+## [v0.3.1] -- 2026-04-24
+
+Compare: [`v0.3.0...v0.3.1`](https://github.com/Dicklesworthstone/slb/compare/v0.3.0...v0.3.1)
+
+- Release workflow: the "Verify Linux binary" step tolerates goreleaser v2 dist layout shifts ([`3e9a549`](https://github.com/Dicklesworthstone/slb/commit/3e9a549a5ed9b37188e0ac3b94d208f3740d5d3e))
+
+---
+
+## [v0.3.0] -- 2026-03-26
+
+Compare: [`v0.2.0...v0.3.0`](https://github.com/Dicklesworthstone/slb/compare/v0.2.0...v0.3.0)
+
+### Toolchain & Skill
+
+- Go toolchain bumped to 1.24.13 ([`b4b90a4`](https://github.com/Dicklesworthstone/slb/commit/b4b90a4fea734920468eb6b48d712149df458bfd))
+- Claude Code skill: SKILL.md refreshed and `references/` documentation added ([`ccc708f`](https://github.com/Dicklesworthstone/slb/commit/ccc708fd7d24afa743132fec0e675157488b53a5))
 
 ### Pattern Matching
 
