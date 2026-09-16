@@ -63,6 +63,72 @@ var subshellPattern = regexp.MustCompile("\\$\\([^)]+\\)|`[^`]+`|\\([^)]+\\)")
 
 var envAssignPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 
+// splitPipesShellAware splits a segment on unquoted pipes, using the same
+// quoting rules as splitCompoundShellAware.
+//
+// Splitting with a regex instead broke every command carrying a `|` inside
+// quotes — `jq -r '.[] | .a'`, `gh api ... --jq '.[] | .number'`, `awk '/a|b/'`,
+// a commit message with a pipe — into fragments with unbalanced quotes. The
+// tokenizer then failed on those fragments, and a parse failure is upgraded to
+// CAUTION, which the hook turns into a human approval prompt. Ordinary
+// read-only commands were stopping sessions for someone to approve (GitHub
+// #14). `;`, `&&`, `||` and `&` were already quote-aware; only the pipe was not.
+func splitPipesShellAware(seg string) []string {
+	var parts []string
+	var current strings.Builder
+	inSingleQuote := false
+	inDoubleQuote := false
+	escaped := false
+	runes := []rune(seg)
+
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+
+		if escaped {
+			current.WriteRune(r)
+			escaped = false
+			continue
+		}
+
+		if r == '\\' && !inSingleQuote {
+			current.WriteRune(r)
+			escaped = true
+			continue
+		}
+
+		if r == '\'' && !inDoubleQuote {
+			inSingleQuote = !inSingleQuote
+			current.WriteRune(r)
+			continue
+		}
+
+		if r == '"' && !inSingleQuote {
+			inDoubleQuote = !inDoubleQuote
+			current.WriteRune(r)
+			continue
+		}
+
+		if r == '|' && !inSingleQuote && !inDoubleQuote {
+			// `||` is a compound separator, already split upstream; leave any
+			// that reaches here intact rather than treating it as two pipes.
+			if i+1 < len(runes) && runes[i+1] == '|' {
+				current.WriteRune(r)
+				current.WriteRune(runes[i+1])
+				i++
+				continue
+			}
+			parts = append(parts, strings.TrimSpace(current.String()))
+			current.Reset()
+			continue
+		}
+
+		current.WriteRune(r)
+	}
+
+	parts = append(parts, strings.TrimSpace(current.String()))
+	return parts
+}
+
 // splitCompoundShellAware splits a command on compound separators (;, &&, ||, &)
 // while respecting shell quoting rules. Separators inside quotes are not split.
 func splitCompoundShellAware(cmd string) []string {
@@ -71,6 +137,7 @@ func splitCompoundShellAware(cmd string) []string {
 	inSingleQuote := false
 	inDoubleQuote := false
 	escaped := false
+	parenDepth := 0
 	runes := []rune(cmd)
 
 	for i := 0; i < len(runes); i++ {
@@ -102,8 +169,19 @@ func splitCompoundShellAware(cmd string) []string {
 			continue
 		}
 
-		// Check for compound separators only when outside quotes
+		// Track subshell nesting so a separator inside `( ... )` does not cut
+		// the parentheses in half. expandSubshellSegments splits the inside
+		// afterwards, so nothing is hidden from classification by this.
 		if !inSingleQuote && !inDoubleQuote {
+			if r == '(' {
+				parenDepth++
+			} else if r == ')' && parenDepth > 0 {
+				parenDepth--
+			}
+		}
+
+		// Check for compound separators only when outside quotes and parens
+		if !inSingleQuote && !inDoubleQuote && parenDepth == 0 {
 			// Check for && or ||
 			if i+1 < len(runes) {
 				if (r == '&' && runes[i+1] == '&') || (r == '|' && runes[i+1] == '|') {
@@ -159,27 +237,21 @@ func NormalizeCommand(cmd string) *NormalizedCommand {
 
 	// Split on compound separators using shell-aware parsing.
 	// We use proper tokenization to determine if separators are inside quotes.
-	segments := splitCompoundShellAware(cmd)
+	segments := expandSubshellSegments(splitCompoundShellAware(cmd))
 	if len(segments) > 1 {
 		result.IsCompound = true
 	}
 
 	// Also check for pipes (not technically compound, but multiple commands)
 	for _, seg := range segments {
-		if pipePattern.MatchString(seg) {
+		pipeParts := splitPipesShellAware(seg)
+		if len(pipeParts) > 1 {
 			result.IsCompound = true
-			// Split on pipes and add each segment
-			pipeParts := pipePattern.Split(seg, -1)
-			for _, part := range pipeParts {
-				part = strings.TrimSpace(part)
-				if part != "" {
-					result.Segments = append(result.Segments, part)
-				}
-			}
-		} else {
-			seg = strings.TrimSpace(seg)
-			if seg != "" {
-				result.Segments = append(result.Segments, seg)
+		}
+		for _, part := range pipeParts {
+			part = strings.TrimSpace(part)
+			if part != "" {
+				result.Segments = append(result.Segments, part)
 			}
 		}
 	}
@@ -206,6 +278,122 @@ func NormalizeCommand(cmd string) *NormalizedCommand {
 	return result
 }
 
+// expandSubshellSegments replaces any segment that is entirely one subshell
+// with the segments of the command inside it.
+//
+// The compound splitter does not split inside parentheses, so `(cd /tmp && ls)`
+// arrives here whole. Handing that to the tokenizer as a single command would
+// both fail to parse it and, worse, hide the second command from
+// classification — the risk of a compound subshell is the risk of the most
+// dangerous command in it, so the inner command list has to be split the same
+// way the outer one was (GitHub #14).
+func expandSubshellSegments(segments []string) []string {
+	expanded := make([]string, 0, len(segments))
+	for _, seg := range segments {
+		inner, ok := stripSubshellWrapper(seg)
+		if !ok {
+			expanded = append(expanded, seg)
+			continue
+		}
+		// Recurse: a subshell may wrap another subshell.
+		expanded = append(expanded, expandSubshellSegments(splitCompoundShellAware(inner))...)
+	}
+	return expanded
+}
+
+// stripSubshellWrapper unwraps a segment that is entirely one subshell,
+// returning the inner command. Only a wrapper whose opening parenthesis closes
+// at the very end qualifies, so `(a) | (b)` and `(a) && b` are left to the
+// splitters that already understand them.
+func stripSubshellWrapper(seg string) (string, bool) {
+	seg = strings.TrimSpace(seg)
+	if len(seg) < 2 || seg[0] != '(' || seg[len(seg)-1] != ')' {
+		return "", false
+	}
+	depth := 0
+	inSingleQuote := false
+	inDoubleQuote := false
+	escaped := false
+	runes := []rune(seg)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if r == '\\' && !inSingleQuote {
+			escaped = true
+			continue
+		}
+		if r == '\'' && !inDoubleQuote {
+			inSingleQuote = !inSingleQuote
+			continue
+		}
+		if r == '"' && !inSingleQuote {
+			inDoubleQuote = !inDoubleQuote
+			continue
+		}
+		if inSingleQuote || inDoubleQuote {
+			continue
+		}
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			// Closed before the end: the parentheses wrap only part of the
+			// segment, so this is not a whole-segment subshell.
+			if depth == 0 && i != len(runes)-1 {
+				return "", false
+			}
+		}
+	}
+	if depth != 0 {
+		return "", false
+	}
+	inner := strings.TrimSpace(string(runes[1 : len(runes)-1]))
+	if inner == "" {
+		return "", false
+	}
+	return inner, true
+}
+
+// maskArithmeticExpansions replaces an arithmetic expansion with a literal so
+// the tokenizer can read the rest of the command.
+//
+// go-shellwords cannot parse `$((...))` and fails the whole segment, which the
+// parse-failure path then upgrades to CAUTION — so an ordinary counter
+// increment became a human approval prompt. Substituting a constant is safe
+// because POSIX arithmetic evaluates numbers, not commands: nothing executable
+// is hidden by the mask (GitHub #14).
+func maskArithmeticExpansions(seg string) string {
+	var out strings.Builder
+	runes := []rune(seg)
+	for i := 0; i < len(runes); i++ {
+		if runes[i] == '$' && i+2 < len(runes) && runes[i+1] == '(' && runes[i+2] == '(' {
+			depth := 0
+			j := i + 1
+			for ; j < len(runes); j++ {
+				if runes[j] == '(' {
+					depth++
+				} else if runes[j] == ')' {
+					depth--
+					if depth == 0 {
+						break
+					}
+				}
+			}
+			if depth == 0 && j < len(runes) {
+				out.WriteString("0")
+				i = j
+				continue
+			}
+		}
+		out.WriteRune(runes[i])
+	}
+	return out.String()
+}
+
 // normalizeSegment strips wrappers using a shell-aware tokenizer.
 func normalizeSegment(seg string) (string, []string, bool) {
 	// First check for shell -c 'command' pattern and extract inner command
@@ -217,8 +405,18 @@ func normalizeSegment(seg string) (string, []string, bool) {
 		return inner, wrappers, parseErr
 	}
 
+	// A whole segment wrapped in a subshell is the same command with the same
+	// risk, so it must classify the same way. The tokenizer cannot parse bare
+	// parentheses, and the resulting parse failure only upgrades an
+	// *unclassified* command to CAUTION — so wrapping a CRITICAL command in
+	// parentheses quietly lowered its tier (GitHub #14).
+	if inner, ok := stripSubshellWrapper(seg); ok {
+		innerNorm, wrappers, parseErr := normalizeSegment(inner)
+		return innerNorm, append([]string{"("}, wrappers...), parseErr
+	}
+
 	parser := shellwords.NewParser()
-	tokens, err := parser.Parse(seg)
+	tokens, err := parser.Parse(maskArithmeticExpansions(seg))
 	parseErr := err != nil
 	if parseErr {
 		// Fallback to simple split to avoid losing data
