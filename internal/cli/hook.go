@@ -178,7 +178,7 @@ func runHookInstall(cmd *cobra.Command, args []string) error {
 
 	outputDir := filepath.Join(home, ".slb", "hooks")
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory %s: %w", outputDir, err)
+		return fmt.Errorf("failed to create directory %s: %w", err)
 	}
 
 	// Same custom-pattern merge as runHookGenerate — install must
@@ -510,180 +510,16 @@ func runHookTest(cmd *cobra.Command, args []string) error {
 
 // generateHookScript creates the complete Python hook script with embedded patterns.
 func generateHookScript(engine *core.PatternEngine) string {
-	// Start with shebang
 	var script strings.Builder
 	script.WriteString("#!/usr/bin/env python3\n")
+	script.WriteString(engine.ExportClaudeHook())
 
-	// Get the Claude hook format export
-	pythonPatterns := engine.ExportClaudeHook()
-	script.WriteString(pythonPatterns)
-
-	// Add the hook main logic
-	hookMain := `
-
-# === SLB Hook Integration ===
-
-import sys
-import json
-import socket
-import os
-import hashlib
-import tempfile
-
-SLB_TIMEOUT = 0.05  # 50ms timeout
-
-def _project_root_for_socket(start: str) -> str:
-    """Walk up from start looking for a .slb/ directory and return
-    its parent. Falls back to start if no .slb/ ancestor exists.
-
-    Mirrors the Go-side projectRootForSocket helper so the hook and
-    daemon converge on the same socket name even when fired from
-    different sub-directories of the same project (issue #3).
-    """
-    try:
-        path = os.path.abspath(start)
-    except Exception:
-        return start
-    while True:
-        candidate = os.path.join(path, ".slb")
-        if os.path.isdir(candidate):
-            return path
-        parent = os.path.dirname(path)
-        if parent == path:
-            # Hit filesystem root without finding .slb/ — fall back
-            # to the original CWD to preserve v0.3.x behavior on
-            # installations that have not run "slb init".
-            return os.path.abspath(start)
-        path = parent
-
-def get_socket_path() -> str:
-    """Get the SLB daemon socket path for the current project."""
-    cwd = os.getcwd()
-    hash_base = _project_root_for_socket(cwd)
-    hash_digest = hashlib.sha256(hash_base.encode()).hexdigest()[:12]
-    return os.path.join(tempfile.gettempdir(), f"slb-{hash_digest}.sock")
-
-def query_slb_daemon(command: str, session_id: str, cwd: str) -> Optional[dict]:
-    """Query SLB daemon for approval status. Returns None if unavailable."""
-    socket_path = get_socket_path()
-    if not os.path.exists(socket_path):
-        return None
-
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(SLB_TIMEOUT)
-            sock.connect(socket_path)
-            # Use JSON-RPC format expected by the daemon
-            request = json.dumps({
-                "method": "hook_query",
-                "params": {
-                    "command": command,
-                    "session_id": session_id,
-                    "cwd": cwd
-                },
-                "id": 1
-            })
-            sock.sendall(request.encode() + b'\n')
-            response = sock.recv(4096)
-            data = json.loads(response.decode())
-            # Extract result from JSON-RPC response
-            if "result" in data:
-                return data["result"]
-            return None
-    except (socket.error, json.JSONDecodeError, TimeoutError, OSError):
-        return None
-
-# Map SLB's internal verdict to the JSON shape Claude Code 2026.04
-# recognizes for PreToolUse hooks. The legacy {'action': 'block',
-# 'message': ...} shape is silently ignored by current Claude Code,
-# so the hook fires but the rail never intercepts (issue #5). The
-# hookSpecificOutput shape also supports 'ask', which the older
-# {'decision': ...} shape doesn't.
-#
-# Action vocabulary accepted (case-insensitive):
-#   allow                            -> permissionDecision: allow
-#   block | deny                     -> permissionDecision: deny
-#   ask                              -> permissionDecision: ask
-#   anything else (unknown/missing)  -> permissionDecision: ask
-#
-# Unknown actions fall through to 'ask' rather than 'allow' so a
-# future daemon version that introduces a new verdict doesn't fail
-# open silently. The user can always confirm; allowing-by-default
-# is the wrong direction for a safety rail.
-def _emit_decision(action, message: str = "") -> None:
-    action_lower = (action or "").strip().lower()
-    if action_lower == "allow":
-        permission = "allow"
-    elif action_lower in ("block", "deny"):
-        permission = "deny"
-    elif action_lower == "ask":
-        permission = "ask"
-    else:
-        permission = "ask"
-        if not message:
-            message = (
-                "SLB: unrecognized verdict "
-                + repr(action)
-                + " from classifier; asking for confirmation."
-            )
-    payload = {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": permission,
-        }
-    }
-    if message and permission != "allow":
-        payload["hookSpecificOutput"]["permissionDecisionReason"] = message
-    print(json.dumps(payload))
-
-def main():
-    """Main hook entry point."""
-    try:
-        input_data = json.loads(sys.stdin.read())
-    except json.JSONDecodeError:
-        # Invalid input, allow by default
-        _emit_decision("allow")
-        return
-
-    # Extract command from Bash tool input
-    tool_input = input_data.get("tool_input", {})
-    command = tool_input.get("command", "")
-    session_id = input_data.get("session_id", "")
-    cwd = os.getcwd()
-
-    if not command:
-        _emit_decision("allow")
-        return
-
-    # Try daemon first. The daemon returns the legacy
-    # {'action', 'message'} shape; translate it here rather than
-    # changing the daemon's RPC contract (which other callers
-    # depend on).
-    daemon_response = query_slb_daemon(command, session_id, cwd)
-    if daemon_response:
-        action = daemon_response.get("action", "allow")
-        message = daemon_response.get("message", "")
-        _emit_decision(action, message)
-        return
-
-    # Fall back to local classification (match daemon behavior).
-    tier, min_approvals = classify(command)
-
-    if tier == 'critical':
-        _emit_decision('block',
-            f"SLB CRITICAL: Requires {min_approvals} approvals. Use 'slb request' to submit.")
-    elif tier == 'dangerous':
-        _emit_decision('block',
-            f"SLB DANGEROUS: Requires {min_approvals} approval. Use 'slb request' to submit.")
-    elif tier == 'caution':
-        _emit_decision('ask',
-            "SLB CAUTION: command logged for review. Proceed?")
-    else:
-        _emit_decision("allow")
-
-if __name__ == "__main__":
-    main()
-`
-	script.WriteString(hookMain)
+	// A string slice always marshals successfully. JSON string escapes are also
+	// valid Python syntax, so both runtimes use the same default redaction rules.
+	redactions, _ := json.Marshal(core.RedactionPatterns())
+	script.WriteString("\nAUDIT_REDACTION_PATTERNS = ")
+	script.Write(redactions)
+	script.WriteString("\n")
+	script.WriteString(hookRuntime)
 	return script.String()
 }
