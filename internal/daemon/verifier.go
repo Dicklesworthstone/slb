@@ -95,30 +95,11 @@ func (v *Verifier) VerifyExecutionAllowed(p VerifyExecuteParams) (*VerificationR
 	return &VerificationResult{Allowed: true, Request: request, ApprovalRemainingSeconds: remaining}, nil
 }
 
-// checkExecutionPolicy uses a fresh engine so later edits to persisted custom
-// patterns are enforced, without leaking another project's mutable allowlist.
+// checkExecutionPolicy uses the same effective configuration, persisted rules,
+// project-local quorum and model requirement as the local executor. The final
+// claim repeats the check under its writer reservation after advisory preflight.
 func (v *Verifier) checkExecutionPolicy(request *db.Request) error {
-	engine := core.NewPatternEngine()
-	patterns, err := v.db.ListCustomPatterns()
-	if err != nil {
-		return fmt.Errorf("loading execution policy: %w", err)
-	}
-	for _, p := range patterns {
-		switch p.Tier {
-		case "safe", "caution", "dangerous", "critical":
-		default:
-			return errors.New("invalid persisted pattern tier")
-		}
-		if err := engine.AddPattern(core.RiskTier(p.Tier), p.Pattern, p.Description, p.Source); err != nil {
-			return fmt.Errorf("loading execution policy: %w", err)
-		}
-	}
-	classification := engine.ClassifyCommand(request.Command.Raw, request.Command.Cwd)
-	rank := map[db.RiskTier]int{db.RiskTierCaution: 1, db.RiskTierDangerous: 2, db.RiskTierCritical: 3}
-	if rank[classification.Tier] > rank[request.RiskTier] {
-		return fmt.Errorf("policy escalation: command now classified as %s", classification.Tier)
-	}
-	return nil
+	return core.CheckExecutionPolicy(v.db, request, "")
 }
 
 // VerifyAndMarkExecuting commits an authenticated, single-use execution claim.
@@ -146,8 +127,9 @@ func (v *Verifier) VerifyAndMarkExecuting(p VerifyExecuteParams) (*VerificationR
 		ExecutedByAgent: session.AgentName, ExecutedByModel: session.Model,
 		LogPath: receipt,
 	}
-	if err := v.db.ClaimRequestExecutionAuthenticated(result.Request, execution, p.SessionKey); err != nil {
-		if errors.Is(err, db.ErrExecutionAuthentication) || errors.Is(err, db.ErrInvalidTransition) {
+	if err := v.db.ClaimRequestExecutionAuthenticated(result.Request, execution, p.SessionKey, core.ExecutionPolicyGuard("")); err != nil {
+		if errors.Is(err, db.ErrExecutionAuthentication) || errors.Is(err, db.ErrInvalidTransition) ||
+			errors.Is(err, core.ErrApprovalPolicyChanged) || errors.Is(err, core.ErrTierEscalated) {
 			return &VerificationResult{Reason: err.Error()}, nil
 		}
 		return nil, fmt.Errorf("claiming execution: %w", err)

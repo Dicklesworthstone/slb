@@ -14,21 +14,24 @@ import (
 // the named session in the request's project. Never include keys in errors.
 var ErrExecutionAuthentication = errors.New("execution session authentication failed")
 
+// ExecutionPolicyCheck runs under the execution claim's writer reservation.
+// It must read database policy through tx, not through another connection.
+type ExecutionPolicyCheck func(tx *sql.Tx, request *Request) error
+
 // ClaimRequestExecution atomically claims the reviewed command and records who
 // will execute it. A failed write must never authorize starting the process.
 // This local API assumes its caller already has trusted database access.
-func (db *DB) ClaimRequestExecution(expected *Request, execution *Execution) error {
-	return db.claimRequestExecution(expected, execution, nil)
+func (db *DB) ClaimRequestExecution(expected *Request, execution *Execution, checks ...ExecutionPolicyCheck) error {
+	return db.claimRequestExecution(expected, execution, nil, checks)
 }
 
-// ClaimRequestExecutionAuthenticated is the RPC boundary. Authentication is
-// repeated under the same writer reservation as proof verification and claim,
-// so ending a session or rotating its key cannot race a preflight key check.
-func (db *DB) ClaimRequestExecutionAuthenticated(expected *Request, execution *Execution, sessionKey string) error {
-	return db.claimRequestExecution(expected, execution, &sessionKey)
+// ClaimRequestExecutionAuthenticated repeats authentication, signed evidence
+// verification and current policy checks under the same writer reservation.
+func (db *DB) ClaimRequestExecutionAuthenticated(expected *Request, execution *Execution, sessionKey string, checks ...ExecutionPolicyCheck) error {
+	return db.claimRequestExecution(expected, execution, &sessionKey, checks)
 }
 
-func (db *DB) claimRequestExecution(expected *Request, execution *Execution, sessionKey *string) error {
+func (db *DB) claimRequestExecution(expected *Request, execution *Execution, sessionKey *string, checks []ExecutionPolicyCheck) error {
 	if expected == nil || expected.ID == "" || expected.Status != StatusApproved {
 		return fmt.Errorf("%w: an approved request snapshot is required", ErrInvalidTransition)
 	}
@@ -44,8 +47,6 @@ func (db *DB) claimRequestExecution(expected *Request, execution *Execution, ses
 	}
 
 	return db.Transaction(func(tx *sql.Tx) error {
-		// Reserve the writer before reading reviews so a concurrent vote/key
-		// change cannot race the authorization-to-execution transition.
 		if _, err := tx.Exec(`UPDATE requests SET id = id WHERE id = ?`, expected.ID); err != nil {
 			return fmt.Errorf("locking execution claim: %w", err)
 		}
@@ -61,6 +62,14 @@ func (db *DB) claimRequestExecution(expected *Request, execution *Execution, ses
 		if err := verifyApprovalTx(tx, current, time.Now().UTC()); err != nil {
 			return fmt.Errorf("%w: %w", ErrInvalidTransition, err)
 		}
+		for _, check := range checks {
+			if check == nil {
+				return errors.New("execution policy check must not be nil")
+			}
+			if err := check(tx, current); err != nil {
+				return fmt.Errorf("checking execution policy: %w", err)
+			}
+		}
 		result, err := tx.Exec(`
 			UPDATE requests SET
 				status = 'executing', resolved_at = NULL,
@@ -75,7 +84,7 @@ func (db *DB) claimRequestExecution(expected *Request, execution *Execution, ses
 				AND (approval_expires_at IS NULL OR julianday(approval_expires_at) > julianday('now'))
 				AND EXISTS (
 					SELECT 1 FROM sessions WHERE id = ? AND ended_at IS NULL
-						AND agent_name = ? AND model = ?
+						AND agent_name = ? AND model = ? AND project_path = requests.project_path
 				)
 		`, execution.ExecutedAt.UTC().Format(time.RFC3339), execution.ExecutedBySessionID,
 			execution.ExecutedByAgent, execution.ExecutedByModel, execution.LogPath,
@@ -91,7 +100,7 @@ func (db *DB) claimRequestExecution(expected *Request, execution *Execution, ses
 			return fmt.Errorf("checking execution claim: %w", err)
 		}
 		if count != 1 {
-			return fmt.Errorf("%w: request changed, approval expired, session ended, or execution already claimed", ErrInvalidTransition)
+			return fmt.Errorf("%w: request changed, approval expired, session ended, project differs, or execution already claimed", ErrInvalidTransition)
 		}
 		return nil
 	})
@@ -114,8 +123,7 @@ func authenticateExecutionTx(tx *sql.Tx, project, sessionID, supplied string, re
 }
 
 // ExecutionSessionKeyMatches rejects malformed keys and compares decoded keys
-// in constant time. Exported for the daemon's advisory preflight check only;
-// the authenticated claim repeats it transactionally.
+// in constant time. The authenticated claim repeats this check transactionally.
 func ExecutionSessionKeyMatches(stored, supplied string) bool {
 	a, err := hex.DecodeString(stored)
 	if err != nil || len(a) != 32 {

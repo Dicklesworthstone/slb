@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
@@ -12,6 +13,7 @@ import (
 type enginePolicy struct {
 	tiers                 map[RiskTier]config.PatternTierConfig
 	requireDifferentModel bool
+	configPath            string
 }
 
 // ReplaceCustomPatterns publishes defaults plus exactly the supplied custom
@@ -24,7 +26,7 @@ func (e *PatternEngine) ReplaceCustomPatterns(patterns []Pattern) (int, error) {
 // rules before atomically publishing them. Configured arrays replace their
 // corresponding default arrays; custom rules are then merged by (tier, regex).
 // Invalid policy is an error, never a partially published or weakened policy.
-func (e *PatternEngine) ReplacePolicy(cfg config.Config, patterns []Pattern) (int, error) {
+func (e *PatternEngine) ReplacePolicy(cfg config.Config, patterns []Pattern, configPath ...string) (int, error) {
 	if err := config.Validate(cfg); err != nil {
 		return 0, err
 	}
@@ -35,6 +37,13 @@ func (e *PatternEngine) ReplacePolicy(cfg config.Config, patterns []Pattern) (in
 		},
 		requireDifferentModel: cfg.General.RequireDifferentModel,
 	}}
+	if len(configPath) > 0 && configPath[0] != "" {
+		path, err := filepath.Abs(configPath[0])
+		if err != nil {
+			return 0, fmt.Errorf("resolving policy config path: %w", err)
+		}
+		candidate.policy.configPath = path
+	}
 	seen := make(map[string]bool)
 	defaults := config.DefaultConfig().Patterns
 	builtins := make(map[string]bool)
@@ -136,6 +145,17 @@ func (e *PatternEngine) RequiresDifferentModel() bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.policy != nil && e.policy.requireDifferentModel
+}
+
+// PolicyConfigPath preserves an explicit CLI configuration source for the
+// executor's fresh preflight and transactional policy rechecks.
+func (e *PatternEngine) PolicyConfigPath() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.policy == nil {
+		return ""
+	}
+	return e.policy.configPath
 }
 
 // applyPolicyLocked runs after classification, including compound commands,

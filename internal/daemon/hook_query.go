@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/audit"
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
@@ -80,19 +81,20 @@ func recordHookAudit(directory string, params HookQueryParams, result *HookQuery
 	})
 }
 
-// loadHookPolicy loads a fresh, project-local engine. A global mutable engine
-// would miss later policy edits or leak one project's allowlist into another.
+// loadHookPolicy loads a fresh, project-local effective policy. A global
+// mutable engine would miss edits or leak another project's allowlist.
 func loadHookPolicy(cwd string) (*core.PatternEngine, *db.DB, string, error) {
-	engine := core.NewPatternEngine()
 	if cwd == "" {
-		return engine, nil, "", nil
+		return core.NewPatternEngine(), nil, "", nil
 	}
 	if !filepath.IsAbs(cwd) {
 		return nil, nil, "", fmt.Errorf("hook cwd must be absolute")
 	}
 	root := projectRootForSocket(cwd)
+	opts := config.LoadOptions{ProjectDir: root}
 	if _, err := os.Stat(filepath.Join(root, ".slb")); os.IsNotExist(err) {
-		return engine, nil, "", nil
+		engine, loadErr := core.LoadCommandPolicy(nil, opts)
+		return engine, nil, "", loadErr
 	} else if err != nil {
 		return nil, nil, "", err
 	}
@@ -101,20 +103,7 @@ func loadHookPolicy(cwd string) (*core.PatternEngine, *db.DB, string, error) {
 	if err != nil {
 		return nil, nil, "", err
 	}
-	patterns, err := conn.ListCustomPatterns()
-	if err == nil {
-		for _, pattern := range patterns {
-			switch pattern.Tier {
-			case "safe", "caution", "dangerous", "critical":
-				err = engine.AddPattern(core.RiskTier(pattern.Tier), pattern.Pattern, pattern.Description, pattern.Source)
-			default:
-				err = fmt.Errorf("invalid persisted pattern tier")
-			}
-			if err != nil {
-				break
-			}
-		}
-	}
+	engine, err := core.LoadCommandPolicy(conn, opts)
 	if err != nil {
 		conn.Close()
 		return nil, nil, "", err
@@ -158,6 +147,7 @@ func (s *IPCServer) classifyCommand(params HookQueryParams) *HookQueryResult {
 		return result
 	}
 	result.RequestID = approved.ID
+	result.MinApprovals = approved.MinApprovals
 	result.Message = "Approval ready. Execute with slb execute " + approved.ID + " --session-id <SLB_SESSION_ID>."
 	if params.ExecutionHandoff {
 		result.Action = "execute"
@@ -185,9 +175,11 @@ func findHookApproval(conn *db.DB, engine *core.PatternEngine, params HookQueryP
 	}
 	req, err := conn.GetRequest(id)
 	if err != nil || req.Status != db.StatusApproved || req.ProjectPath != projectRootForSocket(params.CWD) || req.Command.Raw != params.Command ||
-		req.Command.Cwd != params.CWD || req.RequestorSessionID != params.SessionID || req.MinApprovals < minApprovals {
+		req.Command.Cwd != params.CWD || req.RequestorSessionID != params.SessionID {
 		return nil
 	}
+	// CanExecute checks the current project-local dynamic quorum; comparing
+	// against the classifier's advisory full quorum would reject valid claims.
 	if ok, _ := core.NewExecutor(conn, engine).CanExecute(id); !ok {
 		return nil
 	}

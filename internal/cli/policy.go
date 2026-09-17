@@ -22,10 +22,17 @@ func loadCustomPatternsIntoDefaultEngine() (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("loading command policy config: %w", err)
 	}
+	if flagConfig != "" {
+		if info, err := os.Stat(flagConfig); err != nil {
+			return 0, fmt.Errorf("reading explicit policy config: %w", err)
+		} else if !info.Mode().IsRegular() {
+			return 0, fmt.Errorf("explicit policy config is not a regular file")
+		}
+	}
 	path := GetDB()
 	info, err := os.Stat(path)
 	if os.IsNotExist(err) && flagDB == "" {
-		return core.GetDefaultEngine().ReplacePolicy(cfg, nil)
+		return core.GetDefaultEngine().ReplacePolicy(cfg, nil, flagConfig)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("reading project policy database %q: %w", path, err)
@@ -47,5 +54,5 @@ func loadCustomPatternsIntoDefaultEngine() (int, error) {
 		patterns = append(patterns, core.Pattern{Tier: core.RiskTier(row.Tier),
 			Pattern: row.Pattern, Description: row.Description, Source: row.Source})
 	}
-	return core.GetDefaultEngine().ReplacePolicy(cfg, patterns)
+	return core.GetDefaultEngine().ReplacePolicy(cfg, patterns, flagConfig)
 }

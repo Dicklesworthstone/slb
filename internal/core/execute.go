@@ -74,6 +74,7 @@ type ExecutionResult struct {
 type Executor struct {
 	db            *db.DB
 	patternEngine *PatternEngine
+	configPath    string
 	notifier      integrations.RequestNotifier
 }
 
@@ -85,6 +86,7 @@ func NewExecutor(database *db.DB, patternEngine *PatternEngine) *Executor {
 	return &Executor{
 		db:            database,
 		patternEngine: patternEngine,
+		configPath:    patternEngine.PolicyConfigPath(),
 		notifier:      integrations.NoopNotifier{},
 	}
 }
@@ -142,6 +144,9 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 	}
 	if !session.IsActive() {
 		return nil, ErrSessionInactive
+	}
+	if session.ProjectPath != request.ProjectPath {
+		return nil, db.ErrExecutionAuthentication
 	}
 
 	// Gate 1: Request must be approved
@@ -210,14 +215,14 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 	}
 
 	// Gate 5: claim exactly the snapshot we checked and record execution identity
-	// in the same write. Recheck expiry after potentially lengthy rollback capture.
+	// in the same write. Recheck policy after potentially lengthy rollback capture.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if request.ApprovalExpiresAt != nil && !time.Now().Before(*request.ApprovalExpiresAt) {
 		return nil, ErrApprovalExpired
 	}
-	if err := e.db.ClaimRequestExecution(request, exec); err != nil {
+	if err := e.db.ClaimRequestExecution(request, exec, ExecutionPolicyGuard(e.configPath)); err != nil {
 		if errors.Is(err, db.ErrInvalidTransition) {
 			latest, readErr := e.db.GetRequest(request.ID)
 			if readErr == nil && latest.Status == db.StatusExecuting {
@@ -373,5 +378,5 @@ func (e *Executor) verifyApprovalSnapshot(request *db.Request) error {
 		verified.RequireDifferentModel != request.RequireDifferentModel {
 		return fmt.Errorf("%w: request changed during preflight", db.ErrInvalidTransition)
 	}
-	return nil
+	return CheckExecutionPolicy(e.db, request, e.configPath)
 }
