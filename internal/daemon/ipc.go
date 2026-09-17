@@ -324,6 +324,8 @@ func (s *IPCServer) handleRequest(conn net.Conn, data []byte) *RPCResponse {
 		return s.handleSubscribe(req, conn)
 	case "verify_execute":
 		return s.handleVerifyExecute(req)
+	case "complete_execute":
+		return s.handleCompleteExecute(req)
 	case "hook_query":
 		return s.handleHookQuery(req)
 	case "hook_health":
@@ -394,7 +396,7 @@ func (s *IPCServer) handleNotify(req RPCRequest) *RPCResponse {
 
 	return &RPCResponse{
 		Result: map[string]bool{"sent": true},
-		ID:     req.ID,
+		ID:    req.ID,
 	}
 }
 
@@ -526,20 +528,14 @@ func (s *IPCServer) handleVerifyExecute(req RPCRequest) *RPCResponse {
 		}
 	}
 
-	if params.RequestID == "" {
+	if err := params.validate(); err != nil {
 		return &RPCResponse{
-			Error: &Error{Code: ErrCodeInvalidParams, Message: "request_id is required"},
-			ID:    req.ID,
-		}
-	}
-	if params.SessionID == "" {
-		return &RPCResponse{
-			Error: &Error{Code: ErrCodeInvalidParams, Message: "session_id is required"},
+			Error: &Error{Code: ErrCodeInvalidParams, Message: err.Error()},
 			ID:    req.ID,
 		}
 	}
 
-	result, err := s.verifier.VerifyAndMarkExecuting(params.RequestID, params.SessionID)
+	result, err := s.verifier.VerifyAndMarkExecuting(params)
 	if err != nil {
 		return &RPCResponse{
 			Error: &Error{Code: ErrCodeInternal, Message: err.Error()},
@@ -551,4 +547,25 @@ func (s *IPCServer) handleVerifyExecute(req RPCRequest) *RPCResponse {
 		Result: result.ToIPCResponse(),
 		ID:     req.ID,
 	}
+}
+
+// handleCompleteExecute records a terminal result for an authenticated claim.
+// It cannot execute a command or return an execution to APPROVED.
+func (s *IPCServer) handleCompleteExecute(req RPCRequest) *RPCResponse {
+	if s.verifier == nil {
+		return &RPCResponse{Error: &Error{Code: ErrCodeInternal, Message: "verifier not configured"}, ID: req.ID}
+	}
+	var params CompleteExecuteParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return &RPCResponse{Error: &Error{Code: ErrCodeInvalidParams, Message: "invalid params: " + err.Error()}, ID: req.ID}
+	}
+	if err := params.validate(); err != nil {
+		return &RPCResponse{Error: &Error{Code: ErrCodeInvalidParams, Message: err.Error()}, ID: req.ID}
+	}
+	if err := s.verifier.MarkExecutionComplete(params); err != nil {
+		return &RPCResponse{Error: &Error{Code: ErrCodeInternal, Message: err.Error()}, ID: req.ID}
+	}
+	return &RPCResponse{Result: map[string]any{
+		"recorded": true, "request_id": params.RequestID, "status": params.Status,
+	}, ID: req.ID}
 }

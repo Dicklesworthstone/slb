@@ -2,252 +2,254 @@
 package daemon
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
-// VerificationResult contains the outcome of execution verification.
+// VerificationResult describes either an advisory check or a committed claim.
+// Only a committed claim has an ExecutionReceipt and may authorize execution.
 type VerificationResult struct {
-	// Allowed indicates whether execution is permitted.
-	Allowed bool `json:"allowed"`
-	// Reason explains why execution was denied (empty if allowed).
-	Reason string `json:"reason,omitempty"`
-	// Request is the request data (only if allowed).
-	Request *db.Request `json:"request,omitempty"`
-	// ApprovalRemainingSeconds is time left on approval TTL.
-	ApprovalRemainingSeconds int `json:"approval_remaining_seconds"`
+	Allowed                  bool        `json:"allowed"`
+	Reason                   string      `json:"reason,omitempty"`
+	Request                  *db.Request `json:"request,omitempty"`
+	ApprovalRemainingSeconds int         `json:"approval_remaining_seconds"`
+	ExecutionReceipt         string      `json:"execution_receipt,omitempty"`
 }
 
-// Verifier validates execution gate conditions.
+// Verifier validates execution gates. It never starts a command on the daemon.
 type Verifier struct {
 	db *db.DB
 }
 
-// NewVerifier creates a new execution verifier.
-func NewVerifier(database *db.DB) *Verifier {
-	return &Verifier{db: database}
+func NewVerifier(database *db.DB) *Verifier { return &Verifier{db: database} }
+
+// VerifyExecuteParams binds the caller to a session and the exact command it
+// intends to execute. An ID-only request is not an execution authorization.
+type VerifyExecuteParams struct {
+	RequestID   string `json:"request_id"`
+	SessionID   string `json:"session_id"`
+	SessionKey  string `json:"session_key"`
+	CommandHash string `json:"command_hash"`
 }
 
-// VerifyExecutionAllowed checks all gate conditions for executing a request.
-// Does NOT mark the request as executing - use VerifyAndMarkExecuting for that.
-func (v *Verifier) VerifyExecutionAllowed(requestID, sessionID string) (*VerificationResult, error) {
-	if requestID == "" {
-		return nil, errors.New("request_id is required")
+func (p VerifyExecuteParams) validate() error {
+	switch {
+	case p.RequestID == "":
+		return errors.New("request_id is required")
+	case p.SessionID == "":
+		return errors.New("session_id is required")
+	case p.SessionKey == "":
+		return errors.New("session_key is required")
+	case p.CommandHash == "":
+		return errors.New("command_hash is required")
 	}
-	if sessionID == "" {
-		return nil, errors.New("session_id is required")
-	}
+	return nil
+}
 
-	// Get the request.
-	request, err := v.db.GetRequest(requestID)
+// VerifyExecutionAllowed is advisory: it neither consumes approval nor grants
+// permission to run a process. The claim repeats authentication and signed
+// evidence verification inside the database's writer transaction.
+func (v *Verifier) VerifyExecutionAllowed(p VerifyExecuteParams) (*VerificationResult, error) {
+	if err := p.validate(); err != nil {
+		return nil, err
+	}
+	request, err := v.db.GetRequest(p.RequestID)
 	if err != nil {
 		return nil, fmt.Errorf("getting request: %w", err)
 	}
-
-	// Gate 1: Check status is APPROVED.
-	if request.Status != db.StatusApproved {
-		return &VerificationResult{
-			Allowed: false,
-			Reason:  fmt.Sprintf("request status is %s, expected approved", request.Status),
-		}, nil
+	session, err := v.db.GetSession(p.SessionID)
+	if err != nil || !session.IsActive() || session.ProjectPath != request.ProjectPath ||
+		!db.ExecutionSessionKeyMatches(session.SessionKey, p.SessionKey) {
+		return &VerificationResult{Reason: db.ErrExecutionAuthentication.Error()}, nil
 	}
 
-	// Gate 2: Check approval hasn't expired.
-	if request.ApprovalExpiresAt == nil {
-		return &VerificationResult{
-			Allowed: false,
-			Reason:  "approval_expires_at is not set",
-		}, nil
-	}
-
-	now := time.Now()
-	if now.After(*request.ApprovalExpiresAt) {
-		return &VerificationResult{
-			Allowed: false,
-			Reason:  "approval has expired",
-		}, nil
-	}
-
-	remainingSeconds := int(request.ApprovalExpiresAt.Sub(now).Seconds())
-
-	// Gate 3: Command hash verification (already stored in request.Command.Hash).
-	// The hash is computed at request creation and stored; we verify it hasn't
-	// been tampered with by checking the request is in APPROVED state (which
-	// requires valid reviews of the original command).
-
-	// Gate 4: Verify approval count still meets minimum.
-	reviews, err := v.db.ListReviewsForRequest(requestID)
+	// Use the shared evidence verifier, not a count of unsigned review rows.
+	request, err = v.db.VerifyRequestApproval(p.RequestID)
 	if err != nil {
-		return nil, fmt.Errorf("getting reviews: %w", err)
-	}
-
-	approvalCount := 0
-	for _, r := range reviews {
-		if r.Decision == db.DecisionApprove {
-			approvalCount++
+		if errors.Is(err, db.ErrInvalidApprovalProof) {
+			return &VerificationResult{Reason: err.Error()}, nil
 		}
+		return nil, fmt.Errorf("verifying approval: %w", err)
+	}
+	if request.ProjectPath != session.ProjectPath {
+		return &VerificationResult{Reason: db.ErrExecutionAuthentication.Error()}, nil
+	}
+	if request.Command.Hash != p.CommandHash {
+		return &VerificationResult{Reason: "command hash does not match the requested execution"}, nil
+	}
+	if err := v.checkExecutionPolicy(request); err != nil {
+		return &VerificationResult{Reason: err.Error()}, nil
 	}
 
-	if approvalCount < request.MinApprovals {
-		return &VerificationResult{
-			Allowed: false,
-			Reason:  fmt.Sprintf("insufficient approvals: %d < %d required", approvalCount, request.MinApprovals),
-		}, nil
+	remaining := 0
+	if request.ApprovalExpiresAt != nil {
+		remaining = max(0, int(time.Until(*request.ApprovalExpiresAt).Seconds()))
 	}
-
-	// All gates passed.
-	return &VerificationResult{
-		Allowed:                  true,
-		Request:                  request,
-		ApprovalRemainingSeconds: remainingSeconds,
-	}, nil
+	return &VerificationResult{Allowed: true, Request: request, ApprovalRemainingSeconds: remaining}, nil
 }
 
-// VerifyAndMarkExecuting verifies gate conditions and atomically marks the
-// request as EXECUTING. This implements "first executor wins" semantics.
-func (v *Verifier) VerifyAndMarkExecuting(requestID, sessionID string) (*VerificationResult, error) {
-	// First verify all conditions.
-	result, err := v.VerifyExecutionAllowed(requestID, sessionID)
+// checkExecutionPolicy uses a fresh engine so later edits to persisted custom
+// patterns are enforced, without leaking another project's mutable allowlist.
+func (v *Verifier) checkExecutionPolicy(request *db.Request) error {
+	engine := core.NewPatternEngine()
+	patterns, err := v.db.ListCustomPatterns()
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("loading execution policy: %w", err)
 	}
-
-	if !result.Allowed {
-		return result, nil
+	for _, p := range patterns {
+		switch p.Tier {
+		case "safe", "caution", "dangerous", "critical":
+		default:
+			return errors.New("invalid persisted pattern tier")
+		}
+		if err := engine.AddPattern(core.RiskTier(p.Tier), p.Pattern, p.Description, p.Source); err != nil {
+			return fmt.Errorf("loading execution policy: %w", err)
+		}
 	}
+	classification := engine.ClassifyCommand(request.Command.Raw, request.Command.Cwd)
+	rank := map[db.RiskTier]int{db.RiskTierCaution: 1, db.RiskTierDangerous: 2, db.RiskTierCritical: 3}
+	if rank[classification.Tier] > rank[request.RiskTier] {
+		return fmt.Errorf("policy escalation: command now classified as %s", classification.Tier)
+	}
+	return nil
+}
 
-	// Attempt to atomically update status to EXECUTING.
-	// This will fail if someone else already changed the status.
-	err = v.db.UpdateRequestStatus(requestID, db.StatusExecuting)
+// VerifyAndMarkExecuting commits an authenticated, single-use execution claim.
+// A lost reply is ambiguous: callers MUST NOT execute or retry the raw command
+// without a successful response. No reset-to-approved path is exposed.
+func (v *Verifier) VerifyAndMarkExecuting(p VerifyExecuteParams) (*VerificationResult, error) {
+	result, err := v.VerifyExecutionAllowed(p)
+	if err != nil || !result.Allowed {
+		return result, err
+	}
+	session, err := v.db.GetSession(p.SessionID)
 	if err != nil {
-		// Check if it's because status changed (race condition).
-		request, getErr := v.db.GetRequest(requestID)
-		if getErr != nil {
-			return nil, fmt.Errorf("updating status: %w (and failed to re-fetch: %v)", err, getErr)
-		}
-
-		if request.Status == db.StatusExecuting {
-			// Another executor won the race.
-			return &VerificationResult{
-				Allowed: false,
-				Reason:  "request is already being executed by another session",
-			}, nil
-		}
-
-		return nil, fmt.Errorf("updating status to executing: %w", err)
+		return nil, fmt.Errorf("getting executor: %w", err)
 	}
-
+	var nonce [32]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, fmt.Errorf("creating execution receipt: %w", err)
+	}
+	// The database's log reference doubles as the execution fence. A notary
+	// receipt is an opaque reference, NOT a filesystem path or a server log.
+	receipt := "notary:" + hex.EncodeToString(nonce[:])
+	now := time.Now().UTC()
+	execution := &db.Execution{
+		ExecutedAt: &now, ExecutedBySessionID: session.ID,
+		ExecutedByAgent: session.AgentName, ExecutedByModel: session.Model,
+		LogPath: receipt,
+	}
+	if err := v.db.ClaimRequestExecutionAuthenticated(result.Request, execution, p.SessionKey); err != nil {
+		if errors.Is(err, db.ErrExecutionAuthentication) || errors.Is(err, db.ErrInvalidTransition) {
+			return &VerificationResult{Reason: err.Error()}, nil
+		}
+		return nil, fmt.Errorf("claiming execution: %w", err)
+	}
+	result.Request.Status = db.StatusExecuting
+	result.Request.ResolvedAt = nil
+	result.Request.Execution = execution
+	result.ExecutionReceipt = receipt
 	return result, nil
 }
 
-// RevertExecutingOnFailure reverts a request from EXECUTING back to APPROVED
-// if execution fails before the command actually starts. Only works if the
-// approval hasn't expired.
-func (v *Verifier) RevertExecutingOnFailure(requestID string) error {
-	if requestID == "" {
-		return errors.New("request_id is required")
-	}
+// CompleteExecuteParams reports one owned execution, including a failed start
+// (nil exit_code). Completion is terminal and cannot reissue execution rights.
+type CompleteExecuteParams struct {
+	RequestID        string           `json:"request_id"`
+	SessionID        string           `json:"session_id"`
+	SessionKey       string           `json:"session_key"`
+	ExecutionReceipt string           `json:"execution_receipt"`
+	Status           db.RequestStatus `json:"status"`
+	ExitCode         *int             `json:"exit_code"`
+	DurationMs       *int64           `json:"duration_ms,omitempty"`
+}
 
-	// Get current state.
-	request, err := v.db.GetRequest(requestID)
-	if err != nil {
-		return fmt.Errorf("getting request: %w", err)
+func (p CompleteExecuteParams) validate() error {
+	if p.RequestID == "" || p.SessionID == "" || p.SessionKey == "" {
+		return errors.New("request_id, session_id and session_key are required")
 	}
-
-	// Only revert if currently EXECUTING.
-	if request.Status != db.StatusExecuting {
-		return fmt.Errorf("request status is %s, expected executing", request.Status)
+	if !validNotaryReceipt(p.ExecutionReceipt) {
+		return errors.New("a valid execution_receipt is required")
 	}
-
-	// Check approval hasn't expired.
-	if request.ApprovalExpiresAt != nil && time.Now().After(*request.ApprovalExpiresAt) {
-		// Approval expired, transition to TIMED_OUT instead.
-		if err := v.db.UpdateRequestStatus(requestID, db.StatusTimedOut); err != nil {
-			return fmt.Errorf("updating status to timed_out: %w", err)
-		}
-		return nil
+	if p.Status != db.StatusExecuted && p.Status != db.StatusExecutionFailed && p.Status != db.StatusTimedOut {
+		return errors.New("status must be executed, execution_failed or timed_out")
 	}
-
-	// Revert to APPROVED.
-	if err := v.db.UpdateRequestStatus(requestID, db.StatusApproved); err != nil {
-		return fmt.Errorf("reverting status to approved: %w", err)
+	if p.Status == db.StatusExecuted && (p.ExitCode == nil || *p.ExitCode != 0) {
+		return errors.New("executed requires exit_code zero")
 	}
-
+	if p.ExitCode != nil && *p.ExitCode < 0 {
+		return errors.New("exit_code must be nonnegative, or null when unavailable")
+	}
+	if p.DurationMs != nil && *p.DurationMs < 0 {
+		return errors.New("duration_ms must not be negative")
+	}
 	return nil
 }
 
-// MarkExecutionComplete marks a request as having completed execution.
-func (v *Verifier) MarkExecutionComplete(requestID string, exitCode int, success bool) error {
-	if requestID == "" {
-		return errors.New("request_id is required")
+func validNotaryReceipt(receipt string) bool {
+	if !strings.HasPrefix(receipt, "notary:") {
+		return false
 	}
-
-	request, err := v.db.GetRequest(requestID)
-	if err != nil {
-		return fmt.Errorf("getting request: %w", err)
-	}
-
-	if request.Status != db.StatusExecuting {
-		return fmt.Errorf("request status is %s, expected executing", request.Status)
-	}
-
-	// Update execution info.
-	now := time.Now().UTC()
-	exec := &db.Execution{
-		ExitCode:   &exitCode,
-		ExecutedAt: &now,
-	}
-	if err := v.db.UpdateRequestExecution(requestID, exec); err != nil {
-		return fmt.Errorf("updating execution: %w", err)
-	}
-
-	// Update final status.
-	var status db.RequestStatus
-	if success {
-		status = db.StatusExecuted
-	} else {
-		status = db.StatusExecutionFailed
-	}
-
-	if err := v.db.UpdateRequestStatus(requestID, status); err != nil {
-		return fmt.Errorf("updating status: %w", err)
-	}
-
-	return nil
+	decoded, err := hex.DecodeString(strings.TrimPrefix(receipt, "notary:"))
+	return err == nil && len(decoded) == 32
 }
 
-// VerifyExecuteParams are parameters for the verify_execute IPC method.
-type VerifyExecuteParams struct {
-	RequestID string `json:"request_id"`
-	SessionID string `json:"session_id"`
+// MarkExecutionComplete authenticates against the current key and fences the
+// report with the receipt returned by the committed claim. Ended sessions may
+// finish already-started work; rotated keys and stale receipts are rejected.
+func (v *Verifier) MarkExecutionComplete(p CompleteExecuteParams) error {
+	if err := p.validate(); err != nil {
+		return err
+	}
+	return v.db.CompleteRequestExecutionAuthenticated(p.RequestID, p.Status, &db.Execution{
+		ExecutedBySessionID: p.SessionID, LogPath: p.ExecutionReceipt,
+		ExitCode: p.ExitCode, DurationMs: p.DurationMs,
+	}, p.SessionKey)
 }
 
-// VerifyExecuteResponse is the response for the verify_execute IPC method.
+// VerifyExecuteResponse supplies the complete reviewed command specification.
+// Clients must preserve argv, cwd and shell mode, rather than reparse Command.
 type VerifyExecuteResponse struct {
-	Allowed                  bool   `json:"allowed"`
-	Reason                   string `json:"reason,omitempty"`
-	ApprovalRemainingSeconds int    `json:"approval_remaining_seconds"`
-	RequestID                string `json:"request_id,omitempty"`
-	Command                  string `json:"command,omitempty"`
-	CommandHash              string `json:"command_hash,omitempty"`
-	RiskTier                 string `json:"risk_tier,omitempty"`
+	Allowed                  bool            `json:"allowed"`
+	Reason                   string          `json:"reason,omitempty"`
+	ApprovalRemainingSeconds int             `json:"approval_remaining_seconds"`
+	RequestID                string          `json:"request_id,omitempty"`
+	Command                  string          `json:"command,omitempty"`
+	CommandHash              string          `json:"command_hash,omitempty"`
+	RiskTier                 string          `json:"risk_tier,omitempty"`
+	CommandSpec              *db.CommandSpec `json:"command_spec,omitempty"`
+	ExecutionReceipt         string          `json:"execution_receipt,omitempty"`
 }
 
-// ToIPCResponse converts a VerificationResult to an IPC response.
+// ToIPCResponse never turns an advisory check into a raw-command permit.
 func (r *VerificationResult) ToIPCResponse() *VerifyExecuteResponse {
-	resp := &VerifyExecuteResponse{
-		Allowed:                  r.Allowed,
-		Reason:                   r.Reason,
-		ApprovalRemainingSeconds: r.ApprovalRemainingSeconds,
+	resp := &VerifyExecuteResponse{Reason: r.Reason}
+	if !r.Allowed {
+		return resp
 	}
-	if r.Request != nil {
-		resp.RequestID = r.Request.ID
-		resp.Command = r.Request.Command.Raw
-		resp.CommandHash = r.Request.Command.Hash
-		resp.RiskTier = string(r.Request.RiskTier)
+	if r.Request == nil || !validNotaryReceipt(r.ExecutionReceipt) {
+		resp.Reason = "execution has not been claimed"
+		return resp
 	}
+	resp.Allowed = true
+	resp.ApprovalRemainingSeconds = r.ApprovalRemainingSeconds
+	resp.RequestID = r.Request.ID
+	resp.Command = r.Request.Command.Raw
+	resp.CommandHash = r.Request.Command.Hash
+	resp.RiskTier = string(r.Request.RiskTier)
+	spec := r.Request.Command
+	if spec.Argv != nil {
+		spec.Argv = make([]string, len(r.Request.Command.Argv))
+		copy(spec.Argv, r.Request.Command.Argv)
+	}
+	resp.CommandSpec = &spec
+	resp.ExecutionReceipt = r.ExecutionReceipt
 	return resp
 }

@@ -1,8 +1,14 @@
-// Package daemon provides tests for the execution verifier.
 package daemon
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,688 +17,387 @@ import (
 
 func setupTestDB(t *testing.T) *db.DB {
 	t.Helper()
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
-	database, err := db.Open(dbPath)
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
-		t.Fatalf("failed to open database: %v", err)
+		t.Fatal(err)
 	}
-	t.Cleanup(func() { database.Close() })
+	t.Cleanup(func() { _ = database.Close() })
 	return database
 }
 
 func createTestSession(t *testing.T, database *db.DB, id string) *db.Session {
 	t.Helper()
+	key := sha256.Sum256([]byte("notary-test-key-" + id))
 	session := &db.Session{
-		ID:          id,
-		AgentName:   "Agent-" + id, // Unique agent name per session
-		Program:     "test-cli",
-		Model:       "test-model",
-		ProjectPath: "/test/project-" + id, // Unique project path per session
-		SessionKey:  "0123456789abcdef0123456789abcdef",
+		ID: id, AgentName: "Agent-" + id, Program: "test-cli", Model: "test-model",
+		ProjectPath: "/test/project", SessionKey: hex.EncodeToString(key[:]),
 	}
 	if err := database.CreateSession(session); err != nil {
-		t.Fatalf("failed to create session: %v", err)
+		t.Fatal(err)
 	}
 	return session
 }
 
 func createTestRequest(t *testing.T, database *db.DB, id, sessionID string, status db.RequestStatus, minApprovals int) *db.Request {
 	t.Helper()
-	now := time.Now().UTC()
-	expiresAt := now.Add(30 * time.Minute)
-	approvalExpiresAt := now.Add(5 * time.Minute)
-
-	request := &db.Request{
-		ID:          id,
-		ProjectPath: "/test/project",
-		Command: db.CommandSpec{
-			Raw:  "rm -rf /tmp/test",
-			Cwd:  "/tmp",
-			Hash: "testhash123",
-		},
-		RiskTier:           db.RiskTierDangerous,
-		RequestorSessionID: sessionID,
-		RequestorAgent:     "TestAgent",
-		RequestorModel:     "test-model",
-		Justification: db.Justification{
-			Reason: "Testing execution",
-		},
-		Status:            status,
-		MinApprovals:      minApprovals,
-		ExpiresAt:         &expiresAt,
-		ApprovalExpiresAt: &approvalExpiresAt,
+	session, err := database.GetSession(sessionID)
+	if err != nil {
+		t.Fatal(err)
 	}
+	expires := time.Now().UTC().Add(5 * time.Minute)
+	request := &db.Request{
+		ID: id, ProjectPath: session.ProjectPath,
+		Command:  db.CommandSpec{Raw: "rm -rf /tmp/test", Argv: []string{"rm", "-rf", "/tmp/test"}, Cwd: "/tmp"},
+		RiskTier: db.RiskTierDangerous, RequestorSessionID: sessionID,
+		RequestorAgent: session.AgentName, RequestorModel: session.Model,
+		Justification: db.Justification{Reason: "Test notary; no command is executed"},
+		Status:        status, MinApprovals: minApprovals, ApprovalExpiresAt: &expires,
+	}
+	request.Command.Hash = db.ComputeCommandHash(request.Command)
 	if err := database.CreateRequest(request); err != nil {
-		t.Fatalf("failed to create request: %v", err)
+		t.Fatal(err)
 	}
 	return request
 }
 
 func createTestReview(t *testing.T, database *db.DB, requestID, sessionID string, decision db.Decision) *db.Review {
 	t.Helper()
+	session, err := database.GetSession(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
 	review := &db.Review{
-		RequestID:         requestID,
-		ReviewerSessionID: sessionID,
-		ReviewerAgent:     "ReviewerAgent",
-		ReviewerModel:     "reviewer-model",
-		Decision:          decision,
-		Comments:          "Test review",
+		RequestID: requestID, ReviewerSessionID: sessionID,
+		ReviewerAgent: session.AgentName, ReviewerModel: session.Model, Decision: decision,
+		SignatureTimestamp: now, Signature: db.ComputeReviewSignature(session.SessionKey, requestID, decision, now),
 	}
 	if err := database.CreateReview(review); err != nil {
-		t.Fatalf("failed to create review: %v", err)
+		t.Fatal(err)
 	}
 	return review
 }
 
-func TestVerifier_VerifyExecutionAllowed_MissingParams(t *testing.T) {
+func notaryFixture(t *testing.T) (*db.DB, *Verifier, VerifyExecuteParams) {
+	t.Helper()
 	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	tests := []struct {
-		name      string
-		requestID string
-		sessionID string
-		wantErr   string
-	}{
-		{"missing request_id", "", "sess1", "request_id is required"},
-		{"missing session_id", "req1", "", "session_id is required"},
+	requestor := createTestSession(t, database, "requestor")
+	executor := createTestSession(t, database, "executor")
+	reviewer := createTestSession(t, database, "reviewer")
+	request := createTestRequest(t, database, "request", requestor.ID, db.StatusApproved, 1)
+	createTestReview(t, database, request.ID, reviewer.ID, db.DecisionApprove)
+	return database, NewVerifier(database), VerifyExecuteParams{
+		RequestID: request.ID, SessionID: executor.ID, SessionKey: executor.SessionKey, CommandHash: request.Command.Hash,
 	}
+}
 
+func notarySQL(t *testing.T, database *db.DB, query string, args ...any) {
+	t.Helper()
+	if _, err := database.Exec(query, args...); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func requireNotaryClaim(t *testing.T, v *Verifier, p VerifyExecuteParams) *VerificationResult {
+	t.Helper()
+	result, err := v.VerifyAndMarkExecuting(p)
+	if err != nil || result == nil || !result.Allowed || !validNotaryReceipt(result.ExecutionReceipt) {
+		t.Fatalf("claim failed: result=%+v error=%v", result, err)
+	}
+	return result
+}
+
+func TestVerifier_AdvisoryAndAtomicClaim(t *testing.T) {
+	database, v, p := notaryFixture(t)
+	for i := 0; i < 2; i++ {
+		result, err := v.VerifyExecutionAllowed(p)
+		if err != nil || !result.Allowed || result.ExecutionReceipt != "" {
+			t.Fatalf("advisory check: %+v %v", result, err)
+		}
+		if response := result.ToIPCResponse(); response.Allowed || response.CommandSpec != nil || response.Command != "" {
+			t.Fatalf("advisory result became a permit: %+v", response)
+		}
+	}
+	result := requireNotaryClaim(t, v, p)
+	stored, err := database.GetRequest(p.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != db.StatusExecuting || stored.Execution == nil ||
+		stored.Execution.ExecutedBySessionID != p.SessionID || stored.Execution.LogPath != result.ExecutionReceipt {
+		t.Fatalf("claim identity not persisted: %+v", stored)
+	}
+	response := result.ToIPCResponse()
+	if !response.Allowed || response.CommandSpec == nil || response.CommandHash != p.CommandHash ||
+		response.CommandSpec.Cwd != "/tmp" || response.CommandSpec.Shell || len(response.CommandSpec.Argv) != 3 {
+		t.Fatalf("incomplete command binding: %+v", response)
+	}
+	payload, err := json.Marshal(response)
+	if err != nil || strings.Contains(string(payload), p.SessionKey) {
+		t.Fatalf("response leaked credentials or failed encoding: %v", err)
+	}
+	response.CommandSpec.Argv[0] = "changed"
+	if result.Request.Command.Argv[0] != "rm" {
+		t.Fatal("response aliases approved argv")
+	}
+	second, err := v.VerifyAndMarkExecuting(p)
+	if err != nil || second.Allowed || second.ToIPCResponse().Command != "" {
+		t.Fatalf("claim replay accepted: %+v %v", second, err)
+	}
+}
+
+func TestVerifier_RefusesInvalidClaims(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *db.DB, *VerifyExecuteParams)
+	}{
+		{"unknown session", func(_ *testing.T, _ *db.DB, p *VerifyExecuteParams) { p.SessionID = "missing" }},
+		{"wrong key", func(_ *testing.T, _ *db.DB, p *VerifyExecuteParams) { p.SessionKey = strings.Repeat("f", 64) }},
+		{"malformed key", func(_ *testing.T, _ *db.DB, p *VerifyExecuteParams) { p.SessionKey = "not-hex" }},
+		{"wrong command", func(_ *testing.T, _ *db.DB, p *VerifyExecuteParams) { p.CommandHash = "wrong" }},
+		{"ended session", func(t *testing.T, d *db.DB, p *VerifyExecuteParams) {
+			notarySQL(t, d, "UPDATE sessions SET ended_at = ? WHERE id = ?", time.Now().UTC().Format(time.RFC3339), p.SessionID)
+		}},
+		{"other project", func(t *testing.T, d *db.DB, p *VerifyExecuteParams) {
+			notarySQL(t, d, "UPDATE sessions SET project_path = '/other' WHERE id = ?", p.SessionID)
+		}},
+		{"no evidence", func(t *testing.T, d *db.DB, p *VerifyExecuteParams) {
+			notarySQL(t, d, "DELETE FROM reviews WHERE request_id = ?", p.RequestID)
+		}},
+		{"forged review", func(t *testing.T, d *db.DB, p *VerifyExecuteParams) {
+			notarySQL(t, d, "UPDATE reviews SET signature = 'forged' WHERE request_id = ?", p.RequestID)
+		}},
+		{"missing ttl", func(t *testing.T, d *db.DB, p *VerifyExecuteParams) {
+			notarySQL(t, d, "UPDATE requests SET approval_expires_at = NULL WHERE id = ?", p.RequestID)
+		}},
+		{"expired ttl", func(t *testing.T, d *db.DB, p *VerifyExecuteParams) {
+			notarySQL(t, d, "UPDATE requests SET approval_expires_at = ? WHERE id = ?", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339), p.RequestID)
+		}},
+		{"mutated command", func(t *testing.T, d *db.DB, p *VerifyExecuteParams) {
+			notarySQL(t, d, "UPDATE requests SET command_raw = 'changed' WHERE id = ?", p.RequestID)
+		}},
+		{"quorum unmet", func(t *testing.T, d *db.DB, p *VerifyExecuteParams) {
+			notarySQL(t, d, "UPDATE requests SET min_approvals = 2 WHERE id = ?", p.RequestID)
+		}},
+		{"model unmet", func(t *testing.T, d *db.DB, p *VerifyExecuteParams) {
+			notarySQL(t, d, "UPDATE requests SET require_different_model = 1 WHERE id = ?", p.RequestID)
+		}},
+		{"revoked signer key", func(t *testing.T, d *db.DB, _ *VerifyExecuteParams) {
+			notarySQL(t, d, "UPDATE sessions SET session_key = ? WHERE id = 'reviewer'", strings.Repeat("f", 64))
+		}},
+		{"new restrictive pattern", func(t *testing.T, d *db.DB, _ *VerifyExecuteParams) {
+			if _, err := d.InsertCustomPattern("critical", `^rm\s+-rf`, "new restriction", "human"); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"corrupt policy", func(t *testing.T, d *db.DB, _ *VerifyExecuteParams) {
+			if _, err := d.InsertCustomPattern("bogus", `^rm`, "invalid tier", "human"); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := v.VerifyExecutionAllowed(tc.requestID, tc.sessionID)
-			if err == nil {
-				t.Fatalf("expected error, got nil")
+			database, v, p := notaryFixture(t)
+			tc.mutate(t, database, &p)
+			result, err := v.VerifyAndMarkExecuting(p)
+			if err != nil || result.Allowed || result.Reason == "" || result.Request != nil || result.ExecutionReceipt != "" {
+				t.Fatalf("unsafe claim: %+v %v", result, err)
 			}
-			if err.Error() != tc.wantErr {
-				t.Errorf("expected error %q, got %q", tc.wantErr, err.Error())
+			stored, err := database.GetRequest(p.RequestID)
+			if err != nil || stored.Status != db.StatusApproved || stored.Execution != nil {
+				t.Fatalf("refusal consumed authorization: %+v %v", stored, err)
 			}
 		})
 	}
 }
 
-func TestVerifier_VerifyExecutionAllowed_RequestNotFound(t *testing.T) {
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	_, err := v.VerifyExecutionAllowed("nonexistent-id", "sess1")
-	if err == nil {
-		t.Fatalf("expected error for nonexistent request")
+func TestVerifier_MissingClaimFields(t *testing.T) {
+	_, v, valid := notaryFixture(t)
+	for _, field := range []string{"request_id", "session_id", "session_key", "command_hash"} {
+		t.Run(field, func(t *testing.T) {
+			p := valid
+			switch field {
+			case "request_id":
+				p.RequestID = ""
+			case "session_id":
+				p.SessionID = ""
+			case "session_key":
+				p.SessionKey = ""
+			case "command_hash":
+				p.CommandHash = ""
+			}
+			if _, err := v.VerifyAndMarkExecuting(p); err == nil || err.Error() != field+" is required" {
+				t.Fatalf("missing %s: %v", field, err)
+			}
+		})
 	}
 }
 
-func TestVerifier_VerifyExecutionAllowed_NotApproved(t *testing.T) {
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	createTestSession(t, database, "sess1")
-	createTestRequest(t, database, "req1", "sess1", db.StatusPending, 1)
-
-	result, err := v.VerifyExecutionAllowed("req1", "sess1")
+func TestVerifier_ConcurrentClaims(t *testing.T) {
+	var p VerifyExecuteParams
+	// Independent DB handles exercise SQLite locking, not a Go mutex.
+	path := filepath.Join(t.TempDir(), "race.db")
+	other, err := db.Open(path)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatal(err)
 	}
-	if result.Allowed {
-		t.Error("expected Allowed=false for pending request")
+	t.Cleanup(func() { _ = other.Close() })
+	requestor := createTestSession(t, other, "requestor")
+	executor := createTestSession(t, other, "executor")
+	reviewer := createTestSession(t, other, "reviewer")
+	request := createTestRequest(t, other, "race", requestor.ID, db.StatusApproved, 1)
+	createTestReview(t, other, request.ID, reviewer.ID, db.DecisionApprove)
+	p.RequestID, p.SessionID, p.SessionKey, p.CommandHash = request.ID, executor.ID, executor.SessionKey, request.Command.Hash
+	var winners atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < 8; i++ {
+		conn, err := db.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		wg.Add(1)
+		go func(d *db.DB) {
+			defer wg.Done()
+			<-start
+			result, err := NewVerifier(d).VerifyAndMarkExecuting(p)
+			if err != nil {
+				t.Errorf("claim: %v", err)
+				return
+			}
+			if result.Allowed {
+				winners.Add(1)
+			}
+		}(conn)
 	}
-	if result.Reason == "" {
-		t.Error("expected reason to be set")
-	}
-}
-
-func TestVerifier_VerifyExecutionAllowed_ExpiredApproval(t *testing.T) {
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	createTestSession(t, database, "sess1")
-
-	// Create a request with expired approval
-	now := time.Now().UTC()
-	expiresAt := now.Add(30 * time.Minute)
-	approvalExpiresAt := now.Add(-1 * time.Minute) // Already expired
-
-	request := &db.Request{
-		ID:          "req-expired",
-		ProjectPath: "/test/project",
-		Command: db.CommandSpec{
-			Raw:  "rm -rf /tmp/test",
-			Cwd:  "/tmp",
-			Hash: "testhash123",
-		},
-		RiskTier:           db.RiskTierDangerous,
-		RequestorSessionID: "sess1",
-		RequestorAgent:     "TestAgent",
-		RequestorModel:     "test-model",
-		Justification: db.Justification{
-			Reason: "Testing execution",
-		},
-		Status:            db.StatusApproved,
-		MinApprovals:      1,
-		ExpiresAt:         &expiresAt,
-		ApprovalExpiresAt: &approvalExpiresAt,
-	}
-	if err := database.CreateRequest(request); err != nil {
-		t.Fatalf("failed to create request: %v", err)
-	}
-
-	// Add approval
-	createTestSession(t, database, "reviewer-sess")
-	createTestReview(t, database, "req-expired", "reviewer-sess", db.DecisionApprove)
-
-	result, err := v.VerifyExecutionAllowed("req-expired", "sess1")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Allowed {
-		t.Error("expected Allowed=false for expired approval")
-	}
-	if result.Reason != "approval has expired" {
-		t.Errorf("expected reason 'approval has expired', got %q", result.Reason)
+	close(start)
+	wg.Wait()
+	if winners.Load() != 1 {
+		t.Fatalf("got %d winners, want exactly one", winners.Load())
 	}
 }
 
-func TestVerifier_VerifyExecutionAllowed_InsufficientApprovals(t *testing.T) {
-	database := setupTestDB(t)
-	v := NewVerifier(database)
+func completionFor(p VerifyExecuteParams, result *VerificationResult) CompleteExecuteParams {
+	zero, duration := 0, int64(23)
+	return CompleteExecuteParams{RequestID: p.RequestID, SessionID: p.SessionID, SessionKey: p.SessionKey,
+		ExecutionReceipt: result.ExecutionReceipt, Status: db.StatusExecuted, ExitCode: &zero, DurationMs: &duration}
+}
 
-	createTestSession(t, database, "sess1")
-	createTestRequest(t, database, "req1", "sess1", db.StatusApproved, 2)
-
-	// Only add 1 approval when 2 are required
-	createTestSession(t, database, "reviewer-sess")
-	createTestReview(t, database, "req1", "reviewer-sess", db.DecisionApprove)
-
-	result, err := v.VerifyExecutionAllowed("req1", "sess1")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Allowed {
-		t.Error("expected Allowed=false for insufficient approvals")
-	}
-	if result.Reason == "" {
-		t.Error("expected reason to be set")
+func TestVerifier_CompletionOutcomes(t *testing.T) {
+	for _, status := range []db.RequestStatus{db.StatusExecuted, db.StatusExecutionFailed, db.StatusTimedOut} {
+		t.Run(string(status), func(t *testing.T) {
+			database, v, p := notaryFixture(t)
+			claim := requireNotaryClaim(t, v, p)
+			report := completionFor(p, claim)
+			report.Status = status
+			if status != db.StatusExecuted {
+				report.ExitCode = nil
+			}
+			if err := v.MarkExecutionComplete(report); err != nil {
+				t.Fatal(err)
+			}
+			stored, err := database.GetRequest(p.RequestID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.Status != status || stored.Execution.LogPath != claim.ExecutionReceipt ||
+				stored.Execution.ExecutedByAgent != claim.Request.Execution.ExecutedByAgent ||
+				stored.Execution.DurationMs == nil || *stored.Execution.DurationMs != 23 {
+				t.Fatalf("incorrect outcome: %+v", stored)
+			}
+			if err := v.MarkExecutionComplete(report); err == nil {
+				t.Fatal("completion replay accepted")
+			}
+			if next, err := v.VerifyAndMarkExecuting(p); err != nil || next.Allowed {
+				t.Fatalf("terminal claim reissued: %+v %v", next, err)
+			}
+		})
 	}
 }
 
-func TestVerifier_VerifyExecutionAllowed_Success(t *testing.T) {
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	createTestSession(t, database, "sess1")
-	createTestRequest(t, database, "req1", "sess1", db.StatusApproved, 1)
-
-	createTestSession(t, database, "reviewer-sess")
-	createTestReview(t, database, "req1", "reviewer-sess", db.DecisionApprove)
-
-	result, err := v.VerifyExecutionAllowed("req1", "sess1")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !result.Allowed {
-		t.Errorf("expected Allowed=true, got false (reason: %s)", result.Reason)
-	}
-	if result.Request == nil {
-		t.Error("expected Request to be set when allowed")
-	}
-	if result.ApprovalRemainingSeconds <= 0 {
-		t.Error("expected positive ApprovalRemainingSeconds")
-	}
-}
-
-func TestVerifier_VerifyAndMarkExecuting_Success(t *testing.T) {
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	createTestSession(t, database, "sess1")
-	createTestRequest(t, database, "req1", "sess1", db.StatusApproved, 1)
-
-	createTestSession(t, database, "reviewer-sess")
-	createTestReview(t, database, "req1", "reviewer-sess", db.DecisionApprove)
-
-	result, err := v.VerifyAndMarkExecuting("req1", "sess1")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !result.Allowed {
-		t.Errorf("expected Allowed=true, got false (reason: %s)", result.Reason)
-	}
-
-	// Verify status was updated
-	request, err := database.GetRequest("req1")
-	if err != nil {
-		t.Fatalf("failed to get request: %v", err)
-	}
-	if request.Status != db.StatusExecuting {
-		t.Errorf("expected status %s, got %s", db.StatusExecuting, request.Status)
+func TestVerifier_CompletionOwnershipAndValidation(t *testing.T) {
+	for _, mode := range []string{"wrong key", "wrong receipt", "local log", "other session", "rotated key", "invalid status", "missing exit", "nonzero success", "negative duration"} {
+		t.Run(mode, func(t *testing.T) {
+			database, v, p := notaryFixture(t)
+			claim := requireNotaryClaim(t, v, p)
+			report := completionFor(p, claim)
+			switch mode {
+			case "wrong key":
+				report.SessionKey = strings.Repeat("f", 64)
+			case "wrong receipt":
+				report.ExecutionReceipt = "notary:" + strings.Repeat("f", 64)
+			case "local log":
+				report.ExecutionReceipt = "/tmp/local.log"
+			case "other session":
+				other := createTestSession(t, database, "other")
+				report.SessionID, report.SessionKey = other.ID, other.SessionKey
+			case "rotated key":
+				notarySQL(t, database, "UPDATE sessions SET session_key = ? WHERE id = ?", strings.Repeat("f", 64), p.SessionID)
+			case "invalid status":
+				report.Status = db.StatusApproved
+			case "missing exit":
+				report.ExitCode = nil
+			case "nonzero success":
+				code := 1
+				report.ExitCode = &code
+			case "negative duration":
+				duration := int64(-1)
+				report.DurationMs = &duration
+			}
+			if err := v.MarkExecutionComplete(report); err == nil {
+				t.Fatalf("accepted %s", mode)
+			}
+			stored, err := database.GetRequest(p.RequestID)
+			if err != nil || stored.Status != db.StatusExecuting || stored.Execution.ExitCode != nil {
+				t.Fatalf("invalid report modified execution: %+v %v", stored, err)
+			}
+		})
 	}
 }
 
-func TestVerifier_VerifyAndMarkExecuting_RaceCondition(t *testing.T) {
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	createTestSession(t, database, "sess1")
-	createTestRequest(t, database, "req1", "sess1", db.StatusApproved, 1)
-
-	createTestSession(t, database, "reviewer-sess")
-	createTestReview(t, database, "req1", "reviewer-sess", db.DecisionApprove)
-
-	// First executor wins
-	result1, err := v.VerifyAndMarkExecuting("req1", "sess1")
-	if err != nil {
-		t.Fatalf("first VerifyAndMarkExecuting failed: %v", err)
-	}
-	if !result1.Allowed {
-		t.Errorf("expected first executor to be allowed, got false (reason: %s)", result1.Reason)
-	}
-
-	// Second executor should fail
-	result2, err := v.VerifyAndMarkExecuting("req1", "sess1")
-	if err != nil {
-		t.Fatalf("second VerifyAndMarkExecuting returned error: %v", err)
-	}
-	if result2.Allowed {
-		t.Error("expected second executor to be denied")
+func TestVerifier_EndedSessionCanComplete(t *testing.T) {
+	database, v, p := notaryFixture(t)
+	claim := requireNotaryClaim(t, v, p)
+	notarySQL(t, database, "UPDATE sessions SET ended_at = ? WHERE id = ?", time.Now().UTC().Format(time.RFC3339), p.SessionID)
+	if err := v.MarkExecutionComplete(completionFor(p, claim)); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestVerifier_MarkExecutionComplete_Success(t *testing.T) {
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	createTestSession(t, database, "sess1")
-	createTestRequest(t, database, "req1", "sess1", db.StatusApproved, 1)
-
-	createTestSession(t, database, "reviewer-sess")
-	createTestReview(t, database, "req1", "reviewer-sess", db.DecisionApprove)
-
-	// Mark as executing first
-	_, err := v.VerifyAndMarkExecuting("req1", "sess1")
-	if err != nil {
-		t.Fatalf("VerifyAndMarkExecuting failed: %v", err)
-	}
-
-	// Mark as complete
-	if err := v.MarkExecutionComplete("req1", 0, true); err != nil {
-		t.Fatalf("MarkExecutionComplete failed: %v", err)
-	}
-
-	// Verify status
-	request, err := database.GetRequest("req1")
-	if err != nil {
-		t.Fatalf("failed to get request: %v", err)
-	}
-	if request.Status != db.StatusExecuted {
-		t.Errorf("expected status %s, got %s", db.StatusExecuted, request.Status)
-	}
-}
-
-func TestVerifier_MarkExecutionComplete_Failure(t *testing.T) {
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	createTestSession(t, database, "sess1")
-	createTestRequest(t, database, "req1", "sess1", db.StatusApproved, 1)
-
-	createTestSession(t, database, "reviewer-sess")
-	createTestReview(t, database, "req1", "reviewer-sess", db.DecisionApprove)
-
-	// Mark as executing first
-	_, err := v.VerifyAndMarkExecuting("req1", "sess1")
-	if err != nil {
-		t.Fatalf("VerifyAndMarkExecuting failed: %v", err)
-	}
-
-	// Mark as failed
-	if err := v.MarkExecutionComplete("req1", 1, false); err != nil {
-		t.Fatalf("MarkExecutionComplete failed: %v", err)
-	}
-
-	// Verify status
-	request, err := database.GetRequest("req1")
-	if err != nil {
-		t.Fatalf("failed to get request: %v", err)
-	}
-	if request.Status != db.StatusExecutionFailed {
-		t.Errorf("expected status %s, got %s", db.StatusExecutionFailed, request.Status)
-	}
-}
-
-func TestVerifier_MarkExecutionComplete_WrongStatus(t *testing.T) {
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	createTestSession(t, database, "sess1")
-	createTestRequest(t, database, "req1", "sess1", db.StatusApproved, 1)
-
-	// Try to mark complete without first marking as executing
-	err := v.MarkExecutionComplete("req1", 0, true)
-	if err == nil {
-		t.Fatal("expected error when marking complete on non-executing request")
-	}
-}
-
-func TestVerifier_MarkExecutionComplete_MissingRequestID(t *testing.T) {
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	err := v.MarkExecutionComplete("", 0, true)
-	if err == nil {
-		t.Fatal("expected error for missing request_id")
-	}
-}
-
-func TestVerificationResult_ToIPCResponse(t *testing.T) {
-	result := &VerificationResult{
-		Allowed:                  true,
-		Reason:                   "",
-		ApprovalRemainingSeconds: 300,
-		Request: &db.Request{
-			ID: "req-123",
-			Command: db.CommandSpec{
-				Raw:  "echo hello",
-				Hash: "abc123",
-			},
-			RiskTier: db.RiskTierCaution,
-		},
-	}
-
-	resp := result.ToIPCResponse()
-
-	if !resp.Allowed {
-		t.Error("expected Allowed=true")
-	}
-	if resp.RequestID != "req-123" {
-		t.Errorf("expected RequestID 'req-123', got %q", resp.RequestID)
-	}
-	if resp.Command != "echo hello" {
-		t.Errorf("expected Command 'echo hello', got %q", resp.Command)
-	}
-	if resp.CommandHash != "abc123" {
-		t.Errorf("expected CommandHash 'abc123', got %q", resp.CommandHash)
-	}
-	if resp.RiskTier != "caution" {
-		t.Errorf("expected RiskTier 'caution', got %q", resp.RiskTier)
-	}
-	if resp.ApprovalRemainingSeconds != 300 {
-		t.Errorf("expected ApprovalRemainingSeconds 300, got %d", resp.ApprovalRemainingSeconds)
-	}
-}
-
-func TestVerificationResult_ToIPCResponse_Denied(t *testing.T) {
-	result := &VerificationResult{
-		Allowed: false,
-		Reason:  "request is not approved",
-	}
-
-	resp := result.ToIPCResponse()
-
-	if resp.Allowed {
-		t.Error("expected Allowed=false")
-	}
-	if resp.Reason != "request is not approved" {
-		t.Errorf("expected Reason 'request is not approved', got %q", resp.Reason)
-	}
-	if resp.RequestID != "" {
-		t.Errorf("expected empty RequestID for denied request, got %q", resp.RequestID)
-	}
-}
-
-func TestVerifier_NilApprovalExpiresAt(t *testing.T) {
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	createTestSession(t, database, "sess1")
-
-	// Create request without ApprovalExpiresAt
-	now := time.Now().UTC()
-	expiresAt := now.Add(30 * time.Minute)
-
-	request := &db.Request{
-		ID:          "req-no-approval-expiry",
-		ProjectPath: "/test/project",
-		Command: db.CommandSpec{
-			Raw:  "echo test",
-			Cwd:  "/tmp",
-			Hash: "testhash",
-		},
-		RiskTier:           db.RiskTierDangerous,
-		RequestorSessionID: "sess1",
-		RequestorAgent:     "TestAgent",
-		RequestorModel:     "test-model",
-		Justification: db.Justification{
-			Reason: "Testing",
-		},
-		Status:            db.StatusApproved,
-		MinApprovals:      1,
-		ExpiresAt:         &expiresAt,
-		ApprovalExpiresAt: nil, // No approval expiry set
-	}
-	if err := database.CreateRequest(request); err != nil {
-		t.Fatalf("failed to create request: %v", err)
-	}
-
-	createTestSession(t, database, "reviewer-sess")
-	createTestReview(t, database, "req-no-approval-expiry", "reviewer-sess", db.DecisionApprove)
-
-	result, err := v.VerifyExecutionAllowed("req-no-approval-expiry", "sess1")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Allowed {
-		t.Error("expected Allowed=false when ApprovalExpiresAt is nil")
-	}
-	if result.Reason != "approval_expires_at is not set" {
-		t.Errorf("expected reason 'approval_expires_at is not set', got %q", result.Reason)
-	}
-}
-
-func TestVerifier_RevertExecutingOnFailure_MissingRequestID(t *testing.T) {
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	err := v.RevertExecutingOnFailure("")
-	if err == nil {
-		t.Fatal("expected error for missing request_id")
-	}
-	if err.Error() != "request_id is required" {
-		t.Errorf("expected error 'request_id is required', got %q", err.Error())
-	}
-}
-
-func TestVerifier_RevertExecutingOnFailure_RequestNotFound(t *testing.T) {
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	err := v.RevertExecutingOnFailure("nonexistent-id")
-	if err == nil {
-		t.Fatal("expected error for nonexistent request")
-	}
-}
-
-func TestVerifier_RevertExecutingOnFailure_WrongStatus(t *testing.T) {
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	createTestSession(t, database, "sess1")
-	createTestRequest(t, database, "req1", "sess1", db.StatusApproved, 1)
-
-	// Try to revert when status is APPROVED (not EXECUTING)
-	err := v.RevertExecutingOnFailure("req1")
-	if err == nil {
-		t.Fatal("expected error when request is not executing")
-	}
-	if err.Error() != "request status is approved, expected executing" {
-		t.Errorf("expected status error, got %q", err.Error())
-	}
-}
-
-func TestVerifier_RevertExecutingOnFailure_Success(t *testing.T) {
-	// Test that EXECUTING -> APPROVED transition works for pre-execution failure reverts.
-	// This allows execution to be retried if setup fails before the command runs.
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	createTestSession(t, database, "sess1")
-	createTestRequest(t, database, "req1", "sess1", db.StatusApproved, 1)
-
-	createTestSession(t, database, "reviewer-sess")
-	createTestReview(t, database, "req1", "reviewer-sess", db.DecisionApprove)
-
-	// First mark as executing
-	_, err := v.VerifyAndMarkExecuting("req1", "sess1")
-	if err != nil {
-		t.Fatalf("VerifyAndMarkExecuting failed: %v", err)
-	}
-
-	// Verify it's executing
-	req, _ := database.GetRequest("req1")
-	if req.Status != db.StatusExecuting {
-		t.Fatalf("expected status EXECUTING, got %s", req.Status)
-	}
-
-	// Revert should succeed, transitioning back to APPROVED
-	err = v.RevertExecutingOnFailure("req1")
-	if err != nil {
-		t.Fatalf("RevertExecutingOnFailure failed: %v", err)
-	}
-
-	// Status should now be APPROVED
-	req, _ = database.GetRequest("req1")
-	if req.Status != db.StatusApproved {
-		t.Errorf("expected status %s after revert, got %s", db.StatusApproved, req.Status)
-	}
-}
-
-func TestVerifier_RevertExecutingOnFailure_ExpiredApproval(t *testing.T) {
-	// When approval has expired during execution, revert should transition to TIMED_OUT
-	// instead of APPROVED, since the request cannot be retried.
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	createTestSession(t, database, "sess1")
-
-	// Create request with approval that will expire
-	now := time.Now().UTC()
-	expiresAt := now.Add(30 * time.Minute)
-	approvalExpiresAt := now.Add(-1 * time.Minute) // Already expired
-
-	request := &db.Request{
-		ID:          "req-expired-approval",
-		ProjectPath: "/test/project",
-		Command: db.CommandSpec{
-			Raw:  "rm -rf /tmp/test",
-			Cwd:  "/tmp",
-			Hash: "testhash123",
-		},
-		RiskTier:           db.RiskTierDangerous,
-		RequestorSessionID: "sess1",
-		RequestorAgent:     "TestAgent",
-		RequestorModel:     "test-model",
-		Justification: db.Justification{
-			Reason: "Testing execution",
-		},
-		Status:            db.StatusExecuting, // Already executing
-		MinApprovals:      1,
-		ExpiresAt:         &expiresAt,
-		ApprovalExpiresAt: &approvalExpiresAt, // Already expired
-	}
-	if err := database.CreateRequest(request); err != nil {
-		t.Fatalf("failed to create request: %v", err)
-	}
-
-	// Revert transitions to TIMED_OUT when approval has expired
-	err := v.RevertExecutingOnFailure("req-expired-approval")
-	if err != nil {
-		t.Fatalf("RevertExecutingOnFailure failed: %v", err)
-	}
-
-	// Status should now be TIMED_OUT
-	req, _ := database.GetRequest("req-expired-approval")
-	if req.Status != db.StatusTimedOut {
-		t.Errorf("expected status %s after expired revert, got %s", db.StatusTimedOut, req.Status)
-	}
-}
-
-func TestVerifier_RevertExecutingOnFailure_NilApprovalExpiry(t *testing.T) {
-	// When ApprovalExpiresAt is nil, it's treated as "not expired",
-	// so revert should transition back to APPROVED.
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	createTestSession(t, database, "sess1")
-
-	// Create request without approval expiry
-	now := time.Now().UTC()
-	expiresAt := now.Add(30 * time.Minute)
-
-	request := &db.Request{
-		ID:          "req-nil-expiry",
-		ProjectPath: "/test/project",
-		Command: db.CommandSpec{
-			Raw:  "echo test",
-			Cwd:  "/tmp",
-			Hash: "testhash",
-		},
-		RiskTier:           db.RiskTierCaution,
-		RequestorSessionID: "sess1",
-		RequestorAgent:     "TestAgent",
-		RequestorModel:     "test-model",
-		Justification: db.Justification{
-			Reason: "Testing",
-		},
-		Status:            db.StatusExecuting,
-		MinApprovals:      1,
-		ExpiresAt:         &expiresAt,
-		ApprovalExpiresAt: nil, // No approval expiry - treated as "not expired"
-	}
-	if err := database.CreateRequest(request); err != nil {
-		t.Fatalf("failed to create request: %v", err)
-	}
-
-	// Revert should succeed, transitioning to APPROVED
-	err := v.RevertExecutingOnFailure("req-nil-expiry")
-	if err != nil {
-		t.Fatalf("RevertExecutingOnFailure failed: %v", err)
-	}
-
-	// Status should now be APPROVED
-	req, _ := database.GetRequest("req-nil-expiry")
-	if req.Status != db.StatusApproved {
-		t.Errorf("expected status %s after revert, got %s", db.StatusApproved, req.Status)
-	}
-}
-
-func TestVerifier_VerifyAndMarkExecuting_NotAllowed(t *testing.T) {
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	createTestSession(t, database, "sess1")
-	// Create with PENDING status - should not be allowed
-	createTestRequest(t, database, "req1", "sess1", db.StatusPending, 1)
-
-	result, err := v.VerifyAndMarkExecuting("req1", "sess1")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Allowed {
-		t.Error("expected Allowed=false for pending request")
-	}
-
-	// Status should still be pending
-	req, _ := database.GetRequest("req1")
-	if req.Status != db.StatusPending {
-		t.Errorf("expected status to remain %s, got %s", db.StatusPending, req.Status)
-	}
-}
-
-func TestVerifier_MarkExecutionComplete_RequestNotFound(t *testing.T) {
-	database := setupTestDB(t)
-	v := NewVerifier(database)
-
-	err := v.MarkExecutionComplete("nonexistent-id", 0, true)
-	if err == nil {
-		t.Fatal("expected error for nonexistent request")
+func TestVerifier_DatabaseFailuresNeverAuthorize(t *testing.T) {
+	for _, boundary := range []string{"claim", "completion"} {
+		t.Run(boundary, func(t *testing.T) {
+			database, v, p := notaryFixture(t)
+			var claim *VerificationResult
+			if boundary == "completion" {
+				claim = requireNotaryClaim(t, v, p)
+			}
+			next := "executing"
+			if boundary == "completion" {
+				next = "executed"
+			}
+			notarySQL(t, database, fmt.Sprintf(`CREATE TRIGGER fail_notary BEFORE UPDATE OF status ON requests
+			WHEN NEW.status = '%s' BEGIN SELECT RAISE(ABORT, 'injected persistence failure'); END`, next))
+			if boundary == "claim" {
+				result, err := v.VerifyAndMarkExecuting(p)
+				if err == nil || result != nil {
+					t.Fatalf("failed claim granted permission: %+v %v", result, err)
+				}
+			} else if err := v.MarkExecutionComplete(completionFor(p, claim)); err == nil {
+				t.Fatal("failed completion reported success")
+			}
+			stored, err := database.GetRequest(p.RequestID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if boundary == "claim" && (stored.Status != db.StatusApproved || stored.Execution != nil) {
+				t.Fatal("failed claim partially persisted")
+			}
+			if boundary == "completion" && (stored.Status != db.StatusExecuting || stored.Execution.ExitCode != nil) {
+				t.Fatal("failed completion partially persisted")
+			}
+		})
 	}
 }

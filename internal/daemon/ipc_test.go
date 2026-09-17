@@ -965,7 +965,7 @@ func TestIPCServer_handleVerifyExecute_RequestNotFound(t *testing.T) {
 
 	req := RPCRequest{
 		Method: "verify_execute",
-		Params: json.RawMessage(`{"request_id":"does-not-exist","session_id":"sess-1"}`),
+		Params: json.RawMessage(`{"request_id":"does-not-exist","session_id":"sess-1","session_key":"missing","command_hash":"missing"}`),
 		ID:     1,
 	}
 
@@ -983,7 +983,14 @@ func TestIPCServer_handleVerifyExecute_AllowedMarksExecuting(t *testing.T) {
 
 	database := setupTestDB(t)
 	requestor := createTestSession(t, database, "sess-requestor")
-	createTestRequest(t, database, "req-1", requestor.ID, db.StatusApproved, 1)
+	request := createTestRequest(t, database, "req-1", requestor.ID, db.StatusApproved, 1)
+	executor := createTestSession(t, database, "sess-executor")
+	params, err := json.Marshal(VerifyExecuteParams{
+		RequestID: request.ID, SessionID: executor.ID, SessionKey: executor.SessionKey, CommandHash: request.Command.Hash,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	reviewer := createTestSession(t, database, "sess-reviewer")
 	createTestReview(t, database, "req-1", reviewer.ID, db.DecisionApprove)
@@ -993,7 +1000,7 @@ func TestIPCServer_handleVerifyExecute_AllowedMarksExecuting(t *testing.T) {
 
 	req := RPCRequest{
 		Method: "verify_execute",
-		Params: json.RawMessage(`{"request_id":"req-1","session_id":"sess-executor"}`),
+		Params: params,
 		ID:     1,
 	}
 
@@ -1027,7 +1034,14 @@ func TestIPCServer_handleVerifyExecute_DeniedDoesNotMarkExecuting(t *testing.T) 
 
 	database := setupTestDB(t)
 	requestor := createTestSession(t, database, "sess-requestor")
-	createTestRequest(t, database, "req-1", requestor.ID, db.StatusApproved, 2)
+	request := createTestRequest(t, database, "req-1", requestor.ID, db.StatusApproved, 2)
+	executor := createTestSession(t, database, "sess-executor")
+	params, err := json.Marshal(VerifyExecuteParams{
+		RequestID: request.ID, SessionID: executor.ID, SessionKey: executor.SessionKey, CommandHash: request.Command.Hash,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	reviewer := createTestSession(t, database, "sess-reviewer")
 	createTestReview(t, database, "req-1", reviewer.ID, db.DecisionApprove)
@@ -1037,7 +1051,7 @@ func TestIPCServer_handleVerifyExecute_DeniedDoesNotMarkExecuting(t *testing.T) 
 
 	req := RPCRequest{
 		Method: "verify_execute",
-		Params: json.RawMessage(`{"request_id":"req-1","session_id":"sess-executor"}`),
+		Params: params,
 		ID:     1,
 	}
 
