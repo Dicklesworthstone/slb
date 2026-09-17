@@ -178,7 +178,7 @@ func runHookInstall(cmd *cobra.Command, args []string) error {
 
 	outputDir := filepath.Join(home, ".slb", "hooks")
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory %s: %w", err)
+		return fmt.Errorf("failed to create directory %s: %w", outputDir, err)
 	}
 
 	// Same custom-pattern merge as runHookGenerate — install must

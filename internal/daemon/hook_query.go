@@ -24,7 +24,7 @@ type HookQueryResult struct {
 	Message        string `json:"message"`              // Human-readable message
 	Tier           string `json:"tier"`                 // Risk tier
 	MatchedPattern string `json:"matched_pattern"`      // Pattern that matched
-	MinApprovals   int    `json:"min_approvals"`          // Required approvals
+	MinApprovals   int    `json:"min_approvals"`        // Required approvals
 	RequestID      string `json:"request_id,omitempty"` // If pending approval exists
 	AuditRecorded  bool   `json:"audit_recorded,omitempty"`
 	AuditError     string `json:"audit_error,omitempty"`
