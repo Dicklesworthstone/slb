@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/audit"
 	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
@@ -23,8 +24,10 @@ type HookQueryResult struct {
 	Message        string `json:"message"`              // Human-readable message
 	Tier           string `json:"tier"`                 // Risk tier
 	MatchedPattern string `json:"matched_pattern"`      // Pattern that matched
-	MinApprovals   int    `json:"min_approvals"`        // Required approvals
+	MinApprovals   int    `json:"min_approvals"`          // Required approvals
 	RequestID      string `json:"request_id,omitempty"` // If pending approval exists
+	AuditRecorded  bool   `json:"audit_recorded,omitempty"`
+	AuditError     string `json:"audit_error,omitempty"`
 }
 
 // handleHookQuery processes a hook query request.
@@ -45,11 +48,37 @@ func (s *IPCServer) handleHookQuery(req RPCRequest) *RPCResponse {
 	}
 
 	result := s.classifyCommand(params)
+	if result.Action == "block" || result.Action == "ask" {
+		directory, err := audit.DefaultDirectory()
+		if err == nil {
+			err = recordHookAudit(directory, params, result)
+		}
+		result.AuditRecorded = err == nil
+		if err != nil {
+			// Preserve the safety decision even when logging is unavailable.
+			// The generated hook can retry locally and expose the failure.
+			result.AuditError = err.Error()
+		}
+	}
 
 	return &RPCResponse{
 		Result: result,
 		ID:     req.ID,
 	}
+}
+
+func recordHookAudit(directory string, params HookQueryParams, result *HookQueryResult) error {
+	return audit.Record(directory, audit.Event{
+		CommandRedacted: core.ApplyRedaction(params.Command, nil),
+		CommandHash:     audit.CommandHash(params.Command, params.CWD),
+		CWD:             params.CWD,
+		SessionID:       params.SessionID,
+		Action:          result.Action,
+		Tier:            result.Tier,
+		MatchedPattern:  result.MatchedPattern,
+		MinApprovals:    result.MinApprovals,
+		Source:          "daemon",
+	})
 }
 
 // classifyCommand classifies a command and checks for existing approvals.
