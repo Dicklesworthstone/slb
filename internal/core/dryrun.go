@@ -151,6 +151,7 @@ func parsePreviewTokens(raw string, depth int) ([]string, bool) {
 
 func hasLiteralPreviewSyntax(raw string) bool {
 	var single, double, escaped bool
+	wordStart := true
 	for _, r := range raw {
 		if r == 0 {
 			return false
@@ -162,9 +163,11 @@ func hasLiteralPreviewSyntax(raw string) bool {
 				return false
 			}
 			escaped = false
+			wordStart = false
 			continue
 		}
 		if single {
+			wordStart = false
 			if r == '\'' {
 				single = false
 			}
@@ -172,22 +175,31 @@ func hasLiteralPreviewSyntax(raw string) bool {
 		}
 		if r == '\\' {
 			escaped = true
+			wordStart = false
 			continue
 		}
 		if r == '"' {
 			double = !double
+			wordStart = false
 			continue
 		}
 		if r == '\'' && !double {
 			single = true
+			wordStart = false
 			continue
 		}
 		if r == '$' || r == '`' {
 			return false
 		}
-		if !double && strings.ContainsRune(";|&<>\n\r(){}*?[]~#", r) {
+		if !double && strings.ContainsRune(";|&<>\n\r(){}*?[]", r) {
 			return false
 		}
+		// Tildes and hashes inside a word are literal (HEAD~1, file#name).
+		// Only an unquoted word-start tilde/comment changes shell semantics.
+		if !double && wordStart && (r == '~' || r == '#') {
+			return false
+		}
+		wordStart = !double && (r == ' ' || r == '\t')
 	}
 	return !single && !double && !escaped
 }
@@ -204,7 +216,14 @@ func transformDryRunTokens(tokens []string) ([]string, bool) {
 	case "rm":
 		return dryRunRM(tokens)
 	case "git":
-		return dryRunGit(tokens)
+		preview, ok := dryRunGit(tokens)
+		if !ok {
+			return nil, false
+		}
+		// Git's normal diff presentation can execute repository-configured
+		// external diff/textconv programs. Suppress those at the common
+		// preview boundary for both raw commands and authoritative argv.
+		return append([]string{"git", "diff", "--no-ext-diff", "--no-textconv"}, preview[2:]...), true
 	case "helm":
 		return dryRunHelm(tokens)
 	default:

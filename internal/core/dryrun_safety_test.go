@@ -2,6 +2,7 @@ package core
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -146,6 +147,8 @@ func TestPreviewPreservesLiteralArgumentBoundaries(t *testing.T) {
 		{`rm -- "price\$5"`, []string{"ls", "-la", "--", "price$5"}},
 		{`rm -- 'a\b'`, []string{"ls", "-la", "--", `a\b`}},
 		{`rm -- ''`, []string{"ls", "-la", "--", ""}},
+		{`rm -- file~backup#suffix`, []string{"ls", "-la", "--", "file~backup#suffix"}},
+		{`git reset --hard HEAD~1`, []string{"git", "diff", "--no-ext-diff", "--no-textconv", "HEAD~1..HEAD"}},
 		{`bash -c 'rm -rf "directory with spaces"'`, []string{"ls", "-la", "--", "directory with spaces"}},
 		{`sudo rm -rf 'directory with spaces'`, []string{"ls", "-la", "--", "directory with spaces"}},
 		{`kubectl delete pod --selector='env in (one, two)'`, []string{"kubectl", "delete", "--dry-run=client", "-o", "yaml", "pod", "--selector=env in (one, two)"}},
@@ -177,6 +180,7 @@ func TestPreviewRejectsDynamicOrContextChangingCommands(t *testing.T) {
 		"rm -rf `printf target`",
 		`rm *.log`,
 		`rm ~/cache`,
+		`rm ~other/cache`,
 		`rm file > evidence.txt`,
 		`rm file # ignored-by-shell`,
 		"rm \\\nfile",
@@ -278,5 +282,98 @@ func TestRunDryRunUsesExecutionArgv(t *testing.T) {
 		if got, err := os.ReadFile(filepath.Join(directory, name)); err != nil || string(got) != "untouched" {
 			t.Fatalf("preview modified %q: %q, %v", name, got, err)
 		}
+	}
+}
+
+func TestGitPreviewDoesNotRunConfiguredDiffPrograms(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("custom diff fixture uses a POSIX shell script")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is unavailable")
+	}
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(t.TempDir(), "absent-config"))
+	t.Setenv("GIT_EXTERNAL_DIFF", "")
+	if err := os.Unsetenv("GIT_EXTERNAL_DIFF"); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"external", "textconv"} {
+		t.Run(kind, func(t *testing.T) {
+			directory := t.TempDir()
+			git := func(args ...string) string {
+				t.Helper()
+				command := exec.Command("git", args...)
+				command.Dir = directory
+				output, err := command.CombinedOutput()
+				if err != nil {
+					t.Fatalf("git %q: %v: %s", args, err, output)
+				}
+				return string(output)
+			}
+			git("init", "-q")
+			git("config", "user.name", "SLB preview test")
+			git("config", "user.email", "slb-preview@example.invalid")
+			git("config", "commit.gpgsign", "false")
+			if err := os.WriteFile(filepath.Join(directory, ".gitattributes"), []byte("tracked.txt diff=slbpreview\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			for _, content := range []string{"old\n", "new\n"} {
+				if err := os.WriteFile(filepath.Join(directory, "tracked.txt"), []byte(content), 0600); err != nil {
+					t.Fatal(err)
+				}
+				git("add", ".gitattributes", "tracked.txt")
+				git("commit", "-qm", "preview fixture")
+			}
+			marker := filepath.Join(directory, "custom-program-ran")
+			t.Setenv("SLB_TEST_DIFF_MARKER", marker)
+			program := filepath.Join(directory, "custom-diff.sh")
+			if err := os.WriteFile(program, []byte("#!/bin/sh\nprintf 'invoked\\n' >> \"$SLB_TEST_DIFF_MARKER\"\nprintf 'custom output\\n'\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if kind == "external" {
+				git("config", "diff.external", program)
+				t.Setenv("GIT_EXTERNAL_DIFF", program)
+			} else {
+				git("config", "diff.slbpreview.textconv", program)
+			}
+
+			// Demonstrate that ordinary git diff really executes the configured
+			// program; the fixture only writes to a disposable marker file.
+			git("diff", "HEAD~1..HEAD")
+			if contents, err := os.ReadFile(marker); err != nil || len(contents) == 0 {
+				t.Fatalf("custom-program fixture did not run: %q, %v", contents, err)
+			}
+			if err := os.WriteFile(marker, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			head := git("rev-parse", "HEAD")
+			if preview, ok := GetDryRunCommand("git reset --hard HEAD~1"); !ok || !strings.Contains(preview, "--no-ext-diff --no-textconv") {
+				t.Fatalf("raw-command preview lost its Git revision or safety options: %q", preview)
+			}
+			result, err := RunDryRun(&db.CommandSpec{
+				Raw:  "git reset --hard HEAD~1",
+				Argv: []string{"git", "reset", "--hard", "HEAD~1"},
+				Cwd:  directory,
+			})
+			if err != nil || result == nil {
+				t.Fatalf("Git preview failed: %v, %v", result, err)
+			}
+			if contents, err := os.ReadFile(marker); err != nil || len(contents) != 0 {
+				t.Fatalf("Git preview executed %s before approval: %q, %v", kind, contents, err)
+			}
+			if !strings.Contains(result.Command, "--no-ext-diff") || !strings.Contains(result.Command, "--no-textconv") {
+				t.Fatalf("preview omitted its safety options: %s", result.Command)
+			}
+			if !strings.Contains(result.Output, "-old") || !strings.Contains(result.Output, "+new") {
+				t.Fatalf("preview did not produce the builtin diff: %q", result.Output)
+			}
+			if head != git("rev-parse", "HEAD") {
+				t.Fatal("preview changed HEAD")
+			}
+			if contents, err := os.ReadFile(filepath.Join(directory, "tracked.txt")); err != nil || string(contents) != "new\n" {
+				t.Fatalf("preview changed the working tree: %q, %v", contents, err)
+			}
+		})
 	}
 }
