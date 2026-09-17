@@ -38,6 +38,11 @@ func RunDryRun(spec *db.CommandSpec) (*db.DryRunResult, error) {
 	}
 
 	tokens, ok := getDryRunTokens(spec.Raw)
+	if !spec.Shell && len(spec.Argv) > 0 {
+		// Argv is authoritative for non-shell execution. Do not reinterpret a
+		// display string and preview different arguments from those approved.
+		tokens, ok = transformDryRunTokens(spec.Argv)
+	}
 	if !ok {
 		return nil, nil
 	}
@@ -101,26 +106,96 @@ func runDryRunProcess(ctx context.Context, tokens []string, cwd string) (string,
 }
 
 func getDryRunTokens(raw string) ([]string, bool) {
-	normalized := NormalizeCommand(raw)
-	// A preview must not silently describe only the first command in a
-	// pipeline/list, or guess at arguments after a parse failure. Classification
-	// can conservatively recover from those inputs; pre-approval execution cannot.
-	if normalized.ParseError || normalized.IsCompound || normalized.HasSubshell {
+	tokens, ok := parsePreviewTokens(raw, 0)
+	if !ok {
 		return nil, false
 	}
-	cmd := strings.TrimSpace(normalized.Primary)
-	if cmd == "" {
-		cmd = strings.TrimSpace(raw)
-	}
+	return transformDryRunTokens(tokens)
+}
 
+// parsePreviewTokens preserves argv boundaries. Display normalization loses
+// quoting and must never be reparsed for pre-approval execution. We support
+// only literal commands: no expansion, redirection, pipelines, or partial
+// parsing, and no context-changing wrapper options or environment assignments.
+func parsePreviewTokens(raw string, depth int) ([]string, bool) {
+	if depth > 8 || !hasLiteralPreviewSyntax(raw) {
+		return nil, false
+	}
 	parser := shellwords.NewParser()
 	parser.ParseEnv = false
 	parser.ParseBacktick = false
-	tokens, err := parser.Parse(cmd)
-	if err != nil || len(tokens) == 0 {
+	tokens, err := parser.Parse(raw)
+	if err != nil || parser.Position >= 0 || len(tokens) == 0 {
 		return nil, false
 	}
+	for len(tokens) > 0 {
+		switch tokens[0] {
+		case "bash", "sh", "zsh", "ksh", "dash":
+			if len(tokens) != 3 || tokens[1] != "-c" {
+				return nil, false
+			}
+			return parsePreviewTokens(tokens[2], depth+1)
+		case "sudo", "doas", "nohup", "command", "env":
+			// Bare privilege wrappers retain the existing unprivileged preview
+			// behavior. Options, assignments, and changed users are not guessed.
+			tokens = tokens[1:]
+			if len(tokens) == 0 || strings.HasPrefix(tokens[0], "-") || strings.Contains(tokens[0], "=") {
+				return nil, false
+			}
+		default:
+			return tokens, true
+		}
+	}
+	return nil, false
+}
 
+func hasLiteralPreviewSyntax(raw string) bool {
+	var single, double, escaped bool
+	for _, r := range raw {
+		if r == 0 {
+			return false
+		}
+		if escaped {
+			// The tokenizer and POSIX shells differ for these double-quoted
+			// escapes and line continuations. Decline rather than change argv.
+			if r == '\n' || r == '\r' || (double && !strings.ContainsRune("$`\"\\", r)) {
+				return false
+			}
+			escaped = false
+			continue
+		}
+		if single {
+			if r == '\'' {
+				single = false
+			}
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		if r == '"' {
+			double = !double
+			continue
+		}
+		if r == '\'' && !double {
+			single = true
+			continue
+		}
+		if r == '$' || r == '`' {
+			return false
+		}
+		if !double && strings.ContainsRune(";|&<>\n\r(){}*?[]~#", r) {
+			return false
+		}
+	}
+	return !single && !double && !escaped
+}
+
+func transformDryRunTokens(tokens []string) ([]string, bool) {
+	if len(tokens) == 0 {
+		return nil, false
+	}
 	switch tokens[0] {
 	case "kubectl":
 		return dryRunKubectl(tokens)
@@ -195,11 +270,34 @@ func dryRunKubectl(tokens []string) ([]string, bool) {
 }
 
 func dryRunTerraform(tokens []string) ([]string, bool) {
-	if len(tokens) < 2 || tokens[1] != "destroy" {
+	verb := 1
+	out := []string{"terraform"}
+	if len(tokens) > 1 && strings.HasPrefix(tokens[1], "-chdir=") {
+		if tokens[1] == "-chdir=" {
+			return nil, false
+		}
+		out = append(out, tokens[1])
+		verb++
+	}
+	if len(tokens) <= verb || tokens[verb] != "destroy" {
 		return nil, false
 	}
-	out := []string{"terraform", "plan", "-destroy"}
-	out = append(out, tokens[2:]...)
+	out = append(out, "plan", "-destroy", "-input=false")
+	for _, arg := range tokens[verb+1:] {
+		flag, _, _ := strings.Cut(arg, "=")
+		switch flag {
+		case "-auto-approve", "-input":
+			// Destroy-only approval and interactive input must not break an
+			// unattended plan. The preview always disables interactive input.
+			continue
+		case "-out", "-state-out", "-backup", "-destroy", "-refresh-only":
+			// Never generate a plan that writes a requested output file or
+			// changes planning mode behind the reviewer's back.
+			return nil, false
+		default:
+			out = append(out, arg)
+		}
+	}
 	return out, true
 }
 
@@ -240,11 +338,64 @@ func dryRunGit(tokens []string) ([]string, bool) {
 }
 
 func dryRunHelm(tokens []string) ([]string, bool) {
-	if len(tokens) < 3 || tokens[1] != "uninstall" {
+	var scope []string
+	release := ""
+	seenUninstall := false
+	for i := 1; i < len(tokens); i++ {
+		arg := tokens[i]
+		if !seenUninstall && arg == "uninstall" {
+			seenUninstall = true
+			continue
+		}
+		flag, value, equals := strings.Cut(arg, "=")
+		if strings.HasPrefix(arg, "-n") && !strings.HasPrefix(arg, "--") && len(arg) > 2 && !equals {
+			flag, value, equals = "-n", arg[2:], true
+		}
+		switch flag {
+		case "-n", "--namespace", "--kube-context", "--kubeconfig", "--kube-apiserver", "--kube-ca-file", "--kube-token", "--kube-as-user", "--kube-as-group", "--kube-tls-server-name":
+			if !equals {
+				if i+1 >= len(tokens) || strings.HasPrefix(tokens[i+1], "-") {
+					return nil, false
+				}
+				i++
+				value = tokens[i]
+			}
+			if value == "" {
+				return nil, false
+			}
+			scope = append(scope, flag+"="+value)
+		case "--kube-insecure-skip-tls-verify", "--debug":
+			if equals && value != "true" && value != "false" {
+				return nil, false
+			}
+			scope = append(scope, arg)
+		case "--wait", "--no-hooks", "--keep-history", "--ignore-not-found", "--dry-run":
+			if !seenUninstall || (equals && value != "true" && value != "false") {
+				return nil, false
+			}
+		case "--timeout", "--cascade", "--description":
+			if !seenUninstall {
+				return nil, false
+			}
+			if !equals {
+				if i+1 >= len(tokens) || strings.HasPrefix(tokens[i+1], "-") {
+					return nil, false
+				}
+				i++
+			}
+		default:
+			if !seenUninstall || strings.HasPrefix(arg, "-") || release != "" || arg == "" {
+				// Do not preview one release out of a multi-release uninstall,
+				// or silently discard an unrecognized scoping option.
+				return nil, false
+			}
+			release = arg
+		}
+	}
+	if !seenUninstall || release == "" {
 		return nil, false
 	}
-	release := tokens[2]
-	return []string{"helm", "get", "manifest", release}, true
+	return append([]string{"helm", "get", "manifest", release}, scope...), true
 }
 
 func rmTargets(args []string) []string {
