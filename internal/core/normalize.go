@@ -79,6 +79,7 @@ func splitPipesShellAware(seg string) []string {
 	inSingleQuote := false
 	inDoubleQuote := false
 	escaped := false
+	parenDepth := 0
 	runes := []rune(seg)
 
 	for i := 0; i < len(runes); i++ {
@@ -108,7 +109,14 @@ func splitPipesShellAware(seg string) []string {
 			continue
 		}
 
-		if r == '|' && !inSingleQuote && !inDoubleQuote {
+		if !inSingleQuote && !inDoubleQuote {
+			if r == '(' {
+				parenDepth++
+			} else if r == ')' && parenDepth > 0 {
+				parenDepth--
+			}
+		}
+		if r == '|' && !inSingleQuote && !inDoubleQuote && parenDepth == 0 {
 			// `||` is a compound separator, already split upstream; leave any
 			// that reaches here intact rather than treating it as two pipes.
 			if i+1 < len(runes) && runes[i+1] == '|' {
@@ -142,6 +150,21 @@ func splitCompoundShellAware(cmd string) []string {
 
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
+		// An unquoted backslash-newline is removed, not turned into a
+		// separator or a space (r\\\nm is still the executable rm).
+		if !escaped && !inSingleQuote && r == '\\' && i+1 < len(runes) && runes[i+1] == '\n' {
+			i++
+			continue
+		}
+		// Comments run to the next newline. Quote/parenthesis characters in
+		// a comment must not change the state used to find the next command.
+		if !escaped && !inSingleQuote && !inDoubleQuote && r == '#' &&
+			(i == 0 || strings.ContainsRune(" \t\r\n;|&(", runes[i-1])) {
+			for i+1 < len(runes) && runes[i+1] != '\n' {
+				i++
+			}
+			continue
+		}
 
 		// Handle escape sequences
 		if escaped {
@@ -195,8 +218,10 @@ func splitCompoundShellAware(cmd string) []string {
 				}
 			}
 
-			// Check for ; or single &
-			if r == ';' || r == '&' {
+			// Redirection operators >& / <& / &> are not command separators.
+			redirectAmp := r == '&' && ((i > 0 && strings.ContainsRune("<>", runes[i-1])) ||
+				(i+1 < len(runes) && runes[i+1] == '>'))
+			if r == ';' || r == '\n' || r == '\r' || (r == '&' && !redirectAmp) {
 				seg := strings.TrimSpace(current.String())
 				if seg != "" {
 					segments = append(segments, seg)
@@ -220,6 +245,15 @@ func splitCompoundShellAware(cmd string) []string {
 
 // NormalizeCommand parses and normalizes a command for pattern matching.
 func NormalizeCommand(cmd string) *NormalizedCommand {
+	return normalizeCommandDepth(cmd, 0)
+}
+
+const maxCommandNesting = 32
+
+// normalizeCommandDepth analyzes the entire executable body of shell wrappers,
+// not just its first simple command. All parsing is static: no env expansion,
+// command substitution, shell startup, or external executable is invoked.
+func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 	result := &NormalizedCommand{
 		Original:   cmd,
 		Segments:   []string{},
@@ -232,43 +266,57 @@ func NormalizeCommand(cmd string) *NormalizedCommand {
 		return result
 	}
 
-	// Check for subshells
+	if depth >= maxCommandNesting || len(cmd) > 1<<20 {
+		result.Primary = cmd
+		result.Segments = []string{cmd}
+		result.ParseError = true
+		return result
+	}
+
 	result.HasSubshell = subshellPattern.MatchString(cmd)
-
-	// Split on compound separators using shell-aware parsing.
-	// We use proper tokenization to determine if separators are inside quotes.
-	segments := expandSubshellSegments(splitCompoundShellAware(cmd))
-	if len(segments) > 1 {
-		result.IsCompound = true
+	appendInner := func(inner *NormalizedCommand) {
+		result.Segments = append(result.Segments, inner.Segments...)
+		result.StrippedWrappers = append(result.StrippedWrappers, inner.StrippedWrappers...)
+		result.ParseError = result.ParseError || inner.ParseError
+		result.HasSubshell = result.HasSubshell || inner.HasSubshell
 	}
-
-	// Also check for pipes (not technically compound, but multiple commands)
-	for _, seg := range segments {
-		pipeParts := splitPipesShellAware(seg)
-		if len(pipeParts) > 1 {
-			result.IsCompound = true
-		}
-		for _, part := range pipeParts {
+	for _, seg := range splitCompoundShellAware(cmd) {
+		for _, part := range splitPipesShellAware(seg) {
 			part = strings.TrimSpace(part)
-			if part != "" {
-				result.Segments = append(result.Segments, part)
+			if part == "" {
+				continue
 			}
+			if inner, ok := stripSubshellWrapper(part); ok {
+				result.StrippedWrappers = append(result.StrippedWrappers, "(")
+				appendInner(normalizeCommandDepth(inner, depth+1))
+				continue
+			}
+			parser := shellwords.NewParser()
+			parser.ParseEnv = false
+			parser.ParseBacktick = false
+			tokens, err := parser.Parse(maskArithmeticExpansions(part))
+			if err != nil {
+				result.ParseError = true
+				tokens = strings.Fields(part)
+			}
+			tokens, wrappers, valid := unwrapCommandTokens(tokens)
+			result.StrippedWrappers = append(result.StrippedWrappers, wrappers...)
+			result.ParseError = result.ParseError || !valid
+			if len(tokens) == 0 {
+				continue
+			}
+			if script, ok, valid := shellCommandBody(tokens); ok {
+				result.StrippedWrappers = append(result.StrippedWrappers, filepath.Base(tokens[0])+" -c")
+				appendInner(normalizeCommandDepth(script, depth+1))
+				continue
+			} else if !valid {
+				result.ParseError = true
+			}
+			tokens[0] = canonicalExecutable(tokens[0])
+			result.Segments = append(result.Segments, strings.Join(tokens, " "))
 		}
 	}
-
-	// Normalize each segment (strip wrappers with shell-aware parsing)
-	normalizedSegments := make([]string, 0, len(result.Segments))
-	for _, seg := range result.Segments {
-		normalized, wrappers, parseErr := normalizeSegment(seg)
-		if parseErr {
-			result.ParseError = true
-		}
-		if normalized != "" {
-			normalizedSegments = append(normalizedSegments, normalized)
-		}
-		result.StrippedWrappers = append(result.StrippedWrappers, wrappers...)
-	}
-	result.Segments = normalizedSegments
+	result.IsCompound = len(result.Segments) > 1
 
 	// Primary command is the first segment after normalization
 	if len(result.Segments) > 0 {
