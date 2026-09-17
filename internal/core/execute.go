@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -53,7 +54,7 @@ type ExecuteOptions struct {
 type ExecutionResult struct {
 	// Request is the executed request.
 	Request *db.Request
-	// ExitCode is the command's exit code.
+	// ExitCode is the command's exit code (-1 if no exit status is available).
 	ExitCode int
 	// LogPath is the path to the execution log.
 	LogPath string
@@ -187,6 +188,7 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 		}
 		return nil, fmt.Errorf("updating status to executing: %w", err)
 	}
+	request.Status = db.StatusExecuting
 
 	// Record executor info
 	now := time.Now().UTC()
@@ -204,48 +206,46 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 		fmt.Fprintf(os.Stderr, "warning: failed to record execution info: %v\n", err)
 	}
 
-	// Execute the command
+	// Execute the command. Do not report success when a process never starts.
 	result := &ExecutionResult{
-		Request: request,
-		LogPath: logPath,
+		Request:  request,
+		LogPath:  logPath,
+		ExitCode: -1,
 	}
 
 	execCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
 
-	var streamWriter *os.File
+	// Keep a nil interface when streaming is disabled. A typed nil *os.File
+	// becomes a non-nil io.Writer and would cause output copying to fail.
+	var streamWriter io.Writer
 	if !opts.SuppressOutput {
 		streamWriter = os.Stdout
 	}
 	cmdResult, err := RunCommand(execCtx, &request.Command, logPath, streamWriter)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			result.TimedOut = true
-			result.Error = ErrExecutionTimeout
-			if statusErr := e.db.UpdateRequestStatus(opts.RequestID, db.StatusTimedOut); statusErr != nil {
-				fmt.Fprintf(os.Stderr, "warning: failed to update status to timed_out: %v\n", statusErr)
-			}
-		} else {
-			result.Error = err
-			if statusErr := e.db.UpdateRequestStatus(opts.RequestID, db.StatusExecutionFailed); statusErr != nil {
-				fmt.Fprintf(os.Stderr, "warning: failed to update status to execution_failed: %v\n", statusErr)
-			}
-		}
-	} else {
+	if cmdResult != nil {
+		// Cancellation and I/O failures can still have output and a real exit
+		// status. Preserve these before handling the error.
 		result.ExitCode = cmdResult.ExitCode
 		result.Duration = cmdResult.Duration
 		result.Output = cmdResult.Output
+	}
 
-		// Determine final status based on exit code
-		if cmdResult.ExitCode == 0 {
-			if statusErr := e.db.UpdateRequestStatus(opts.RequestID, db.StatusExecuted); statusErr != nil {
-				fmt.Fprintf(os.Stderr, "warning: failed to update status to executed: %v\n", statusErr)
-			}
-		} else {
-			if statusErr := e.db.UpdateRequestStatus(opts.RequestID, db.StatusExecutionFailed); statusErr != nil {
-				fmt.Fprintf(os.Stderr, "warning: failed to update status to execution_failed: %v\n", statusErr)
-			}
-		}
+	finalStatus := db.StatusExecutionFailed
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		result.TimedOut = true
+		result.Error = ErrExecutionTimeout
+		finalStatus = db.StatusTimedOut
+	case err != nil:
+		result.Error = err
+	case cmdResult != nil && cmdResult.ExitCode == 0:
+		finalStatus = db.StatusExecuted
+	}
+	if statusErr := e.db.UpdateRequestStatus(opts.RequestID, finalStatus); statusErr != nil {
+		result.Error = errors.Join(result.Error, fmt.Errorf("recording execution status %s: %w", finalStatus, statusErr))
+	} else {
+		request.Status = finalStatus
 	}
 
 	// Update execution details - only set exit code and duration when we have valid results.
@@ -257,10 +257,11 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 		exec.DurationMs = &durationMs
 	}
 	if execErr := e.db.UpdateRequestExecution(opts.RequestID, exec); execErr != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to update execution details: %v\n", execErr)
+		result.Error = errors.Join(result.Error, fmt.Errorf("recording execution details: %w", execErr))
 	}
+	request.Execution = exec
 
-	// Notify (best effort)
+	// Notify (best effort), using the current status and execution metadata.
 	_ = e.notifier.NotifyRequestExecuted(request, exec, result.ExitCode)
 
 	return result, result.Error

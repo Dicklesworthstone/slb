@@ -4,6 +4,7 @@ package core
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,7 +17,7 @@ import (
 
 // CommandResult holds the result of running a command.
 type CommandResult struct {
-	// ExitCode is the command's exit code.
+	// ExitCode is the command's exit code (-1 when terminated by a signal).
 	ExitCode int
 	// Output is the combined stdout/stderr.
 	Output string
@@ -26,10 +27,18 @@ type CommandResult struct {
 
 // RunCommand executes a command and captures output to both terminal and log file.
 // The command runs in the current shell environment, inheriting all env vars.
+// Once a process starts, its result is returned even on cancellation or I/O error.
+// A non-zero child exit status is not itself a Go error.
 func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, stream io.Writer) (*CommandResult, error) {
+	if spec == nil {
+		return nil, fmt.Errorf("command specification is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	startTime := time.Now()
 
-	// Open log file for writing
+	// Open log file for writing.
 	var logFile *os.File
 	if logPath != "" {
 		var err error
@@ -39,7 +48,6 @@ func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, strea
 		}
 		defer logFile.Close()
 
-		// Write header
 		fmt.Fprintf(logFile, "=== SLB Command Execution ===\n")
 		fmt.Fprintf(logFile, "Time: %s\n", startTime.Format(time.RFC3339))
 		fmt.Fprintf(logFile, "Command: %s\n", spec.Raw)
@@ -49,20 +57,16 @@ func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, strea
 		fmt.Fprintf(logFile, "=============================\n\n")
 	}
 
-	// Build the command
 	var cmd *exec.Cmd
 	if spec.Shell {
-		// Use shell execution
 		shell := os.Getenv("SHELL")
 		if shell == "" {
 			shell = "/bin/sh"
 		}
 		cmd = exec.CommandContext(ctx, shell, "-c", spec.Raw)
 	} else if len(spec.Argv) > 0 {
-		// Use parsed argv
 		cmd = exec.CommandContext(ctx, spec.Argv[0], spec.Argv[1:]...)
 	} else {
-		// Parse the raw command
 		parts := strings.Fields(spec.Raw)
 		if len(parts) == 0 {
 			return nil, fmt.Errorf("empty command")
@@ -70,76 +74,71 @@ func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, strea
 		cmd = exec.CommandContext(ctx, parts[0], parts[1:]...)
 	}
 
-	// Set working directory
 	if spec.Cwd != "" {
 		cmd.Dir = spec.Cwd
 	}
-
-	// Inherit environment
 	cmd.Env = os.Environ()
 
-	// Set up output capture
+	// A descendant can inherit an output pipe after the direct child exits or
+	// is killed. Bound pipe draining so it cannot defeat the execution timeout.
+	// This is not process-tree termination; detached descendants may survive.
+	cmd.WaitDelay = time.Second
+
 	var outputBuf bytes.Buffer
-	var writers []io.Writer
-
-	// Always capture to buffer
-	writers = append(writers, &outputBuf)
-
-	// Stream to caller-provided writer (optional)
+	writers := []io.Writer{&outputBuf}
 	if stream != nil {
 		writers = append(writers, stream)
 	}
-
-	// Write to log file
 	if logFile != nil {
 		writers = append(writers, logFile)
 	}
-
-	// Combine writers
 	multiWriter := io.MultiWriter(writers...)
 	cmd.Stdout = multiWriter
 	cmd.Stderr = multiWriter
-
-	// Connect stdin to terminal for interactive commands
 	cmd.Stdin = os.Stdin
 
-	// Run the command; record the child PID in the log as soon as it starts so
-	// an orphaned child (caller killed mid-run before the footer is written)
-	// remains traceable (see GH issue #9).
-	err := cmd.Start()
-	if err == nil {
-		if logFile != nil {
-			fmt.Fprintf(logFile, "[started pid=%d]\n", cmd.Process.Pid)
+	// Record the child PID as soon as it starts so an orphaned child remains
+	// traceable if the caller is killed before the footer is written.
+	if err := cmd.Start(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
 		}
-		err = cmd.Wait()
+		return nil, fmt.Errorf("starting command: %w", err)
+	}
+	if logFile != nil {
+		fmt.Fprintf(logFile, "[started pid=%d]\n", cmd.Process.Pid)
+	}
+	err := cmd.Wait()
+	result := &CommandResult{
+		ExitCode: cmd.ProcessState.ExitCode(),
+		Output:   outputBuf.String(),
+		Duration: time.Since(startTime),
 	}
 
-	duration := time.Since(startTime)
-
-	// Get exit code
-	exitCode := 0
+	// CommandContext commonly reports a killed process as *exec.ExitError.
+	// Check cancellation before accepting that as an ordinary non-zero exit.
+	// Do not turn a successful Wait into a failure due to a late cancellation.
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else if ctx.Err() == context.DeadlineExceeded {
-			// Timeout
-			return nil, context.DeadlineExceeded
-		} else {
-			return nil, fmt.Errorf("running command: %w", err)
+		var exitErr *exec.ExitError
+		switch {
+		case ctx.Err() != nil:
+			err = ctx.Err()
+		case errors.As(err, &exitErr):
+			err = nil
+		default:
+			err = fmt.Errorf("waiting for command: %w", err)
 		}
 	}
 
-	// Write footer to log
 	if logFile != nil {
 		fmt.Fprintf(logFile, "\n=============================\n")
-		fmt.Fprintf(logFile, "Exit Code: %d\n", exitCode)
-		fmt.Fprintf(logFile, "Duration: %s\n", duration)
+		fmt.Fprintf(logFile, "Exit Code: %d\n", result.ExitCode)
+		fmt.Fprintf(logFile, "Duration: %s\n", result.Duration)
+		if err != nil {
+			fmt.Fprintf(logFile, "Error: %v\n", err)
+		}
 		fmt.Fprintf(logFile, "Completed: %s\n", time.Now().Format(time.RFC3339))
 	}
 
-	return &CommandResult{
-		ExitCode: exitCode,
-		Output:   outputBuf.String(),
-		Duration: duration,
-	}, nil
+	return result, err
 }
