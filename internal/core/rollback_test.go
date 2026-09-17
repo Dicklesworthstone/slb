@@ -569,6 +569,20 @@ func TestRestoreGitRollback_Full(t *testing.T) {
 	}
 	branch = strings.TrimSpace(branch)
 
+	// Capture the actual artifact set and repository identity before mutation.
+	// Hand-built HEAD-only metadata must not bypass integrity validation.
+	data, err := CaptureRollbackState(context.Background(), &db.Request{
+		ID:          "test-git-full-restore",
+		ProjectPath: project,
+		Command:     db.CommandSpec{Raw: "git reset --hard HEAD", Cwd: repo},
+	}, RollbackCaptureOptions{})
+	if err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	if data.Git.Head != head || data.Git.Branch != branch {
+		t.Fatalf("capture changed the selected HEAD or branch")
+	}
+
 	// Modify the file
 	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("modified\n"), 0644); err != nil {
 		t.Fatalf("modify a: %v", err)
@@ -581,17 +595,6 @@ func TestRestoreGitRollback_Full(t *testing.T) {
 	}
 
 	// Now restore to the original HEAD
-	rollbackDir := t.TempDir()
-	data := &RollbackData{
-		Kind:         rollbackKindGit,
-		RollbackPath: rollbackDir,
-		Git: &GitRollbackData{
-			RepoRoot: repo,
-			Head:     head,
-			Branch:   branch,
-		},
-	}
-
 	err = RestoreRollbackState(context.Background(), data, RollbackRestoreOptions{Force: true})
 	if err != nil {
 		t.Fatalf("RestoreRollbackState: %v", err)
