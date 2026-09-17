@@ -2,7 +2,6 @@
 package core
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -21,7 +20,8 @@ import (
 type CommandResult struct {
 	// ExitCode is the command's exit code (-1 when terminated by a signal).
 	ExitCode int
-	// Output is the combined stdout/stderr.
+	// Output is bounded combined stdout/stderr, with an explicit truncation
+	// notice when needed. The execution log and live stream remain complete.
 	Output string
 	// Duration is the execution time.
 	Duration time.Duration
@@ -90,8 +90,8 @@ func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, strea
 	// Descendants deliberately escaping their process group may still survive.
 	cmd.WaitDelay = time.Second
 
-	var outputBuf bytes.Buffer
-	writers := []io.Writer{&outputBuf}
+	outputBuf := &outputCapture{limit: maxCapturedOutputBytes}
+	writers := []io.Writer{outputBuf}
 	if stream != nil {
 		writers = append(writers, stream)
 	}

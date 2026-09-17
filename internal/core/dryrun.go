@@ -2,11 +2,12 @@
 package core
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"time"
 
@@ -44,35 +45,59 @@ func RunDryRun(spec *db.CommandSpec) (*db.DryRunResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultDryRunTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, tokens[0], tokens[1:]...)
-	if spec.Cwd != "" {
-		cmd.Dir = spec.Cwd
-	}
-	cmd.Env = os.Environ()
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	out := combineStdoutStderr(stdout.String(), stderr.String())
-
-	res := &db.DryRunResult{
+	out, err := runDryRunProcess(ctx, tokens, spec.Cwd)
+	return &db.DryRunResult{
 		Command: shellJoin(tokens),
 		Output:  out,
-	}
+	}, err
+}
 
+// runDryRunProcess never supplies stdin or invokes a shell to interpret argv.
+// It bounds both memory and inherited-pipe waits, and stops ordinary Unix
+// descendants on cancellation just like approved command execution does.
+func runDryRunProcess(ctx context.Context, tokens []string, cwd string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if len(tokens) == 0 || tokens[0] == "" {
+		return "", fmt.Errorf("dry-run command is required")
+	}
+	ctx, stopSignals := signal.NotifyContext(ctx, commandSignals()...)
+	defer stopSignals()
+
+	cmd := exec.CommandContext(ctx, tokens[0], tokens[1:]...)
+	cmd.Dir = cwd
+	cmd.Env = os.Environ()
+	cmd.WaitDelay = time.Second
+	stdout := &outputCapture{limit: maxCapturedOutputBytes}
+	stderr := &outputCapture{limit: maxCapturedOutputBytes}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	stopGroup := configureCommandCancellation(cmd, false)
+
+	err := cmd.Run()
+	var stopErr error
+	if err != nil && stopGroup != nil {
+		stopErr = stopGroup()
+		if errors.Is(stopErr, os.ErrProcessDone) {
+			stopErr = nil
+		}
+	}
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return res, context.DeadlineExceeded
+		var exitErr *exec.ExitError
+		switch {
+		case ctx.Err() != nil:
+			err = ctx.Err()
+		case errors.As(err, &exitErr):
+			err = fmt.Errorf("dry-run exited with code %d: %w", exitErr.ExitCode(), err)
+		default:
+			err = fmt.Errorf("dry-run failed: %w", err)
 		}
-		if ee, ok := err.(*exec.ExitError); ok {
-			return res, fmt.Errorf("dry-run exited with code %d", ee.ExitCode())
-		}
-		return res, fmt.Errorf("dry-run failed: %w", err)
 	}
-
-	return res, nil
+	if stopErr != nil {
+		err = errors.Join(err, fmt.Errorf("stopping dry-run process group: %w", stopErr))
+	}
+	return combineStdoutStderr(stdout.String(), stderr.String()), err
 }
 
 func getDryRunTokens(raw string) ([]string, bool) {
