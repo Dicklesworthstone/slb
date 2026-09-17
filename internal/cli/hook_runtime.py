@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import socket
 import sys
 import tempfile
@@ -31,15 +33,15 @@ def _project_root_for_socket(start: str) -> str:
         path = parent
 
 
-def get_socket_path() -> str:
-    root = _project_root_for_socket(os.getcwd())
+def get_socket_path(cwd=None) -> str:
+    root = _project_root_for_socket(cwd if cwd is not None else os.getcwd())
     digest = hashlib.sha256(root.encode()).hexdigest()[:12]
     return os.path.join(tempfile.gettempdir(), f"slb-{digest}.sock")
 
 
 def query_slb_daemon(command: str, session_id: str, cwd: str) -> Optional[dict]:
     """Read one bounded JSON-RPC frame within a single total time budget."""
-    socket_path = get_socket_path()
+    socket_path = get_socket_path(cwd)
     if not os.path.exists(socket_path):
         return None
     try:
@@ -49,6 +51,7 @@ def query_slb_daemon(command: str, session_id: str, cwd: str) -> Optional[dict]:
             sock.connect(socket_path)
             request = {"method": "hook_query", "params": {
                 "command": command, "session_id": session_id, "cwd": cwd,
+                "execution_handoff": True,
             }, "id": 1}
             sock.sendall(json.dumps(request).encode() + b"\n")
             response = bytearray()
@@ -93,6 +96,48 @@ def _emit_decision(action, message: str = "") -> None:
     print(json.dumps(payload))
 
 
+def _emit_execution_handoff(response, tool_input, session_id, cwd):
+    """Replace Bash input with the atomic executor, not a raw-shell permit.
+
+    The daemon only looks up a candidate. Competing retries, expiry, policy
+    escalation, and mutation are checked again when slb execute claims it.
+    No process is launched by this hook, and a missing executable fails closed.
+    """
+    handoff = response.get("execution_handoff")
+    if not isinstance(handoff, dict):
+        raise ValueError("missing handoff")
+    request_id = handoff.get("request_id")
+    command_hash = handoff.get("command_hash")
+    database_path = handoff.get("database_path")
+    if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", request_id):
+        raise ValueError("invalid request ID")
+    if not isinstance(command_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", command_hash):
+        raise ValueError("invalid command hash")
+    if not session_id or handoff.get("session_id") != session_id or "\x00" in session_id:
+        raise ValueError("session mismatch")
+    expected_db = os.path.join(_project_root_for_socket(cwd), ".slb", "state.db")
+    if not isinstance(database_path, str) or database_path != expected_db:
+        raise ValueError("project database mismatch")
+    executable = shutil.which("slb")
+    if executable is None:
+        raise ValueError("slb executable unavailable")
+    argv = [os.path.abspath(executable), "execute", "--db", database_path,
+            "--log-dir", os.path.join(os.path.dirname(database_path), "logs"),
+            "--session-id", session_id, "--expected-command-hash", command_hash, "--json"]
+    timeout = tool_input.get("timeout")
+    if type(timeout) is int and timeout > 0:
+        argv += ["--timeout", str(max(1, timeout // 1000))]
+    argv += ["--", request_id]
+    updated = dict(tool_input)
+    # exec removes the wrapper shell so cancellation reaches the SLB process.
+    updated["command"] = "exec " + " ".join(shlex.quote(arg) for arg in argv)
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse", "permissionDecision": "allow",
+        "updatedInput": updated,
+        "additionalContext": "SLB is executing the reviewed request once and recording its outcome.",
+    }}))
+
+
 def _record_audit(command, session_id, cwd, action, tier, min_approvals, source, matched_pattern="") -> bool:
     """Publish the same private JSONL schema as internal/audit, without slb or a daemon."""
     action = _normalized_action(action)
@@ -101,8 +146,6 @@ def _record_audit(command, session_id, cwd, action, tier, min_approvals, source,
     pending = None
     try:
         display = command
-        # Go exports its default redaction rules; there is no separate Python
-        # ruleset that can silently drift from the daemon's privacy behavior.
         try:
             for pattern in AUDIT_REDACTION_PATTERNS:
                 display = re.sub(pattern, "[REDACTED]", display)
@@ -139,8 +182,6 @@ def _record_audit(command, session_id, cwd, action, tier, min_approvals, source,
         pending = None
         return True
     except (OSError, ValueError, TypeError) as error:
-        # Never include the command or a potentially secret-bearing exception
-        # message, and never contaminate the JSON protocol on stdout.
         print("SLB: audit recording failed (" + type(error).__name__ + "); safety decision unchanged.", file=sys.stderr)
         return False
     finally:
@@ -179,12 +220,25 @@ def main():
     if not command:
         _emit_decision("allow")
         return
-    session_id = input_data.get("session_id", "")
+    # Provider session IDs are not SLB sessions. An explicit SLB session wins;
+    # the fallback supports integrations already supplying an SLB session ID.
+    session_id = os.environ.get("SLB_SESSION_ID") or input_data.get("session_id", "")
     if not isinstance(session_id, str):
         session_id = ""
-    cwd = os.getcwd()
+    cwd = input_data.get("cwd", os.getcwd())
+    if not isinstance(cwd, str) or not os.path.isabs(cwd) or "\x00" in cwd:
+        _emit_decision("ask", "SLB: invalid working directory; unable to inspect the command.")
+        return
     response = query_slb_daemon(command, session_id, cwd)
     if response is not None:
+        if response.get("action") == "execute":
+            try:
+                _emit_execution_handoff(response, input_data["tool_input"], session_id, cwd)
+            except (OSError, ValueError, TypeError):
+                _decide_and_audit(command, session_id, cwd, "block",
+                                  "SLB: execution handoff unavailable or invalid; use slb execute explicitly.",
+                                  response.get("tier", "unknown"), response.get("min_approvals", 0), "hook_daemon")
+            return
         _decide_and_audit(command, session_id, cwd, response.get("action"), response.get("message", ""),
                           response.get("tier", "unknown"), response.get("min_approvals", 0), "hook_daemon",
                           response.get("matched_pattern", ""), response.get("audit_recorded", False))
@@ -192,7 +246,6 @@ def main():
     try:
         tier, min_approvals = classify(command)
     except Exception:
-        # A classifier failure must not become a silent permit.
         _decide_and_audit(command, session_id, cwd, "ask", "SLB: classification failed; confirmation required.",
                           "unknown", 0, "hook_offline")
         return

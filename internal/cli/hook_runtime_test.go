@@ -24,7 +24,7 @@ func runHookRuntime(t *testing.T, home, setup, input string) (string, string) {
 	script := preamble + hookRuntime + "\n" + setup + "\nmain()\n"
 	command := exec.Command(python, "-c", script)
 	command.Dir = t.TempDir()
-	command.Env = append(os.Environ(), "HOME="+home, "USERPROFILE="+home)
+	command.Env = append(os.Environ(), "HOME="+home, "USERPROFILE="+home, "SLB_SESSION_ID=")
 	command.Stdin = strings.NewReader(input)
 	var stdout, stderr bytes.Buffer
 	command.Stdout, command.Stderr = &stdout, &stderr
@@ -132,7 +132,7 @@ fixture_path = os.path.join(fixture_dir.name, "s")
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 server.bind(fixture_path)
 server.listen(1)
-get_socket_path = lambda: fixture_path
+get_socket_path = lambda *args: fixture_path
 def respond():
     with server:
         connection, _ = server.accept()
