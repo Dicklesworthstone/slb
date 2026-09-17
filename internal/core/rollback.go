@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
+	"github.com/mattn/go-shellwords"
 )
 
 const (
@@ -114,17 +115,17 @@ func CaptureRollbackState(ctx context.Context, req *db.Request, opts RollbackCap
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	opts = normalizeRollbackCaptureOptions(opts)
 
-	normalized := NormalizeCommand(req.Command.Raw)
-	cmd := strings.TrimSpace(normalized.Primary)
-	if cmd == "" {
-		cmd = strings.TrimSpace(req.Command.Raw)
-	}
-	tokens := parseShellTokens(cmd)
-	if len(tokens) == 0 {
-		return nil, fmt.Errorf("empty command")
+	// A classifier's display form is not execution argv: it strips quoting,
+	// expands wrappers, and may contain only the first command in a list.
+	tokens, err := rollbackCommandTokens(req.Command)
+	if err != nil {
+		return nil, err
 	}
 
 	kind := detectRollbackKind(tokens)
@@ -135,8 +136,13 @@ func CaptureRollbackState(ctx context.Context, req *db.Request, opts RollbackCap
 	baseDir := filepath.Join(req.ProjectPath, ".slb", "rollback")
 	_ = cleanupOldRollbackCaptures(baseDir, opts.Retention, opts.Now())
 
-	rollbackDir := filepath.Join(baseDir, "req-"+req.ID)
-	if err := os.MkdirAll(rollbackDir, 0700); err != nil {
+	if err := os.MkdirAll(baseDir, 0700); err != nil {
+		return nil, fmt.Errorf("creating rollback base dir: %w", err)
+	}
+	// Each attempt owns a new directory. A concurrent executor or later retry
+	// must never truncate an archive already referenced by a previous attempt.
+	rollbackDir, err := os.MkdirTemp(baseDir, "req-"+sanitizeFilename(req.ID)+"-*")
+	if err != nil {
 		return nil, fmt.Errorf("creating rollback dir: %w", err)
 	}
 
@@ -232,13 +238,43 @@ func normalizeRollbackCaptureOptions(opts RollbackCaptureOptions) RollbackCaptur
 	return opts
 }
 
+// rollbackCommandTokens follows the command runner's execution mode without
+// evaluating shell code. A snapshot of only part of a compound/dynamic command
+// would promise recovery for paths that were never captured.
+func rollbackCommandTokens(spec db.CommandSpec) ([]string, error) {
+	var tokens []string
+	if !spec.Shell {
+		if len(spec.Argv) > 0 {
+			tokens = append([]string(nil), spec.Argv...)
+		} else {
+			// Match RunCommand's legacy raw-only non-shell execution exactly.
+			tokens = strings.Fields(spec.Raw)
+		}
+	} else {
+		if !hasLiteralPreviewSyntax(spec.Raw) {
+			return nil, fmt.Errorf("rollback capture requires a single literal command; shell expansion or compound commands are unsupported")
+		}
+		parser := shellwords.NewParser()
+		parser.ParseEnv, parser.ParseBacktick = false, false
+		var err error
+		tokens, err = parser.Parse(spec.Raw)
+		if err != nil || parser.Position >= 0 {
+			return nil, fmt.Errorf("rollback capture cannot parse the complete command")
+		}
+	}
+	if len(tokens) == 0 || tokens[0] == "" {
+		return nil, fmt.Errorf("empty command")
+	}
+	return tokens, nil
+}
+
 func detectRollbackKind(tokens []string) string {
 	if len(tokens) == 0 {
 		return ""
 	}
 	switch tokens[0] {
 	case "rm":
-		paths := rmTargets(tokens[1:])
+		paths := rollbackRMTargets(tokens[1:])
 		if len(paths) == 0 {
 			return ""
 		}
@@ -297,7 +333,7 @@ func cleanupOldRollbackCaptures(baseDir string, retention time.Duration, now tim
 }
 
 func captureFilesystemRollback(rollbackDir string, req *db.Request, tokens []string, opts RollbackCaptureOptions) (*FilesystemRollbackData, error) {
-	targets := rmTargets(tokens[1:])
+	targets := rollbackRMTargets(tokens[1:])
 	if len(targets) == 0 {
 		return nil, fmt.Errorf("no rm targets found")
 	}
@@ -307,7 +343,10 @@ func captureFilesystemRollback(rollbackDir string, req *db.Request, tokens []str
 		cwd = req.ProjectPath
 	}
 
-	paths, missing := resolvePaths(cwd, targets)
+	paths, missing, err := resolveLiteralRollbackTargets(cwd, targets, rollbackDir)
+	if err != nil {
+		return nil, err
+	}
 	if len(paths) == 0 {
 		return nil, fmt.Errorf("no existing rm targets to capture")
 	}
@@ -336,6 +375,98 @@ func captureFilesystemRollback(rollbackDir string, req *db.Request, tokens []str
 		TotalBytes: totalBytes,
 		Missing:    missing,
 	}, nil
+}
+
+// rollbackRMTargets preserves every operand after the first option terminator,
+// including a literal second "--". The command's parsed argv is already literal.
+func rollbackRMTargets(args []string) []string {
+	var targets []string
+	operands := false
+	for _, arg := range args {
+		if !operands && arg == "--" {
+			operands = true
+			continue
+		}
+		if !operands && strings.HasPrefix(arg, "-") {
+			continue
+		}
+		targets = append(targets, arg)
+	}
+	return targets
+}
+
+// resolveLiteralRollbackTargets must not glob or trim argv: a file named
+// "[draft]" or " notes " is distinct from the files a display parser might
+// infer. Resolve parent symlinks before cleaning '..', but preserve a leaf
+// symlink itself since rm removes the link, not its destination.
+func resolveLiteralRollbackTargets(cwd string, targets []string, archiveDir string) ([]string, []string, error) {
+	cwd, err := filepath.Abs(cwd)
+	if err != nil {
+		return nil, nil, err
+	}
+	archiveDir, err = filepath.EvalSymlinks(archiveDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolving archive directory: %w", err)
+	}
+	archiveDir, err = filepath.Abs(archiveDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	separators := string(os.PathSeparator)
+	if os.PathSeparator == '\\' {
+		separators += "/"
+	}
+	seen := make(map[string]bool)
+	var paths, missing []string
+	for _, target := range targets {
+		if target == "" || strings.ContainsRune(target, 0) {
+			return nil, nil, fmt.Errorf("invalid empty or NUL-containing rollback target")
+		}
+		candidate := target
+		if !filepath.IsAbs(candidate) {
+			// filepath.Join would erase link/.. before resolving the symlink.
+			candidate = cwd + string(os.PathSeparator) + candidate
+		}
+		last := strings.LastIndexAny(candidate, separators)
+		leaf := candidate[last+1:]
+		var resolved string
+		if leaf == "" || leaf == "." || leaf == ".." {
+			resolved, err = filepath.EvalSymlinks(candidate)
+		} else {
+			var parent string
+			parent, err = filepath.EvalSymlinks(candidate[:last+1])
+			resolved = filepath.Join(parent, leaf)
+		}
+		if err != nil {
+			if os.IsNotExist(err) {
+				missing = append(missing, filepath.Clean(candidate))
+				continue
+			}
+			return nil, nil, fmt.Errorf("resolving rollback target %q: %w", target, err)
+		}
+		info, err := os.Lstat(resolved)
+		if os.IsNotExist(err) {
+			missing = append(missing, resolved)
+			continue
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("reading rollback target %q: %w", target, err)
+		}
+		if info.IsDir() {
+			rel, err := filepath.Rel(resolved, archiveDir)
+			if err != nil {
+				return nil, nil, err
+			}
+			if rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))) {
+				return nil, nil, fmt.Errorf("rollback target %q contains its recovery storage; refusing a self-containing backup", target)
+			}
+		}
+		if !seen[resolved] {
+			seen[resolved] = true
+			paths = append(paths, resolved)
+		}
+	}
+	return paths, missing, nil
 }
 
 func resolvePaths(cwd string, targets []string) ([]string, []string) {
@@ -418,25 +549,32 @@ func estimateFileBytes(roots []string, maxBytes int64) (int64, error) {
 	return total, nil
 }
 
-func writeTarGz(outPath string, roots []FilesystemRoot) error {
-	f, err := os.Create(outPath)
+func writeTarGz(outPath string, roots []FilesystemRoot) (err error) {
+	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("creating tar.gz: %w", err)
 	}
-	defer f.Close()
+	defer func() { err = errors.Join(err, f.Close()) }()
+	if err := writeRollbackArchive(f, roots); err != nil {
+		return fmt.Errorf("writing rollback archive: %w", err)
+	}
+	// Do not publish metadata until the archive, including both trailers,
+	// has been written successfully. Buffered close failures are data loss.
+	return f.Sync()
+}
 
-	gw := gzip.NewWriter(f)
-	defer gw.Close()
-
+func writeRollbackArchive(w io.Writer, roots []FilesystemRoot) error {
+	gw := gzip.NewWriter(w)
 	tw := tar.NewWriter(gw)
-	defer tw.Close()
-
+	var captureErr error
 	for _, root := range roots {
-		if err := addRootToTar(tw, root.ID, root.Path); err != nil {
-			return err
+		if captureErr = addRootToTar(tw, root.ID, root.Path); captureErr != nil {
+			break
 		}
 	}
-	return nil
+	tarErr := tw.Close()
+	gzipErr := gw.Close()
+	return errors.Join(captureErr, tarErr, gzipErr)
 }
 
 func addRootToTar(tw *tar.Writer, rootID, rootPath string) error {
@@ -477,6 +615,9 @@ func addRootToTar(tw *tar.Writer, rootID, rootPath string) error {
 
 func addPathToTar(tw *tar.Writer, fsPath, tarName string, info fs.FileInfo) error {
 	mode := info.Mode()
+	if !mode.IsRegular() && !mode.IsDir() && mode&os.ModeSymlink == 0 {
+		return fmt.Errorf("rollback cannot restore special file: %s", fsPath)
+	}
 
 	var linkTarget string
 	if mode&os.ModeSymlink != 0 {
