@@ -56,8 +56,8 @@ Patterns are regex strings matched against normalized commands.
 Commands are classified in order: SAFE → CRITICAL → DANGEROUS → CAUTION.
 The first matching pattern determines the tier.
 
-Agents can ADD patterns freely (making things safer) but CANNOT remove patterns.
-Pattern removal requires human approval through the TUI.`,
+Agents can add restrictive patterns, but SAFE additions and custom-pattern
+removals require human approval through the TUI.`,
 }
 
 var patternsListCmd = &cobra.Command{
@@ -183,7 +183,8 @@ var patternsAddCmd = &cobra.Command{
 	Short: "Add a new pattern to a tier",
 	Long: `Add a new regex pattern to classify commands.
 
-Agents CAN add patterns freely - this makes classification stricter (safer).
+Restrictive patterns take effect immediately. SAFE patterns are queued for
+human review because allowlist entries can bypass dangerous-command checks.
 The --tier flag is required to specify which tier the pattern applies to.
 
 Examples:
@@ -203,6 +204,9 @@ Examples:
 		// must not leave a new in-memory allow rule behind.
 		if _, err := regexp.Compile("(?i)" + pattern); err != nil {
 			return fmt.Errorf("invalid pattern: %w", err)
+		}
+		if tier == core.RiskTier(core.RiskSafe) {
+			return queuePatternChange(pattern, string(tier), db.PatternChangeTypeAdd, flagPatternReason)
 		}
 
 		conn, err := db.OpenAndMigrate(GetDB())
@@ -259,21 +263,16 @@ var patternsRequestRemovalCmd = &cobra.Command{
 	Short: "Request removal of a pattern (requires human review)",
 	Long: `Create a pending removal request for a pattern.
 
-This creates a request that must be approved by a human before
-the pattern is actually removed. Use --reason to explain why
-the pattern should be removed.`,
+This records a request that must be approved by a human before the custom
+pattern is removed. Use --reason to explain why and --tier to disambiguate.
+Builtin rules are not removed by this workflow.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		pattern := args[0]
-		if flagPatternReason == "" {
+		if strings.TrimSpace(flagPatternReason) == "" {
 			return fmt.Errorf("--reason is required for removal requests")
 		}
-		// TODO: Implement pattern_changes table recording
-		out := output.New(output.Format(GetOutput()))
-		return out.Write(map[string]any{
-			"status": "pending", "request_id": "pending-impl", "pattern": pattern,
-			"reason": flagPatternReason, "message": "Removal request created. Awaiting human review in TUI.",
-		})
+		return queuePatternChange(pattern, flagPatternTier, db.PatternChangeTypeRemove, flagPatternReason)
 	},
 }
 
@@ -292,12 +291,7 @@ Use --tier to specify the suggested tier.`,
 		if flagPatternTier == "" {
 			return fmt.Errorf("--tier is required")
 		}
-		// TODO: Implement pattern_changes table with status='suggested'
-		out := output.New(output.Format(GetOutput()))
-		return out.Write(map[string]any{
-			"status": "suggested", "pattern": pattern, "tier": flagPatternTier,
-			"reason": flagPatternReason, "message": "Pattern suggested. Awaiting human review in TUI.",
-		})
+		return queuePatternChange(pattern, flagPatternTier, db.PatternChangeTypeSuggest, flagPatternReason)
 	},
 }
 

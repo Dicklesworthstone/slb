@@ -400,7 +400,7 @@ func TestApprovePatternChange(t *testing.T) {
 
 	t.Run("approve existing", func(t *testing.T) {
 		pc := &PatternChange{
-			Tier:       "high",
+			Tier:       "dangerous",
 			Pattern:    "approve-test.txt",
 			ChangeType: PatternChangeTypeAdd,
 			Reason:     "Test approve",
@@ -544,7 +544,7 @@ func TestCountPendingPatternChanges(t *testing.T) {
 	// Create mixed status pattern changes
 	for i := 0; i < 3; i++ {
 		pc := &PatternChange{
-			Tier:       "high",
+			Tier:       "dangerous",
 			Pattern:    "count-pending" + string(rune('A'+i)),
 			ChangeType: PatternChangeTypeAdd,
 			Reason:     "Test",
@@ -578,9 +578,14 @@ func TestCountPendingPatternChanges(t *testing.T) {
 	})
 
 	// Approve one pending
-	changes, _ := db.ListPendingPatternChanges()
+	changes, err := db.ListPendingPatternChanges()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(changes) > 0 {
-		db.ApprovePatternChange(changes[0].ID)
+		if err := db.ApprovePatternChange(changes[0].ID); err != nil {
+			t.Fatalf("ApprovePatternChange failed: %v", err)
+		}
 	}
 
 	t.Run("after approval", func(t *testing.T) {
