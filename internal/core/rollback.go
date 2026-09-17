@@ -124,6 +124,14 @@ func CaptureRollbackState(ctx context.Context, req *db.Request, opts RollbackCap
 	}
 
 	baseDir := filepath.Join(req.ProjectPath, ".slb", "rollback")
+	if kind == rollbackKindGit {
+		// git clean -x may remove .slb itself. Git recovery must live under
+		// the selected repository's Git directory, not its working tree.
+		baseDir, err = gitRollbackStorage(ctx, req, tokens)
+		if err != nil {
+			return nil, err
+		}
+	}
 	_ = cleanupOldRollbackCaptures(baseDir, opts.Retention, opts.Now())
 
 	if err := os.MkdirAll(baseDir, 0700); err != nil {

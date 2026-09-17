@@ -21,15 +21,16 @@ import (
 // Patches are binary-capable and integrity checked before any destructive step.
 // Capture requires a quiescent repository; it is not a filesystem transaction.
 type GitRollbackData struct {
-	RepoRoot      string                         `json:"repo_root"`
-	GitDir        string                         `json:"git_dir,omitempty"`
-	Head          string                         `json:"head"`
-	Branch        string                         `json:"branch"`
-	StatusFile    string                         `json:"status_file"`
-	DiffFile      string                         `json:"diff_file"`
-	CachedFile    string                         `json:"cached_file"`
-	UntrackedFile string                         `json:"untracked_file"`
-	Artifacts     map[string]GitRollbackArtifact `json:"artifacts,omitempty"`
+	RepoRoot         string                         `json:"repo_root"`
+	GitDir           string                         `json:"git_dir,omitempty"`
+	Head             string                         `json:"head"`
+	Branch           string                         `json:"branch"`
+	StatusFile       string                         `json:"status_file"`
+	DiffFile         string                         `json:"diff_file"`
+	CachedFile       string                         `json:"cached_file"`
+	UntrackedFile    string                         `json:"untracked_file"`
+	UntrackedArchive string                         `json:"untracked_archive,omitempty"`
+	Artifacts        map[string]GitRollbackArtifact `json:"artifacts,omitempty"`
 }
 
 type GitRollbackArtifact struct {
@@ -106,6 +107,10 @@ func captureGitRollback(ctx context.Context, rollbackDir string, req *db.Request
 		Artifacts:     make(map[string]GitRollbackArtifact),
 	}
 	budget := &rollbackBudgetWriter{remaining: opts.MaxSizeBytes, limited: opts.MaxSizeBytes > 0}
+	untrackedArgs := []string{"ls-files", "--others", "-z"}
+	if !gitCleanRemovesIgnored(tokens) {
+		untrackedArgs = append(untrackedArgs, "--exclude-standard")
+	}
 	diffArgs := []string{"diff", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", "--no-relative", "--src-prefix=a/", "--dst-prefix=b/"}
 	for _, item := range []struct {
 		path string
@@ -114,13 +119,16 @@ func captureGitRollback(ctx context.Context, rollbackDir string, req *db.Request
 		{data.StatusFile, []string{"status", "--porcelain=v1", "-z"}},
 		{data.CachedFile, append(append([]string(nil), diffArgs...), "--cached", state[0], "--")},
 		{data.DiffFile, append(append([]string(nil), diffArgs...), "--")},
-		{data.UntrackedFile, []string{"ls-files", "--others", "--exclude-standard", "-z"}},
+		{data.UntrackedFile, untrackedArgs},
 	} {
 		artifact, err := writeGitSnapshotArtifact(ctx, root, filepath.Join(rollbackDir, filepath.FromSlash(item.path)), budget, item.args...)
 		if err != nil {
 			return nil, fmt.Errorf("capturing %s: %w", item.path, err)
 		}
 		data.Artifacts[item.path] = artifact
+	}
+	if err := captureGitUntracked(ctx, rollbackDir, data, budget); err != nil {
+		return nil, err
 	}
 	for name, value := range map[string]string{rollbackGitHeadFilename: state[0], rollbackGitBranchFilename: state[1]} {
 		if err := os.WriteFile(filepath.Join(gitPath, name), []byte(value+"\n"), 0600); err != nil {
@@ -320,6 +328,10 @@ func restoreGitRollback(ctx context.Context, data *RollbackData, opts RollbackRe
 	if err != nil {
 		return err
 	}
+	untracked, err := validateGitUntracked(ctx, data)
+	if err != nil {
+		return err
+	}
 	branch := data.Git.Branch
 	if branch == "" {
 		return fmt.Errorf("saved Git branch is missing")
@@ -351,7 +363,10 @@ func restoreGitRollback(ctx context.Context, data *RollbackData, opts RollbackRe
 	if err := applyGitPatchIfPresent(ctx, root, cached, true); err != nil {
 		return err
 	}
-	return applyGitPatchIfPresent(ctx, root, diff, false)
+	if err := applyGitPatchIfPresent(ctx, root, diff, false); err != nil {
+		return err
+	}
+	return restoreGitUntracked(ctx, data, untracked)
 }
 
 func applyGitPatchIfPresent(ctx context.Context, root, patchPath string, cached bool) error {
