@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
@@ -105,6 +104,12 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 	if opts.SessionID == "" {
 		return nil, errors.New("session_id is required")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if opts.Timeout < 0 {
+		return nil, errors.New("execution timeout must not be negative")
+	}
 
 	// Set defaults
 	if opts.Timeout == 0 {
@@ -180,16 +185,6 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 		}
 	}
 
-	// Gate 5: First executor wins - transition to EXECUTING
-	if err := e.db.UpdateRequestStatus(opts.RequestID, db.StatusExecuting); err != nil {
-		// If another executor already started, we'll get an error
-		if errors.Is(err, db.ErrInvalidTransition) {
-			return nil, ErrAlreadyExecuting
-		}
-		return nil, fmt.Errorf("updating status to executing: %w", err)
-	}
-	request.Status = db.StatusExecuting
-
 	// Record executor info
 	now := time.Now().UTC()
 	exec := &db.Execution{
@@ -200,11 +195,25 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 		LogPath:             logPath,
 	}
 
-	// Update execution info
-	if err := e.db.UpdateRequestExecution(opts.RequestID, exec); err != nil {
-		// Log but don't fail - the command will still execute
-		fmt.Fprintf(os.Stderr, "warning: failed to record execution info: %v\n", err)
+	// Gate 5: claim exactly the snapshot we checked and record execution identity
+	// in the same write. Recheck expiry after potentially lengthy rollback capture.
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
+	if request.ApprovalExpiresAt != nil && !time.Now().Before(*request.ApprovalExpiresAt) {
+		return nil, ErrApprovalExpired
+	}
+	if err := e.db.ClaimRequestExecution(request, exec); err != nil {
+		if errors.Is(err, db.ErrInvalidTransition) {
+			latest, readErr := e.db.GetRequest(request.ID)
+			if readErr == nil && latest.Status == db.StatusExecuting {
+				return nil, ErrAlreadyExecuting
+			}
+		}
+		return nil, fmt.Errorf("claiming execution: %w", err)
+	}
+	request.Status = db.StatusExecuting
+	request.Execution = exec
 
 	// Execute the command. Do not report success when a process never starts.
 	result := &ExecutionResult{
@@ -242,12 +251,6 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 	case cmdResult != nil && cmdResult.ExitCode == 0:
 		finalStatus = db.StatusExecuted
 	}
-	if statusErr := e.db.UpdateRequestStatus(opts.RequestID, finalStatus); statusErr != nil {
-		result.Error = errors.Join(result.Error, fmt.Errorf("recording execution status %s: %w", finalStatus, statusErr))
-	} else {
-		request.Status = finalStatus
-	}
-
 	// Update execution details - only set exit code and duration when we have valid results.
 	// When cmdResult is nil (timeout before process started, or other error), leave as NULL.
 	if cmdResult != nil {
@@ -256,9 +259,14 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 		exec.ExitCode = &exitCode
 		exec.DurationMs = &durationMs
 	}
-	if execErr := e.db.UpdateRequestExecution(opts.RequestID, exec); execErr != nil {
-		result.Error = errors.Join(result.Error, fmt.Errorf("recording execution details: %w", execErr))
+	if execErr := e.db.CompleteRequestExecution(opts.RequestID, finalStatus, exec); execErr != nil {
+		result.Error = errors.Join(result.Error, fmt.Errorf("recording execution outcome: %w", execErr))
+		// Do not announce an outcome as durable when its database write failed.
+		return result, result.Error
 	}
+	request.Status = finalStatus
+	resolvedAt := time.Now().UTC()
+	request.ResolvedAt = &resolvedAt
 	request.Execution = exec
 
 	// Notify (best effort), using the current status and execution metadata.
@@ -280,16 +288,17 @@ func (e *Executor) createLogFile(logDir, requestID string) (string, error) {
 	if len(idSuffix) > 8 {
 		idSuffix = idSuffix[:8]
 	}
-	logName := fmt.Sprintf("%s_%s.log", timestamp, idSuffix)
-	logPath := filepath.Join(logDir, logName)
-
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	// Unique, exclusively created files prevent a competing executor from
+	// truncating the winner's audit log before its claim is rejected.
+	f, err := os.CreateTemp(logDir, fmt.Sprintf("%s-*_%s.log", timestamp, idSuffix))
 	if err != nil {
 		return "", fmt.Errorf("creating log file: %w", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("closing new log file: %w", err)
+	}
 
-	return logPath, nil
+	return f.Name(), nil
 }
 
 // tierHigher returns true if tier1 is higher (more restrictive) than tier2.

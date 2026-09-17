@@ -99,3 +99,26 @@ func TestExecutorLifecyclePersistsOutcome(t *testing.T) {
 		})
 	}
 }
+
+func TestExecutionLogCreationDoesNotClobberAnotherAttempt(t *testing.T) {
+	executor := &Executor{}
+	directory := t.TempDir()
+	first, err := executor.createLogFile(directory, "same-request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(first, []byte("first executor output"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := executor.createLogFile(directory, "same-request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("competing attempts share an audit log")
+	}
+	data, err := os.ReadFile(first)
+	if err != nil || string(data) != "first executor output" {
+		t.Fatalf("losing attempt clobbered audit log: %q, %v", data, err)
+	}
+}
