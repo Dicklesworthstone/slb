@@ -273,20 +273,23 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 		return result
 	}
 
-	result.HasSubshell = subshellPattern.MatchString(cmd)
+	outer, substitutions, valid := splitExecutableSubstitutions(cmd, depth)
+	result.ParseError = !valid
+	result.HasSubshell = len(substitutions) > 0
 	appendInner := func(inner *NormalizedCommand) {
 		result.Segments = append(result.Segments, inner.Segments...)
 		result.StrippedWrappers = append(result.StrippedWrappers, inner.StrippedWrappers...)
 		result.ParseError = result.ParseError || inner.ParseError
 		result.HasSubshell = result.HasSubshell || inner.HasSubshell
 	}
-	for _, seg := range splitCompoundShellAware(cmd) {
+	for _, seg := range splitCompoundShellAware(outer) {
 		for _, part := range splitPipesShellAware(seg) {
 			part = strings.TrimSpace(part)
 			if part == "" {
 				continue
 			}
 			if inner, ok := stripSubshellWrapper(part); ok {
+				result.HasSubshell = true
 				result.StrippedWrappers = append(result.StrippedWrappers, "(")
 				appendInner(normalizeCommandDepth(inner, depth+1))
 				continue
@@ -294,7 +297,7 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 			parser := shellwords.NewParser()
 			parser.ParseEnv = false
 			parser.ParseBacktick = false
-			tokens, err := parser.Parse(maskArithmeticExpansions(part))
+			tokens, err := parser.Parse(part)
 			if err != nil {
 				result.ParseError = true
 				tokens = strings.Fields(part)
@@ -315,6 +318,11 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 			tokens[0] = canonicalExecutable(tokens[0])
 			result.Segments = append(result.Segments, strings.Join(tokens, " "))
 		}
+	}
+	// Analyze expansions independently so an allowlisted outer command cannot
+	// hide a destructive command executed while its arguments are evaluated.
+	for _, body := range substitutions {
+		appendInner(normalizeCommandDepth(body, depth+1))
 	}
 	result.IsCompound = len(result.Segments) > 1
 
