@@ -140,14 +140,9 @@ func runHookGenerate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create directory %s: %w", outputDir, err)
 	}
 
-	// Merge persisted custom_patterns into the engine before
-	// emitting the script. Without this, `slb patterns add` would
-	// persist custom rules that never make it into the generated
-	// `slb_guard.py` — the embedded fallback would only enforce
-	// the 52 builtins. Best-effort: missing DB falls back to
-	// builtins-only (matches `slb patterns test` behavior).
+	// Never replace an installed guard with stale or incomplete policy.
 	if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+		return err
 	}
 
 	// Generate hook script
@@ -181,11 +176,9 @@ func runHookInstall(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create directory %s: %w", outputDir, err)
 	}
 
-	// Same custom-pattern merge as runHookGenerate — install must
-	// embed the same set of patterns the user has persisted, not
-	// just the builtins.
+	// Install must embed the complete current policy, just like generate.
 	if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+		return err
 	}
 
 	engine := core.GetDefaultEngine()
@@ -395,11 +388,9 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 	hookScriptPath := filepath.Join(home, ".slb", "hooks", "slb_guard.py")
 	settingsPath := filepath.Join(home, ".claude", "settings.json")
 
-	// Reflect persisted customs in the current_pattern_hash — the
-	// hash must compare apples-to-apples against what the next
-	// `slb hook generate` would produce, which now includes them.
+	// Compare the current persisted policy with the installed guard.
 	if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+		return err
 	}
 
 	status := map[string]any{
@@ -410,14 +401,12 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 		"current_pattern_hash": core.GetDefaultEngine().ComputeHash(),
 	}
 
-	// Check hook script
 	if info, err := os.Stat(hookScriptPath); err == nil {
 		status["hook_script_exists"] = true
 		status["hook_script_executable"] = info.Mode()&0111 != 0
 		status["hook_script_size"] = info.Size()
 	}
 
-	// Check settings.json
 	data, err := os.ReadFile(settingsPath)
 	if err == nil {
 		var settings map[string]any
@@ -448,7 +437,6 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Overall status
 	scriptOK := status["hook_script_exists"].(bool)
 	settingsOK := status["settings_configured"].(bool)
 	if scriptOK && settingsOK {
@@ -464,19 +452,13 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 }
 
 func runHookTest(cmd *cobra.Command, args []string) error {
-	command := args[0] // Args: ExactArgs(1) ensures this exists
-
-	// Reflect persisted custom_patterns in the test result. Without
-	// this, `slb hook test` would diverge from what the actual
-	// installed hook would do (which sees customs after the fix in
-	// runHookGenerate / runHookInstall).
+	command := args[0]
 	if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+		return err
 	}
 
 	result := core.Classify(command, "")
 
-	// Determine what the hook would do
 	var action, message string
 	switch {
 	case result.IsSafe:
@@ -498,13 +480,9 @@ func runHookTest(cmd *cobra.Command, args []string) error {
 
 	out := output.New(output.Format(GetOutput()))
 	return out.Write(map[string]any{
-		"command":         command,
-		"action":          action,
-		"message":         message,
-		"tier":            string(result.Tier),
-		"matched_pattern": result.MatchedPattern,
-		"min_approvals":   result.MinApprovals,
-		"needs_approval":  result.NeedsApproval,
+		"command": command, "action": action, "message": message,
+		"tier": string(result.Tier), "matched_pattern": result.MatchedPattern,
+		"min_approvals": result.MinApprovals, "needs_approval": result.NeedsApproval,
 	})
 }
 
