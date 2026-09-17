@@ -165,19 +165,14 @@ func (rc *RequestCreator) CreateRequest(opts CreateRequestOptions) (*CreateReque
 		return nil, err
 	}
 	if !limitResult.Allowed {
-		// Enforce block for actions that return Allowed=false (like queue, if not handled)
 		return nil, fmt.Errorf("rate limit exceeded (action=%s): %s", limitResult.Action, limitResult.Message)
 	}
 
 	// Step 4: Classify command
 	classification := rc.patternEngine.ClassifyCommand(opts.Command, opts.Cwd)
 
-	// Step 5: If SAFE, skip — but only when the SAFE verdict covers the whole
-	// command. In a compound command a safe segment sets the overall tier to
-	// SAFE even when another segment matched nothing at all, so
-	// "git stash && uv run python <script>" would skip approval outright and
-	// re-open the GH issue #9 default-allow bypass. An unrecognised segment
-	// falls through to the escalation below instead.
+	// Step 5: Skip only when the SAFE verdict covers the entire command.
+	// An unknown segment cannot borrow another segment's allowlist entry.
 	if classification.IsSafe && !classification.HasUnmatchedSegment {
 		return &CreateRequestResult{
 			Request:        nil,
@@ -187,17 +182,12 @@ func (rc *RequestCreator) CreateRequest(opts CreateRequestOptions) (*CreateReque
 		}, nil
 	}
 
-	// If no pattern matched, ESCALATE to dangerous rather than skip (fail
-	// closed). A command deliberately submitted through `slb run`/`slb request`
-	// is self-declared risky by its author, and text-level patterns cannot see
-	// inside arbitrary interpreter wrappers ("uv run python <script>" mutated a
-	// production database as an unmatched command; see GH issue #9). Only an
-	// explicit SAFE pattern match may skip approval. The PreToolUse hook path
-	// is unaffected: it calls ClassifyCommand directly and never reaches
-	// CreateRequest.
+	// Commands deliberately submitted to SLB default to dangerous when the
+	// normalizer cannot recognize the operation (GH #9). Use the configured
+	// dangerous quorum here too; opaque wrappers must not get a weaker quorum.
 	if !classification.NeedsApproval {
 		classification.Tier = RiskTierDangerous
-		classification.MinApprovals = tierApprovals(RiskTierDangerous)
+		classification.MinApprovals = rc.patternEngine.RequiredApprovals(RiskTierDangerous, -1)
 		classification.NeedsApproval = true
 		classification.IsSafe = false
 		if classification.MatchedPattern == "" || classification.HasUnmatchedSegment {
@@ -220,40 +210,41 @@ func (rc *RequestCreator) CreateRequest(opts CreateRequestOptions) (*CreateReque
 	cmdSpec.DisplayRedacted = ApplyRedaction(opts.Command, opts.RedactPatterns)
 	cmdSpec.ContainsSensitive = cmdSpec.DisplayRedacted != opts.Command
 
-	// Step 9: Get min approvals (with dynamic quorum check)
-	minApprovals := classification.MinApprovals
+	// Resolve scope before counting: an empty override must not count agents
+	// in all projects. Distinct active agents exclude the requester identity.
+	projectPath := opts.ProjectPath
+	if projectPath == "" {
+		projectPath = session.ProjectPath
+	}
+	available, err := CountPolicyReviewers(rc.db, projectPath, session.ID, session.AgentName)
+	if err != nil {
+		return nil, fmt.Errorf("counting available reviewers: %w", err)
+	}
+	minApprovals := rc.patternEngine.RequiredApprovals(classification.Tier, available)
 	if rc.config.DynamicQuorumEnabled {
-		minApprovals = rc.checkDynamicQuorum(classification.Tier, minApprovals, opts.ProjectPath)
+		// Explicit programmatic overrides still cannot lower the configured
+		// policy below what the execution gate will accept.
+		minApprovals = max(minApprovals, rc.checkDynamicQuorum(classification.Tier, minApprovals, projectPath))
 	}
 
 	// Step 10: Set expiry times
 	now := time.Now().UTC()
 	requestExpiry := now.Add(time.Duration(rc.config.RequestTimeoutMinutes) * time.Minute)
 
-	// Determine project path
-	projectPath := opts.ProjectPath
-	if projectPath == "" {
-		projectPath = session.ProjectPath
-	}
-
 	// Step 11: Create request in DB
 	request := &db.Request{
-		ProjectPath:        projectPath,
-		Command:            cmdSpec,
-		RiskTier:           classification.Tier,
-		RequestorSessionID: opts.SessionID,
-		RequestorAgent:     session.AgentName,
-		RequestorModel:     session.Model,
-		Justification:      opts.Justification,
-		Attachments:        opts.Attachments,
-		Status:             db.StatusPending,
-		MinApprovals:       minApprovals,
-		ExpiresAt:          &requestExpiry,
-	}
-
-	// Set require_different_model based on tier
-	if classification.Tier == RiskTierCritical {
-		request.RequireDifferentModel = true
+		ProjectPath:           projectPath,
+		Command:               cmdSpec,
+		RiskTier:              classification.Tier,
+		RequestorSessionID:    opts.SessionID,
+		RequestorAgent:        session.AgentName,
+		RequestorModel:        session.Model,
+		Justification:         opts.Justification,
+		Attachments:           opts.Attachments,
+		Status:                db.StatusPending,
+		MinApprovals:          minApprovals,
+		RequireDifferentModel: rc.patternEngine.RequiresDifferentModel(),
+		ExpiresAt:             &requestExpiry,
 	}
 
 	if err := rc.db.CreateRequest(request); err != nil {
@@ -285,20 +276,15 @@ func (rc *RequestCreator) isAgentBlocked(agentName string) bool {
 
 // checkDynamicQuorum adjusts min approvals based on active sessions.
 func (rc *RequestCreator) checkDynamicQuorum(tier RiskTier, minApprovals int, projectPath string) int {
-	// Count active sessions in the project
 	sessions, err := rc.db.ListActiveSessions(projectPath)
 	if err != nil {
-		// On error, use default min approvals
 		return minApprovals
 	}
-
 	activeSessions := len(sessions)
 	if activeSessions == 0 {
 		return minApprovals
 	}
-
-	// Dynamic quorum: at most (active_sessions - 1), but never below floor
-	availableReviewers := activeSessions - 1 // Exclude requestor
+	availableReviewers := activeSessions - 1
 	if availableReviewers < minApprovals {
 		adjusted := availableReviewers
 		if adjusted < rc.config.DynamicQuorumFloor {
@@ -306,7 +292,6 @@ func (rc *RequestCreator) checkDynamicQuorum(tier RiskTier, minApprovals int, pr
 		}
 		return adjusted
 	}
-
 	return minApprovals
 }
 
@@ -320,17 +305,11 @@ func ParseCommandToArgv(cmd string) ([]string, error) {
 
 // Default redaction patterns for sensitive data.
 var defaultRedactionPatterns = []string{
-	// API keys and tokens
 	`(?i)(api[_-]?key|apikey|token|secret|password|passwd|pwd)\s*[=:]\s*['"]?[^\s'"]+['"]?`,
-	// AWS credentials
 	`(?i)aws[_-]?(access[_-]?key|secret[_-]?key|session[_-]?token)\s*[=:]\s*['"]?[^\s'"]+['"]?`,
-	// Environment variable exports with sensitive names
 	`(?i)export\s+(API_KEY|SECRET|TOKEN|PASSWORD|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|DATABASE_URL)\s*=\s*['"]?[^\s'"]+['"]?`,
-	// Connection strings
 	`(?i)(postgres|mysql|mongodb|redis)://[^@\s]+@`,
-	// Bearer tokens
 	`(?i)bearer\s+[a-zA-Z0-9._-]+`,
-	// Private keys (just the header)
 	`(?i)-----BEGIN\s+[A-Z]+\s+PRIVATE\s+KEY-----`,
 }
 
@@ -338,8 +317,6 @@ var defaultRedactionPatterns = []string{
 // Returns a display-safe version of the command with sensitive data masked.
 func ApplyRedaction(cmd string, customPatterns []string) string {
 	result := cmd
-
-	// Apply default patterns
 	for _, pattern := range defaultRedactionPatterns {
 		re, err := regexp.Compile(pattern)
 		if err != nil {
@@ -347,8 +324,6 @@ func ApplyRedaction(cmd string, customPatterns []string) string {
 		}
 		result = re.ReplaceAllString(result, "[REDACTED]")
 	}
-
-	// Apply custom patterns
 	for _, pattern := range customPatterns {
 		re, err := regexp.Compile(pattern)
 		if err != nil {
@@ -356,7 +331,6 @@ func ApplyRedaction(cmd string, customPatterns []string) string {
 		}
 		result = re.ReplaceAllString(result, "[REDACTED]")
 	}
-
 	return result
 }
 

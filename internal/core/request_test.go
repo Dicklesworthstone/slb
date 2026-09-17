@@ -3,6 +3,7 @@ package core
 import (
 	"testing"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 )
@@ -118,7 +119,13 @@ func TestCreateRequest_DangerousCommand_Created(t *testing.T) {
 func TestCreateRequest_CriticalCommand_RequiresDifferentModel(t *testing.T) {
 	database := testutil.NewTestDB(t)
 	session := testutil.MakeSession(t, database, testutil.SessionWithAgentName("agent1"))
-	creator := NewRequestCreator(database, nil, nil, nil)
+	cfg := config.DefaultConfig()
+	cfg.General.RequireDifferentModel = true
+	engine := NewPatternEngine()
+	if _, err := engine.ReplacePolicy(cfg, nil); err != nil {
+		t.Fatal(err)
+	}
+	creator := NewRequestCreator(database, nil, engine, nil)
 
 	result, err := creator.CreateRequest(CreateRequestOptions{
 		SessionID: session.ID,
@@ -139,7 +146,7 @@ func TestCreateRequest_CriticalCommand_RequiresDifferentModel(t *testing.T) {
 		t.Errorf("expected RiskTierCritical, got %s", result.Request.RiskTier)
 	}
 	if !result.Request.RequireDifferentModel {
-		t.Error("expected RequireDifferentModel=true for critical tier")
+		t.Error("expected configured RequireDifferentModel=true")
 	}
 }
 
