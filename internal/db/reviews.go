@@ -313,51 +313,13 @@ func (db *DB) CheckRequestApprovalStatus(requestID string) (approved bool, rejec
 	return false, false, nil
 }
 
-// CreateReviewWithValidation creates a review with full validation:
-// - Checks the request exists and is pending
-// - Verifies the signature
-// - Prevents self-review
-// - Updates request status if approval threshold met
+// CreateReviewWithValidation verifies an externally signed review and commits
+// its decision through the same atomic path used by the CLI review service.
+// In particular, the supplied key must belong to the persisted reviewer session.
 func (db *DB) CreateReviewWithValidation(r *Review, sessionKey string) error {
-	// Get the request
-	req, err := db.GetRequest(r.RequestID)
-	if err != nil {
-		return err
-	}
-
-	// Verify request is pending
-	if req.Status != StatusPending {
-		return fmt.Errorf("request is not pending (status: %s)", req.Status)
-	}
-
-	// Prevent self-review
-	if r.ReviewerSessionID == req.RequestorSessionID {
-		return ErrSelfReview
-	}
-
-	// Verify signature
-	if !VerifyReviewSignature(sessionKey, r.RequestID, r.Decision, r.SignatureTimestamp, r.Signature) {
+	if r == nil || r.Signature == "" || r.SignatureTimestamp.IsZero() {
 		return ErrInvalidSignature
 	}
-
-	// Create the review
-	if err := db.CreateReview(r); err != nil {
-		return err
-	}
-
-	// Check if request should be approved or rejected
-	approved, rejected, err := db.CheckRequestApprovalStatus(r.RequestID)
-	if err != nil {
-		return err
-	}
-
-	if rejected {
-		return db.UpdateRequestStatus(r.RequestID, StatusRejected)
-	}
-
-	if approved {
-		return db.UpdateRequestStatus(r.RequestID, StatusApproved)
-	}
-
-	return nil
+	_, err := db.ApplyReview(r, sessionKey, ReviewPolicy{})
+	return err
 }
