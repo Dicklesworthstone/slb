@@ -140,6 +140,9 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 	if err != nil {
 		return nil, fmt.Errorf("getting session: %w", err)
 	}
+	if !session.IsActive() {
+		return nil, ErrSessionInactive
+	}
 
 	// Gate 1: Request must be approved
 	if request.Status == db.StatusExecuting {
@@ -168,6 +171,11 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 	if tierHigher(classification.Tier, request.RiskTier) {
 		return nil, fmt.Errorf("%w: approved as %s but now classified as %s",
 			ErrTierEscalated, request.RiskTier, classification.Tier)
+	}
+	// Refuse unusable approvals before creating logs or running capture tools.
+	// The final claim repeats this check under its own writer reservation.
+	if err := e.verifyApprovalSnapshot(request); err != nil {
+		return nil, err
 	}
 
 	// Preflight: create log file and capture rollback state before locking EXECUTING.
@@ -346,6 +354,24 @@ func (e *Executor) CanExecute(requestID string) (bool, string) {
 	if tierHigher(classification.Tier, request.RiskTier) {
 		return false, fmt.Sprintf("policy escalation: command now classified as %s", classification.Tier)
 	}
+	if err := e.verifyApprovalSnapshot(request); err != nil {
+		return false, err.Error()
+	}
 
 	return true, ""
+}
+
+// verifyApprovalSnapshot aligns advisory/hook preflight with the final claim.
+// Never substitute a newer command for the snapshot whose policy was checked.
+func (e *Executor) verifyApprovalSnapshot(request *db.Request) error {
+	verified, err := e.db.VerifyRequestApproval(request.ID)
+	if err != nil {
+		return fmt.Errorf("verifying approval: %w", err)
+	}
+	if verified.Command.Hash != request.Command.Hash || verified.ProjectPath != request.ProjectPath ||
+		verified.RiskTier != request.RiskTier || verified.MinApprovals != request.MinApprovals ||
+		verified.RequireDifferentModel != request.RequireDifferentModel {
+		return fmt.Errorf("%w: request changed during preflight", db.ErrInvalidTransition)
+	}
+	return nil
 }
