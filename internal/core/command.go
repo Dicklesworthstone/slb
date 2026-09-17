@@ -9,10 +9,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
+	"golang.org/x/term"
 )
 
 // CommandResult holds the result of running a command.
@@ -36,6 +38,10 @@ func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, strea
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// Keep the caller alive long enough to reap the child and persist its
+	// outcome when a terminal interrupt or supervisor termination arrives.
+	ctx, stopSignals := signal.NotifyContext(ctx, commandSignals()...)
+	defer stopSignals()
 	startTime := time.Now()
 
 	// Open log file for writing.
@@ -81,7 +87,7 @@ func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, strea
 
 	// A descendant can inherit an output pipe after the direct child exits or
 	// is killed. Bound pipe draining so it cannot defeat the execution timeout.
-	// This is not process-tree termination; detached descendants may survive.
+	// Descendants deliberately escaping their process group may still survive.
 	cmd.WaitDelay = time.Second
 
 	var outputBuf bytes.Buffer
@@ -96,6 +102,7 @@ func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, strea
 	cmd.Stdout = multiWriter
 	cmd.Stderr = multiWriter
 	cmd.Stdin = os.Stdin
+	stopGroup := configureCommandCancellation(cmd, term.IsTerminal(int(os.Stdin.Fd())))
 
 	// Record the child PID as soon as it starts so an orphaned child remains
 	// traceable if the caller is killed before the footer is written.
@@ -109,6 +116,16 @@ func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, strea
 		fmt.Fprintf(logFile, "[started pid=%d]\n", cmd.Process.Pid)
 	}
 	err := cmd.Wait()
+	// Stop remaining group members on failure, including a shell that exits
+	// while a background child keeps our output pipe open. Wait may report
+	// ExitError instead of ErrWaitDelay when both failures occur.
+	var stopErr error
+	if stopGroup != nil && err != nil {
+		stopErr = stopGroup()
+		if errors.Is(stopErr, os.ErrProcessDone) {
+			stopErr = nil
+		}
+	}
 	result := &CommandResult{
 		ExitCode: cmd.ProcessState.ExitCode(),
 		Output:   outputBuf.String(),
@@ -128,6 +145,9 @@ func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, strea
 		default:
 			err = fmt.Errorf("waiting for command: %w", err)
 		}
+	}
+	if stopErr != nil {
+		err = errors.Join(err, fmt.Errorf("stopping command process group: %w", stopErr))
 	}
 
 	if logFile != nil {
