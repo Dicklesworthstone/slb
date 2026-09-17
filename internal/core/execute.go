@@ -31,6 +31,9 @@ const DefaultExecutionTimeout = 5 * time.Minute
 type ExecuteOptions struct {
 	// RequestID is the approved request to execute (required).
 	RequestID string
+	// ExpectedCommandHash binds a handoff to the exact command seen by its
+	// caller. Empty means no additional caller-side binding is requested.
+	ExpectedCommandHash string
 	// SessionID is the executor's session ID (required for tracking).
 	SessionID string
 	// Timeout is the maximum execution duration (default 5 minutes).
@@ -127,6 +130,9 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 	request, err := e.db.GetRequest(opts.RequestID)
 	if err != nil {
 		return nil, fmt.Errorf("getting request: %w", err)
+	}
+	if opts.ExpectedCommandHash != "" && opts.ExpectedCommandHash != request.Command.Hash {
+		return nil, fmt.Errorf("%w: command changed since execution was requested", ErrCommandHashMismatch)
 	}
 
 	// Get the session (for tracking who executed)

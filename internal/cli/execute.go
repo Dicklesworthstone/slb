@@ -1,14 +1,12 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
-	"github.com/Dicklesworthstone/slb/internal/integrations"
 	"github.com/Dicklesworthstone/slb/internal/output"
 	"github.com/spf13/cobra"
 )
@@ -21,18 +19,25 @@ var (
 )
 
 func init() {
-	// No -s/-t shorthands here: -s (--session-id) and -t (--toon) are owned by
-	// the root persistent flags. Reusing those shorthands locally collides with
-	// cobra's shorthand merge (it panicked outright on `slb execute`). Pass the
-	// session via the long --session-id flag.
+	// -s and -t belong to root persistent flags.
 	executeCmd.Flags().StringVar(&flagExecuteSessionID, "session-id", "", "executor session ID (required)")
 	executeCmd.Flags().IntVar(&flagExecuteTimeout, "timeout", 300, "execution timeout in seconds")
 	executeCmd.Flags().BoolVar(&flagExecuteBackground, "background", false, "run in background, return immediately")
 	executeCmd.Flags().StringVar(&flagExecuteLogDir, "log-dir", ".slb/logs", "directory for execution logs")
-	// Reuse Agent Mail notifier builder from approve/reject
-	_ = integrations.NoopNotifier{} // keep import if build tags change
-
+	executeCmd.Flags().String("expected-command-hash", "", "require the command hash observed before handing off execution")
 	rootCmd.AddCommand(executeCmd)
+}
+
+// commandExitError lets the entry point preserve a child's nonzero exit status
+// without bypassing deferred database/log cleanup with os.Exit in a handler.
+type commandExitError struct{ code int }
+
+func (e commandExitError) Error() string { return fmt.Sprintf("command exited with code %d", e.code) }
+func (e commandExitError) ExitCode() int {
+	if e.code < 1 || e.code > 255 {
+		return 1
+	}
+	return e.code
 }
 
 var executeCmd = &cobra.Command{
@@ -52,24 +57,24 @@ Gate conditions are validated before execution:
 Examples:
   slb execute abc123 --session-id $SESSION_ID
   slb execute abc123 --session-id $SESSION_ID --timeout 600
-  slb execute abc123 --session-id $SESSION_ID --background`,
+  slb execute abc123 --session-id $SESSION_ID --expected-command-hash <hash>`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		requestID := args[0]
-
-		// Validate required flags
 		if flagExecuteSessionID == "" {
 			return fmt.Errorf("--session-id is required")
 		}
+		expectedHash, err := cmd.Flags().GetString("expected-command-hash")
+		if err != nil {
+			return err
+		}
 
-		// Open database
 		dbConn, err := db.OpenAndMigrate(GetDB())
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}
 		defer dbConn.Close()
 
-		// Load config based on the request's project path (not just CWD).
 		req, err := dbConn.GetRequest(requestID)
 		if err != nil {
 			return fmt.Errorf("getting request: %w", err)
@@ -81,88 +86,70 @@ Examples:
 		if err != nil {
 			return fmt.Errorf("loading config: %w", err)
 		}
-
-		// Merge the project's custom patterns into the default engine before
-		// classifying. The executor's CanExecute re-classifies the command
-		// against the default engine (the "current policy must not require a
-		// higher tier" gate). Without this, project-specific patterns are
-		// invisible here and the gate evaluates against builtins only.
 		if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
 			return fmt.Errorf("loading custom patterns: %w", err)
 		}
 
-		// Create executor
 		executor := core.NewExecutor(dbConn, nil).WithNotifier(buildAgentMailNotifier(req.ProjectPath))
+		format := GetOutput()
+		structured := format == "json" || format == "yaml" || format == "toon"
+		result, execErr := executor.ExecuteApprovedRequest(cmd.Context(), core.ExecuteOptions{
+			RequestID:           requestID,
+			ExpectedCommandHash: expectedHash,
+			SessionID:           flagExecuteSessionID,
+			Timeout:             time.Duration(flagExecuteTimeout) * time.Second,
+			Background:          flagExecuteBackground,
+			LogDir:              flagExecuteLogDir,
+			SuppressOutput:      structured,
+			CaptureRollback:     cfg.General.EnableRollbackCapture,
+			MaxRollbackSizeMB:   cfg.General.MaxRollbackSizeMB,
+		})
 
-		// Check if we can execute first
-		canExec, reason := executor.CanExecute(requestID)
-		if !canExec {
-			return fmt.Errorf("cannot execute: %s", reason)
-		}
-
-		// Build options
-		opts := core.ExecuteOptions{
-			RequestID:         requestID,
-			SessionID:         flagExecuteSessionID,
-			Timeout:           time.Duration(flagExecuteTimeout) * time.Second,
-			Background:        flagExecuteBackground,
-			LogDir:            flagExecuteLogDir,
-			SuppressOutput:    GetOutput() == "json",
-			CaptureRollback:   cfg.General.EnableRollbackCapture,
-			MaxRollbackSizeMB: cfg.General.MaxRollbackSizeMB,
-		}
-
-		// Execute
-		ctx := context.Background()
-		result, err := executor.ExecuteApprovedRequest(ctx, opts)
-
-		// Build output
 		type executeResult struct {
 			RequestID  string `json:"request_id"`
+			Status     string `json:"status"`
 			ExitCode   int    `json:"exit_code"`
 			DurationMs int64  `json:"duration_ms"`
 			LogPath    string `json:"log_path"`
+			Output     string `json:"output,omitempty"`
 			TimedOut   bool   `json:"timed_out,omitempty"`
 			Error      string `json:"error,omitempty"`
 		}
-
-		resp := executeResult{
-			RequestID: requestID,
-		}
-
+		resp := executeResult{RequestID: requestID, Status: "not_executed", ExitCode: -1}
 		if result != nil {
 			resp.ExitCode = result.ExitCode
 			resp.DurationMs = result.Duration.Milliseconds()
 			resp.LogPath = result.LogPath
+			resp.Output = result.Output
 			resp.TimedOut = result.TimedOut
-		}
-
-		if err != nil {
-			resp.Error = err.Error()
-		}
-
-		out := output.New(output.Format(GetOutput()))
-		if GetOutput() == "json" {
-			if writeErr := out.Write(resp); writeErr != nil {
-				return writeErr
+			if result.Request != nil {
+				resp.Status = string(result.Request.Status)
 			}
-			return err
+		}
+		if execErr == nil && resp.ExitCode != 0 {
+			execErr = commandExitError{code: resp.ExitCode}
+		}
+		if execErr != nil {
+			resp.Error = execErr.Error()
 		}
 
-		// Human-readable output
-		if err != nil {
-			fmt.Printf("Execution failed: %s\n", err)
-			if result != nil && result.LogPath != "" {
-				fmt.Printf("Log: %s\n", result.LogPath)
+		if structured {
+			out := output.New(output.Format(format))
+			if err := out.Write(resp); err != nil {
+				return err
 			}
-			return err
+			return execErr
 		}
-
-		fmt.Printf("Executed request %s\n", requestID)
+		if execErr != nil {
+			fmt.Printf("Execution failed: %s\n", execErr)
+		} else {
+			fmt.Printf("Executed request %s\n", requestID)
+		}
 		fmt.Printf("Exit code: %d\n", resp.ExitCode)
 		fmt.Printf("Duration: %dms\n", resp.DurationMs)
-		fmt.Printf("Log: %s\n", resp.LogPath)
-
-		return nil
+		if resp.LogPath != "" {
+			fmt.Printf("Log: %s\n", resp.LogPath)
+		}
+		return execErr
 	},
 }

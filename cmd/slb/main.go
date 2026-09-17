@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 
 	"github.com/Dicklesworthstone/slb/internal/cli"
@@ -10,6 +11,13 @@ import (
 
 func main() {
 	if err := cli.Execute(); err != nil {
+		var exitErr interface{ ExitCode() int }
+		if errors.As(err, &exitErr) {
+			code := exitErr.ExitCode()
+			if code > 0 && code <= 255 {
+				os.Exit(code)
+			}
+		}
 		os.Exit(1)
 	}
 }
