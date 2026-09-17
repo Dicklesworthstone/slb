@@ -2,7 +2,6 @@
 package core
 
 import (
-	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -13,13 +12,13 @@ import (
 
 // Review errors.
 var (
-	ErrRequestNotPending  = errors.New("request is not pending")
-	ErrSelfReview         = errors.New("cannot review your own request")
-	ErrAlreadyReviewed    = errors.New("you have already reviewed this request")
-	ErrRequireDiffModel   = errors.New("different model required for approval")
-	ErrInvalidDecision    = errors.New("invalid decision (must be approve or reject)")
+	ErrRequestNotPending  = db.ErrReviewNotPending
+	ErrSelfReview         = db.ErrSelfReview
+	ErrAlreadyReviewed    = db.ErrReviewExists
+	ErrRequireDiffModel   = db.ErrReviewDifferentModel
+	ErrInvalidDecision    = db.ErrReviewInvalidDecision
 	ErrMissingSessionKey  = errors.New("session key required for signature")
-	ErrSessionKeyMismatch = errors.New("session key does not match session")
+	ErrSessionKeyMismatch = db.ErrReviewSessionKeyMismatch
 )
 
 // ConflictResolution specifies how to handle conflicting reviews.
@@ -61,6 +60,10 @@ type ReviewConfig struct {
 	// DifferentModelTimeout is how long to wait for a different-model reviewer
 	// before escalating to human when require_different_model is set.
 	DifferentModelTimeout time.Duration
+	// ApprovalTTL starts when the decisive review commits, not at creation.
+	ApprovalTTL time.Duration
+	// CriticalApprovalTTL is the shorter deadline for critical requests.
+	CriticalApprovalTTL time.Duration
 }
 
 // DefaultReviewConfig returns the default review configuration.
@@ -70,6 +73,8 @@ func DefaultReviewConfig() ReviewConfig {
 		TrustedSelfApprove:      nil,
 		TrustedSelfApproveDelay: 5 * time.Minute,
 		DifferentModelTimeout:   5 * time.Minute,
+		ApprovalTTL:             30 * time.Minute,
+		CriticalApprovalTTL:     10 * time.Minute,
 	}
 }
 
@@ -111,9 +116,9 @@ func (rs *ReviewService) SetNotifier(n integrations.RequestNotifier) {
 }
 
 // SubmitReview validates and submits a review for a request.
-// Returns the created review and any status change to the request.
+// Session authentication, request eligibility, the review, and its resulting
+// status/approval deadline are checked and committed under one DB write lock.
 func (rs *ReviewService) SubmitReview(opts ReviewOptions) (*ReviewResult, error) {
-	// Validate required fields
 	if opts.SessionID == "" {
 		return nil, errors.New("session_id is required")
 	}
@@ -123,135 +128,37 @@ func (rs *ReviewService) SubmitReview(opts ReviewOptions) (*ReviewResult, error)
 	if opts.SessionKey == "" {
 		return nil, ErrMissingSessionKey
 	}
-	if opts.Decision != db.DecisionApprove && opts.Decision != db.DecisionReject {
-		return nil, ErrInvalidDecision
+	review := &db.Review{
+		RequestID: opts.RequestID, ReviewerSessionID: opts.SessionID,
+		Decision: opts.Decision, Responses: opts.Responses, Comments: opts.Comments,
 	}
-
-	// Step 1: Get and validate session
-	session, err := rs.db.GetSession(opts.SessionID)
-	if err != nil {
-		return nil, fmt.Errorf("getting session: %w", err)
-	}
-	if !session.IsActive() {
+	outcome, err := rs.db.ApplyReview(review, opts.SessionKey, db.ReviewPolicy{
+		ConflictResolution:      string(rs.config.ConflictResolution),
+		TrustedSelfApprove:      rs.config.TrustedSelfApprove,
+		TrustedSelfApproveDelay: rs.config.TrustedSelfApproveDelay,
+		ApprovalTTL:             rs.config.ApprovalTTL,
+		CriticalApprovalTTL:     rs.config.CriticalApprovalTTL,
+	})
+	if errors.Is(err, db.ErrReviewSessionInactive) {
 		return nil, ErrSessionInactive
 	}
-	if opts.SessionKey != session.SessionKey {
-		return nil, ErrSessionKeyMismatch
-	}
-
-	// Step 2: Get and validate request
-	request, err := rs.db.GetRequest(opts.RequestID)
-	if err != nil {
-		return nil, fmt.Errorf("getting request: %w", err)
-	}
-	if !CanApprove(request.Status) {
-		return nil, fmt.Errorf("%w: status is %s", ErrRequestNotPending, request.Status)
-	}
-
-	// Step 3: Check not self-review (unless trusted self-approve agent)
-	isSelfReview := opts.SessionID == request.RequestorSessionID
-	if isSelfReview {
-		if !rs.isTrustedSelfApprove(session.AgentName) {
-			return nil, ErrSelfReview
-		}
-		// Trusted agents can self-approve after delay
-		delay := rs.config.TrustedSelfApproveDelay
-		if time.Since(request.CreatedAt) < delay {
-			return nil, fmt.Errorf("trusted self-approve requires %v delay", delay)
-		}
-	}
-
-	// Step 4: Check not already reviewed by this session
-	alreadyReviewed, err := rs.db.HasReviewerAlreadyReviewed(opts.RequestID, opts.SessionID)
-	if err != nil {
-		return nil, fmt.Errorf("checking previous review: %w", err)
-	}
-	if alreadyReviewed {
-		return nil, ErrAlreadyReviewed
-	}
-
-	// Step 5: Check require_different_model (for approvals only)
-	if opts.Decision == db.DecisionApprove && request.RequireDifferentModel {
-		if session.Model == request.RequestorModel {
-			return nil, fmt.Errorf("%w: your model (%s) matches the requestor's", ErrRequireDiffModel, session.Model)
-		}
-	}
-
-	// Step 6: Generate signature
-	timestamp := time.Now().UTC()
-	signature := db.ComputeReviewSignature(opts.SessionKey, opts.RequestID, opts.Decision, timestamp)
-
-	review := &db.Review{
-		RequestID:          opts.RequestID,
-		ReviewerSessionID:  opts.SessionID,
-		ReviewerAgent:      session.AgentName,
-		ReviewerModel:      session.Model,
-		Decision:           opts.Decision,
-		Signature:          signature,
-		SignatureTimestamp: timestamp,
-		Responses:          opts.Responses,
-		Comments:           opts.Comments,
-	}
-
-	result := &ReviewResult{
-		Review: review,
-	}
-
-	// Execute review creation and status update in a transaction
-	err = rs.db.Transaction(func(tx *sql.Tx) error {
-		// Re-fetch request inside transaction to lock (if using serialized) or at least get fresh state
-		// Note: SQLite doesn't strictly lock on read unless BEGIN IMMEDIATE, but this helps.
-		// However, CreateReviewTx (insert) will lock the DB for writing.
-
-		// Check duplicate again inside transaction
-		if exists, err := rs.db.HasReviewerAlreadyReviewedTx(tx, opts.RequestID, opts.SessionID); err != nil {
-			return err
-		} else if exists {
-			return ErrAlreadyReviewed
-		}
-
-		if err := rs.db.CreateReviewTx(tx, review); err != nil {
-			return fmt.Errorf("creating review: %w", err)
-		}
-
-		approvals, rejections, err := rs.db.CountReviewsByDecisionTx(tx, opts.RequestID)
-		if err != nil {
-			return fmt.Errorf("counting reviews: %w", err)
-		}
-		result.Approvals = approvals
-		result.Rejections = rejections
-
-		// Get latest status for transition check
-		reqTx, err := rs.db.GetRequestTx(tx, opts.RequestID)
-		if err != nil {
-			return fmt.Errorf("getting request: %w", err)
-		}
-
-		// Apply conflict resolution rules
-		newStatus := rs.determineNewStatus(reqTx, opts.Decision, approvals, rejections)
-		if newStatus != "" && newStatus != reqTx.Status {
-			// Pass current status for optimistic locking check
-			if err := rs.db.UpdateRequestStatusTx(tx, opts.RequestID, newStatus, reqTx.Status); err != nil {
-				return fmt.Errorf("updating request status: %w", err)
-			}
-			result.RequestStatusChanged = true
-			result.NewRequestStatus = newStatus
-		}
-		return nil
-	})
-
 	if err != nil {
 		return nil, err
 	}
-
-	// Notify asynchronously (best effort)
+	result := &ReviewResult{
+		Review: outcome.Review, Approvals: outcome.Approvals, Rejections: outcome.Rejections,
+		RequestStatusChanged: outcome.StatusChanged,
+	}
+	if outcome.StatusChanged {
+		result.NewRequestStatus = outcome.Request.Status
+	}
+	// Notifications describe committed state and are never sent on rollback.
 	switch opts.Decision {
 	case db.DecisionApprove:
-		_ = rs.notifier.NotifyRequestApproved(request, review)
+		_ = rs.notifier.NotifyRequestApproved(outcome.Request, outcome.Review)
 	case db.DecisionReject:
-		_ = rs.notifier.NotifyRequestRejected(request, review)
+		_ = rs.notifier.NotifyRequestRejected(outcome.Request, outcome.Review)
 	}
-
 	return result, nil
 }
 
@@ -339,9 +246,12 @@ func (rs *ReviewService) CanReview(sessionID, requestID string) (bool, string) {
 	if !CanApprove(request.Status) {
 		return false, fmt.Sprintf("request cannot be reviewed (status: %s)", request.Status)
 	}
+	if request.Status == db.StatusPending && request.ExpiresAt != nil && !time.Now().Before(*request.ExpiresAt) {
+		return false, db.ErrReviewExpired.Error()
+	}
 
-	// Check self-review
-	if sessionID == request.RequestorSessionID {
+	// Check self-review, including a restarted session with the same agent.
+	if sessionID == request.RequestorSessionID || session.AgentName == request.RequestorAgent {
 		if !rs.isTrustedSelfApprove(session.AgentName) {
 			return false, "cannot review your own request"
 		}
@@ -351,7 +261,7 @@ func (rs *ReviewService) CanReview(sessionID, requestID string) (bool, string) {
 		}
 	}
 
-	// Check already reviewed
+	// Check already reviewed (the write path also checks the stable agent name).
 	alreadyReviewed, err := rs.db.HasReviewerAlreadyReviewed(requestID, sessionID)
 	if err != nil {
 		return false, fmt.Sprintf("error checking previous review: %v", err)

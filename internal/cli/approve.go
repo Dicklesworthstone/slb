@@ -108,8 +108,11 @@ database contains the request you want to approve.
 			Comments: flagApproveComments,
 		}
 
-		// Create review service and submit
-		reviewSvc := core.NewReviewService(dbConn, core.DefaultReviewConfig())
+		// Load the request's project policy, even when --db selects another project.
+		reviewSvc, err := buildConfiguredReviewService(dbConn, requestID)
+		if err != nil {
+			return err
+		}
 		reviewSvc.SetNotifier(buildAgentMailNotifier(project))
 		result, err := reviewSvc.SubmitReview(opts)
 		if err != nil {
@@ -161,6 +164,28 @@ database contains the request you want to approve.
 
 		return nil
 	},
+}
+
+// buildConfiguredReviewService binds review policy to the target request rather
+// than the caller's working directory. A configuration error must not silently
+// fall back to a potentially weaker default policy.
+func buildConfiguredReviewService(database *db.DB, requestID string) (*core.ReviewService, error) {
+	request, err := database.GetRequest(requestID)
+	if err != nil {
+		return nil, fmt.Errorf("loading request policy: %w", err)
+	}
+	cfg, err := config.Load(config.LoadOptions{ProjectDir: request.ProjectPath, ConfigPath: flagConfig})
+	if err != nil {
+		return nil, fmt.Errorf("loading review policy: %w", err)
+	}
+	review := core.DefaultReviewConfig()
+	review.ConflictResolution = core.ConflictResolution(cfg.General.ConflictResolution)
+	review.TrustedSelfApprove = cfg.Agents.TrustedSelfApprove
+	review.TrustedSelfApproveDelay = time.Duration(cfg.Agents.TrustedSelfApproveDelaySecs) * time.Second
+	review.DifferentModelTimeout = time.Duration(cfg.General.DifferentModelTimeoutSecs) * time.Second
+	review.ApprovalTTL = time.Duration(cfg.General.ApprovalTTLMins) * time.Minute
+	review.CriticalApprovalTTL = time.Duration(cfg.General.ApprovalTTLCriticalMins) * time.Minute
+	return core.NewReviewService(database, review), nil
 }
 
 // buildAgentMailNotifier constructs a notifier from config; falls back to no-op on errors/disabled.

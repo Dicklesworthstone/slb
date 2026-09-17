@@ -99,8 +99,11 @@ database contains the request you want to reject.
 			Comments:   comments,
 		}
 
-		// Create review service and submit
-		reviewSvc := core.NewReviewService(dbConn, core.DefaultReviewConfig())
+		// Load the request's project policy, even when --db selects another project.
+		reviewSvc, err := buildConfiguredReviewService(dbConn, requestID)
+		if err != nil {
+			return err
+		}
 		reviewSvc.SetNotifier(buildAgentMailNotifier(project))
 		result, err := reviewSvc.SubmitReview(opts)
 		if err != nil {
@@ -143,7 +146,7 @@ database contains the request you want to reject.
 		// Human-readable output
 		fmt.Printf("Rejected request %s\n", requestID)
 		fmt.Printf("Review ID: %s\n", resp.ReviewID)
-		fmt.Printf("Reason: %s\n", flagRejectReason)
+		fmt.Printf("Reason: %s\n", resp.Reason)
 		fmt.Printf("Approvals: %d, Rejections: %d\n", resp.Approvals, resp.Rejections)
 
 		if result.RequestStatusChanged {
