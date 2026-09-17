@@ -41,7 +41,7 @@ const (
 )
 
 type RollbackCaptureOptions struct {
-	// MaxSizeBytes limits filesystem capture. 0 disables the limit.
+	// MaxSizeBytes limits filesystem and Git capture. 0 disables the limit.
 	MaxSizeBytes int64
 	// Retention controls cleanup of old rollback captures. 0 uses the default.
 	Retention time.Duration
@@ -80,16 +80,6 @@ type FilesystemRollbackData struct {
 type FilesystemRoot struct {
 	ID   string `json:"id"`
 	Path string `json:"path"`
-}
-
-type GitRollbackData struct {
-	RepoRoot      string `json:"repo_root"`
-	Head          string `json:"head"`
-	Branch        string `json:"branch"`
-	StatusFile    string `json:"status_file"`
-	DiffFile      string `json:"diff_file"`
-	CachedFile    string `json:"cached_file"`
-	UntrackedFile string `json:"untracked_file"`
 }
 
 type KubernetesRollbackData struct {
@@ -165,7 +155,7 @@ func CaptureRollbackState(ctx context.Context, req *db.Request, opts RollbackCap
 		}
 		data.Filesystem = fsData
 	case rollbackKindGit:
-		gitData, err := captureGitRollback(ctx, rollbackDir, req, tokens)
+		gitData, err := captureGitRollback(ctx, rollbackDir, req, tokens, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -860,115 +850,6 @@ func restoreFilesystemRollback(data *RollbackData, opts RollbackRestoreOptions) 
 		}
 	}
 
-	return nil
-}
-
-func captureGitRollback(ctx context.Context, rollbackDir string, req *db.Request, tokens []string) (*GitRollbackData, error) {
-	captureCtx, cancel := context.WithTimeout(ctx, defaultRollbackCmdTimeout)
-	defer cancel()
-
-	cwd := req.Command.Cwd
-	if strings.TrimSpace(cwd) == "" {
-		cwd = req.ProjectPath
-	}
-
-	repoRoot, err := runCmdString(captureCtx, cwd, "git", "rev-parse", "--show-toplevel")
-	if err != nil {
-		return nil, fmt.Errorf("git repo detection failed: %w", err)
-	}
-	repoRoot = strings.TrimSpace(repoRoot)
-
-	head, err := runCmdString(captureCtx, repoRoot, "git", "rev-parse", "HEAD")
-	if err != nil {
-		return nil, fmt.Errorf("git head: %w", err)
-	}
-	branch, _ := runCmdString(captureCtx, repoRoot, "git", "rev-parse", "--abbrev-ref", "HEAD")
-
-	status, _ := runCmdString(captureCtx, repoRoot, "git", "status", "--porcelain=v1")
-	diff, _ := runCmdString(captureCtx, repoRoot, "git", "diff")
-	cached, _ := runCmdString(captureCtx, repoRoot, "git", "diff", "--cached")
-	untracked, _ := runCmdString(captureCtx, repoRoot, "git", "ls-files", "--others", "--exclude-standard")
-
-	gitDir := filepath.Join(rollbackDir, rollbackGitDirName)
-	if err := os.MkdirAll(gitDir, 0700); err != nil {
-		return nil, fmt.Errorf("creating git rollback dir: %w", err)
-	}
-
-	if err := os.WriteFile(filepath.Join(gitDir, rollbackGitHeadFilename), []byte(strings.TrimSpace(head)+"\n"), 0600); err != nil {
-		return nil, fmt.Errorf("writing git head: %w", err)
-	}
-	_ = os.WriteFile(filepath.Join(gitDir, rollbackGitBranchFilename), []byte(strings.TrimSpace(branch)+"\n"), 0600)
-	_ = os.WriteFile(filepath.Join(gitDir, rollbackGitStatusFilename), []byte(status), 0600)
-	_ = os.WriteFile(filepath.Join(gitDir, rollbackGitDiffFilename), []byte(diff), 0600)
-	_ = os.WriteFile(filepath.Join(gitDir, rollbackGitCachedFilename), []byte(cached), 0600)
-	_ = os.WriteFile(filepath.Join(gitDir, rollbackGitUntrackedFilename), []byte(untracked), 0600)
-
-	return &GitRollbackData{
-		RepoRoot:      repoRoot,
-		Head:          strings.TrimSpace(head),
-		Branch:        strings.TrimSpace(branch),
-		StatusFile:    filepath.ToSlash(filepath.Join(rollbackGitDirName, rollbackGitStatusFilename)),
-		DiffFile:      filepath.ToSlash(filepath.Join(rollbackGitDirName, rollbackGitDiffFilename)),
-		CachedFile:    filepath.ToSlash(filepath.Join(rollbackGitDirName, rollbackGitCachedFilename)),
-		UntrackedFile: filepath.ToSlash(filepath.Join(rollbackGitDirName, rollbackGitUntrackedFilename)),
-	}, nil
-}
-
-func restoreGitRollback(ctx context.Context, data *RollbackData, opts RollbackRestoreOptions) error {
-	if data.Git == nil {
-		return fmt.Errorf("git rollback data missing")
-	}
-	if !opts.Force {
-		return fmt.Errorf("git rollback is destructive (use --force)")
-	}
-	if _, err := exec.LookPath("git"); err != nil {
-		return fmt.Errorf("git not found in PATH")
-	}
-
-	restoreCtx, cancel := context.WithTimeout(ctx, 2*DefaultExecutionTimeout)
-	defer cancel()
-
-	repoRoot := data.Git.RepoRoot
-	if strings.TrimSpace(repoRoot) == "" {
-		return fmt.Errorf("git repo root missing")
-	}
-
-	// Try to return to the original branch if it existed.
-	if b := strings.TrimSpace(data.Git.Branch); b != "" && b != "HEAD" {
-		_, _ = runCmdString(restoreCtx, repoRoot, "git", "checkout", b)
-	}
-
-	if _, err := runCmdString(restoreCtx, repoRoot, "git", "reset", "--hard", data.Git.Head); err != nil {
-		return fmt.Errorf("git reset --hard: %w", err)
-	}
-
-	// Re-apply captured diffs (best-effort).
-	if err := applyGitPatchIfPresent(restoreCtx, repoRoot, filepath.Join(data.RollbackPath, filepath.FromSlash(data.Git.CachedFile)), true); err != nil {
-		return err
-	}
-	if err := applyGitPatchIfPresent(restoreCtx, repoRoot, filepath.Join(data.RollbackPath, filepath.FromSlash(data.Git.DiffFile)), false); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func applyGitPatchIfPresent(ctx context.Context, repoRoot, patchPath string, cached bool) error {
-	b, err := os.ReadFile(patchPath)
-	if err != nil {
-		return nil
-	}
-	if len(bytesTrimSpace(b)) == 0 {
-		return nil
-	}
-	args := []string{"apply"}
-	if cached {
-		args = append(args, "--cached")
-	}
-	args = append(args, patchPath)
-	if _, err := runCmdString(ctx, repoRoot, "git", args...); err != nil {
-		return fmt.Errorf("git apply (%s): %w", filepath.Base(patchPath), err)
-	}
 	return nil
 }
 
