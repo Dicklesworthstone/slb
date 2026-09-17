@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -24,39 +25,53 @@ func (db *DB) ClaimRequestExecution(expected *Request, execution *Execution) err
 		return fmt.Errorf("encoding execution arguments: %w", err)
 	}
 
-	result, err := db.Exec(`
-		UPDATE requests SET
-			status = 'executing', resolved_at = NULL,
-			execution_executed_at = ?, execution_executed_by_session_id = ?,
-			execution_executed_by_agent = ?, execution_executed_by_model = ?,
-			execution_log_path = ?, execution_exit_code = NULL, execution_duration_ms = NULL
-		WHERE id = ? AND status = 'approved'
-			AND project_path = ?
-			AND command_hash = ? AND command_raw = ? AND command_cwd = ?
-			AND command_argv_json = ? AND command_shell = ?
-			AND risk_tier = ? AND min_approvals = ? AND require_different_model = ?
-			AND (approval_expires_at IS NULL OR julianday(approval_expires_at) > julianday('now'))
-			AND EXISTS (
-				SELECT 1 FROM sessions WHERE id = ? AND ended_at IS NULL
-					AND agent_name = ? AND model = ?
-			)
-	`, execution.ExecutedAt.UTC().Format(time.RFC3339), execution.ExecutedBySessionID,
-		execution.ExecutedByAgent, execution.ExecutedByModel, execution.LogPath,
-		expected.ID, expected.ProjectPath, expected.Command.Hash, expected.Command.Raw, expected.Command.Cwd,
-		string(argv), boolToInt(expected.Command.Shell), string(expected.RiskTier), expected.MinApprovals,
-		boolToInt(expected.RequireDifferentModel), execution.ExecutedBySessionID,
-		execution.ExecutedByAgent, execution.ExecutedByModel)
-	if err != nil {
-		return fmt.Errorf("claiming request execution: %w", err)
-	}
-	count, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("checking execution claim: %w", err)
-	}
-	if count != 1 {
-		return fmt.Errorf("%w: request changed, approval expired, session ended, or execution already claimed", ErrInvalidTransition)
-	}
-	return nil
+	return db.Transaction(func(tx *sql.Tx) error {
+		// Reserve the writer before reading reviews so a concurrent vote/key
+		// change cannot race the authorization-to-execution transition.
+		if _, err := tx.Exec(`UPDATE requests SET id = id WHERE id = ?`, expected.ID); err != nil {
+			return fmt.Errorf("locking execution claim: %w", err)
+		}
+		current, err := db.GetRequestTx(tx, expected.ID)
+		if err != nil {
+			return err
+		}
+		if err := verifyApprovalTx(tx, current, time.Now().UTC()); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidTransition, err)
+		}
+		result, err := tx.Exec(`
+			UPDATE requests SET
+				status = 'executing', resolved_at = NULL,
+				execution_executed_at = ?, execution_executed_by_session_id = ?,
+				execution_executed_by_agent = ?, execution_executed_by_model = ?,
+				execution_log_path = ?, execution_exit_code = NULL, execution_duration_ms = NULL
+			WHERE id = ? AND status = 'approved'
+				AND project_path = ?
+				AND command_hash = ? AND command_raw = ? AND command_cwd = ?
+				AND command_argv_json = ? AND command_shell = ?
+				AND risk_tier = ? AND min_approvals = ? AND require_different_model = ?
+				AND (approval_expires_at IS NULL OR julianday(approval_expires_at) > julianday('now'))
+				AND EXISTS (
+					SELECT 1 FROM sessions WHERE id = ? AND ended_at IS NULL
+						AND agent_name = ? AND model = ?
+				)
+		`, execution.ExecutedAt.UTC().Format(time.RFC3339), execution.ExecutedBySessionID,
+			execution.ExecutedByAgent, execution.ExecutedByModel, execution.LogPath,
+			expected.ID, expected.ProjectPath, expected.Command.Hash, expected.Command.Raw, expected.Command.Cwd,
+			string(argv), boolToInt(expected.Command.Shell), string(expected.RiskTier), expected.MinApprovals,
+			boolToInt(expected.RequireDifferentModel), execution.ExecutedBySessionID,
+			execution.ExecutedByAgent, execution.ExecutedByModel)
+		if err != nil {
+			return fmt.Errorf("claiming request execution: %w", err)
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("checking execution claim: %w", err)
+		}
+		if count != 1 {
+			return fmt.Errorf("%w: request changed, approval expired, session ended, or execution already claimed", ErrInvalidTransition)
+		}
+		return nil
+	})
 }
 
 // CompleteRequestExecution persists the terminal state and child outcome in one
