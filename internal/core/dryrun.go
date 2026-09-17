@@ -77,13 +77,22 @@ func RunDryRun(spec *db.CommandSpec) (*db.DryRunResult, error) {
 
 func getDryRunTokens(raw string) ([]string, bool) {
 	normalized := NormalizeCommand(raw)
+	// A preview must not silently describe only the first command in a
+	// pipeline/list, or guess at arguments after a parse failure. Classification
+	// can conservatively recover from those inputs; pre-approval execution cannot.
+	if normalized.ParseError || normalized.IsCompound || normalized.HasSubshell {
+		return nil, false
+	}
 	cmd := strings.TrimSpace(normalized.Primary)
 	if cmd == "" {
 		cmd = strings.TrimSpace(raw)
 	}
 
-	tokens := parseShellTokens(cmd)
-	if len(tokens) == 0 {
+	parser := shellwords.NewParser()
+	parser.ParseEnv = false
+	parser.ParseBacktick = false
+	tokens, err := parser.Parse(cmd)
+	if err != nil || len(tokens) == 0 {
 		return nil, false
 	}
 
@@ -116,15 +125,47 @@ func dryRunKubectl(tokens []string) ([]string, bool) {
 	if len(tokens) < 2 || tokens[1] != "delete" {
 		return nil, false
 	}
-	if hasFlagPrefix(tokens, "--dry-run") {
-		return tokens, true
-	}
 
-	out := append([]string{}, tokens...)
-	out = append(out, "--dry-run=client")
-	if !hasFlag(out, "-o") && !hasFlagPrefix(out, "--output") {
+	// This command runs BEFORE approval. Never trust a supplied dry-run mode:
+	// "none" (or older "false") performs the deletion. Put our flag first so
+	// neither a preceding value-taking option nor "--" can swallow it, and
+	// remove every later override. Never mutate the requested argv.
+	out := []string{tokens[0], "delete", "--dry-run=client"}
+	args := make([]string, 0, len(tokens)-2)
+	var operands []string
+	for i := 2; i < len(tokens); i++ {
+		token := tokens[i]
+		if token == "--" {
+			operands = tokens[i:]
+			break
+		}
+		switch {
+		case token == "--raw" || strings.HasPrefix(token, "--raw="):
+			// Raw API deletion is not an object-level client-side preview.
+			return nil, false
+		case token == "--dry-run":
+			// Accept explicit separated modes as well as the bare flag, but do
+			// not consume a resource type/name as if it were a mode.
+			if i+1 < len(tokens) {
+				switch tokens[i+1] {
+				case "client", "server", "none", "true", "false":
+					i++
+				}
+			}
+		case strings.HasPrefix(token, "--dry-run="):
+			// Replace all requested modes with the enforced client-side mode.
+		case strings.HasPrefix(token, "--dry-run"):
+			return nil, false
+		default:
+			args = append(args, token)
+		}
+	}
+	if !hasFlag(args, "-o") && !hasFlagPrefix(args, "-o=") &&
+		!hasFlag(args, "--output") && !hasFlagPrefix(args, "--output=") {
 		out = append(out, "-o", "yaml")
 	}
+	out = append(out, args...)
+	out = append(out, operands...)
 	return out, true
 }
 
