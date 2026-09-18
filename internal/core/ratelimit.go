@@ -2,6 +2,8 @@
 package core
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -63,7 +65,7 @@ type RateLimitResult struct {
 	Message            string          `json:"message,omitempty"`
 }
 
-// RateLimitError is returned when Action == "reject" and limits are exceeded.
+// RateLimitError is returned when a strict admission exceeds its limits.
 type RateLimitError struct {
 	SessionID    string
 	Pending      int
@@ -110,6 +112,43 @@ func NewRateLimiter(database *db.DB, cfg RateLimitConfig) *RateLimiter {
 	}
 }
 
+// AdmitRequest atomically consumes quota AND persists the request. A successful
+// CheckRateLimit is only advisory and must never authorize a separate insert.
+// Both queue and reject return a typed RateLimitError when no slot is available;
+// callers may retry queue admissions, but must not retry other storage errors.
+func (rl *RateLimiter) AdmitRequest(ctx context.Context, request *db.Request) (*RateLimitResult, error) {
+	cfg := rl.cfg.normalized()
+	stats, err := rl.db.AdmitRequest(ctx, request, db.RequestAdmissionLimits{
+		MaxPending: cfg.MaxPendingPerSession, MaxPerMinute: cfg.MaxRequestsPerMinute,
+		WarnOnly: cfg.Action == RateLimitActionWarn,
+	})
+	var denied *db.RequestAdmissionLimitError
+	if err != nil && !errors.As(err, &denied) {
+		return nil, err
+	}
+	result := &RateLimitResult{
+		Allowed: err == nil, Action: cfg.Action,
+		RemainingPending:   max(0, cfg.MaxPendingPerSession-stats.Pending),
+		RemainingPerMinute: max(0, cfg.MaxRequestsPerMinute-stats.Recent),
+		ResetAt:            stats.ResetAt, Message: "ok",
+	}
+	limitErr := &RateLimitError{
+		SessionID: request.RequestorSessionID,
+		Pending:   stats.Pending, MaxPending: cfg.MaxPendingPerSession,
+		Recent: stats.Recent, MaxPerMinute: cfg.MaxRequestsPerMinute, ResetAt: stats.ResetAt,
+	}
+	if stats.Exceeded {
+		result.Message = limitErr.Error()
+	}
+	if err != nil {
+		return result, limitErr
+	}
+	// Remaining capacity describes the state AFTER this successful admission.
+	result.RemainingPending = max(0, result.RemainingPending-1)
+	result.RemainingPerMinute = max(0, result.RemainingPerMinute-1)
+	return result, nil
+}
+
 // ResetRateLimits resets the per-minute counter for a session by recording a reset timestamp.
 // Callers can expose this via a human-only CLI command (e.g. `slb session reset-limits`).
 func (rl *RateLimiter) ResetRateLimits(sessionID string) (time.Time, error) {
@@ -119,7 +158,8 @@ func (rl *RateLimiter) ResetRateLimits(sessionID string) (time.Time, error) {
 	return rl.db.ResetSessionRateLimits(sessionID, rl.now().UTC())
 }
 
-// CheckRateLimit checks whether the session may submit a new request.
+// CheckRateLimit returns an advisory snapshot. Use AdmitRequest to submit: the
+// counters can change immediately after this method returns.
 func (rl *RateLimiter) CheckRateLimit(sessionID string) (*RateLimitResult, error) {
 	if sessionID == "" {
 		return nil, fmt.Errorf("session_id is required")
@@ -179,8 +219,6 @@ func (rl *RateLimiter) CheckRateLimit(sessionID string) (*RateLimitResult, error
 		return result, nil
 	}
 
-	result.RemainingPending = 0
-	result.RemainingPerMinute = 0
 	result.Message = (&RateLimitError{
 		SessionID:    sessionID,
 		Pending:      pending,

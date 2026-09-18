@@ -2,6 +2,7 @@
 package core
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"regexp"
@@ -43,6 +44,8 @@ type CreateRequestResult struct {
 	SkipReason string
 	// Classification is the risk classification result.
 	Classification *MatchResult
+	// RateLimit is the committed admission result, including warn-only overruns.
+	RateLimit *RateLimitResult
 }
 
 // Request creation errors.
@@ -158,15 +161,8 @@ func (rc *RequestCreator) CreateRequest(opts CreateRequestOptions) (*CreateReque
 		return nil, fmt.Errorf("%w: %s", ErrAgentBlocked, session.AgentName)
 	}
 
-	// Step 3: Check rate limits
-	// CheckRateLimit returns an error when Action=reject and limits are exceeded
-	limitResult, err := rc.rateLimiter.CheckRateLimit(opts.SessionID)
-	if err != nil {
-		return nil, err
-	}
-	if !limitResult.Allowed {
-		return nil, fmt.Errorf("rate limit exceeded (action=%s): %s", limitResult.Action, limitResult.Message)
-	}
+	// Quota is checked atomically with persistence below, not with a separate
+	// precheck that concurrent clients could all pass. SAFE skips consume none.
 
 	// Step 4: Classify command
 	classification := rc.patternEngine.ClassifyCommand(opts.Command, opts.Cwd)
@@ -198,7 +194,7 @@ func (rc *RequestCreator) CreateRequest(opts CreateRequestOptions) (*CreateReque
 	// Step 6: Parse command to argv
 	argv, _ := ParseCommandToArgv(opts.Command)
 
-	// Step 7: Build command spec (hash computed by db.CreateRequest)
+	// Step 7: Build command spec (hash computed by DB admission)
 	cmdSpec := db.CommandSpec{
 		Raw:   opts.Command,
 		Argv:  argv,
@@ -247,8 +243,9 @@ func (rc *RequestCreator) CreateRequest(opts CreateRequestOptions) (*CreateReque
 		ExpiresAt:             &requestExpiry,
 	}
 
-	if err := rc.db.CreateRequest(request); err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+	admission, err := rc.rateLimiter.AdmitRequest(context.Background(), request)
+	if err != nil {
+		return nil, fmt.Errorf("admitting request: %w", err)
 	}
 
 	// Step 12: Notify via Agent Mail (best effort; errors ignored)
@@ -261,6 +258,7 @@ func (rc *RequestCreator) CreateRequest(opts CreateRequestOptions) (*CreateReque
 		Request:        request,
 		Skipped:        false,
 		Classification: classification,
+		RateLimit:      admission,
 	}, nil
 }
 
