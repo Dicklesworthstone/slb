@@ -108,6 +108,13 @@ func DefaultSocketPath() string {
 	if err != nil {
 		cwd = "."
 	}
+	return SocketPathForCWD(cwd)
+}
+
+// SocketPathForCWD returns the project-scoped Unix socket path that a hook
+// running from cwd will use. This is the explicit-CWD counterpart to
+// DefaultSocketPath and must stay in lockstep with generated hook discovery.
+func SocketPathForCWD(cwd string) string {
 	hashBase := projectRootForSocket(cwd)
 	hash := sha256.Sum256([]byte(hashBase))
 	shortHash := hex.EncodeToString(hash[:])[:12]

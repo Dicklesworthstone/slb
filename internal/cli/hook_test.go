@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/slb/internal/daemon"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 	"github.com/spf13/cobra"
 )
@@ -23,6 +24,7 @@ func newTestHookCmd(dbPath string) *cobra.Command {
 	root.PersistentFlags().StringVarP(&flagOutput, "output", "o", "text", "output format")
 	root.PersistentFlags().BoolVarP(&flagJSON, "json", "j", false, "json output")
 	root.PersistentFlags().StringVarP(&flagProject, "project", "C", "", "project directory")
+	root.PersistentFlags().StringVarP(&flagSessionID, "session-id", "s", "", "session ID")
 
 	// Create fresh hook commands
 	hkCmd := &cobra.Command{
@@ -60,14 +62,22 @@ func newTestHookCmd(dbPath string) *cobra.Command {
 		RunE:  hookStatusCmd.RunE,
 	}
 
+	healthCmd := &cobra.Command{
+		Use:   "health",
+		Short: "Check hook daemon health",
+		RunE:  hookHealthCmd.RunE,
+	}
+
 	testCmd := &cobra.Command{
 		Use:   "test <command>",
 		Short: "Test hook behavior for a command",
 		Args:  cobra.ExactArgs(1),
 		RunE:  hookTestCmd.RunE,
 	}
+	testCmd.Flags().BoolVar(&flagHookLocalOnly, "local-only", false, "test local policy")
+	testCmd.Flags().BoolVar(&flagHookSimulateFailure, "simulate-failure", false, "simulate daemon failure")
 
-	hkCmd.AddCommand(generateCmd, installCmd, uninstallCmd, statusCmd, testCmd)
+	hkCmd.AddCommand(generateCmd, installCmd, uninstallCmd, statusCmd, healthCmd, testCmd)
 	root.AddCommand(hkCmd)
 
 	return root
@@ -78,10 +88,13 @@ func resetHookFlags() {
 	flagOutput = "text"
 	flagJSON = false
 	flagProject = ""
+	flagSessionID = ""
 	flagHookGlobal = false
 	flagHookMerge = true
 	flagHookForce = false
 	flagHookOutputDir = ""
+	flagHookLocalOnly = false
+	flagHookSimulateFailure = false
 }
 
 func TestHookCommand_Help(t *testing.T) {
@@ -211,7 +224,7 @@ func TestHookTestCommand_SafeCommand(t *testing.T) {
 	resetHookFlags()
 
 	cmd := newTestHookCmd(h.DBPath)
-	stdout, err := executeCommandCapture(t, cmd, "hook", "test", "git stash", "-j")
+	stdout, err := executeCommandCapture(t, cmd, "hook", "test", "git stash", "--local-only", "-j")
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -235,7 +248,7 @@ func TestHookTestCommand_DangerousCommand(t *testing.T) {
 	resetHookFlags()
 
 	cmd := newTestHookCmd(h.DBPath)
-	stdout, err := executeCommandCapture(t, cmd, "hook", "test", "rm -rf node_modules", "-j")
+	stdout, err := executeCommandCapture(t, cmd, "hook", "test", "rm -rf node_modules", "--local-only", "-j")
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -259,7 +272,7 @@ func TestHookTestCommand_CriticalCommand(t *testing.T) {
 	resetHookFlags()
 
 	cmd := newTestHookCmd(h.DBPath)
-	stdout, err := executeCommandCapture(t, cmd, "hook", "test", "git push --force", "-j")
+	stdout, err := executeCommandCapture(t, cmd, "hook", "test", "git push --force", "--local-only", "-j")
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -283,7 +296,7 @@ func TestHookTestCommand_OutputFields(t *testing.T) {
 	resetHookFlags()
 
 	cmd := newTestHookCmd(h.DBPath)
-	stdout, err := executeCommandCapture(t, cmd, "hook", "test", "rm -rf /tmp/test", "-j")
+	stdout, err := executeCommandCapture(t, cmd, "hook", "test", "rm -rf /tmp/test", "--local-only", "-j")
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -917,7 +930,7 @@ func TestHookTestCommand_UnknownRequiresOfflineConfirmation(t *testing.T) {
 	h := testutil.NewHarness(t)
 	resetHookFlags()
 	cmd := newTestHookCmd(h.DBPath)
-	stdout, err := executeCommandCapture(t, cmd, "hook", "test", "ordinary-unmatched-command", "-j")
+	stdout, err := executeCommandCapture(t, cmd, "hook", "test", "ordinary-unmatched-command", "--local-only", "-j")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -927,5 +940,45 @@ func TestHookTestCommand_UnknownRequiresOfflineConfirmation(t *testing.T) {
 	}
 	if result["action"] != "ask" || result["tier"] != "unknown" {
 		t.Fatalf("unknown local command did not require confirmation: %+v", result)
+	}
+}
+
+func TestHookHealthCommand_UnreachableDaemonReportsFallback(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetHookFlags()
+	cmd := newTestHookCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, cmd, "-C", h.ProjectDir, "hook", "health", "-j")
+	if err != nil {
+		t.Fatalf("hook health: %v", err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("decode health: %v\n%s", err, stdout)
+	}
+	if result["status"] != "unreachable" || result["daemon_reachable"] != false ||
+		result["fallback_available"] != true || result["healthy"] != false {
+		t.Fatalf("unexpected offline health result: %+v", result)
+	}
+	if result["socket_path"] != daemon.SocketPathForCWD(h.ProjectDir) {
+		t.Fatalf("health targeted wrong project socket: %+v", result)
+	}
+}
+
+func TestHookTestCommand_SimulatedFailureUsesFallback(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetHookFlags()
+	cmd := newTestHookCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, cmd, "-C", h.ProjectDir, "hook", "test",
+		"ordinary-unmatched-command", "--simulate-failure", "-j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("decode test: %v\n%s", err, stdout)
+	}
+	if result["action"] != "ask" || result["source"] != "local" ||
+		result["fallback"] != true || result["simulated_failure"] != true {
+		t.Fatalf("simulated failure did not exercise fallback: %+v", result)
 	}
 }

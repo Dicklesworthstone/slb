@@ -1478,3 +1478,24 @@ func TestDefaultSocketPath_FormatStable(t *testing.T) {
 		t.Errorf("socket parent %q != os.TempDir() %q", got, want)
 	}
 }
+
+func TestSocketPathForCWDMatchesProjectRoot(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".slb"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(root, "a", "b")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := SocketPathForCWD(sub), SocketPathForCWD(root); got != want {
+		t.Fatalf("subdirectory socket %q != project-root socket %q", got, want)
+	}
+	other := t.TempDir()
+	if err := os.Mkdir(filepath.Join(other, ".slb"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if SocketPathForCWD(other) == SocketPathForCWD(root) {
+		t.Fatal("different project roots resolved to the same socket")
+	}
+}

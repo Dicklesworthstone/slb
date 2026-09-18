@@ -18,8 +18,10 @@ import (
 var (
 	flagHookGlobal    bool
 	flagHookMerge     bool
-	flagHookForce     bool
-	flagHookOutputDir string
+	flagHookForce           bool
+	flagHookOutputDir       string
+	flagHookLocalOnly       bool
+	flagHookSimulateFailure bool
 )
 
 func init() {
@@ -34,12 +36,15 @@ func init() {
 	// that persistent flag entirely, making `slb hook generate -o json` write
 	// to a directory literally named "json" instead of emitting JSON.
 	hookGenerateCmd.Flags().StringVar(&flagHookOutputDir, "output-dir", "", "output directory (default: ~/.slb/hooks/)")
+	hookTestCmd.Flags().BoolVar(&flagHookLocalOnly, "local-only", false, "skip daemon and test embedded/local policy behavior")
+	hookTestCmd.Flags().BoolVar(&flagHookSimulateFailure, "simulate-failure", false, "simulate daemon failure and exercise fallback behavior")
 
 	// Add subcommands
 	hookCmd.AddCommand(hookGenerateCmd)
 	hookCmd.AddCommand(hookInstallCmd)
 	hookCmd.AddCommand(hookUninstallCmd)
 	hookCmd.AddCommand(hookStatusCmd)
+	hookCmd.AddCommand(hookHealthCmd)
 	hookCmd.AddCommand(hookTestCmd)
 
 	rootCmd.AddCommand(hookCmd)
@@ -110,6 +115,18 @@ Checks:
 - SLB daemon is running (for real-time checks)
 - Pattern version matches embedded version`,
 	RunE: runHookStatus,
+}
+
+var hookHealthCmd = &cobra.Command{
+	Use:   "health",
+	Short: "Check real-time hook daemon health and policy parity",
+	Long: `Check whether the project hook daemon is reachable within the hook's
+50ms latency budget and whether it is enforcing the same effective policy as
+the local fallback snapshot source.
+
+An unreachable daemon is reported as degraded-but-fallback-capable rather than
+as a command error, because the generated hook is designed to operate offline.`,
+	RunE: runHookHealth,
 }
 
 var hookTestCmd = &cobra.Command{
@@ -453,12 +470,14 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	cwd, cwdErr := os.Getwd()
-	if cwdErr != nil {
-		status["daemon_error"] = cwdErr.Error()
+	project, projectErr := projectPath()
+	if projectErr != nil {
+		status["daemon_error"] = projectErr.Error()
+	} else if cwd, absErr := filepath.Abs(project); absErr != nil {
+		status["daemon_error"] = absErr.Error()
 	} else {
 		healthCtx, cancel := context.WithTimeout(cmd.Context(), 50*time.Millisecond)
-		client := daemon.NewIPCClient(daemon.DefaultHookSocketPath())
+		client := daemon.NewIPCClient(daemon.SocketPathForCWD(cwd))
 		health, healthErr := client.HookHealth(healthCtx, cwd)
 		cancel()
 		_ = client.Close()
@@ -510,14 +529,109 @@ func embeddedHookPatternHash(data []byte) string {
 	return ""
 }
 
+func runHookHealth(cmd *cobra.Command, args []string) error {
+	if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
+		return err
+	}
+	project, err := projectPath()
+	if err != nil {
+		return err
+	}
+	cwd, err := filepath.Abs(project)
+	if err != nil {
+		return fmt.Errorf("resolving project path: %w", err)
+	}
+	currentHash := core.GetDefaultEngine().ComputeHash()
+	result := map[string]any{
+		"status":               "unreachable",
+		"healthy":              false,
+		"daemon_reachable":     false,
+		"fallback_available":   true,
+		"current_pattern_hash": currentHash,
+		"socket_path":          daemon.SocketPathForCWD(cwd),
+		"cwd":                  cwd,
+	}
+
+	healthCtx, cancel := context.WithTimeout(cmd.Context(), 50*time.Millisecond)
+	client := daemon.NewIPCClient(daemon.SocketPathForCWD(cwd))
+	health, healthErr := client.HookHealth(healthCtx, cwd)
+	cancel()
+	_ = client.Close()
+	if healthErr != nil {
+		result["error"] = healthErr.Error()
+		return output.New(output.Format(GetOutput())).Write(result)
+	}
+
+	hashMatches := health.PatternHash != "" && health.PatternHash == currentHash
+	result["status"] = health.Status
+	result["daemon_reachable"] = true
+	result["healthy"] = health.Status == "ok" && hashMatches
+	result["daemon_pattern_hash"] = health.PatternHash
+	result["pattern_hash_matches"] = hashMatches
+	result["pattern_count"] = health.PatternCount
+	result["uptime_seconds"] = health.Uptime
+	result["server_time"] = health.ServerTime
+	if health.PolicyError != "" {
+		result["policy_error"] = health.PolicyError
+	}
+	return output.New(output.Format(GetOutput())).Write(result)
+}
+
 func runHookTest(cmd *cobra.Command, args []string) error {
+	if flagHookLocalOnly && flagHookSimulateFailure {
+		return fmt.Errorf("--local-only and --simulate-failure are mutually exclusive")
+	}
 	command := args[0]
 	if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
 		return err
 	}
+	project, err := projectPath()
+	if err != nil {
+		return err
+	}
+	cwd, err := filepath.Abs(project)
+	if err != nil {
+		return fmt.Errorf("resolving project path: %w", err)
+	}
 
-	result := core.Classify(command, "")
+	var daemonErr error
+	if !flagHookLocalOnly && !flagHookSimulateFailure {
+		queryCtx, cancel := context.WithTimeout(cmd.Context(), 50*time.Millisecond)
+		client := daemon.NewIPCClient(daemon.SocketPathForCWD(cwd))
+		live, queryErr := client.HookQuery(queryCtx, daemon.HookQueryParams{
+			Command: command, SessionID: flagSessionID, CWD: cwd, ExecutionHandoff: true,
+		})
+		cancel()
+		_ = client.Close()
+		if queryErr == nil {
+			return output.New(output.Format(GetOutput())).Write(map[string]any{
+				"command": command, "action": live.Action, "message": live.Message,
+				"tier": live.Tier, "matched_pattern": live.MatchedPattern,
+				"min_approvals": live.MinApprovals,
+				"needs_approval": live.Action == "block" || live.Action == "execute",
+				"request_id": live.RequestID, "source": "daemon", "fallback": false,
+			})
+		}
+		daemonErr = queryErr
+	} else if flagHookSimulateFailure {
+		daemonErr = fmt.Errorf("simulated daemon failure")
+	}
 
+	result := localHookTestResult(command, cwd)
+	result["source"] = "local"
+	result["fallback"] = !flagHookLocalOnly
+	result["local_only"] = flagHookLocalOnly
+	if flagHookSimulateFailure {
+		result["simulated_failure"] = true
+	}
+	if daemonErr != nil {
+		result["daemon_error"] = daemonErr.Error()
+	}
+	return output.New(output.Format(GetOutput())).Write(result)
+}
+
+func localHookTestResult(command, cwd string) map[string]any {
+	result := core.Classify(command, cwd)
 	var action, message string
 	switch {
 	case result.IsSafe:
@@ -531,22 +645,21 @@ func runHookTest(cmd *cobra.Command, args []string) error {
 		message = fmt.Sprintf("DANGEROUS: Requires %d approval. Use 'slb request' to submit.", result.MinApprovals)
 	case result.Tier == core.RiskTierCaution:
 		action = "ask"
-		message = "CAUTION: Command logged for review."
+		message = "CAUTION: Command requires confirmation."
 	default:
 		action = "ask"
-		message = "No matching local pattern; confirmation required if the daemon is unavailable"
+		message = "No matching local pattern; confirmation required while the daemon is unavailable"
 	}
 
 	tier := string(result.Tier)
 	if tier == "" {
 		tier = "unknown"
 	}
-	out := output.New(output.Format(GetOutput()))
-	return out.Write(map[string]any{
+	return map[string]any{
 		"command": command, "action": action, "message": message,
 		"tier": tier, "matched_pattern": result.MatchedPattern,
 		"min_approvals": result.MinApprovals, "needs_approval": result.NeedsApproval,
-	})
+	}
 }
 
 // generateHookScript creates the complete Python hook script with embedded patterns.

@@ -383,3 +383,31 @@ func TestHookHealthReportsPolicyFailure(t *testing.T) {
 		t.Fatalf("broken project policy was reported healthy: %+v", result)
 	}
 }
+
+func TestIPCClientHookQueryRoundTrip(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "hook-client.sock")
+	srv, err := NewIPCServer(socketPath, newTestLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = srv.Start(ctx) }()
+	time.Sleep(50 * time.Millisecond)
+
+	client := NewIPCClient(socketPath)
+	queryCtx, queryCancel := context.WithTimeout(context.Background(), time.Second)
+	defer queryCancel()
+	result, err := client.HookQuery(queryCtx, HookQueryParams{
+		Command: "git stash", CWD: t.TempDir(),
+	})
+	_ = client.Close()
+	cancel()
+	_ = srv.Stop()
+	if err != nil {
+		t.Fatalf("HookQuery: %v", err)
+	}
+	if result.Action != "allow" || result.Tier != "safe" {
+		t.Fatalf("unexpected hook result: %+v", result)
+	}
+}

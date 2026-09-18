@@ -232,6 +232,30 @@ func (c *IPCClient) HookHealth(ctx context.Context, cwd string) (*HookHealthResu
 	return &health, nil
 }
 
+// HookQuery performs the same bounded project-aware classification used by the
+// generated PreToolUse hook.
+func (c *IPCClient) HookQuery(ctx context.Context, params HookQueryParams) (*HookQueryResult, error) {
+	if err := c.Connect(ctx); err != nil {
+		return nil, err
+	}
+	resp, err := c.callContext(ctx, "hook_query", params)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Error != nil {
+		return nil, fmt.Errorf("hook query error: %s", resp.Error.Message)
+	}
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		return nil, fmt.Errorf("marshal hook query: %w", err)
+	}
+	var result HookQueryResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("unmarshal hook query: %w", err)
+	}
+	return &result, nil
+}
+
 // Notify sends a notification to the daemon for broadcasting.
 func (c *IPCClient) Notify(ctx context.Context, eventType string, payload any) error {
 	if err := c.Connect(ctx); err != nil {
