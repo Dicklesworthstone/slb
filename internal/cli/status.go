@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/output"
 	"github.com/spf13/cobra"
@@ -25,8 +26,8 @@ var statusCmd = &cobra.Command{
 	Short: "Show status of a request",
 	Long: `Show the current status of a command approval request.
 
-Use --wait to block until the request reaches a terminal state
-(approved, rejected, cancelled, timeout, executed, etc).`,
+Use --wait to block until the request leaves pending (including approval,
+rejection, timeout or escalation). Due policy is processed without a daemon.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		requestID := args[0]
@@ -43,15 +44,15 @@ Use --wait to block until the request reaches a terminal state
 			return fmt.Errorf("getting request: %w", err)
 		}
 
-		// If wait is requested and status is pending, poll until resolved
-		if flagStatusWait && !request.Status.IsTerminal() {
-			// Simple polling - in production this would use daemon notifications
-			for !request.Status.IsTerminal() {
-				time.Sleep(500 * time.Millisecond)
-				request, reviews, err = dbConn.GetRequestWithReviews(requestID)
-				if err != nil {
-					return fmt.Errorf("polling request: %w", err)
-				}
+		// Approval is a decision, not a lifecycle terminal state. Do not wait
+		// for some other client to execute it before returning to this caller.
+		if flagStatusWait && request.Status == db.StatusPending {
+			if _, err := core.WaitForDecision(cmd.Context(), dbConn, requestID, core.WaitOptions{ConfigPath: flagConfig}); err != nil {
+				return fmt.Errorf("waiting for request: %w", err)
+			}
+			request, reviews, err = dbConn.GetRequestWithReviews(requestID)
+			if err != nil {
+				return fmt.Errorf("getting resolved request: %w", err)
 			}
 		}
 
