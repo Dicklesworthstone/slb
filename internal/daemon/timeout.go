@@ -1,4 +1,4 @@
-// Package daemon provides the request timeout handler.
+// Package daemon provides pending-request timer processing.
 package daemon
 
 import (
@@ -11,66 +11,43 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
+	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/charmbracelet/log"
 )
 
-// TimeoutAction defines what happens when a request times out.
 type TimeoutAction string
 
 const (
-	// TimeoutActionEscalate transitions to ESCALATED and sends notification.
-	TimeoutActionEscalate TimeoutAction = "escalate"
-	// TimeoutActionAutoReject transitions to REJECTED.
-	TimeoutActionAutoReject TimeoutAction = "auto_reject"
-	// TimeoutActionAutoApproveWarn transitions to APPROVED with warning.
+	TimeoutActionEscalate        TimeoutAction = "escalate"
+	TimeoutActionAutoReject      TimeoutAction = "auto_reject"
 	TimeoutActionAutoApproveWarn TimeoutAction = "auto_approve_warn"
+	DefaultCheckInterval                       = 10 * time.Second
 )
 
-// DefaultCheckInterval is the default interval for checking expired requests.
-const DefaultCheckInterval = 10 * time.Second
-
-// TimeoutHandlerConfig configures the timeout handler behavior.
 type TimeoutHandlerConfig struct {
-	// CheckInterval is how often to check for expired requests.
 	CheckInterval time.Duration
-	// Action determines what happens when a request times out.
-	Action TimeoutAction
-	// DesktopNotify enables desktop notifications on escalation.
+	Action        TimeoutAction
 	DesktopNotify bool
-	// Logger for timeout events.
-	Logger *log.Logger
+	Logger        *log.Logger
 }
 
-// DefaultTimeoutConfig returns the default timeout handler configuration.
 func DefaultTimeoutConfig() TimeoutHandlerConfig {
-	return TimeoutHandlerConfig{
-		CheckInterval: DefaultCheckInterval,
-		Action:        TimeoutActionEscalate,
-		DesktopNotify: true,
-		Logger:        nil,
-	}
+	return TimeoutHandlerConfig{CheckInterval: DefaultCheckInterval, Action: TimeoutActionEscalate, DesktopNotify: true}
 }
 
-// TimeoutConfigFromConfig creates a TimeoutHandlerConfig from the app config.
 func TimeoutConfigFromConfig(cfg config.Config) TimeoutHandlerConfig {
 	action := TimeoutAction(cfg.General.TimeoutAction)
 	switch action {
 	case TimeoutActionEscalate, TimeoutActionAutoReject, TimeoutActionAutoApproveWarn:
-		// Valid
 	default:
 		action = TimeoutActionEscalate
 	}
-
-	return TimeoutHandlerConfig{
-		CheckInterval: DefaultCheckInterval,
-		Action:        action,
-		DesktopNotify: cfg.Notifications.DesktopEnabled,
-		Logger:        nil,
-	}
+	return TimeoutHandlerConfig{CheckInterval: DefaultCheckInterval, Action: action, DesktopNotify: cfg.Notifications.DesktopEnabled}
 }
 
-// TimeoutHandler manages request timeout checking.
+// TimeoutHandler processes both delayed CAUTION approvals and expired
+// requests. Timer writes use the same transactional path as CLI waiters.
 type TimeoutHandler struct {
 	db     *db.DB
 	config TimeoutHandlerConfig
@@ -78,236 +55,174 @@ type TimeoutHandler struct {
 
 	mu      sync.Mutex
 	running bool
-	stopCh  chan struct{}
+	cancel  context.CancelFunc
+	done    chan struct{}
 }
 
-// NewTimeoutHandler creates a new timeout handler.
 func NewTimeoutHandler(database *db.DB, cfg TimeoutHandlerConfig) *TimeoutHandler {
 	logger := cfg.Logger
 	if logger == nil {
 		logger = log.Default()
 	}
-
-	return &TimeoutHandler{
-		db:     database,
-		config: cfg,
-		logger: logger,
+	if cfg.CheckInterval <= 0 {
+		cfg.CheckInterval = DefaultCheckInterval
 	}
+	return &TimeoutHandler{db: database, config: cfg, logger: logger}
 }
 
-// Start begins the timeout checker goroutine.
-// It returns immediately and the checker runs in the background.
 func (h *TimeoutHandler) Start(ctx context.Context) error {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.running {
-		h.mu.Unlock()
 		return fmt.Errorf("timeout handler already running")
 	}
-	h.running = true
-	h.stopCh = make(chan struct{})
-	h.mu.Unlock()
-
-	go h.run(ctx)
-	h.logger.Info("timeout handler started", "interval", h.config.CheckInterval)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	h.running, h.cancel, h.done = true, cancel, done
+	go h.run(ctx, done)
+	h.logger.Info("pending request timer started", "interval", h.config.CheckInterval)
 	return nil
 }
 
-// Stop stops the timeout checker.
+// Stop waits for the captured generation to finish before returning. A stale
+// loop must not keep writing after shutdown or interfere with a restarted loop.
 func (h *TimeoutHandler) Stop() {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if !h.running {
+	cancel, done := h.cancel, h.done
+	h.mu.Unlock()
+	if cancel == nil {
 		return
 	}
-
-	close(h.stopCh)
-	h.running = false
-	h.logger.Info("timeout handler stopped")
+	cancel()
+	<-done
 }
 
-// IsRunning returns true if the handler is running.
 func (h *TimeoutHandler) IsRunning() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.running
 }
 
-// run is the main loop that checks for expired requests.
-func (h *TimeoutHandler) run(ctx context.Context) {
+func (h *TimeoutHandler) run(ctx context.Context, done chan struct{}) {
+	defer func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.done == done {
+			h.running, h.cancel = false, nil
+		}
+		close(done)
+	}()
 	ticker := time.NewTicker(h.config.CheckInterval)
 	defer ticker.Stop()
-
-	// Do an initial check immediately
-	h.checkAndHandleExpired()
-
+	h.checkPending(ctx)
 	for {
 		select {
 		case <-ctx.Done():
-			h.mu.Lock()
-			h.running = false
-			h.mu.Unlock()
-			return
-		case <-h.stopCh:
 			return
 		case <-ticker.C:
-			h.checkAndHandleExpired()
+			h.checkPending(ctx)
 		}
 	}
 }
 
-// checkAndHandleExpired finds and processes all expired requests.
-func (h *TimeoutHandler) checkAndHandleExpired() {
-	expired, err := h.db.FindExpiredRequests()
-	if err != nil {
-		h.logger.Error("failed to find expired requests", "error", err)
+func (h *TimeoutHandler) checkAndHandleExpired() { h.checkPending(context.Background()) }
+
+func (h *TimeoutHandler) checkPending(ctx context.Context) {
+	if ctx.Err() != nil {
 		return
 	}
-
-	for _, req := range expired {
-		if err := h.HandleExpiredRequest(req); err != nil {
-			h.logger.Error("failed to handle expired request",
-				"request_id", req.ID,
-				"error", err)
+	pending, err := h.db.ListPendingRequestsAllProjects()
+	if err != nil {
+		h.logger.Error("failed to find pending requests", "error", err)
+		return
+	}
+	for _, request := range pending {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := h.advance(ctx, request.ID, h.config.Action, false); err != nil {
+			h.logger.Error("failed to process pending request", "request_id", request.ID, "error", err)
 		}
 	}
 }
 
-// HandleExpiredRequest processes a single expired request according to the configured action.
-func (h *TimeoutHandler) HandleExpiredRequest(req *db.Request) error {
-	h.logger.Info("handling expired request",
-		"request_id", req.ID,
-		"command", truncateString(req.Command.Raw, 50),
-		"agent", req.RequestorAgent,
-		"expired_at", req.ExpiresAt)
-
-	switch h.config.Action {
-	case TimeoutActionEscalate:
-		return h.handleEscalate(req)
-	case TimeoutActionAutoReject:
-		return h.handleAutoReject(req)
-	case TimeoutActionAutoApproveWarn:
-		return h.handleAutoApproveWarn(req)
-	default:
-		return h.handleEscalate(req)
+// HandleExpiredRequest treats the supplied request as an ID, not authoritative
+// state. A concurrent review, execution or deadline extension wins in SQLite.
+func (h *TimeoutHandler) HandleExpiredRequest(request *db.Request) error {
+	if request == nil {
+		return fmt.Errorf("request is required")
 	}
+	return h.advance(context.Background(), request.ID, h.config.Action, true)
 }
 
-// handleEscalate transitions to TIMEOUT, then ESCALATED with notification.
-func (h *TimeoutHandler) handleEscalate(req *db.Request) error {
-	// First transition to TIMEOUT
-	if err := h.db.UpdateRequestStatus(req.ID, db.StatusTimeout); err != nil {
-		return fmt.Errorf("transition to timeout: %w", err)
+func (h *TimeoutHandler) handleEscalate(request *db.Request) error {
+	return h.advance(context.Background(), request.ID, TimeoutActionEscalate, true)
+}
+
+func (h *TimeoutHandler) handleAutoReject(request *db.Request) error {
+	return h.advance(context.Background(), request.ID, TimeoutActionAutoReject, true)
+}
+
+func (h *TimeoutHandler) handleAutoApproveWarn(request *db.Request) error {
+	return h.advance(context.Background(), request.ID, TimeoutActionAutoApproveWarn, true)
+}
+
+func (h *TimeoutHandler) advance(ctx context.Context, id string, action TimeoutAction, expiredOnly bool) error {
+	result, err := core.AdvancePendingRequest(ctx, h.db, id, core.PendingOptions{
+		TimeoutAction: string(action), ExpiredOnly: expiredOnly,
+	})
+	if err != nil {
+		return err
 	}
-
-	h.logger.Info("request timed out",
-		"request_id", req.ID,
-		"tier", req.RiskTier)
-
-	// Send desktop notification if enabled
+	if !result.Changed {
+		return nil
+	}
+	request := result.Request
+	h.logger.Info("pending request resolved", "request_id", request.ID, "status", request.Status,
+		"tier", request.RiskTier, "command", truncateString(core.ApplyRedaction(request.Command.Raw, nil), 80))
 	if h.config.DesktopNotify {
-		h.sendDesktopNotification(req)
+		switch request.Status {
+		case db.StatusEscalated:
+			h.sendDesktopNotification(request)
+		case db.StatusApproved:
+			h.sendAutoApproveWarning(request)
+		}
 	}
-
-	// Transition to ESCALATED
-	if err := h.db.UpdateRequestStatus(req.ID, db.StatusEscalated); err != nil {
-		return fmt.Errorf("transition to escalated: %w", err)
-	}
-
-	h.logger.Warn("request escalated - human intervention required",
-		"request_id", req.ID,
-		"command", truncateString(req.Command.Raw, 80),
-		"agent", req.RequestorAgent,
-		"tier", req.RiskTier)
-
 	return nil
 }
 
-// handleAutoReject transitions to REJECTED (via TIMEOUT first for state machine).
-func (h *TimeoutHandler) handleAutoReject(req *db.Request) error {
-	// Transition to TIMEOUT first
-	if err := h.db.UpdateRequestStatus(req.ID, db.StatusTimeout); err != nil {
-		return fmt.Errorf("transition to timeout: %w", err)
-	}
-
-	h.logger.Info("request auto-rejected due to timeout",
-		"request_id", req.ID,
-		"tier", req.RiskTier)
-
-	// Note: StatusTimeout is terminal in most flows, but the action name implies rejection.
-	// The request stays in TIMEOUT state which is effectively rejected.
-	return nil
-}
-
-// handleAutoApproveWarn is dangerous - it approves timed-out requests with a warning.
-// This should only be used for CAUTION tier or very specific workflows.
-func (h *TimeoutHandler) handleAutoApproveWarn(req *db.Request) error {
-	// Safety check: never auto-approve CRITICAL or DANGEROUS tier
-	if req.RiskTier == db.RiskTierCritical || req.RiskTier == db.RiskTierDangerous {
-		h.logger.Warn("refusing to auto-approve high-risk request, escalating instead",
-			"request_id", req.ID,
-			"tier", req.RiskTier)
-		return h.handleEscalate(req)
-	}
-
-	// For CAUTION tier, we can auto-approve with warning
-	if err := h.db.UpdateRequestStatus(req.ID, db.StatusApproved); err != nil {
-		return fmt.Errorf("transition to approved: %w", err)
-	}
-
-	h.logger.Warn("request auto-approved after timeout (CAUTION tier)",
-		"request_id", req.ID,
-		"command", truncateString(req.Command.Raw, 80),
-		"agent", req.RequestorAgent)
-
-	// Send warning notification
-	if h.config.DesktopNotify {
-		h.sendAutoApproveWarning(req)
-	}
-
-	return nil
-}
-
-// sendDesktopNotification sends a desktop notification for escalated requests.
-func (h *TimeoutHandler) sendDesktopNotification(req *db.Request) {
-	title := fmt.Sprintf("SLB: Request Escalated (%s)", req.RiskTier)
-	body := fmt.Sprintf("Request %s timed out.\nCommand: %s\nAgent: %s",
-		truncateID(req.ID, 8), truncateString(req.Command.Raw, 50), req.RequestorAgent)
-
+func (h *TimeoutHandler) sendDesktopNotification(request *db.Request) {
+	title := fmt.Sprintf("SLB: Request Escalated (%s)", request.RiskTier)
+	body := fmt.Sprintf("Request %s timed out.\nCommand: %s\nAgent: %s", truncateID(request.ID, 8),
+		truncateString(core.ApplyRedaction(request.Command.Raw, nil), 50), request.RequestorAgent)
 	if err := notify(title, body); err != nil {
 		h.logger.Debug("desktop notification failed", "error", err)
 	}
 }
 
-// sendAutoApproveWarning sends a warning notification for auto-approved requests.
-func (h *TimeoutHandler) sendAutoApproveWarning(req *db.Request) {
-	title := "SLB: Request Auto-Approved (WARNING)"
-	body := fmt.Sprintf("Request %s was auto-approved after timeout.\nCommand: %s",
-		truncateID(req.ID, 8), truncateString(req.Command.Raw, 50))
-
-	if err := notify(title, body); err != nil {
+func (h *TimeoutHandler) sendAutoApproveWarning(request *db.Request) {
+	body := fmt.Sprintf("Request %s passed its CAUTION review delay.\nCommand: %s", truncateID(request.ID, 8),
+		truncateString(core.ApplyRedaction(request.Command.Raw, nil), 50))
+	if err := notify("SLB: Request Auto-Approved (WARNING)", body); err != nil {
 		h.logger.Debug("desktop notification failed", "error", err)
 	}
 }
 
-// notify sends a desktop notification using platform-specific tools.
+// Notification helpers are bounded so a missing desktop service cannot stall
+// the timer indefinitely. They run only after a committed policy decision.
 func notify(title, body string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	switch runtime.GOOS {
 	case "darwin":
-		// macOS: use osascript
-		script := fmt.Sprintf(
-			`display notification "%s" with title "%s"`,
-			escapeAppleScript(body),
-			escapeAppleScript(title),
-		)
-		return exec.Command("osascript", "-e", script).Run()
+		script := fmt.Sprintf(`display notification "%s" with title "%s"`, escapeAppleScript(body), escapeAppleScript(title))
+		return exec.CommandContext(ctx, "osascript", "-e", script).Run()
 	case "linux":
-		// Linux: use notify-send if available
-		return exec.Command("notify-send", "-u", "critical", title, body).Run()
+		return exec.CommandContext(ctx, "notify-send", "-u", "critical", title, body).Run()
 	case "windows":
-		// Windows: use PowerShell toast notification
-		escapedTitle := escapePowerShellDoubleQuoted(title)
-		escapedBody := escapePowerShellDoubleQuoted(body)
 		script := fmt.Sprintf(`
 			[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 			$template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
@@ -316,19 +231,14 @@ func notify(title, body string) error {
 			$textNodes.Item(1).AppendChild($template.CreateTextNode("%s")) | Out-Null
 			$toast = [Windows.UI.Notifications.ToastNotification]::new($template)
 			[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("SLB").Show($toast)
-		`, escapedTitle, escapedBody)
-		return exec.Command("powershell", "-Command", script).Run()
+		`, escapePowerShellDoubleQuoted(title), escapePowerShellDoubleQuoted(body))
+		return exec.CommandContext(ctx, "powershell", "-Command", script).Run()
 	default:
 		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}
 }
 
 func escapePowerShellDoubleQuoted(s string) string {
-	// Escape a value for use inside a PowerShell double-quoted string literal.
-	// - `  is the escape character, so it must be doubled
-	// - "  must be escaped as `"
-	// - $  must be escaped as `$
-	// - newlines must be represented as `n
 	s = strings.ReplaceAll(s, "`", "``")
 	s = strings.ReplaceAll(s, "\"", "`\"")
 	s = strings.ReplaceAll(s, "$", "`$")
@@ -338,7 +248,6 @@ func escapePowerShellDoubleQuoted(s string) string {
 	return s
 }
 
-// truncateString truncates a string to maxLen characters with ellipsis.
 func truncateString(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
@@ -349,7 +258,6 @@ func truncateString(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
-// truncateID safely truncates an ID to maxLen characters.
 func truncateID(id string, maxLen int) string {
 	if len(id) <= maxLen {
 		return id
@@ -357,22 +265,16 @@ func truncateID(id string, maxLen int) string {
 	return id[:maxLen]
 }
 
-// CheckExpiredRequests is a convenience function that checks for expired requests
-// without starting the full handler loop.
 func CheckExpiredRequests(database *db.DB) ([]*db.Request, error) {
 	return database.FindExpiredRequests()
 }
 
-// StartTimeoutChecker is a convenience function to start the timeout checker
-// with default configuration.
 func StartTimeoutChecker(ctx context.Context, database *db.DB, logger *log.Logger) (*TimeoutHandler, error) {
 	cfg := DefaultTimeoutConfig()
 	cfg.Logger = logger
-
 	handler := NewTimeoutHandler(database, cfg)
 	if err := handler.Start(ctx); err != nil {
 		return nil, err
 	}
-
 	return handler, nil
 }

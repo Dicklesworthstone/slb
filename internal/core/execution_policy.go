@@ -22,40 +22,47 @@ type PolicyReader interface {
 // LoadCommandPolicy reads fresh configuration and persisted custom rules.
 // A nil reader is valid only for classification before project initialization.
 func LoadCommandPolicy(reader PolicyReader, opts config.LoadOptions) (*PatternEngine, error) {
+	engine, _, err := loadCommandPolicy(reader, opts)
+	return engine, err
+}
+
+// loadCommandPolicy returns the configuration used to compile this exact
+// engine, so timers cannot mix approval rules and deadlines from two loads.
+func loadCommandPolicy(reader PolicyReader, opts config.LoadOptions) (*PatternEngine, config.Config, error) {
 	if opts.ConfigPath != "" {
 		if info, err := os.Stat(opts.ConfigPath); err != nil {
-			return nil, fmt.Errorf("reading explicit policy config: %w", err)
+			return nil, config.Config{}, fmt.Errorf("reading explicit policy config: %w", err)
 		} else if !info.Mode().IsRegular() {
-			return nil, errors.New("explicit policy config is not a regular file")
+			return nil, config.Config{}, errors.New("explicit policy config is not a regular file")
 		}
 	}
 	cfg, err := config.Load(opts)
 	if err != nil {
-		return nil, fmt.Errorf("loading command policy: %w", err)
+		return nil, cfg, fmt.Errorf("loading command policy: %w", err)
 	}
 	var patterns []Pattern
 	if reader != nil {
 		rows, err := reader.Query(`SELECT tier, pattern, COALESCE(description, ''), COALESCE(source, '') FROM custom_patterns ORDER BY id`)
 		if err != nil {
-			return nil, fmt.Errorf("reading custom command policy: %w", err)
+			return nil, cfg, fmt.Errorf("reading custom command policy: %w", err)
 		}
 		defer rows.Close()
 		for rows.Next() {
 			var p Pattern
 			if err := rows.Scan(&p.Tier, &p.Pattern, &p.Description, &p.Source); err != nil {
-				return nil, fmt.Errorf("reading custom command policy row: %w", err)
+				return nil, cfg, fmt.Errorf("reading custom command policy row: %w", err)
 			}
 			patterns = append(patterns, p)
 		}
 		if err := rows.Err(); err != nil {
-			return nil, fmt.Errorf("reading custom command policy: %w", err)
+			return nil, cfg, fmt.Errorf("reading custom command policy: %w", err)
 		}
 	}
 	engine := &PatternEngine{}
 	if _, err := engine.ReplacePolicy(cfg, patterns, opts.ConfigPath); err != nil {
-		return nil, err
+		return nil, cfg, err
 	}
-	return engine, nil
+	return engine, cfg, nil
 }
 
 // CountPolicyReviewers counts independent, active identities only in the
