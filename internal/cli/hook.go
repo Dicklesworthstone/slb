@@ -1,13 +1,16 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/core"
+	"github.com/Dicklesworthstone/slb/internal/daemon"
 	"github.com/Dicklesworthstone/slb/internal/output"
 	"github.com/spf13/cobra"
 )
@@ -398,9 +401,13 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 		"hook_script_path":      hookScriptPath,
 		"settings_configured":   false,
 		"settings_path":         settingsPath,
-		"current_pattern_hash":  currentHash,
-		"installed_pattern_hash": "",
-		"pattern_hash_matches":  false,
+		"current_pattern_hash":        currentHash,
+		"installed_pattern_hash":      "",
+		"pattern_hash_matches":        false,
+		"daemon_reachable":            false,
+		"daemon_status":               "unreachable",
+		"daemon_pattern_hash":         "",
+		"daemon_pattern_hash_matches": false,
 	}
 
 	if info, err := os.Stat(hookScriptPath); err == nil {
@@ -446,12 +453,41 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	cwd, cwdErr := os.Getwd()
+	if cwdErr != nil {
+		status["daemon_error"] = cwdErr.Error()
+	} else {
+		healthCtx, cancel := context.WithTimeout(cmd.Context(), 50*time.Millisecond)
+		client := daemon.NewIPCClient(daemon.DefaultHookSocketPath())
+		health, healthErr := client.HookHealth(healthCtx, cwd)
+		cancel()
+		_ = client.Close()
+		if healthErr != nil {
+			status["daemon_error"] = healthErr.Error()
+		} else {
+			status["daemon_reachable"] = true
+			status["daemon_status"] = health.Status
+			status["daemon_pattern_hash"] = health.PatternHash
+			status["daemon_pattern_hash_matches"] = health.PatternHash != "" && health.PatternHash == currentHash
+			status["daemon_pattern_count"] = health.PatternCount
+			status["daemon_uptime_seconds"] = health.Uptime
+			if health.PolicyError != "" {
+				status["daemon_policy_error"] = health.PolicyError
+			}
+		}
+	}
+
 	scriptOK := status["hook_script_exists"].(bool)
 	settingsOK := status["settings_configured"].(bool)
 	fresh := status["pattern_hash_matches"].(bool)
+	daemonReachable := status["daemon_reachable"].(bool)
+	daemonHealthy := !daemonReachable ||
+		(status["daemon_status"] == "ok" && status["daemon_pattern_hash_matches"] == true)
 	switch {
 	case scriptOK && settingsOK && !fresh:
 		status["status"] = "stale"
+	case scriptOK && settingsOK && !daemonHealthy:
+		status["status"] = "degraded"
 	case scriptOK && settingsOK:
 		status["status"] = "installed"
 	case scriptOK || settingsOK:
@@ -497,14 +533,18 @@ func runHookTest(cmd *cobra.Command, args []string) error {
 		action = "ask"
 		message = "CAUTION: Command logged for review."
 	default:
-		action = "allow"
-		message = "No matching pattern, allowed"
+		action = "ask"
+		message = "No matching local pattern; confirmation required if the daemon is unavailable"
 	}
 
+	tier := string(result.Tier)
+	if tier == "" {
+		tier = "unknown"
+	}
 	out := output.New(output.Format(GetOutput()))
 	return out.Write(map[string]any{
 		"command": command, "action": action, "message": message,
-		"tier": string(result.Tier), "matched_pattern": result.MatchedPattern,
+		"tier": tier, "matched_pattern": result.MatchedPattern,
 		"min_approvals": result.MinApprovals, "needs_approval": result.NeedsApproval,
 	})
 }

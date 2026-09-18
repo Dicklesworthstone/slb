@@ -363,3 +363,23 @@ func TestHookQueryPolicyLoadFailureFailsClosed(t *testing.T) {
 		t.Fatalf("broken policy failed open: %+v", result)
 	}
 }
+
+func TestHookHealthReportsPolicyFailure(t *testing.T) {
+	params, err := json.Marshal(HookHealthParams{CWD: "relative-project-path"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &IPCServer{startTime: time.Now()}
+	response := server.handleHookHealth(RPCRequest{Params: params, ID: 99})
+	if response.Error != nil {
+		t.Fatalf("health diagnostics returned protocol error: %+v", response.Error)
+	}
+	result, ok := response.Result.(HookHealthResult)
+	if !ok {
+		t.Fatalf("unexpected health result: %T", response.Result)
+	}
+	if result.Status != "degraded" || result.PolicyError == "" ||
+		result.PatternHash != "" || result.PatternCount != 0 {
+		t.Fatalf("broken project policy was reported healthy: %+v", result)
+	}
+}

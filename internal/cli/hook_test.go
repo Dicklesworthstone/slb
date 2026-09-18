@@ -211,7 +211,7 @@ func TestHookTestCommand_SafeCommand(t *testing.T) {
 	resetHookFlags()
 
 	cmd := newTestHookCmd(h.DBPath)
-	stdout, err := executeCommandCapture(t, cmd, "hook", "test", "ls -la", "-j")
+	stdout, err := executeCommandCapture(t, cmd, "hook", "test", "git stash", "-j")
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -222,8 +222,8 @@ func TestHookTestCommand_SafeCommand(t *testing.T) {
 		t.Fatalf("failed to parse JSON: %v\nstdout: %s", err, stdout)
 	}
 
-	if result["command"] != "ls -la" {
-		t.Errorf("expected command='ls -la', got %v", result["command"])
+	if result["command"] != "git stash" {
+		t.Errorf("expected command='git stash', got %v", result["command"])
 	}
 	if result["action"] != "allow" {
 		t.Errorf("expected action='allow' for safe command, got %v", result["action"])
@@ -910,5 +910,22 @@ func TestHookStatusCommand_DetectsStalePatternSnapshot(t *testing.T) {
 	if result["status"] != "stale" || result["pattern_hash_matches"] != false ||
 		result["installed_pattern_hash"] != strings.Repeat("0", 64) {
 		t.Fatalf("stale snapshot was not detected: %+v", result)
+	}
+}
+
+func TestHookTestCommand_UnknownRequiresOfflineConfirmation(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetHookFlags()
+	cmd := newTestHookCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, cmd, "hook", "test", "ordinary-unmatched-command", "-j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("decode hook test: %v\n%s", err, stdout)
+	}
+	if result["action"] != "ask" || result["tier"] != "unknown" {
+		t.Fatalf("unknown local command did not require confirmation: %+v", result)
 	}
 }

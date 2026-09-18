@@ -189,6 +189,11 @@ func findHookApproval(conn *db.DB, engine *core.PatternEngine, params HookQueryP
 	return req
 }
 
+// HookHealthParams scopes diagnostics to the same project policy as hook_query.
+type HookHealthParams struct {
+	CWD string `json:"cwd,omitempty"`
+}
+
 // HookHealthResult is the result of a hook health check.
 type HookHealthResult struct {
 	Status       string `json:"status"`
@@ -196,15 +201,37 @@ type HookHealthResult struct {
 	PatternHash  string `json:"pattern_hash"`
 	PatternCount int    `json:"pattern_count"`
 	ServerTime   string `json:"server_time"`
+	PolicyError  string `json:"policy_error,omitempty"`
 }
 
 func (s *IPCServer) handleHookHealth(req RPCRequest) *RPCResponse {
+	now := time.Now().UTC()
 	engine := core.GetDefaultEngine()
+	var policyConn *db.DB
+	if len(req.Params) != 0 {
+		var params HookHealthParams
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return &RPCResponse{Error: &Error{Code: ErrCodeInvalidParams, Message: "invalid params: " + err.Error()}, ID: req.ID}
+		}
+		if params.CWD != "" {
+			fresh, conn, _, err := loadHookPolicy(params.CWD)
+			if err != nil {
+				return &RPCResponse{Result: HookHealthResult{
+					Status: "degraded", Uptime: int64(time.Since(s.startTime).Seconds()),
+					ServerTime: now.Format(time.RFC3339), PolicyError: err.Error(),
+				}, ID: req.ID}
+			}
+			engine, policyConn = fresh, conn
+		}
+	}
+	if policyConn != nil {
+		defer policyConn.Close()
+	}
 	export := engine.Export()
 	result := HookHealthResult{
 		Status: "ok", Uptime: int64(time.Since(s.startTime).Seconds()),
 		PatternHash: export.SHA256, PatternCount: export.Metadata.PatternCount,
-		ServerTime: time.Now().UTC().Format(time.RFC3339),
+		ServerTime: now.Format(time.RFC3339),
 	}
 	return &RPCResponse{Result: result, ID: req.ID}
 }

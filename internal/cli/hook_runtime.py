@@ -258,8 +258,14 @@ def main():
         message = f"SLB DANGEROUS: Requires {min_approvals} approval. Use 'slb request' to submit."
     elif tier == "caution":
         action, message = "ask", "SLB CAUTION: command requires confirmation. Proceed?"
-    else:
+    elif tier == "safe":
         action, message = "allow", ""
+    elif tier == "unknown":
+        action, message = "ask", (
+            "SLB OFFLINE: command is not covered by the local policy snapshot; "
+            "confirmation required while the daemon is unavailable.")
+    else:
+        action, message = "block", "SLB: invalid local classification; command blocked."
     _decide_and_audit(command, session_id, cwd, action, message, tier, min_approvals, "hook_offline")
 
 

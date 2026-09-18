@@ -92,15 +92,28 @@ func (c *IPCClient) Close() error {
 
 // call sends a JSON-RPC request and returns the response.
 func (c *IPCClient) call(method string, params any) (*RPCResponse, error) {
+	return c.callContext(context.Background(), method, params)
+}
+
+func (c *IPCClient) callContext(ctx context.Context, method string, params any) (*RPCResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if c.conn == nil {
 		return nil, fmt.Errorf("not connected")
 	}
+	conn := c.conn
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return nil, fmt.Errorf("set IPC deadline: %w", err)
+		}
+		defer conn.SetDeadline(time.Time{})
+	}
 
 	id := c.nextID.Add(1)
-
 	var paramsJSON json.RawMessage
 	if params != nil {
 		p, err := json.Marshal(params)
@@ -110,23 +123,23 @@ func (c *IPCClient) call(method string, params any) (*RPCResponse, error) {
 		paramsJSON = p
 	}
 
-	req := RPCRequest{
-		Method: method,
-		Params: paramsJSON,
-		ID:     id,
-	}
-
+	req := RPCRequest{Method: method, Params: paramsJSON, ID: id}
 	data, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 	data = append(data, '\n')
 
-	if _, err := c.conn.Write(data); err != nil {
+	if _, err := conn.Write(data); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("write request: %w", err)
 	}
-
 	if !c.scanner.Scan() {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		if err := c.scanner.Err(); err != nil {
 			return nil, fmt.Errorf("read response: %w", err)
 		}
@@ -137,7 +150,6 @@ func (c *IPCClient) call(method string, params any) (*RPCResponse, error) {
 	if err := json.Unmarshal(c.scanner.Bytes(), &resp); err != nil {
 		return nil, fmt.Errorf("unmarshal response: %w", err)
 	}
-
 	return &resp, nil
 }
 
@@ -147,7 +159,7 @@ func (c *IPCClient) Ping(ctx context.Context) error {
 		return err
 	}
 
-	resp, err := c.call("ping", nil)
+	resp, err := c.callContext(ctx, "ping", nil)
 	if err != nil {
 		return err
 	}
@@ -173,7 +185,7 @@ func (c *IPCClient) Status(ctx context.Context) (*DaemonStatusInfo, error) {
 		return nil, err
 	}
 
-	resp, err := c.call("status", nil)
+	resp, err := c.callContext(ctx, "status", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -196,13 +208,37 @@ func (c *IPCClient) Status(ctx context.Context) (*DaemonStatusInfo, error) {
 	return &info, nil
 }
 
+
+// HookHealth returns bounded, project-aware hook diagnostics.
+func (c *IPCClient) HookHealth(ctx context.Context, cwd string) (*HookHealthResult, error) {
+	if err := c.Connect(ctx); err != nil {
+		return nil, err
+	}
+	resp, err := c.callContext(ctx, "hook_health", HookHealthParams{CWD: cwd})
+	if err != nil {
+		return nil, err
+	}
+	if resp.Error != nil {
+		return nil, fmt.Errorf("hook health error: %s", resp.Error.Message)
+	}
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		return nil, fmt.Errorf("marshal hook health: %w", err)
+	}
+	var health HookHealthResult
+	if err := json.Unmarshal(data, &health); err != nil {
+		return nil, fmt.Errorf("unmarshal hook health: %w", err)
+	}
+	return &health, nil
+}
+
 // Notify sends a notification to the daemon for broadcasting.
 func (c *IPCClient) Notify(ctx context.Context, eventType string, payload any) error {
 	if err := c.Connect(ctx); err != nil {
 		return err
 	}
 
-	resp, err := c.call("notify", NotifyParams{
+	resp, err := c.callContext(ctx, "notify", NotifyParams{
 		Type:    eventType,
 		Payload: payload,
 	})

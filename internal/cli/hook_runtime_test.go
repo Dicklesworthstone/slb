@@ -179,3 +179,18 @@ def classify(command):
 		t.Fatalf("classifier failure was not auditable: %+v, %v", events, err)
 	}
 }
+
+func TestHookRuntimeOfflineUnknownRequiresConfirmation(t *testing.T) {
+	home := t.TempDir()
+	stdout, stderr := runHookRuntime(t, home,
+		"query_slb_daemon = lambda *args: None\nclassify = lambda command: ('unknown', 0)",
+		`{"tool_input":{"command":"ordinary-unmatched-command"}}`)
+	if hookPermission(t, stdout) != "ask" || stderr != "" {
+		t.Fatalf("offline unknown command failed open: %s %s", stdout, stderr)
+	}
+	events, err := audit.Query(filepath.Join(home, ".slb", "audit", "blocked"), audit.Filter{})
+	if err != nil || len(events) != 1 || events[0].Action != "ask" ||
+		events[0].Tier != "unknown" || events[0].Source != "hook_offline" {
+		t.Fatalf("offline fallback confirmation was not auditable: %+v, %v", events, err)
+	}
+}
