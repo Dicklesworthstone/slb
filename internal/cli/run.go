@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -65,6 +66,10 @@ Examples:
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		command := args[0]
+		waitTimeout, err := approvalWaitDuration(flagRunTimeout)
+		if err != nil {
+			return err
+		}
 
 		if flagSessionID == "" {
 			return fmt.Errorf("--session-id is required")
@@ -161,35 +166,25 @@ Examples:
 			})
 		}
 
-		// Step 4: Wait for approval
-		deadline := time.Now().Add(time.Duration(flagRunTimeout) * time.Second)
-		for time.Now().Before(deadline) {
-			request, _, err = dbConn.GetRequestWithReviews(request.ID)
-			if err != nil {
-				return writeError(cmd, out, "poll_failed", command, err)
+		// Step 4: Advance due policy and wait without requiring a daemon.
+		// The client's wait deadline must never overwrite a peer's decision.
+		requestID := request.ID
+		request, err = core.WaitForDecision(cmd.Context(), dbConn, requestID, core.WaitOptions{
+			ConfigPath: flagConfig, Timeout: waitTimeout,
+		})
+		if err != nil {
+			status := "wait_failed"
+			if errors.Is(err, context.DeadlineExceeded) {
+				status = "timeout"
+			} else if errors.Is(err, context.Canceled) {
+				status = "cancelled"
 			}
-
-			// Evaluate status
-			decision := evaluateRequestForExecution(request.Status)
-
-			if decision.ShouldExecute {
-				break
-			}
-
-			if !decision.ShouldContinuePolling {
-				return writeError(cmd, out, string(request.Status), command,
-					fmt.Errorf("request %s: %s", request.ID, decision.Reason))
-			}
-
-			time.Sleep(500 * time.Millisecond)
+			return writeError(cmd, out, status, command,
+				fmt.Errorf("client wait ended for request %s: %w", requestID, err))
 		}
-
-		// Check if we timed out waiting
-		if request.Status == db.StatusPending {
-			// Mark as timeout
-			_ = dbConn.UpdateRequestStatus(request.ID, db.StatusTimeout)
-			return writeError(cmd, out, "timeout", command,
-				fmt.Errorf("request %s timed out waiting for approval", request.ID))
+		if request.Status != db.StatusApproved {
+			return writeError(cmd, out, string(request.Status), command,
+				fmt.Errorf("request %s is %s, not approved for execution", request.ID, request.Status))
 		}
 
 		// Step 5: Execute the approved command
@@ -202,6 +197,15 @@ Examples:
 		}
 		return nil
 	},
+}
+
+// approvalWaitDuration validates before creating requests or attachments.
+// Conversion must not overflow and silently turn a bounded wait into infinity.
+func approvalWaitDuration(seconds int) (time.Duration, error) {
+	if seconds <= 0 || int64(seconds) > int64((1<<63-1)/time.Second) {
+		return 0, fmt.Errorf("--timeout must be a positive, representable number of seconds")
+	}
+	return time.Duration(seconds) * time.Second, nil
 }
 
 func runSafeCommand(cmd *cobra.Command, out *output.Writer, command, cwd, project string) (int, error) {

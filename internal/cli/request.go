@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -38,7 +39,7 @@ func init() {
 	requestCmd.Flags().BoolVar(&flagRequestExecute, "execute", false, "execute the command if approved (use 'slb run' for atomic flow)")
 	requestCmd.Flags().IntVar(&flagRequestTimeout, "timeout", 300, "timeout in seconds when waiting")
 	requestCmd.Flags().StringSliceVar(&flagRequestAttachFile, "attach-file", nil, "attach file content as context")
-	requestCmd.Flags().StringSliceVar(&flagRequestAttachContext, "attach-context", nil, "run command and attach output as context")
+	requestCmd.Flags().StringSliceVar(&flagRequestAttachContext, "attach-context", nil, "attach context")
 	requestCmd.Flags().StringSliceVar(&flagRequestAttachScreen, "attach-screenshot", nil, "attach screenshot/image file")
 
 	rootCmd.AddCommand(requestCmd)
@@ -55,7 +56,7 @@ For atomic command execution, use 'slb run' instead.
 The command is classified by risk tier:
   CRITICAL   - Requires 2+ approvals
   DANGEROUS  - Requires 1 approval
-  CAUTION    - Auto-approved after timeout
+  CAUTION    - Auto-approved after the configured delay, if policy permits
   SAFE       - Skipped (no request created)
 
 Use --wait to block until approval/rejection.
@@ -63,6 +64,13 @@ Use --execute with --wait to execute after approval.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		command := args[0]
+		waitTimeout, err := approvalWaitDuration(flagRequestTimeout)
+		if err != nil {
+			return err
+		}
+		if flagRequestExecute && !flagRequestWait {
+			return fmt.Errorf("--execute requires --wait; use 'slb run' for atomic execution")
+		}
 
 		if flagSessionID == "" {
 			return fmt.Errorf("--session-id is required to create a request")
@@ -164,19 +172,13 @@ Use --execute with --wait to execute after approval.`,
 			return out.Write(resp)
 		}
 
-		// Wait for decision with timeout
-		deadline := time.Now().Add(time.Duration(flagRequestTimeout) * time.Second)
-		for time.Now().Before(deadline) {
-			request, _, err = dbConn.GetRequestWithReviews(request.ID)
-			if err != nil {
-				return fmt.Errorf("polling request: %w", err)
-			}
-
-			if request.Status.IsTerminal() || request.Status == db.StatusApproved {
-				break
-			}
-
-			time.Sleep(500 * time.Millisecond)
+		// Share daemonless policy advancement with run/status. The request's
+		// own expiry is independent of this client's wait timeout.
+		waited, waitErr := core.WaitForDecision(cmd.Context(), dbConn, request.ID, core.WaitOptions{
+			ConfigPath: flagConfig, Timeout: waitTimeout,
+		})
+		if waited != nil {
+			request = waited
 		}
 
 		// Update response with final status
@@ -184,11 +186,21 @@ Use --execute with --wait to execute after approval.`,
 		if request.ResolvedAt != nil {
 			resp["resolved_at"] = request.ResolvedAt.Format(time.RFC3339)
 		}
+		if waitErr != nil {
+			resp["wait_timed_out"] = errors.Is(waitErr, context.DeadlineExceeded)
+			resp["error"] = waitErr.Error()
+			if err := out.Write(resp); err != nil {
+				return err
+			}
+			cmd.SilenceErrors = true
+			cmd.SilenceUsage = true
+			return fmt.Errorf("waiting for request %s: %w", request.ID, waitErr)
+		}
 
 		// Execute if approved and --execute was specified
 		if flagRequestExecute && request.Status == db.StatusApproved {
 			executor := core.NewExecutor(dbConn, nil).WithNotifier(buildAgentMailNotifier(project))
-			execResult, execErr := executor.ExecuteApprovedRequest(context.Background(), core.ExecuteOptions{
+			execResult, execErr := executor.ExecuteApprovedRequest(cmd.Context(), core.ExecuteOptions{
 				RequestID:         request.ID,
 				SessionID:         flagSessionID,
 				LogDir:            ".slb/logs",
