@@ -4,6 +4,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/daemon"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/spf13/cobra"
@@ -20,14 +22,15 @@ var (
 	flagWatchSessionID          string
 	flagWatchAutoApproveCaution bool
 	flagWatchPollInterval       time.Duration
+	errWatchDaemonUnavailable   = errors.New("watch daemon subscription unavailable")
 )
 
 func init() {
 	// -s is owned by the root persistent --session-id; don't reclaim the
 	// shorthand here (it collides/shadows the persistent flag). Pass the
 	// session via the long --session-id flag.
-	watchCmd.Flags().StringVar(&flagWatchSessionID, "session-id", "", "session ID for auto-approve attribution")
-	watchCmd.Flags().BoolVar(&flagWatchAutoApproveCaution, "auto-approve-caution", false, "automatically approve CAUTION tier requests")
+	watchCmd.Flags().StringVar(&flagWatchSessionID, "session-id", "", "reviewer session ID (automatic decisions do not create reviews)")
+	watchCmd.Flags().BoolVar(&flagWatchAutoApproveCaution, "auto-approve-caution", false, "process due zero-review CAUTION approvals under current policy")
 	watchCmd.Flags().DurationVar(&flagWatchPollInterval, "poll-interval", 2*time.Second, "polling interval when daemon not available")
 
 	rootCmd.AddCommand(watchCmd)
@@ -43,6 +46,8 @@ Events are streamed as newline-delimited JSON objects.
 
 If the daemon is running, events are received in real-time via IPC subscription.
 If the daemon is not running, the command falls back to polling the database.
+If a daemon subscription is lost, a watch_degraded event precedes a fresh
+pending snapshot from polling. Consumers should deduplicate by request ID.
 
 Event types:
   request_pending   - New request awaiting approval
@@ -52,26 +57,36 @@ Event types:
   request_timeout   - Request timed out
   request_cancelled - Request was cancelled
 
-Use --auto-approve-caution to automatically approve CAUTION tier requests.`,
+Use --auto-approve-caution to process due CAUTION approvals. The configured
+delay, quorum, model constraints and current project policy still apply.`,
 	RunE: runWatch,
 }
 
 func runWatch(cmd *cobra.Command, args []string) error {
-	ctx, cancel := context.WithCancel(cmd.Context())
-	defer cancel()
-
-	// Handle SIGINT/SIGTERM for graceful shutdown
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		cancel()
-	}()
+	if flagWatchPollInterval <= 0 {
+		return fmt.Errorf("--poll-interval must be positive")
+	}
+	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if ctx.Err() != nil {
+		return nil
+	}
 
 	// Try daemon IPC first
 	client := daemon.NewClient()
 	if client.IsDaemonRunning() {
-		return runWatchDaemon(ctx, client, cmd.OutOrStdout())
+		err := runWatchDaemon(ctx, client, cmd.OutOrStdout())
+		if ctx.Err() != nil {
+			return nil
+		}
+		if !errors.Is(err, errWatchDaemonUnavailable) {
+			return err // Output failures must not trigger a second writer.
+		}
+		if err := json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{
+			"event": "watch_degraded", "mode": "polling", "error": err.Error(),
+		}); err != nil {
+			return fmt.Errorf("encoding fallback event: %w", err)
+		}
 	}
 
 	// Fall back to polling
@@ -86,7 +101,7 @@ func runWatchDaemon(ctx context.Context, client *daemon.Client, out io.Writer) e
 
 	events, err := ipcClient.Subscribe(ctx)
 	if err != nil {
-		return fmt.Errorf("subscribing to events: %w", err)
+		return fmt.Errorf("%w: %v", errWatchDaemonUnavailable, err)
 	}
 
 	enc := json.NewEncoder(out)
@@ -97,7 +112,10 @@ func runWatchDaemon(ctx context.Context, client *daemon.Client, out io.Writer) e
 			return nil
 		case event, ok := <-events:
 			if !ok {
-				return nil
+				if ctx.Err() != nil {
+					return nil
+				}
+				return errWatchDaemonUnavailable
 			}
 
 			watchEvent := daemon.ToRequestStreamEvent(event)
@@ -114,7 +132,9 @@ func runWatchDaemon(ctx context.Context, client *daemon.Client, out io.Writer) e
 						"request_id": watchEvent.RequestID,
 						"error":      err.Error(),
 					}
-					_ = enc.Encode(errEvent)
+					if err := enc.Encode(errEvent); err != nil {
+						return fmt.Errorf("encoding auto-approval error: %w", err)
+					}
 				}
 			}
 		}
@@ -123,6 +143,9 @@ func runWatchDaemon(ctx context.Context, client *daemon.Client, out io.Writer) e
 
 // runWatchPolling polls the database for pending requests.
 func runWatchPolling(ctx context.Context, out io.Writer) error {
+	if flagWatchPollInterval <= 0 {
+		return fmt.Errorf("--poll-interval must be positive")
+	}
 	dbConn, err := db.Open(GetDB())
 	if err != nil {
 		return fmt.Errorf("opening database: %w", err)
@@ -304,18 +327,6 @@ func processPolledRequest(ctx context.Context, req *db.Request, enc *json.Encode
 			return fmt.Errorf("encoding event: %w", err)
 		}
 
-		// Auto-approve CAUTION tier if enabled
-		if flagWatchAutoApproveCaution && req.RiskTier == db.RiskTierCaution {
-			if err := autoApproveCaution(ctx, req.ID); err != nil {
-				errEvent := map[string]any{
-					"event":      "auto_approve_error",
-					"request_id": req.ID,
-					"error":      err.Error(),
-				}
-				_ = enc.Encode(errEvent)
-			}
-		}
-
 	case PollActionEmitStatusChange:
 		// Status changed - emit status change event
 		event := daemon.RequestStreamEvent{
@@ -331,6 +342,20 @@ func processPolledRequest(ctx context.Context, req *db.Request, enc *json.Encode
 	}
 
 	seen[req.ID] = req.Status
+	// Revisit pending candidates on every poll, not only discovery: the
+	// configured delay may not have elapsed when the request first appeared.
+	if flagWatchAutoApproveCaution && shouldAutoApproveCaution(req.Status, req.RiskTier).ShouldApprove {
+		if err := autoApproveCaution(ctx, req.ID); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if err := enc.Encode(map[string]any{
+				"event": "auto_approve_error", "request_id": req.ID, "error": err.Error(),
+			}); err != nil {
+				return fmt.Errorf("encoding auto-approval error: %w", err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -341,9 +366,9 @@ type AutoApproveDecision struct {
 	Reason        string
 }
 
-// shouldAutoApproveCaution is a SAFETY-CRITICAL pure function that determines
-// whether a request should be auto-approved. This function MUST maintain 100%
-// test coverage as it guards against unauthorized command execution.
+// shouldAutoApproveCaution is only a cheap candidate filter. It does not grant
+// approval: the shared transactional resolver rechecks current policy, delay,
+// request binding, requester identity and review evidence before any change.
 //
 // Decision rules:
 //   - Auto-approve must be enabled (checked at call site)
@@ -378,8 +403,9 @@ func shouldAutoApproveCaution(
 	}
 }
 
-// autoApproveCaution automatically approves a CAUTION tier request.
-// This is the side-effectful wrapper that calls the pure decision function.
+// autoApproveCaution advances only eligible, due zero-review CAUTION decisions.
+// It never fabricates a reviewer identity, unsigned vote or independent status
+// write, and it cannot change the project's unrelated timeout policy.
 func autoApproveCaution(ctx context.Context, requestID string) error {
 	dbConn, err := db.Open(GetDB())
 	if err != nil {
@@ -387,61 +413,11 @@ func autoApproveCaution(ctx context.Context, requestID string) error {
 	}
 	defer dbConn.Close()
 
-	// Get request to verify it's still pending and CAUTION
-	request, err := dbConn.GetRequest(requestID)
+	_, err = core.AdvancePendingRequest(ctx, dbConn, requestID, core.PendingOptions{
+		ConfigPath: flagConfig, OnlyAutoApprove: true,
+	})
 	if err != nil {
-		return fmt.Errorf("getting request: %w", err)
-	}
-
-	// Use pure decision function for safety-critical logic
-	decision := shouldAutoApproveCaution(request.Status, request.RiskTier)
-	if !decision.ShouldApprove {
-		if request.Status != db.StatusPending {
-			return nil // Already resolved - not an error
-		}
-		return fmt.Errorf("auto-approve denied: %s", decision.Reason)
-	}
-
-	// Determine reviewer identity
-	agent := "auto-reviewer"
-	model := "auto"
-	session := flagWatchSessionID
-	if session == "" {
-		session = "auto-approve"
-	}
-
-	// Submit approval
-	review := &db.Review{
-		RequestID:         requestID,
-		ReviewerSessionID: session,
-		ReviewerAgent:     agent,
-		ReviewerModel:     model,
-		Decision:          db.DecisionApprove,
-		Comments:          "Auto-approved CAUTION tier request",
-		CreatedAt:         time.Now(),
-	}
-
-	if err := dbConn.CreateReview(review); err != nil {
-		return fmt.Errorf("creating review: %w", err)
-	}
-
-	// Check if approval threshold met and update status
-	reviews, err := dbConn.ListReviewsForRequest(requestID)
-	if err != nil {
-		return fmt.Errorf("getting reviews: %w", err)
-	}
-
-	approvals := 0
-	for _, r := range reviews {
-		if r.Decision == db.DecisionApprove {
-			approvals++
-		}
-	}
-
-	if approvals >= request.MinApprovals {
-		if err := dbConn.UpdateRequestStatus(requestID, db.StatusApproved); err != nil {
-			return fmt.Errorf("approving request: %w", err)
-		}
+		return fmt.Errorf("advancing CAUTION policy: %w", err)
 	}
 
 	return nil
