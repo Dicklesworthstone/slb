@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -148,7 +149,7 @@ Examples:
 				return err
 			}
 			if exitCode != 0 {
-				os.Exit(exitCode)
+				return commandExitError{code: exitCode}
 			}
 			return nil
 		}
@@ -190,10 +191,12 @@ Examples:
 		// Step 5: Execute the approved command
 		exitCode, err := runApprovedRequest(cmd.Context(), out, dbConn, cfg, project, request.ID)
 		if err != nil {
+			cmd.SilenceErrors = true // The execution response already contains it.
+			cmd.SilenceUsage = true
 			return err
 		}
 		if exitCode != 0 {
-			os.Exit(exitCode)
+			return commandExitError{code: exitCode}
 		}
 		return nil
 	},
@@ -221,50 +224,67 @@ func runSafeCommand(cmd *cobra.Command, out *output.Writer, command, cwd, projec
 	}
 	spec.Hash = db.ComputeCommandHash(*spec)
 
-	var streamWriter *os.File
-	if GetOutput() != "json" {
+	// A typed nil *os.File is a non-nil io.Writer and breaks output copying.
+	var streamWriter io.Writer
+	if !executionOutputStructured() {
 		streamWriter = os.Stdout
 	}
 
 	result, execErr := core.RunCommand(cmd.Context(), spec, logPath, streamWriter)
 
-	exitCode := 0
+	exitCode := -1
 	durationMs := int64(0)
+	status := "not_executed"
+	capturedOutput := ""
 	if result != nil {
 		exitCode = result.ExitCode
 		durationMs = result.Duration.Milliseconds()
+		capturedOutput = result.Output
+		status = "execution_failed"
+		if execErr == nil && exitCode == 0 {
+			status = "executed"
+		} else if errors.Is(execErr, context.DeadlineExceeded) {
+			status = "timed_out"
+		}
+	} else if execErr == nil {
+		execErr = errors.New("command runner returned no execution outcome")
+	}
+	if execErr == nil && exitCode != 0 {
+		execErr = commandExitError{code: exitCode}
 	}
 
 	resp := map[string]any{
-		"status":           "executed",
+		"status":           status,
+		"executed":         result != nil,
 		"command":          command,
 		"exit_code":        exitCode,
 		"duration_ms":      durationMs,
 		"log_path":         logPath,
 		"tier":             "safe",
 		"skipped_approval": true,
+		"output":           capturedOutput,
 	}
 	if execErr != nil {
 		resp["error"] = execErr.Error()
 	}
 
-	if GetOutput() == "json" {
-		_ = out.Write(resp)
-		if execErr != nil {
-			return 1, nil // JSON output success, but command failed
+	if executionOutputStructured() {
+		if err := out.Write(resp); err != nil {
+			return exitCode, err
 		}
-		return exitCode, nil
+		if execErr != nil {
+			cmd.SilenceErrors = true
+			cmd.SilenceUsage = true
+		}
+		return exitCode, execErr
 	}
 
 	if execErr != nil {
 		fmt.Fprintf(os.Stderr, "[slb] Execution failed: %s\n", execErr.Error())
-		return 1, nil
+		cmd.SilenceErrors = true
+		cmd.SilenceUsage = true
 	}
-	if exitCode != 0 {
-		fmt.Fprintf(os.Stderr, "\n[slb] Command exited with code %d\n", exitCode)
-		return exitCode, nil
-	}
-	return 0, nil
+	return exitCode, execErr
 }
 
 func runApprovedRequest(ctx context.Context, out *output.Writer, dbConn *db.DB, cfg config.Config, project, requestID string) (int, error) {
@@ -274,48 +294,24 @@ func runApprovedRequest(ctx context.Context, out *output.Writer, dbConn *db.DB, 
 		RequestID:         requestID,
 		SessionID:         flagSessionID,
 		LogDir:            ".slb/logs",
-		SuppressOutput:    GetOutput() == "json",
+		SuppressOutput:    executionOutputStructured(),
 		CaptureRollback:   cfg.General.EnableRollbackCapture,
 		MaxRollbackSizeMB: cfg.General.MaxRollbackSizeMB,
 	})
 
-	exitCode := 0
-	durationMs := int64(0)
-	logPath := ""
-	if execResult != nil {
-		exitCode = execResult.ExitCode
-		durationMs = execResult.Duration.Milliseconds()
-		logPath = execResult.LogPath
-	}
+	resp, execErr := executionOutcomeFor(requestID, execResult, execErr)
 
-	resp := map[string]any{
-		"status":      "executed",
-		"request_id":  requestID,
-		"exit_code":   exitCode,
-		"duration_ms": durationMs,
-		"log_path":    logPath,
-	}
-	if execErr != nil {
-		resp["error"] = execErr.Error()
-	}
-
-	if GetOutput() == "json" {
-		_ = out.Write(resp)
-		if execErr != nil {
-			return 1, nil
+	if executionOutputStructured() {
+		if err := out.Write(resp); err != nil {
+			return resp.ExitCode, err
 		}
-		return exitCode, nil
+		return resp.ExitCode, execErr
 	}
 
 	if execErr != nil {
 		fmt.Fprintf(os.Stderr, "[slb] Execution failed: %s\n", execErr.Error())
-		return 1, nil
 	}
-	if exitCode != 0 {
-		fmt.Fprintf(os.Stderr, "\n[slb] Command exited with code %d\n", exitCode)
-		return exitCode, nil
-	}
-	return 0, nil
+	return resp.ExitCode, execErr
 }
 
 func createRunLogFile(project, prefix string) (string, error) {

@@ -204,51 +204,41 @@ Use --execute with --wait to execute after approval.`,
 				RequestID:         request.ID,
 				SessionID:         flagSessionID,
 				LogDir:            ".slb/logs",
-				SuppressOutput:    GetOutput() == "json",
+				SuppressOutput:    executionOutputStructured(),
 				CaptureRollback:   cfg.General.EnableRollbackCapture,
 				MaxRollbackSizeMB: cfg.General.MaxRollbackSizeMB,
 			})
 
-			exitCode := 0
-			durationMs := int64(0)
-			logPath := ""
-			if execResult != nil {
-				exitCode = execResult.ExitCode
-				durationMs = execResult.Duration.Milliseconds()
-				logPath = execResult.LogPath
-			}
-
-			resp["executed"] = true
-			resp["exit_code"] = exitCode
-			resp["duration_ms"] = durationMs
-			resp["log_path"] = logPath
-
+			outcome, execErr := executionOutcomeFor(request.ID, execResult, execErr)
+			resp["status"] = outcome.Status
+			resp["executed"] = outcome.Executed
+			resp["exit_code"] = outcome.ExitCode
+			resp["duration_ms"] = outcome.DurationMs
+			resp["log_path"] = outcome.LogPath
+			resp["output"] = outcome.Output
+			resp["timed_out"] = outcome.TimedOut
 			if execErr != nil {
 				resp["execution_error"] = execErr.Error()
 			}
-
-			// Refresh status after execution.
-			if updated, err := dbConn.GetRequest(request.ID); err == nil && updated != nil {
-				resp["status"] = string(updated.Status)
+			if err := out.Write(resp); err != nil {
+				return err
 			}
-
-			if GetOutput() == "json" {
-				_ = out.Write(resp)
-				if execErr != nil {
-					os.Exit(1)
-				}
-				if exitCode != 0 {
-					os.Exit(exitCode)
-				}
-				return nil
-			}
-
 			if execErr != nil {
-				return fmt.Errorf("executing request: %w", execErr)
+				cmd.SilenceErrors = true
+				cmd.SilenceUsage = true
 			}
-			if exitCode != 0 {
-				os.Exit(exitCode)
+			return execErr // Preserve child exit status and deferred cleanup.
+		}
+		if flagRequestExecute {
+			err := fmt.Errorf("request %s is %s, not approved for execution", request.ID, request.Status)
+			resp["executed"] = false
+			resp["execution_error"] = err.Error()
+			if writeErr := out.Write(resp); writeErr != nil {
+				return writeErr
 			}
+			cmd.SilenceErrors = true
+			cmd.SilenceUsage = true
+			return err
 		}
 
 		return out.Write(resp)
