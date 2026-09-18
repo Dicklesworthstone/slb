@@ -66,6 +66,11 @@ Examples:
   slb run "kubectl delete deployment nginx" --reason "Removing unused deployment"`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		finish, err := beginRequestCommand(cmd)
+		if err != nil {
+			return err
+		}
+		defer finish()
 		command := args[0]
 		waitTimeout, err := approvalWaitDuration(flagRunTimeout)
 		if err != nil {
@@ -124,7 +129,7 @@ Examples:
 		// Step 1: Classify and create request using config-derived limits and notifiers
 		rl := core.NewRateLimiter(dbConn, toRateLimitConfig(cfg))
 		creator := core.NewRequestCreator(dbConn, rl, nil, toRequestCreatorConfig(cfg))
-		result, err := creator.CreateRequest(core.CreateRequestOptions{
+		result, err := submitRequestWithCapacity(cmd, creator, core.CreateRequestOptions{
 			SessionID: flagSessionID,
 			Command:   command,
 			Cwd:       cwd,
@@ -139,7 +144,7 @@ Examples:
 			ProjectPath: project,
 		})
 		if err != nil {
-			return writeError(cmd, out, "request_failed", command, err)
+			return writeRequestAdmissionError(cmd, err)
 		}
 
 		// Step 2: If SAFE, execute immediately
@@ -158,13 +163,15 @@ Examples:
 
 		// Step 3: If yield mode and not immediately approved, return request info
 		if flagRunYield && request.Status == db.StatusPending {
-			return out.Write(map[string]any{
+			resp := map[string]any{
 				"status":        "pending",
 				"request_id":    request.ID,
 				"tier":          string(request.RiskTier),
 				"min_approvals": request.MinApprovals,
 				"message":       "Request created, yielding to background. Check status with: slb status " + request.ID,
-			})
+			}
+			addRequestAdmissionMetadata(resp, result)
+			return out.Write(resp)
 		}
 
 		// Step 4: Advance due policy and wait without requiring a daemon.

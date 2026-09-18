@@ -63,6 +63,11 @@ Use --wait to block until approval/rejection.
 Use --execute with --wait to execute after approval.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		finish, err := beginRequestCommand(cmd)
+		if err != nil {
+			return err
+		}
+		defer finish()
 		command := args[0]
 		waitTimeout, err := approvalWaitDuration(flagRequestTimeout)
 		if err != nil {
@@ -122,7 +127,7 @@ Use --execute with --wait to execute after approval.`,
 		// Create the request using the core logic (config-driven rate limits + integrations).
 		rl := core.NewRateLimiter(dbConn, toRateLimitConfig(cfg))
 		creator := core.NewRequestCreator(dbConn, rl, nil, toRequestCreatorConfig(cfg))
-		result, err := creator.CreateRequest(core.CreateRequestOptions{
+		result, err := submitRequestWithCapacity(cmd, creator, core.CreateRequestOptions{
 			SessionID: flagSessionID,
 			Command:   command,
 			Cwd:       cwd,
@@ -137,7 +142,7 @@ Use --execute with --wait to execute after approval.`,
 			ProjectPath:    project,
 		})
 		if err != nil {
-			return fmt.Errorf("creating request: %w", err)
+			return writeRequestAdmissionError(cmd, err)
 		}
 
 		out := output.New(output.Format(GetOutput()))
@@ -159,6 +164,7 @@ Use --execute with --wait to execute after approval.`,
 			"min_approvals": request.MinApprovals,
 			"created_at":    request.CreatedAt.Format(time.RFC3339),
 		}
+		addRequestAdmissionMetadata(resp, result)
 
 		if request.Command.DisplayRedacted != "" {
 			resp["command_redacted"] = request.Command.DisplayRedacted
