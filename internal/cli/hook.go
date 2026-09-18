@@ -475,7 +475,6 @@ func embeddedHookPatternHash(data []byte) string {
 }
 
 func runHookTest(cmd *cobra.Command, args []string) error {
-func runHookTest(cmd *cobra.Command, args []string) error {
 	command := args[0]
 	if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
 		return err
