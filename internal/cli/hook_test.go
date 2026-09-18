@@ -863,3 +863,52 @@ func TestHookGenerateCommand_IncludesPersistedCustomPatterns(t *testing.T) {
 			"  fallback never does.", uniqPattern)
 	}
 }
+
+func TestHookStatusCommand_DetectsStalePatternSnapshot(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetHookFlags()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	installCmd := newTestHookCmd(h.DBPath)
+	if _, err := executeCommandCapture(t, installCmd, "hook", "install", "-j"); err != nil {
+		t.Fatalf("install hook: %v", err)
+	}
+
+	scriptPath := filepath.Join(home, ".slb", "hooks", "slb_guard.py")
+	body, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(body), "\n")
+	replaced := false
+	for i, line := range lines {
+		if strings.HasPrefix(line, "# SHA256: ") {
+			lines[i] = "# SHA256: " + strings.Repeat("0", 64)
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		t.Fatal("generated hook did not contain a policy hash")
+	}
+	if err := os.WriteFile(scriptPath, []byte(strings.Join(lines, "\n")), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	resetHookFlags()
+	statusCmd := newTestHookCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, statusCmd, "hook", "status", "-j")
+	if err != nil {
+		t.Fatalf("hook status: %v", err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("decode status: %v\n%s", err, stdout)
+	}
+	if result["status"] != "stale" || result["pattern_hash_matches"] != false ||
+		result["installed_pattern_hash"] != strings.Repeat("0", 64) {
+		t.Fatalf("stale snapshot was not detected: %+v", result)
+	}
+}

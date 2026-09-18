@@ -392,19 +392,28 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 	if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
 		return err
 	}
-
+	currentHash := core.GetDefaultEngine().ComputeHash()
 	status := map[string]any{
-		"hook_script_exists":   false,
-		"hook_script_path":     hookScriptPath,
-		"settings_configured":  false,
-		"settings_path":        settingsPath,
-		"current_pattern_hash": core.GetDefaultEngine().ComputeHash(),
+		"hook_script_exists":    false,
+		"hook_script_path":      hookScriptPath,
+		"settings_configured":   false,
+		"settings_path":         settingsPath,
+		"current_pattern_hash":  currentHash,
+		"installed_pattern_hash": "",
+		"pattern_hash_matches":  false,
 	}
 
 	if info, err := os.Stat(hookScriptPath); err == nil {
 		status["hook_script_exists"] = true
 		status["hook_script_executable"] = info.Mode()&0111 != 0
 		status["hook_script_size"] = info.Size()
+		if data, readErr := os.ReadFile(hookScriptPath); readErr == nil {
+			installedHash := embeddedHookPatternHash(data)
+			status["installed_pattern_hash"] = installedHash
+			status["pattern_hash_matches"] = installedHash != "" && installedHash == currentHash
+		} else {
+			status["hook_script_read_error"] = readErr.Error()
+		}
 	}
 
 	data, err := os.ReadFile(settingsPath)
@@ -419,11 +428,11 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 								if hookList, ok := h["hooks"].([]any); ok {
 									for _, hk := range hookList {
 										if hkMap, ok := hk.(map[string]any); ok {
-											if cmd, ok := hkMap["command"].(string); ok {
-												if filepath.Base(cmd) == "slb_guard.py" ||
-													(len(cmd) >= 13 && cmd[len(cmd)-13:] == "slb_guard.py") {
+											if configured, ok := hkMap["command"].(string); ok {
+												if filepath.Base(configured) == "slb_guard.py" ||
+													(len(configured) >= 13 && configured[len(configured)-13:] == "slb_guard.py") {
 													status["settings_configured"] = true
-													status["configured_command"] = cmd
+													status["configured_command"] = configured
 												}
 											}
 										}
@@ -439,11 +448,15 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 
 	scriptOK := status["hook_script_exists"].(bool)
 	settingsOK := status["settings_configured"].(bool)
-	if scriptOK && settingsOK {
+	fresh := status["pattern_hash_matches"].(bool)
+	switch {
+	case scriptOK && settingsOK && !fresh:
+		status["status"] = "stale"
+	case scriptOK && settingsOK:
 		status["status"] = "installed"
-	} else if scriptOK || settingsOK {
+	case scriptOK || settingsOK:
 		status["status"] = "partial"
-	} else {
+	default:
 		status["status"] = "not_installed"
 	}
 
@@ -451,6 +464,17 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 	return out.Write(status)
 }
 
+func embeddedHookPatternHash(data []byte) string {
+	for _, line := range strings.Split(string(data), "\n") {
+		const prefix = "# SHA256: "
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		}
+	}
+	return ""
+}
+
+func runHookTest(cmd *cobra.Command, args []string) error {
 func runHookTest(cmd *cobra.Command, args []string) error {
 	command := args[0]
 	if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {

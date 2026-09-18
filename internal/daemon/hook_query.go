@@ -114,7 +114,10 @@ func loadHookPolicy(cwd string) (*core.PatternEngine, *db.DB, string, error) {
 func (s *IPCServer) classifyCommand(params HookQueryParams) *HookQueryResult {
 	engine, conn, dbPath, err := loadHookPolicy(params.CWD)
 	if err != nil {
-		return &HookQueryResult{Action: "ask", Tier: "unknown", Message: "SLB: project policy could not be loaded; confirmation required."}
+		return &HookQueryResult{
+			Action: "block", Tier: "unknown", MatchedPattern: "policy_load_error",
+			Message: "SLB: project policy could not be loaded; command blocked until policy is repaired.",
+		}
 	}
 	if conn != nil {
 		defer conn.Close()

@@ -162,3 +162,20 @@ func TestHookRuntimeRedactionFailureOmitsCommand(t *testing.T) {
 		t.Fatalf("redaction failure leaked command: %+v, %v", events, err)
 	}
 }
+
+func TestHookRuntimeClassifierFailureFailsClosed(t *testing.T) {
+	home := t.TempDir()
+	setup := `query_slb_daemon = lambda *args: None
+def classify(command):
+    raise RuntimeError("policy unavailable")
+`
+	stdout, stderr := runHookRuntime(t, home, setup, `{"tool_input":{"command":"opaque command"}}`)
+	if hookPermission(t, stdout) != "deny" || stderr != "" {
+		t.Fatalf("classifier failure did not deny cleanly: %s %s", stdout, stderr)
+	}
+	events, err := audit.Query(filepath.Join(home, ".slb", "audit", "blocked"), audit.Filter{})
+	if err != nil || len(events) != 1 || events[0].Action != "block" ||
+		events[0].Tier != "unknown" || events[0].Source != "hook_offline" {
+		t.Fatalf("classifier failure was not auditable: %+v, %v", events, err)
+	}
+}

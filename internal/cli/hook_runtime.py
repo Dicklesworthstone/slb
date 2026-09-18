@@ -246,7 +246,8 @@ def main():
     try:
         tier, min_approvals = classify(command)
     except Exception:
-        _decide_and_audit(command, session_id, cwd, "ask", "SLB: classification failed; confirmation required.",
+        _decide_and_audit(command, session_id, cwd, "block",
+                          "SLB: classification failed; command blocked until policy is available.",
                           "unknown", 0, "hook_offline")
         return
     if tier == "critical":

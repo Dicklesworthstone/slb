@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -345,5 +346,20 @@ func TestItoa(t *testing.T) {
 		if result != tt.expected {
 			t.Errorf("itoa(%d) = %q, want %q", tt.input, result, tt.expected)
 		}
+	}
+}
+
+func TestHookQueryPolicyLoadFailureFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".slb"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".slb", "config.toml"), []byte("[patterns.safe\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := (&IPCServer{}).classifyCommand(HookQueryParams{Command: "ls -la", CWD: root})
+	if result.Action != "block" || result.Tier != "unknown" ||
+		result.MatchedPattern != "policy_load_error" {
+		t.Fatalf("broken policy failed open: %+v", result)
 	}
 }
