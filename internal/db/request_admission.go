@@ -46,6 +46,10 @@ func (e *RequestAdmissionLimitError) Error() string { return "request admission 
 // after this method returns, never inside the transaction. CreateRequest remains
 // the low-level import/fixture API; normal submissions must use this gate.
 func (db *DB) AdmitRequest(ctx context.Context, r *Request, limits RequestAdmissionLimits) (*RequestAdmissionStats, error) {
+	return db.admitRequest(ctx, r, limits, time.Now)
+}
+
+func (db *DB) admitRequest(ctx context.Context, r *Request, limits RequestAdmissionLimits, clock func() time.Time) (*RequestAdmissionStats, error) {
 	if r == nil || r.RequestorSessionID == "" {
 		return nil, errors.New("request and requester session are required")
 	}
@@ -102,8 +106,11 @@ func (db *DB) AdmitRequest(ctx context.Context, r *Request, limits RequestAdmiss
 
 	// Sample time after obtaining the lock: a caller may have waited for a
 	// competing transaction. Expired rows must not consume a full new minute.
-	now := time.Now().UTC()
-	windowStart := now.Add(-time.Minute)
+	now := clock().UTC()
+	// Legacy requests are stored with second precision. Include the entire
+	// boundary second so truncation cannot release a burst up to one second
+	// early. This matches the existing advisory limiter's conservative window.
+	windowStart := now.Truncate(time.Second).Add(-time.Minute)
 	var resetWatermark any
 	if resetAt.Valid && resetAt.String != "" {
 		reset, err := time.Parse(time.RFC3339Nano, resetAt.String)
@@ -127,7 +134,7 @@ func (db *DB) AdmitRequest(ctx context.Context, r *Request, limits RequestAdmiss
 	var oldest sql.NullString
 	if err := tx.QueryRowContext(ctx, `
 		SELECT COUNT(*), MIN(created_at) FROM requests
-		WHERE requestor_session_id = ? AND julianday(created_at) > julianday(?)
+		WHERE requestor_session_id = ? AND julianday(created_at) >= julianday(?)
 		  AND (? IS NULL OR julianday(created_at) >= julianday(?))
 	`, candidate.RequestorSessionID, windowStart.Format(time.RFC3339Nano), resetWatermark, resetWatermark).Scan(&stats.Recent, &oldest); err != nil {
 		return nil, fmt.Errorf("counting recent admissions: %w", err)
@@ -137,7 +144,7 @@ func (db *DB) AdmitRequest(ctx context.Context, r *Request, limits RequestAdmiss
 		if err != nil {
 			return nil, fmt.Errorf("parsing oldest admission: %w", err)
 		}
-		stats.ResetAt = createdAt.UTC().Add(time.Minute)
+		stats.ResetAt = createdAt.UTC().Truncate(time.Second).Add(time.Minute + time.Second)
 	}
 	stats.Exceeded = stats.Pending >= limits.MaxPending || stats.Recent >= limits.MaxPerMinute
 	if stats.Exceeded && !limits.WarnOnly {

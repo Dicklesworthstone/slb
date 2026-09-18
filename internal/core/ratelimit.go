@@ -219,6 +219,10 @@ func (rl *RateLimiter) CheckRateLimit(sessionID string) (*RateLimitResult, error
 		return result, nil
 	}
 
+	// Preserve the advisory API's blocked-capacity contract. The atomic
+	// admission result separately reports each committed counter.
+	result.RemainingPending = 0
+	result.RemainingPerMinute = 0
 	result.Message = (&RateLimitError{
 		SessionID:    sessionID,
 		Pending:      pending,

@@ -46,6 +46,10 @@ type CreateRequestResult struct {
 	Classification *MatchResult
 	// RateLimit is the committed admission result, including warn-only overruns.
 	RateLimit *RateLimitResult
+	// Queued means this call waited for capacity before it completed.
+	Queued bool
+	// QueueWait is elapsed admission time when Queued is true.
+	QueueWait time.Duration
 }
 
 // Request creation errors.
@@ -87,7 +91,7 @@ type RequestCreatorConfig struct {
 	ApprovalTTLCriticalMinutes int
 	// AgentMailEnabled toggles Agent Mail notifications.
 	AgentMailEnabled bool
-	// AgentMailThread is the thread to post notifications to.
+	// AgentMailThread is the thread to post notifications.
 	AgentMailThread string
 	// AgentMailSender optional sender name.
 	AgentMailSender string
@@ -128,8 +132,8 @@ func NewRequestCreator(database *db.DB, rateLimiter *RateLimiter, patternEngine 
 	}
 }
 
-// CreateRequest creates a new command approval request with full validation.
-func (rc *RequestCreator) CreateRequest(opts CreateRequestOptions) (*CreateRequestResult, error) {
+// createRequestOnce performs one fresh validation and atomic admission attempt.
+func (rc *RequestCreator) createRequestOnce(ctx context.Context, opts CreateRequestOptions) (*CreateRequestResult, error) {
 	// Validate required fields
 	if opts.SessionID == "" {
 		return nil, ErrSessionRequired
@@ -225,7 +229,7 @@ func (rc *RequestCreator) CreateRequest(opts CreateRequestOptions) (*CreateReque
 
 	// Step 10: Set expiry times
 	now := time.Now().UTC()
-	requestExpiry := now.Add(time.Duration(rc.config.RequestTimeoutMinutes) * time.Minute)
+	requestExpiry := now.Add(rc.requestLifetime())
 
 	// Step 11: Create request in DB
 	request := &db.Request{
@@ -243,7 +247,7 @@ func (rc *RequestCreator) CreateRequest(opts CreateRequestOptions) (*CreateReque
 		ExpiresAt:             &requestExpiry,
 	}
 
-	admission, err := rc.rateLimiter.AdmitRequest(context.Background(), request)
+	admission, err := rc.rateLimiter.AdmitRequest(ctx, request)
 	if err != nil {
 		return nil, fmt.Errorf("admitting request: %w", err)
 	}
