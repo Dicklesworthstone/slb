@@ -2,6 +2,8 @@ package cli
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -255,5 +257,77 @@ func TestDedupeStrings(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+
+func TestPendingCommand_ReviewPoolUsesAgentAllowlist(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetPendingFlags()
+
+	reviewer := testutil.MakeSession(t, h.DB,
+		testutil.WithProject(h.ProjectDir), testutil.WithAgent("Reviewer"), testutil.WithModel("review-model"))
+	localRequestor := testutil.MakeSession(t, h.DB,
+		testutil.WithProject(h.ProjectDir), testutil.WithAgent("LocalRequestor"), testutil.WithModel("request-model"))
+	local := testutil.MakeRequest(t, h.DB, localRequestor)
+
+	allowedProject := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(allowedProject, ".slb"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(allowedProject, ".slb", "config.toml"),
+		[]byte("[general]\ncross_project_reviews = true\nreview_pool = ['Reviewer']\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	allowedRequestor := testutil.MakeSession(t, h.DB,
+		testutil.WithProject(allowedProject), testutil.WithAgent("AllowedRequestor"), testutil.WithModel("request-model"))
+	allowed := testutil.MakeRequest(t, h.DB, allowedRequestor)
+
+	deniedProject := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(deniedProject, ".slb"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deniedProject, ".slb", "config.toml"),
+		[]byte("[general]\ncross_project_reviews = true\nreview_pool = ['SomeoneElse']\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deniedRequestor := testutil.MakeSession(t, h.DB,
+		testutil.WithProject(deniedProject), testutil.WithAgent("DeniedRequestor"), testutil.WithModel("request-model"))
+	denied := testutil.MakeRequest(t, h.DB, deniedRequestor)
+
+	own := testutil.MakeRequest(t, h.DB, reviewer)
+
+	cmd := newTestPendingCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, cmd, "pending",
+		"-C", h.ProjectDir, "-s", reviewer.ID, "--review-pool", "-j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result []map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, item := range result {
+		seen[item["request_id"].(string)] = true
+	}
+	if !seen[local.ID] || !seen[allowed.ID] || seen[denied.ID] || seen[own.ID] || len(seen) != 2 {
+		t.Fatalf("review-pool agent filtering wrong: seen=%v", seen)
+	}
+}
+
+func TestPendingCommand_ReviewPoolRejectsInactiveReviewerSession(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetPendingFlags()
+	reviewer := testutil.MakeSession(t, h.DB,
+		testutil.WithProject(h.ProjectDir), testutil.WithAgent("Reviewer"))
+	if err := h.DB.EndSession(reviewer.ID); err != nil {
+		t.Fatal(err)
+	}
+	cmd := newTestPendingCmd(h.DBPath)
+	_, err := executeCommandCapture(t, cmd, "pending",
+		"-C", h.ProjectDir, "-s", reviewer.ID, "--review-pool", "-j")
+	if err == nil {
+		t.Fatal("inactive reviewer session was accepted for review-pool filtering")
 	}
 }

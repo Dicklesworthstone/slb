@@ -2,6 +2,8 @@ package cli
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -742,5 +744,61 @@ func TestReviewShowCommand_TextOutputWithSafetyArgument(t *testing.T) {
 	// Text output should contain safety argument
 	if !strings.Contains(stdout, "Safety Argument:") {
 		t.Error("expected text output to contain 'Safety Argument:'")
+	}
+}
+
+
+func TestReviewListCommand_ReviewPoolUsesAgentAllowlist(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetReviewFlags()
+	t.Setenv("SLB_ACTOR", "Reviewer")
+
+	localRequestor := testutil.MakeSession(t, h.DB,
+		testutil.WithProject(h.ProjectDir), testutil.WithAgent("LocalRequestor"))
+	local := testutil.MakeRequest(t, h.DB, localRequestor)
+
+	allowedProject := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(allowedProject, ".slb"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(allowedProject, ".slb", "config.toml"),
+		[]byte("[general]\ncross_project_reviews = true\nreview_pool = ['Reviewer']\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	allowedRequestor := testutil.MakeSession(t, h.DB,
+		testutil.WithProject(allowedProject), testutil.WithAgent("AllowedRequestor"))
+	allowed := testutil.MakeRequest(t, h.DB, allowedRequestor)
+
+	deniedProject := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(deniedProject, ".slb"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deniedProject, ".slb", "config.toml"),
+		[]byte("[general]\ncross_project_reviews = true\nreview_pool = ['AnotherReviewer']\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deniedRequestor := testutil.MakeSession(t, h.DB,
+		testutil.WithProject(deniedProject), testutil.WithAgent("DeniedRequestor"))
+	denied := testutil.MakeRequest(t, h.DB, deniedRequestor)
+
+	cmd := newTestReviewCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, cmd, "review", "list",
+		"-C", h.ProjectDir, "--review-pool", "-j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result []map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, item := range result {
+		seen[item["id"].(string)] = true
+		if item["project_path"] == nil {
+			t.Fatalf("review-pool result omitted target project: %+v", item)
+		}
+	}
+	if !seen[local.ID] || !seen[allowed.ID] || seen[denied.ID] || len(seen) != 2 {
+		t.Fatalf("review-pool agent filtering wrong: seen=%v", seen)
 	}
 }
