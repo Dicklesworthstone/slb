@@ -21,6 +21,7 @@ func TestValidate_Errors(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.General.MinApprovals = 0
 	cfg.General.RequestTimeoutSecs = 0
+	cfg.General.DifferentModelTimeoutSecs = -1
 	cfg.General.ApprovalTTLMins = 0
 	cfg.General.ApprovalTTLCriticalMins = 0
 	cfg.General.MaxRollbackSizeMB = -1
@@ -376,5 +377,14 @@ func TestWriteValue_DecodeExistingInvalidTOMLErrors(t *testing.T) {
 		t.Fatalf("expected decode error")
 	} else if !strings.Contains(err.Error(), "decode config") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_DifferentModelTimeoutRequiredWhenEnabled(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.General.RequireDifferentModel = true
+	cfg.General.DifferentModelTimeoutSecs = 0
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "different_model_timeout") {
+		t.Fatalf("expected different-model timeout validation error, got %v", err)
 	}
 }

@@ -288,3 +288,85 @@ func TestPendingDatabaseBoundaryRefusesConstraintWaivers(t *testing.T) {
 		})
 	}
 }
+
+func TestPendingDifferentModelTimeoutEscalatesAtomically(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		createdAgo      time.Duration
+		reviewerModel   string
+		reviewerAlready bool
+		want            db.RequestStatus
+	}{
+		{name: "no-reviewer", createdAgo: 2 * time.Minute, want: db.StatusEscalated},
+		{name: "same-model-does-not-satisfy", createdAgo: 2 * time.Minute, reviewerModel: "test-model", want: db.StatusEscalated},
+		{name: "different-model-available", createdAgo: 2 * time.Minute, reviewerModel: "other-model", want: db.StatusPending},
+		{name: "different-model-already-voted", createdAgo: 2 * time.Minute, reviewerModel: "other-model", reviewerAlready: true, want: db.StatusEscalated},
+		{name: "timeout-not-due", createdAgo: 10 * time.Second, want: db.StatusPending},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database, request := pendingFixture(t)
+			pendingSQL(t, database, "UPDATE requests SET risk_tier = 'dangerous', min_approvals = 2, require_different_model = 1, created_at = ?, expires_at = ? WHERE id = ?",
+				time.Now().UTC().Add(-tc.createdAgo).Format(time.RFC3339),
+				time.Now().UTC().Add(time.Hour).Format(time.RFC3339), request.ID)
+			pendingConfig(t, request, "[general]\ndifferent_model_timeout = 30\n")
+			if tc.reviewerModel != "" {
+				reviewer := &db.Session{AgentName: "independent-reviewer", Model: tc.reviewerModel, Program: "test", ProjectPath: request.ProjectPath}
+				if err := database.CreateSession(reviewer); err != nil {
+					t.Fatal(err)
+				}
+				if tc.reviewerAlready {
+					if err := database.CreateReview(&db.Review{
+						RequestID: request.ID, ReviewerSessionID: reviewer.ID, ReviewerAgent: reviewer.AgentName,
+						ReviewerModel: reviewer.Model, Decision: db.DecisionApprove,
+					}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			result, err := AdvancePendingRequest(context.Background(), database, request.ID, PendingOptions{})
+			if err != nil || result.Request.Status != tc.want || result.Changed != (tc.want == db.StatusEscalated) {
+				t.Fatalf("different-model timeout result=%+v err=%v want=%s", result, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestPendingDifferentModelTimeoutDatabaseGuard(t *testing.T) {
+	database, request := pendingFixture(t)
+	pendingSQL(t, database, "UPDATE requests SET risk_tier = 'dangerous', min_approvals = 1, created_at = ?, expires_at = ? WHERE id = ?",
+		time.Now().UTC().Add(-time.Minute).Format(time.RFC3339),
+		time.Now().UTC().Add(time.Hour).Format(time.RFC3339), request.ID)
+
+	_, err := database.ResolvePendingRequest(context.Background(), request.ID,
+		func(*sql.Tx, *db.Request, time.Time) (*db.PendingDecision, error) {
+			return &db.PendingDecision{Status: db.StatusEscalated, DifferentModelTimeout: 30 * time.Second}, nil
+		})
+	if !errors.Is(err, db.ErrInvalidTransition) {
+		t.Fatalf("database accepted unbound early escalation: %v", err)
+	}
+
+	pendingSQL(t, database, "UPDATE requests SET require_different_model = 1 WHERE id = ?", request.ID)
+	reviewer := &db.Session{AgentName: "available-reviewer", Model: "other-model", Program: "test", ProjectPath: request.ProjectPath}
+	if err := database.CreateSession(reviewer); err != nil {
+		t.Fatal(err)
+	}
+	result, err := database.ResolvePendingRequest(context.Background(), request.ID,
+		func(*sql.Tx, *db.Request, time.Time) (*db.PendingDecision, error) {
+			return &db.PendingDecision{Status: db.StatusEscalated, DifferentModelTimeout: 30 * time.Second}, nil
+		})
+	if err != nil || result.Changed || result.Request.Status != db.StatusPending {
+		t.Fatalf("database ignored available different-model reviewer: %+v %v", result, err)
+	}
+}
+
+func TestPendingAutoApproveOnlyDoesNotEscalateModelTimeout(t *testing.T) {
+	database, request := pendingFixture(t)
+	pendingSQL(t, database, "UPDATE requests SET risk_tier = 'dangerous', min_approvals = 1, require_different_model = 1, created_at = ?, expires_at = ? WHERE id = ?",
+		time.Now().UTC().Add(-time.Minute).Format(time.RFC3339),
+		time.Now().UTC().Add(time.Hour).Format(time.RFC3339), request.ID)
+	pendingConfig(t, request, "[general]\ndifferent_model_timeout = 1\n")
+	result, err := AdvancePendingRequest(context.Background(), database, request.ID, PendingOptions{OnlyAutoApprove: true})
+	if err != nil || result.Changed || result.Request.Status != db.StatusPending {
+		t.Fatalf("auto-approval-only path escalated model timeout: %+v %v", result, err)
+	}
+}
