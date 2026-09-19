@@ -4,11 +4,9 @@ package tui
 
 import (
 	"os"
-	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/tui/dashboard"
 	"github.com/Dicklesworthstone/slb/internal/tui/history"
 	"github.com/Dicklesworthstone/slb/internal/tui/patterns"
@@ -64,7 +62,12 @@ type Model struct {
 	patterns  patterns.Model
 
 	// Navigation state
-	selectedRequestID string
+	selectedRequestID     string
+	detailGeneration      uint64
+	detailRefreshToken    uint64
+	detailRevision        uint64
+	detailRefreshInFlight bool
+	navigationError       string
 }
 
 // New creates a new TUI model with options.
@@ -128,10 +131,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case navigateMsg:
 		return m.handleNavigation(msg)
+	case detailRefreshTick:
+		return m.beginDetailRefresh(msg)
+	case detailRefreshResult:
+		return m.finishDetailRefresh(msg)
 
 	case request.ReviewSubmittedMsg:
 		// A late worker result must not navigate away from another request.
 		if m.view == ViewRequestDetail && m.detail != nil && m.detail.Request != nil && m.detail.Request.ID == msg.RequestID {
+			m.detailRevision++
 			return m.forwardUpdate(msg)
 		}
 		return m, nil
@@ -142,6 +150,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// form before it leaves the detail view.
 		if m.view == ViewRequestDetail && m.detail != nil && m.detail.Mode != request.DetailModeView {
 			return m.forwardUpdate(msg)
+		}
+		if m.view == ViewRequestDetail && (msg.String() == "f5" || msg.String() == "ctrl+r") && !m.detailRefreshInFlight {
+			cmd := m.scheduleDetailRefresh(0)
+			return m, cmd
 		}
 		// Handle global navigation keys based on current view
 		if m.view == ViewDashboard {
@@ -219,6 +231,9 @@ func (m Model) forwardUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 // handleNavigation handles view navigation. New views inherit the last known
 // terminal size rather than waiting until the terminal is resized again.
 func (m Model) handleNavigation(nav navigateMsg) (tea.Model, tea.Cmd) {
+	m.navigationError = ""
+	m.detailGeneration++
+	m.detailRefreshInFlight = false
 	m.view = nav.view
 
 	switch nav.view {
@@ -237,7 +252,8 @@ func (m Model) handleNavigation(nav navigateMsg) (tea.Model, tea.Cmd) {
 				m.detail = detail
 				m.setupDetailCallbacks()
 				m, sizeCmd := m.seedViewSize()
-				return m, tea.Batch(sizeCmd, m.detail.Init())
+				refresh := m.scheduleDetailRefresh(m.detailRefreshInterval())
+				return m, tea.Batch(sizeCmd, m.detail.Init(), refresh)
 			}
 		}
 		m.view = ViewDashboard
@@ -310,62 +326,27 @@ func (m *Model) setupPatternsCallbacks() {
 	m.patterns.OnBack = func() {}
 }
 
-// loadRequestDetail loads a request and creates a detail model.
-func (m *Model) loadRequestDetail(requestID string) *request.DetailModel {
-	dbPath := filepath.Join(m.options.ProjectPath, ".slb", "state.db")
-	dbConn, err := db.OpenWithOptions(dbPath, db.OpenOptions{
-		CreateIfNotExists: false, InitSchema: false, ReadOnly: true,
-	})
-	if err != nil {
-		return nil
-	}
-	defer dbConn.Close()
-
-	var currentSession *db.Session
-	if m.options.SessionID != "" && m.options.SessionKey != "" {
-		s, err := dbConn.GetSession(m.options.SessionID)
-		if err == nil && s.IsActive() && db.ExecutionSessionKeyMatches(s.SessionKey, m.options.SessionKey) {
-			currentSession = s
-		}
-	}
-	req, err := dbConn.GetRequest(requestID)
-	if err != nil || req.ProjectPath != m.options.ProjectPath {
-		return nil
-	}
-	reviewPtrs, err := dbConn.ListReviewsForRequest(requestID)
-	if err != nil {
-		return nil // An incomplete review snapshot must not enable another vote.
-	}
-	reviews := make([]db.Review, 0, len(reviewPtrs))
-	for _, r := range reviewPtrs {
-		if r != nil {
-			reviews = append(reviews, *r)
-		}
-	}
-	detail := request.NewDetailModel(req, reviews)
-	if currentSession != nil {
-		detail.WithSession(currentSession)
-	}
-	return detail
-}
-
 // View implements tea.Model.
 func (m Model) View() string {
+	view := "Loading..."
 	switch m.view {
 	case ViewDashboard:
 		if m.dashboard != nil {
-			return m.dashboard.View()
+			view = m.dashboard.View()
 		}
 	case ViewRequestDetail:
 		if m.detail != nil {
-			return m.detail.View()
+			view = m.detail.View()
 		}
 	case ViewHistory:
-		return m.history.View()
+		view = m.history.View()
 	case ViewPatterns:
-		return m.patterns.View()
+		view = m.patterns.View()
 	}
-	return "Loading..."
+	if m.navigationError != "" {
+		return m.navigationError + "\n" + view
+	}
+	return view
 }
 
 // Run starts the TUI with default options.

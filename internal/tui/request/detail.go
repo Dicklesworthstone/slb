@@ -94,6 +94,7 @@ type DetailModel struct {
 
 	ReviewPending  bool
 	ReviewFeedback string
+	SnapshotError  string
 	reviewFailed   bool
 	copied         bool
 }
@@ -179,7 +180,10 @@ func (m *DetailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.approveForm = updated.(*ApproveModel)
 			cmds = append(cmds, cmd)
 			if m.approveForm.Submitted && !m.ReviewPending {
-				if m.OnApprove == nil {
+				if !m.canApprove() {
+					m.approveForm.Submitted = false
+					m.ReviewFeedback, m.reviewFailed = "Approval is unavailable; cancel the form and refresh the request.", true
+				} else if m.OnApprove == nil {
 					m.approveForm.Submitted = false
 					m.ReviewFeedback, m.reviewFailed = "Approval is unavailable in this view.", true
 				} else {
@@ -205,7 +209,10 @@ func (m *DetailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.rejectForm = updated.(*RejectModel)
 			cmds = append(cmds, cmd)
 			if m.rejectForm.Submitted && !m.ReviewPending {
-				if m.OnReject == nil {
+				if !m.canReject() {
+					m.rejectForm.Submitted = false
+					m.ReviewFeedback, m.reviewFailed = "Rejection is unavailable; cancel the form and refresh the request.", true
+				} else if m.OnReject == nil {
 					m.rejectForm.Submitted = false
 					m.ReviewFeedback, m.reviewFailed = "Rejection is unavailable in this view.", true
 				} else {
@@ -283,6 +290,9 @@ type clearCopiedMsg struct{}
 func (m *DetailModel) View() string {
 	th := theme.Current
 	feedback := ""
+	if m.SnapshotError != "" {
+		feedback = lipgloss.NewStyle().Foreground(th.Red).Render(m.SnapshotError) + "\n"
+	}
 	if m.ReviewFeedback != "" {
 		color := th.Green
 		if m.reviewFailed {
@@ -290,7 +300,7 @@ func (m *DetailModel) View() string {
 		} else if m.ReviewPending {
 			color = th.Yellow
 		}
-		feedback = lipgloss.NewStyle().Foreground(color).Render(m.ReviewFeedback) + "\n"
+		feedback += lipgloss.NewStyle().Foreground(color).Render(m.ReviewFeedback) + "\n"
 	}
 	if m.Mode == DetailModeApprove && m.approveForm != nil {
 		return feedback + m.approveForm.View()
@@ -510,7 +520,7 @@ func (m *DetailModel) canApprove() bool {
 }
 
 func (m *DetailModel) canReject() bool {
-	if m.ReviewPending || m.Request == nil || m.Session == nil || !m.Session.IsActive() {
+	if m.SnapshotError != "" || m.ReviewPending || m.Request == nil || m.Session == nil || !m.Session.IsActive() {
 		return false
 	}
 	if m.Request.Status != db.StatusPending && m.Request.Status != db.StatusEscalated {
@@ -528,6 +538,39 @@ func (m *DetailModel) canReject() bool {
 		}
 	}
 	return true
+}
+
+// ApplySnapshot refreshes display evidence without silently retargeting an open
+// review form. A failed read keeps the last display but disables new votes.
+// A committing review owns the view until its result arrives; the root also
+// rejects reads that started before that commit.
+func (m *DetailModel) ApplySnapshot(target *db.Request, reviews []db.Review, session *db.Session, err error) {
+	if m.ReviewPending {
+		return
+	}
+	if err != nil {
+		m.SnapshotError = "Request refresh failed; review disabled: " + err.Error()
+		return
+	}
+	if target == nil || m.Request == nil || target.ID != m.Request.ID || target.ProjectPath != m.Request.ProjectPath {
+		m.SnapshotError = "Request refresh returned a different target; review disabled."
+		return
+	}
+	if m.Mode != DetailModeView && target.Command.Hash != m.Request.Command.Hash {
+		m.SnapshotError = "Command changed while this form was open. Cancel the form and refresh before reviewing."
+		return
+	}
+	m.Request, m.Reviews, m.Session = target, reviews, session
+	m.SnapshotError = ""
+	if m.approveForm != nil {
+		m.approveForm.Request = target
+	}
+	if m.rejectForm != nil {
+		m.rejectForm.Request = target
+	}
+	if m.ready {
+		m.viewport.SetContent(m.renderContent())
+	}
 }
 
 func (m *DetailModel) canExecute() bool {

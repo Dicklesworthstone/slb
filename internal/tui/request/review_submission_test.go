@@ -133,3 +133,45 @@ func TestDetailReviewEligibility(t *testing.T) {
 		})
 	}
 }
+
+func TestDetailSnapshotNeverRetargetsOpenForm(t *testing.T) {
+	m := submissionDetail()
+	m.Request.Command.Hash = "displayed-hash"
+	m.OnApprove = func(id, comments string) tea.Cmd {
+		return func() tea.Msg { t.Fatal("retargeted form submitted"); return nil }
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("checked the original command")})
+	changed := *m.Request
+	changed.Command.Hash = "different-hash"
+	m.ApplySnapshot(&changed, nil, m.Session, nil)
+	if m.Request.Command.Hash != "displayed-hash" || !strings.Contains(m.View(), "Command changed") {
+		t.Fatal("open form silently switched command")
+	}
+	_, submit := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	runSubmissionCmd(submit)
+	if m.ReviewPending || m.approveForm.commentsInput.Value() != "checked the original command" {
+		t.Fatal("stale form submitted or lost comments")
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m.ApplySnapshot(&changed, nil, m.Session, nil)
+	if m.SnapshotError != "" || m.Request.Command.Hash != "different-hash" || !m.canApprove() {
+		t.Fatal("fresh view did not recover after cancelling stale form")
+	}
+}
+
+func TestDetailSnapshotUpdatesFormEligibilityWithoutLosingText(t *testing.T) {
+	m := submissionDetail()
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("still typing")})
+	changed := *m.Request
+	changed.Status = db.StatusRejected
+	m.ApplySnapshot(&changed, nil, m.Session, nil)
+	if m.rejectForm.Request.Status != db.StatusRejected || m.rejectForm.reasonInput.Value() != "still typing" {
+		t.Fatal("refresh erased form or left its status stale")
+	}
+	_, submit := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	if submit != nil || m.ReviewPending {
+		t.Fatal("resolved request submitted from an old form")
+	}
+}

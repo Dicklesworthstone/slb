@@ -17,7 +17,7 @@ var (
 
 func init() {
 	tuiCmd.Flags().BoolVar(&flagTuiNoMouse, "no-mouse", false, "disable mouse support")
-	tuiCmd.Flags().IntVar(&flagTuiRefreshSeconds, "refresh-interval", 5, "polling interval when no daemon (seconds)")
+	tuiCmd.Flags().IntVar(&flagTuiRefreshSeconds, "refresh-interval", 5, "request detail refresh interval (seconds)")
 	tuiCmd.Flags().StringVar(&flagTuiTheme, "theme", "", "override theme (mocha, macchiato, frappe, latte)")
 	tuiCmd.Flags().StringVar(&flagTuiSessionID, "session-id", "", "session ID for approvals")
 	tuiCmd.Flags().StringVar(&flagTuiSessionKey, "session-key", "", "session key for approvals")
@@ -30,7 +30,7 @@ var tuiCmd = &cobra.Command{
 	Short: "Launch the interactive TUI dashboard",
 	Long: `Launch the SLB Bubble Tea dashboard.
 
-If the daemon is running, live updates are streamed; otherwise polling is used.
+The dashboard and open request details refresh from the project database.
 Providing --session-id and --session-key enables interactive approval/rejection.
 Reviews obey the request project's policy and --config override. A recorded
 vote is not full approval until the configured quorum is met. No command is
@@ -43,6 +43,7 @@ Key bindings:
   a/r            Open approval/rejection form in request details
   ctrl+s         Submit the review form
   esc            Cancel the form, or leave request details
+  f5/ctrl+r      Refresh request details immediately (outside a form)
   m              Pattern management
   H              History browser
   q              Quit

@@ -1,9 +1,11 @@
 package dashboard
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -28,6 +30,7 @@ const (
 type requestRow struct {
 	ID        string
 	Tier      string
+	Status    string
 	Command   string
 	Requestor string
 	CreatedAt time.Time
@@ -46,45 +49,33 @@ type dataMsg struct {
 // Model is the main dashboard Bubble Tea model.
 type Model struct {
 	projectPath string
-
-	ready  bool
-	width  int
-	height int
-
-	focus focusPanel
-
-	agents   []components.AgentInfo
-	pending  []requestRow
-	activity []string
-
-	agentSel int
-	agentOff int
-
-	pendingSel int
-	pendingOff int
-
+	ready       bool
+	width       int
+	height      int
+	focus       focusPanel
+	agents      []components.AgentInfo
+	pending     []requestRow
+	activity    []string
+	agentSel    int
+	agentOff    int
+	pendingSel  int
+	pendingOff  int
 	activitySel int
 	activityOff int
-
 	lastErr     error
 	lastRefresh time.Time
 
-	// Callbacks
-	OnPatterns func() // Navigate to pattern management view
-	OnHistory  func() // Navigate to history view
+	OnPatterns func()
+	OnHistory  func()
 }
 
-// New creates a dashboard model for a project.
 func New(projectPath string) Model {
 	if projectPath == "" {
 		if pwd, err := os.Getwd(); err == nil {
 			projectPath = pwd
 		}
 	}
-	return Model{
-		projectPath: projectPath,
-		focus:       focusPending,
-	}
+	return Model{projectPath: projectPath, focus: focusPending}
 }
 
 func (m Model) Init() tea.Cmd {
@@ -94,23 +85,32 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		m.ready = true
+		m.width, m.height, m.ready = msg.Width, msg.Height, true
 		return m, nil
 	case refreshMsg:
 		return m, tea.Batch(loadCmd(m.projectPath), tickCmd())
 	case dataMsg:
-		m.agents = msg.agents
-		m.pending = msg.pending
-		m.activity = msg.activity
 		m.lastErr = msg.err
+		if msg.err != nil {
+			return m, nil // Keep last-known state; do not pretend the queue emptied.
+		}
+		selectedID := ""
+		if m.pendingSel >= 0 && m.pendingSel < len(m.pending) {
+			selectedID = m.pending[m.pendingSel].ID
+		}
+		m.agents, m.pending, m.activity = msg.agents, msg.pending, msg.activity
 		m.lastRefresh = msg.refreshedAt
-
+		// New escalations can reorder the queue. Preserve the chosen request,
+		// not merely its old row number, before the user presses Enter.
+		for i, row := range m.pending {
+			if row.ID == selectedID {
+				m.pendingSel = i
+				break
+			}
+		}
 		m.agentSel, m.agentOff = clampSelection(m.agentSel, m.agentOff, len(m.agents), m.visibleRows())
 		m.pendingSel, m.pendingOff = clampSelection(m.pendingSel, m.pendingOff, len(m.pending), m.visibleRows())
 		m.activitySel, m.activityOff = clampSelection(m.activitySel, m.activityOff, len(m.activity), m.visibleRows())
-
 		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -118,38 +118,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "tab":
 			m.focus = (m.focus + 1) % 3
-			return m, nil
-		case "shift+tab":
+		case "shift+tab", "left":
 			m.focus = (m.focus + 2) % 3
-			return m, nil
-		case "left":
-			m.focus = (m.focus + 2) % 3
-			return m, nil
 		case "right", "l":
 			m.focus = (m.focus + 1) % 3
-			return m, nil
 		case "up", "k":
 			m.moveSelection(-1)
-			return m, nil
 		case "down", "j":
 			m.moveSelection(1)
-			return m, nil
 		case "m":
 			if m.OnPatterns != nil {
 				m.OnPatterns()
 			}
-			return m, nil
 		case "h":
 			if m.OnHistory != nil {
 				m.OnHistory()
 			} else {
-				// Fallback to left focus if no handler
 				m.focus = (m.focus + 2) % 3
 			}
-			return m, nil
 		}
+		return m, nil
 	}
-
 	return m, nil
 }
 
@@ -157,211 +146,121 @@ func (m Model) View() string {
 	if !m.ready {
 		return "Loading..."
 	}
-
 	th := theme.Current
-
-	header := m.renderHeader()
-	footer := m.renderFooter()
-
-	bodyHeight := m.height - lipgloss.Height(header) - lipgloss.Height(footer)
-	if bodyHeight < 6 {
-		bodyHeight = 6
-	}
-
+	header, footer := m.renderHeader(), m.renderFooter()
+	bodyHeight := maxInt(6, m.height-lipgloss.Height(header)-lipgloss.Height(footer))
 	gap := 1
-	leftW := maxInt(28, m.width/4)
-	rightW := maxInt(28, m.width/4)
-	centerW := m.width - leftW - rightW - (2 * gap)
-	if centerW < 30 {
-		centerW = 30
-	}
-
-	agentsPanel := m.renderAgentsPanel(leftW, bodyHeight)
-	pendingPanel := m.renderPendingPanel(centerW, bodyHeight)
-	activityPanel := m.renderActivityPanel(rightW, bodyHeight)
-
+	leftW, rightW := maxInt(28, m.width/4), maxInt(28, m.width/4)
+	centerW := maxInt(30, m.width-leftW-rightW-2*gap)
 	body := lipgloss.JoinHorizontal(lipgloss.Top,
-		agentsPanel,
+		m.renderAgentsPanel(leftW, bodyHeight),
 		lipgloss.NewStyle().Width(gap).Render(""),
-		pendingPanel,
+		m.renderPendingPanel(centerW, bodyHeight),
 		lipgloss.NewStyle().Width(gap).Render(""),
-		activityPanel,
+		m.renderActivityPanel(rightW, bodyHeight),
 	)
-
-	// Keep the whole view on a consistent background.
-	page := lipgloss.NewStyle().Background(th.Base).Render(
-		lipgloss.JoinVertical(lipgloss.Left, header, body, footer),
-	)
-	return page
+	return lipgloss.NewStyle().Background(th.Base).Render(lipgloss.JoinVertical(lipgloss.Left, header, body, footer))
 }
 
 func (m Model) renderHeader() string {
 	th := theme.Current
-
 	title := lipgloss.NewStyle().Foreground(th.Mauve).Bold(true).Render("SLB Dashboard")
-	statusDot := lipgloss.NewStyle().Foreground(th.Yellow).Render("●")
-	daemon := lipgloss.NewStyle().Foreground(th.Subtext).Render(fmt.Sprintf("%s Daemon: unknown", statusDot))
-
-	row := lipgloss.JoinHorizontal(lipgloss.Top,
-		title,
-		lipgloss.NewStyle().Width(maxInt(0, m.width-lipgloss.Width(title)-lipgloss.Width(daemon))).Render(""),
-		daemon,
-	)
-
-	return lipgloss.NewStyle().
-		Background(th.Mantle).
-		Foreground(th.Text).
-		Padding(0, 1).
-		Width(maxInt(0, m.width)).
-		Render(row)
+	status := lipgloss.NewStyle().Foreground(th.Subtext).Render("Project database • polling")
+	row := lipgloss.JoinHorizontal(lipgloss.Top, title,
+		lipgloss.NewStyle().Width(maxInt(0, m.width-lipgloss.Width(title)-lipgloss.Width(status))).Render(""), status)
+	return lipgloss.NewStyle().Background(th.Mantle).Foreground(th.Text).Padding(0, 1).Width(maxInt(0, m.width)).Render(row)
 }
 
 func (m Model) renderFooter() string {
 	th := theme.Current
-
-	hint := lipgloss.NewStyle().Foreground(th.Subtext).Render("[tab] focus  [↑/↓] navigate  [enter] details  [m] patterns  [h] history  [q] quit")
-
+	hint := lipgloss.NewStyle().Foreground(th.Subtext).Render("[tab] focus  [↑/↓] navigate  [enter] details  [m] patterns  [H] history  [q] quit")
 	right := ""
 	if !m.lastRefresh.IsZero() {
 		right = "refreshed " + formatTimeAgo(m.lastRefresh)
 	}
 	if m.lastErr != nil {
-		right = "error: " + m.lastErr.Error()
+		right = "error (showing last known state): " + m.lastErr.Error()
 	}
 	rightStyled := lipgloss.NewStyle().Foreground(th.Subtext).Render(right)
-
-	row := lipgloss.JoinHorizontal(lipgloss.Top,
-		hint,
-		lipgloss.NewStyle().Width(maxInt(0, m.width-lipgloss.Width(hint)-lipgloss.Width(rightStyled))).Render(""),
-		rightStyled,
-	)
-
-	return lipgloss.NewStyle().
-		Background(th.Mantle).
-		Padding(0, 1).
-		Width(maxInt(0, m.width)).
-		Render(row)
+	row := lipgloss.JoinHorizontal(lipgloss.Top, hint,
+		lipgloss.NewStyle().Width(maxInt(0, m.width-lipgloss.Width(hint)-lipgloss.Width(rightStyled))).Render(""), rightStyled)
+	return lipgloss.NewStyle().Background(th.Mantle).Padding(0, 1).Width(maxInt(0, m.width)).Render(row)
 }
 
 func (m Model) renderAgentsPanel(width, height int) string {
 	th := theme.Current
-
 	title := lipgloss.NewStyle().Foreground(th.Blue).Bold(true).Render(fmt.Sprintf("Agents (%d)", len(m.agents)))
-
 	lines := []string{title}
-	visible := maxInt(1, height-4) // title + border padding
-	start, end := window(m.agentOff, len(m.agents), visible)
-
+	start, end := window(m.agentOff, len(m.agents), maxInt(1, height-4))
 	for i := start; i < end; i++ {
-		card := components.NewAgentCard(m.agents[i]).
-			AsCompact().
-			AsSelected(i == m.agentSel && m.focus == focusAgents).
-			WithWidth(width - 4)
+		card := components.NewAgentCard(m.agents[i]).AsCompact().AsSelected(i == m.agentSel && m.focus == focusAgents).WithWidth(width - 4)
 		lines = append(lines, card.Render())
 	}
 	if len(m.agents) == 0 {
 		lines = append(lines, lipgloss.NewStyle().Foreground(th.Subtext).Render("No active sessions"))
 	}
-
 	borderColor := th.Overlay0
 	if m.focus == focusAgents {
 		borderColor = th.Mauve
 	}
-
-	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(borderColor).
-		Padding(0, 1).
-		Width(width).
-		Height(height).
-		Render(strings.Join(lines, "\n"))
+	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(borderColor).Padding(0, 1).Width(width).Height(height).Render(strings.Join(lines, "\n"))
 }
 
 func (m Model) renderPendingPanel(width, height int) string {
 	th := theme.Current
-
-	title := lipgloss.NewStyle().Foreground(th.Blue).Bold(true).Render(fmt.Sprintf("Pending Requests (%d)", len(m.pending)))
+	title := lipgloss.NewStyle().Foreground(th.Blue).Bold(true).Render(fmt.Sprintf("Pending Requests (%d, incl. escalated)", len(m.pending)))
 	lines := []string{title}
-
-	visible := maxInt(1, height-4)
-	start, end := window(m.pendingOff, len(m.pending), visible)
-
+	start, end := window(m.pendingOff, len(m.pending), maxInt(1, height-4))
 	lineStyle := lipgloss.NewStyle().Foreground(th.Text)
 	selectedStyle := lipgloss.NewStyle().Foreground(th.Text).Background(th.Surface1).Bold(true)
-
 	for i := start; i < end; i++ {
 		r := m.pending[i]
-		emoji := theme.TierEmoji(r.Tier)
-		age := formatTimeAgo(r.CreatedAt)
-		label := fmt.Sprintf("%s %s  •  %s  •  %s", emoji, r.Command, r.Requestor, age)
-		label = truncateRunes(label, width-4)
-
+		prefix := theme.TierEmoji(r.Tier)
+		if r.Status == string(db.StatusEscalated) {
+			prefix = "ESCALATED " + prefix
+		}
+		label := truncateRunes(fmt.Sprintf("%s %s  •  %s  •  %s", prefix, r.Command, r.Requestor, formatTimeAgo(r.CreatedAt)), width-4)
 		style := lineStyle
 		if i == m.pendingSel && m.focus == focusPending {
 			style = selectedStyle
 		}
 		lines = append(lines, style.Render(label))
 	}
-
 	if len(m.pending) == 0 {
 		lines = append(lines, lipgloss.NewStyle().Foreground(th.Subtext).Render("No pending requests"))
 	}
-
 	borderColor := th.Overlay0
 	if m.focus == focusPending {
 		borderColor = th.Mauve
 	}
-
-	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(borderColor).
-		Padding(0, 1).
-		Width(width).
-		Height(height).
-		Render(strings.Join(lines, "\n"))
+	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(borderColor).Padding(0, 1).Width(width).Height(height).Render(strings.Join(lines, "\n"))
 }
 
 func (m Model) renderActivityPanel(width, height int) string {
 	th := theme.Current
-
 	title := lipgloss.NewStyle().Foreground(th.Blue).Bold(true).Render("Recent Activity")
 	lines := []string{title}
-
-	visible := maxInt(1, height-4)
-	start, end := window(m.activityOff, len(m.activity), visible)
-
+	start, end := window(m.activityOff, len(m.activity), maxInt(1, height-4))
 	lineStyle := lipgloss.NewStyle().Foreground(th.Text)
 	selectedStyle := lipgloss.NewStyle().Foreground(th.Text).Background(th.Surface1).Bold(true)
-
 	for i := start; i < end; i++ {
-		line := truncateRunes(m.activity[i], width-4)
 		style := lineStyle
 		if i == m.activitySel && m.focus == focusActivity {
 			style = selectedStyle
 		}
-		lines = append(lines, style.Render(line))
+		lines = append(lines, style.Render(truncateRunes(m.activity[i], width-4)))
 	}
-
 	if len(m.activity) == 0 {
 		lines = append(lines, lipgloss.NewStyle().Foreground(th.Subtext).Render("No recent activity"))
 	}
-
 	borderColor := th.Overlay0
 	if m.focus == focusActivity {
 		borderColor = th.Mauve
 	}
-
-	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(borderColor).
-		Padding(0, 1).
-		Width(width).
-		Height(height).
-		Render(strings.Join(lines, "\n"))
+	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(borderColor).Padding(0, 1).Width(width).Height(height).Render(strings.Join(lines, "\n"))
 }
 
 func (m *Model) visibleRows() int {
-	// A conservative estimate used for keeping selection/offset stable.
 	if m.height <= 0 {
 		return 6
 	}
@@ -382,22 +281,14 @@ func (m *Model) moveSelection(delta int) {
 	}
 }
 
-// SelectedRequestID returns the ID of the currently selected pending request.
-// Returns empty string if no request is selected or if the pending requests panel is not focused.
 func (m *Model) SelectedRequestID() string {
-	if m.focus != focusPending {
-		return ""
-	}
-	if m.pendingSel < 0 || m.pendingSel >= len(m.pending) {
+	if m.focus != focusPending || m.pendingSel < 0 || m.pendingSel >= len(m.pending) {
 		return ""
 	}
 	return m.pending[m.pendingSel].ID
 }
 
-// IsPendingFocused returns true if the pending requests panel is focused.
-func (m *Model) IsPendingFocused() bool {
-	return m.focus == focusPending
-}
+func (m *Model) IsPendingFocused() bool { return m.focus == focusPending }
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(refreshInterval, func(time.Time) tea.Msg { return refreshMsg{} })
@@ -406,73 +297,84 @@ func tickCmd() tea.Cmd {
 func loadCmd(projectPath string) tea.Cmd {
 	return func() tea.Msg {
 		agents, pending, activity, err := loadData(projectPath)
-		return dataMsg{
-			agents:      agents,
-			pending:     pending,
-			activity:    activity,
-			err:         err,
-			refreshedAt: time.Now().UTC(),
-		}
+		return dataMsg{agents: agents, pending: pending, activity: activity, err: err, refreshedAt: time.Now().UTC()}
 	}
 }
 
 func loadData(projectPath string) ([]components.AgentInfo, []requestRow, []string, error) {
-	dbPath := filepath.Join(projectPath, ".slb", "state.db")
-	dbConn, err := db.OpenWithOptions(dbPath, db.OpenOptions{
-		CreateIfNotExists: false,
-		InitSchema:        false,
-		ReadOnly:          true,
-	})
+	database, err := db.OpenWithOptions(filepath.Join(projectPath, ".slb", "state.db"), db.OpenOptions{ReadOnly: true})
 	if err != nil {
-		// Dashboard is still useful without a DB; treat as empty data.
-		return []components.AgentInfo{}, []requestRow{}, []string{}, err
+		return nil, nil, nil, err
 	}
-	defer dbConn.Close()
-
-	sessions, err := dbConn.ListActiveSessions(projectPath)
+	defer database.Close()
+	sessions, err := database.ListActiveSessions(projectPath)
 	if err != nil {
-		return []components.AgentInfo{}, []requestRow{}, []string{}, err
+		return nil, nil, nil, err
 	}
 	agents := make([]components.AgentInfo, 0, len(sessions))
 	for _, s := range sessions {
-		agents = append(agents, components.AgentInfo{
-			Name:        s.AgentName,
-			Program:     s.Program,
-			Model:       s.Model,
-			Status:      classifyAgentStatus(s.LastActiveAt),
-			LastActive:  s.LastActiveAt,
-			SessionID:   s.ID,
-			ProjectPath: s.ProjectPath,
-		})
+		agents = append(agents, components.AgentInfo{Name: s.AgentName, Program: s.Program, Model: s.Model,
+			Status: classifyAgentStatus(s.LastActiveAt), LastActive: s.LastActiveAt, SessionID: s.ID, ProjectPath: s.ProjectPath})
 	}
-
-	reqs, err := dbConn.ListPendingRequests(projectPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	state, err := database.ReadProjectWatchState(ctx, projectPath, time.Now().Add(-24*time.Hour))
 	if err != nil {
-		return agents, []requestRow{}, []string{}, err
+		return nil, nil, nil, err
 	}
-	pending := make([]requestRow, 0, len(reqs))
-	for _, r := range reqs {
-		cmd := r.Command.DisplayRedacted
-		if cmd == "" {
-			cmd = r.Command.Raw
+	pending, activity, err := projectStateRows(state)
+	return agents, pending, activity, err
+}
+
+// projectStateRows uses the shared bounded, redacted DB projection. Escalated
+// requests stay actionable; activity reflects persisted state, not fabricated
+// events derived solely from the pending list. This is not a durable journal.
+func projectStateRows(state *db.ProjectWatchState) ([]requestRow, []string, error) {
+	pending := make([]requestRow, 0)
+	type recentState struct {
+		id, status, requestor string
+		at                    time.Time
+	}
+	recent := make([]recentState, 0, len(state.Requests))
+	for _, r := range state.Requests {
+		created, err := time.Parse(time.RFC3339Nano, r.CreatedAt)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid creation time for request %s: %w", r.ID, err)
 		}
-		pending = append(pending, requestRow{
-			ID:        r.ID,
-			Tier:      string(r.RiskTier),
-			Command:   cmd,
-			Requestor: r.RequestorAgent,
-			CreatedAt: r.CreatedAt,
-		})
+		at := created
+		if r.ResolvedAt != "" {
+			at, err = time.Parse(time.RFC3339Nano, r.ResolvedAt)
+			if err != nil {
+				return nil, nil, fmt.Errorf("invalid resolution time for request %s: %w", r.ID, err)
+			}
+		}
+		if r.Status == db.StatusPending || r.Status == db.StatusEscalated {
+			pending = append(pending, requestRow{ID: r.ID, Tier: string(r.RiskTier), Status: string(r.Status), Command: r.Command, Requestor: r.Requestor, CreatedAt: created})
+		}
+		recent = append(recent, recentState{r.ID, string(r.Status), r.Requestor, at})
 	}
-
-	// Minimal activity stream: derive from pending requests for now.
-	activity := make([]string, 0, minInt(10, len(pending)))
-	for i := 0; i < len(pending) && i < 10; i++ {
-		p := pending[i]
-		activity = append(activity, fmt.Sprintf("Pending %s by %s (%s)", shortID(p.ID), p.Requestor, formatTimeAgo(p.CreatedAt)))
+	sort.Slice(pending, func(i, j int) bool {
+		ei, ej := pending[i].Status == string(db.StatusEscalated), pending[j].Status == string(db.StatusEscalated)
+		if ei != ej {
+			return ei
+		}
+		if !pending[i].CreatedAt.Equal(pending[j].CreatedAt) {
+			return pending[i].CreatedAt.Before(pending[j].CreatedAt)
+		}
+		return pending[i].ID < pending[j].ID
+	})
+	sort.Slice(recent, func(i, j int) bool {
+		if !recent[i].at.Equal(recent[j].at) {
+			return recent[i].at.After(recent[j].at)
+		}
+		return recent[i].id < recent[j].id
+	})
+	activity := make([]string, 0, minInt(10, len(recent)))
+	for i := 0; i < len(recent) && i < 10; i++ {
+		r := recent[i]
+		activity = append(activity, fmt.Sprintf("%s %s by %s (%s)", r.status, shortID(r.id), r.requestor, formatTimeAgo(r.at)))
 	}
-
-	return agents, pending, activity, nil
+	return pending, activity, nil
 }
 
 func classifyAgentStatus(lastActive time.Time) components.AgentStatus {
@@ -507,8 +409,7 @@ func window(offset, total, visible int) (start, end int) {
 	if offset > total {
 		offset = total
 	}
-	start = offset
-	end = start + visible
+	start, end = offset, offset+visible
 	if end > total {
 		end = total
 	}
@@ -528,7 +429,6 @@ func clampSelection(sel, off, total, visible int) (newSel, newOff int) {
 	if visible <= 0 {
 		visible = 1
 	}
-
 	if sel < off {
 		off = sel
 	}
@@ -562,7 +462,6 @@ func formatTimeAgo(t time.Time) string {
 	if t.IsZero() {
 		return "never"
 	}
-
 	d := time.Since(t)
 	switch {
 	case d < time.Minute:
@@ -594,7 +493,6 @@ func maxInt(a, b int) int {
 	}
 	return b
 }
-
 func minInt(a, b int) int {
 	if a < b {
 		return a
