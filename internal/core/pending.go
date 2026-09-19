@@ -45,6 +45,21 @@ func AdvancePendingRequest(ctx context.Context, database *db.DB, id string, opts
 			return timeoutDecision(action), nil
 		}
 
+		// A stored different-model requirement is part of the request's review
+		// contract. Escalate for human attention when its wait expires instead
+		// of leaving the request indefinitely pending. The DB rechecks reviewer
+		// availability under the same writer reservation as the transition.
+		if request.RequireDifferentModel && !opts.OnlyAutoApprove {
+			modelTimeout, err := pendingDuration(cfg.General.DifferentModelTimeoutSecs, time.Second)
+			if err != nil || modelTimeout == 0 {
+				return nil, errors.New("different-model review requires a positive, representable timeout")
+			}
+			if !request.CreatedAt.IsZero() && !request.CreatedAt.After(now) &&
+				now.Sub(request.CreatedAt) >= modelTimeout {
+				return &db.PendingDecision{Status: db.StatusEscalated, DifferentModelTimeout: modelTimeout}, nil
+			}
+		}
+
 		eligible := request.RiskTier == db.RiskTierCaution && request.MinApprovals == 0 && !request.RequireDifferentModel
 		classification := engine.ClassifyCommand(request.Command.Raw, request.Command.Cwd)
 		eligible = eligible && !classification.ParseError && !classification.HasUnmatchedSegment &&

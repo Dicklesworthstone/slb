@@ -15,6 +15,10 @@ type PendingDecision struct {
 	Status       RequestStatus
 	ApprovalTTL  time.Duration
 	AllowExpired bool // Only for an explicitly configured auto_approve_warn policy.
+	// DifferentModelTimeout authorizes only an early ESCALATED transition for a
+	// stored require_different_model request. The database independently checks
+	// request age and that no eligible different-model reviewer is active.
+	DifferentModelTimeout time.Duration
 }
 
 // PendingResolution reports only a committed change. Competing timers and
@@ -91,9 +95,39 @@ func (db *DB) ResolvePendingRequest(ctx context.Context, id string, decide Pendi
 		}
 		deadline := now.Add(decision.ApprovalTTL)
 		approvalExpiresAt = &deadline
-	case StatusTimeout, StatusEscalated:
-		if !expired || decision.ApprovalTTL != 0 || decision.AllowExpired {
+	case StatusTimeout:
+		if !expired || decision.ApprovalTTL != 0 || decision.AllowExpired || decision.DifferentModelTimeout != 0 {
 			return nil, fmt.Errorf("%w: timeout decision requires an expired pending request", ErrInvalidTransition)
+		}
+	case StatusEscalated:
+		if decision.ApprovalTTL != 0 || decision.AllowExpired {
+			return nil, fmt.Errorf("%w: escalation cannot carry approval authority", ErrInvalidTransition)
+		}
+		if expired {
+			if decision.DifferentModelTimeout != 0 {
+				return nil, fmt.Errorf("%w: expiry escalation cannot masquerade as model-timeout escalation", ErrInvalidTransition)
+			}
+			break
+		}
+		if decision.DifferentModelTimeout <= 0 || !request.RequireDifferentModel ||
+			request.CreatedAt.IsZero() || request.CreatedAt.After(now) ||
+			now.Sub(request.CreatedAt) < decision.DifferentModelTimeout {
+			return nil, fmt.Errorf("%w: request is not eligible for different-model escalation", ErrInvalidTransition)
+		}
+		var available int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM sessions s
+			WHERE s.project_path = ? AND s.ended_at IS NULL
+			  AND COALESCE(s.model, '') != ? AND s.agent_name != ?
+			  AND NOT EXISTS (
+				SELECT 1 FROM reviews v
+				WHERE v.request_id = ? AND v.reviewer_agent = s.agent_name
+			  )
+		`, request.ProjectPath, request.RequestorModel, request.RequestorAgent, request.ID).Scan(&available); err != nil {
+			return nil, fmt.Errorf("checking different-model reviewer availability: %w", err)
+		}
+		if available > 0 {
+			return result, nil
 		}
 	default:
 		return nil, fmt.Errorf("%w: unsupported pending decision %s", ErrInvalidTransition, decision.Status)

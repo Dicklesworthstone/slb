@@ -15,6 +15,12 @@ func Validate(cfg Config) error {
 	if cfg.General.RequestTimeoutSecs <= 0 {
 		errs = append(errs, "general.request_timeout must be > 0 seconds")
 	}
+	if cfg.General.DifferentModelTimeoutSecs < 0 {
+		errs = append(errs, "general.different_model_timeout cannot be negative")
+	}
+	if cfg.General.RequireDifferentModel && cfg.General.DifferentModelTimeoutSecs == 0 {
+		errs = append(errs, "general.different_model_timeout must be > 0 when require_different_model is enabled")
+	}
 	if cfg.General.ApprovalTTLMins <= 0 {
 		errs = append(errs, "general.approval_ttl_minutes must be > 0")
 	}
