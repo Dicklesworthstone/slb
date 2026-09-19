@@ -119,6 +119,20 @@ func (s *IPCServer) classifyCommand(params HookQueryParams) *HookQueryResult {
 			Message: "SLB: project policy could not be loaded; command blocked until policy is repaired.",
 		}
 	}
+	cautionAction := "block"
+	if params.CWD != "" {
+		cfg, cfgErr := config.Load(config.LoadOptions{ProjectDir: projectRootForSocket(params.CWD)})
+		if cfgErr != nil {
+			if conn != nil {
+				conn.Close()
+			}
+			return &HookQueryResult{
+				Action: "block", Tier: "unknown", MatchedPattern: "policy_load_error",
+				Message: "SLB: hook policy could not be loaded; command blocked until policy is repaired.",
+			}
+		}
+		cautionAction = cfg.Integrations.HookCautionAction
+	}
 	if conn != nil {
 		defer conn.Close()
 	}
@@ -136,7 +150,12 @@ func (s *IPCServer) classifyCommand(params HookQueryParams) *HookQueryResult {
 	case classification.Tier == core.RiskTierDangerous:
 		result.Action, result.Message = "block", "DANGEROUS: Requires approval"
 	case classification.Tier == core.RiskTierCaution:
-		result.Action, result.Message = "ask", "CAUTION: Proceed with care"
+		if cautionAction == "ask" {
+			result.Action, result.Message = "ask", "CAUTION: Proceed with care"
+		} else {
+			result.Action = "block"
+			result.Message = "CAUTION: Submit with slb request; configured auto-approval policy applies after admission."
+		}
 	default:
 		result.Action, result.Message = "allow", "No matching pattern"
 		return result

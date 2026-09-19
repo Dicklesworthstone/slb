@@ -89,6 +89,10 @@ type IntegrationsConfig struct {
 	AgentMailEnabled   bool   `toml:"agent_mail_enabled" mapstructure:"agent_mail_enabled"`
 	AgentMailThread    string `toml:"agent_mail_thread" mapstructure:"agent_mail_thread"`
 	ClaudeHooksEnabled bool   `toml:"claude_hooks_enabled" mapstructure:"claude_hooks_enabled"`
+	// HookCautionAction controls Claude PreToolUse handling for CAUTION:
+	// block keeps the command inside SLB's request/auto-approval workflow;
+	// ask delegates the decision to Claude Code's human permission prompt.
+	HookCautionAction string `toml:"hook_caution_action" mapstructure:"hook_caution_action"`
 }
 
 // AgentsConfig holds agent-specific allow/deny lists.

@@ -109,6 +109,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("integrations.agent_mail_enabled", def.Integrations.AgentMailEnabled)
 	v.SetDefault("integrations.agent_mail_thread", def.Integrations.AgentMailThread)
 	v.SetDefault("integrations.claude_hooks_enabled", def.Integrations.ClaudeHooksEnabled)
+	v.SetDefault("integrations.hook_caution_action", def.Integrations.HookCautionAction)
 
 	v.SetDefault("agents.trusted_self_approve", def.Agents.TrustedSelfApprove)
 	v.SetDefault("agents.trusted_self_approve_delay_seconds", def.Agents.TrustedSelfApproveDelaySecs)
@@ -353,6 +354,8 @@ func GetValue(cfg Config, key string) (any, bool) {
 				return c.AgentMailThread, true
 			case "claude_hooks_enabled":
 				return c.ClaudeHooksEnabled, true
+			case "hook_caution_action":
+				return c.HookCautionAction, true
 			default:
 				return nil, false
 			}
@@ -514,6 +517,7 @@ var keyKinds = map[string]valueKind{
 	"integrations.agent_mail_enabled":   kindBool,
 	"integrations.agent_mail_thread":    kindString,
 	"integrations.claude_hooks_enabled": kindBool,
+	"integrations.hook_caution_action": kindString,
 
 	"agents.trusted_self_approve":               kindStringSlice,
 	"agents.trusted_self_approve_delay_seconds": kindInt,
@@ -564,6 +568,7 @@ var envBindings = []struct {
 	{"SLB_AGENT_MAIL_ENABLED", "integrations.agent_mail_enabled", kindBool},
 	{"SLB_AGENT_MAIL_THREAD", "integrations.agent_mail_thread", kindString},
 	{"SLB_CLAUDE_HOOKS_ENABLED", "integrations.claude_hooks_enabled", kindBool},
+	{"SLB_HOOK_CAUTION_ACTION", "integrations.hook_caution_action", kindString},
 
 	{"SLB_TRUSTED_SELF_APPROVE", "agents.trusted_self_approve", kindStringSlice},
 	{"SLB_TRUSTED_SELF_APPROVE_DELAY_SECONDS", "agents.trusted_self_approve_delay_seconds", kindInt},

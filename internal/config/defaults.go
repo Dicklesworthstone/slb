@@ -103,7 +103,7 @@ func DefaultConfig() Config {
 				AutoApproveDelaySeconds: 0, Patterns: append([]string(nil), defaultSafePatterns...),
 			},
 		},
-		Integrations: IntegrationsConfig{AgentMailEnabled: true, AgentMailThread: "SLB-Reviews", ClaudeHooksEnabled: true},
+		Integrations: IntegrationsConfig{AgentMailEnabled: true, AgentMailThread: "SLB-Reviews", ClaudeHooksEnabled: true, HookCautionAction: "block"},
 		Agents:       AgentsConfig{TrustedSelfApprove: []string{}, TrustedSelfApproveDelaySecs: 300, Blocked: []string{}},
 	}
 }

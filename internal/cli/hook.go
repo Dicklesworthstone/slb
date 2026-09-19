@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/daemon"
 	"github.com/Dicklesworthstone/slb/internal/output"
@@ -167,7 +168,11 @@ func runHookGenerate(cmd *cobra.Command, args []string) error {
 
 	// Generate hook script
 	engine := core.GetDefaultEngine()
-	hookScript := generateHookScript(engine)
+	cautionAction, err := hookCautionAction()
+	if err != nil {
+		return err
+	}
+	hookScript := generateHookScriptWithCautionAction(engine, cautionAction)
 
 	// Write script
 	scriptPath := filepath.Join(outputDir, "slb_guard.py")
@@ -202,7 +207,11 @@ func runHookInstall(cmd *cobra.Command, args []string) error {
 	}
 
 	engine := core.GetDefaultEngine()
-	hookScript := generateHookScript(engine)
+	cautionAction, err := hookCautionAction()
+	if err != nil {
+		return err
+	}
+	hookScript := generateHookScriptWithCautionAction(engine, cautionAction)
 
 	hookScriptPath := filepath.Join(outputDir, "slb_guard.py")
 	if err := os.WriteFile(hookScriptPath, []byte(hookScript), 0755); err != nil {
@@ -617,7 +626,11 @@ func runHookTest(cmd *cobra.Command, args []string) error {
 		daemonErr = fmt.Errorf("simulated daemon failure")
 	}
 
-	result := localHookTestResult(command, cwd)
+	cautionAction, cfgErr := hookCautionAction()
+	if cfgErr != nil {
+		return cfgErr
+	}
+	result := localHookTestResultWithCautionAction(command, cwd, cautionAction)
 	result["source"] = "local"
 	result["fallback"] = !flagHookLocalOnly
 	result["local_only"] = flagHookLocalOnly
@@ -631,6 +644,10 @@ func runHookTest(cmd *cobra.Command, args []string) error {
 }
 
 func localHookTestResult(command, cwd string) map[string]any {
+	return localHookTestResultWithCautionAction(command, cwd, "block")
+}
+
+func localHookTestResultWithCautionAction(command, cwd, cautionAction string) map[string]any {
 	result := core.Classify(command, cwd)
 	var action, message string
 	switch {
@@ -644,8 +661,13 @@ func localHookTestResult(command, cwd string) map[string]any {
 		action = "block"
 		message = fmt.Sprintf("DANGEROUS: Requires %d approval. Use 'slb request' to submit.", result.MinApprovals)
 	case result.Tier == core.RiskTierCaution:
-		action = "ask"
-		message = "CAUTION: Command requires confirmation."
+		if cautionAction == "ask" {
+			action = "ask"
+			message = "CAUTION: Command requires confirmation."
+		} else {
+			action = "block"
+			message = "CAUTION: Submit with 'slb request'; configured auto-approval policy applies after admission."
+		}
 	default:
 		action = "ask"
 		message = "No matching local pattern; confirmation required while the daemon is unavailable"
@@ -664,6 +686,13 @@ func localHookTestResult(command, cwd string) map[string]any {
 
 // generateHookScript creates the complete Python hook script with embedded patterns.
 func generateHookScript(engine *core.PatternEngine) string {
+	return generateHookScriptWithCautionAction(engine, "block")
+}
+
+func generateHookScriptWithCautionAction(engine *core.PatternEngine, cautionAction string) string {
+	if cautionAction != "ask" {
+		cautionAction = "block"
+	}
 	var script strings.Builder
 	script.WriteString("#!/usr/bin/env python3\n")
 	script.WriteString(engine.ExportClaudeHook())
@@ -673,7 +702,22 @@ func generateHookScript(engine *core.PatternEngine) string {
 	redactions, _ := json.Marshal(core.RedactionPatterns())
 	script.WriteString("\nAUDIT_REDACTION_PATTERNS = ")
 	script.Write(redactions)
+	script.WriteString("\nHOOK_CAUTION_ACTION = ")
+	actionJSON, _ := json.Marshal(cautionAction)
+	script.Write(actionJSON)
 	script.WriteString("\n")
 	script.WriteString(hookRuntime)
 	return script.String()
+}
+
+func hookCautionAction() (string, error) {
+	project, err := projectPath()
+	if err != nil {
+		return "", err
+	}
+	cfg, err := config.Load(config.LoadOptions{ProjectDir: project, ConfigPath: flagConfig})
+	if err != nil {
+		return "", fmt.Errorf("loading hook caution policy: %w", err)
+	}
+	return cfg.Integrations.HookCautionAction, nil
 }

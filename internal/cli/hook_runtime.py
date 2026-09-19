@@ -257,7 +257,13 @@ def main():
         action = "block"
         message = f"SLB DANGEROUS: Requires {min_approvals} approval. Use 'slb request' to submit."
     elif tier == "caution":
-        action, message = "ask", "SLB CAUTION: command requires confirmation. Proceed?"
+        if HOOK_CAUTION_ACTION == "ask":
+            action, message = "ask", "SLB CAUTION: command requires confirmation. Proceed?"
+        else:
+            action, message = "block", (
+                "SLB CAUTION: submit with 'slb request'; configured auto-approval "
+                "policy applies after admission."
+            )
     elif tier == "safe":
         action, message = "allow", ""
     elif tier == "unknown":

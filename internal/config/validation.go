@@ -54,6 +54,9 @@ func Validate(cfg Config) error {
 	if cfg.History.RetentionDays < 0 {
 		errs = append(errs, "history.retention_days cannot be negative")
 	}
+	if !oneOf(cfg.Integrations.HookCautionAction, "block", "ask") {
+		errs = append(errs, "integrations.hook_caution_action must be one of block|ask")
+	}
 
 	validateTier := func(name string, tier PatternTierConfig) {
 		if tier.MinApprovals < 0 {
