@@ -1174,3 +1174,73 @@ func TestNativeHookCommandRecognition(t *testing.T) {
 		t.Fatal("legacy Python guard was not recognized")
 	}
 }
+
+
+func TestHookInstallAutoUpgradesLegacyPythonGuard(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetHookFlags()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	legacyScript := filepath.Join(home, ".slb", "hooks", "slb_guard.py")
+	if err := os.MkdirAll(filepath.Dir(legacyScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyScript, []byte("# legacy\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	settingsDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(settingsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := map[string]any{
+		"hooks": map[string]any{
+			"PreToolUse": []any{
+				map[string]any{
+					"matcher": "Bash",
+					"hooks": []any{
+						map[string]any{"type": "command", "command": "python3 " + legacyScript},
+					},
+				},
+			},
+		},
+	}
+	data, _ := json.Marshal(legacy)
+	if err := os.WriteFile(filepath.Join(settingsDir, "settings.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := newTestHookCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, cmd, "hook", "install", "-j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result["upgraded"] != true || result["already_existed"] != false {
+		t.Fatalf("legacy registration was not reported upgraded: %+v", result)
+	}
+	updated, err := os.ReadFile(filepath.Join(settingsDir, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(updated), "python3") || !strings.Contains(string(updated), "hook guard") {
+		t.Fatalf("legacy registration was not migrated to native guard: %s", updated)
+	}
+
+	resetHookFlags()
+	second := newTestHookCmd(h.DBPath)
+	stdout, err = executeCommandCapture(t, second, "hook", "install", "-j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result = map[string]any{}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result["upgraded"] != false || result["already_existed"] != true {
+		t.Fatalf("current native registration was not idempotent: %+v", result)
+	}
+}
