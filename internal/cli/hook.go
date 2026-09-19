@@ -57,7 +57,9 @@ var hookCmd = &cobra.Command{
 	Long: `Manage the Claude Code PreToolUse hook that integrates SLB approval workflow.
 
 The hook intercepts Bash tool calls before execution and checks if the command
-requires SLB approval. Dangerous commands are blocked until approved.
+requires SLB approval. Installed hooks use the native slb binary on the hot
+path; the generated Python guard remains available as a standalone fallback
+artifact. Dangerous commands are blocked until approved.
 
 Quick start:
   slb hook install    # Generate and install hook
@@ -86,8 +88,8 @@ var hookInstallCmd = &cobra.Command{
 	Long: `Generate the hook script and configure Claude Code to use it.
 
 This command:
-1. Generates the hook script to ~/.slb/hooks/slb_guard.py
-2. Updates ~/.claude/settings.json with the hook configuration
+1. Generates the standalone fallback script at ~/.slb/hooks/slb_guard.py
+2. Configures Claude Code to call the native 'slb hook guard' entrypoint
 3. Preserves existing hooks (use --force to overwrite)
 
 Use --global to install for all projects (user-level settings).`,
@@ -236,13 +238,19 @@ func runHookInstall(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Build hook configuration
+	// The installed hot path is native. Keep writing the Python guard above as
+	// an explicit standalone fallback/debugging artifact, but do not pay a
+	// Python startup/import penalty on every Bash tool call.
+	guardCommand, err := nativeHookGuardCommand()
+	if err != nil {
+		return fmt.Errorf("resolving native hook command: %w", err)
+	}
 	slbHook := map[string]any{
 		"matcher": "Bash",
 		"hooks": []map[string]any{
 			{
 				"type":    "command",
-				"command": fmt.Sprintf("python3 %s", hookScriptPath),
+				"command": guardCommand,
 			},
 		},
 	}
@@ -268,7 +276,7 @@ func runHookInstall(cmd *cobra.Command, args []string) error {
 					for _, hk := range hookList {
 						if hkMap, ok := hk.(map[string]any); ok {
 							if cmd, ok := hkMap["command"].(string); ok {
-								if filepath.Base(cmd) == "slb_guard.py" || cmd == fmt.Sprintf("python3 %s", hookScriptPath) {
+								if isSLBHookCommand(cmd, hookScriptPath) {
 									found = true
 									if flagHookForce {
 										preToolUse[i] = slbHook
@@ -310,6 +318,8 @@ func runHookInstall(cmd *cobra.Command, args []string) error {
 		"status":          "installed",
 		"settings_path":   settingsPath,
 		"hook_script":     hookScriptPath,
+		"hook_command":    guardCommand,
+		"native_guard":    true,
 		"already_existed": found && !flagHookForce,
 	})
 }
@@ -369,9 +379,8 @@ func runHookUninstall(cmd *cobra.Command, args []string) error {
 					isSLB := false
 					for _, hk := range hookList {
 						if hkMap, ok := hk.(map[string]any); ok {
-							if cmd, ok := hkMap["command"].(string); ok {
-								if filepath.Base(cmd) == "slb_guard.py" ||
-									(len(cmd) >= 13 && cmd[len(cmd)-13:] == "slb_guard.py") {
+							if configured, ok := hkMap["command"].(string); ok {
+								if isSLBHookCommand(configured, filepath.Join(home, ".slb", "hooks", "slb_guard.py")) {
 									isSLB = true
 									removed = true
 									break
@@ -472,10 +481,10 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 									for _, hk := range hookList {
 										if hkMap, ok := hk.(map[string]any); ok {
 											if configured, ok := hkMap["command"].(string); ok {
-												if filepath.Base(configured) == "slb_guard.py" ||
-													(len(configured) >= 13 && configured[len(configured)-13:] == "slb_guard.py") {
+												if isSLBHookCommand(configured, hookScriptPath) {
 													status["settings_configured"] = true
 													status["configured_command"] = configured
+													status["native_guard"] = strings.Contains(configured, "hook guard")
 												}
 											}
 										}
