@@ -2,7 +2,6 @@ package cli
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/Dicklesworthstone/slb/internal/tui"
 	"github.com/spf13/cobra"
@@ -33,25 +32,33 @@ var tuiCmd = &cobra.Command{
 
 If the daemon is running, live updates are streamed; otherwise polling is used.
 Providing --session-id and --session-key enables interactive approval/rejection.
+Reviews obey the request project's policy and --config override. A recorded
+vote is not full approval until the configured quorum is met. No command is
+executed by submitting a review.
 
 Key bindings:
   tab/shift+tab  Switch between panels
   up/down (j/k)  Navigate within panels
   enter          View selected request details
+  a/r            Open approval/rejection form in request details
+  ctrl+s         Submit the review form
+  esc            Cancel the form, or leave request details
   m              Pattern management
   H              History browser
   q              Quit
 
 Theme options: mocha (default), macchiato, frappe, latte`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// Determine project path
-		projectPath, err := os.Getwd()
+		project, err := projectPath()
 		if err != nil {
-			return fmt.Errorf("getting working directory: %w", err)
+			return fmt.Errorf("resolving project: %w", err)
 		}
-
+		if flagTuiRefreshSeconds <= 0 {
+			return fmt.Errorf("--refresh-interval must be positive")
+		}
 		opts := tui.Options{
-			ProjectPath:     projectPath,
+			ProjectPath:     project,
+			ConfigPath:      flagConfig,
 			Theme:           flagTuiTheme,
 			DisableMouse:    flagTuiNoMouse,
 			RefreshInterval: flagTuiRefreshSeconds,

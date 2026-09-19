@@ -15,6 +15,7 @@ var (
 	ErrReviewSessionKeyMismatch = errors.New("session key does not match session")
 	ErrReviewDifferentModel     = errors.New("different model required for approval")
 	ErrReviewInvalidDecision    = errors.New("invalid decision (must be approve or reject)")
+	ErrReviewTargetChanged      = errors.New("request changed since it was displayed; reload before reviewing")
 )
 
 // ReviewPolicy is the policy applied while committing a review. Zero TTLs use
@@ -26,6 +27,11 @@ type ReviewPolicy struct {
 	TrustedSelfApproveDelay time.Duration
 	ApprovalTTL             time.Duration
 	CriticalApprovalTTL     time.Duration
+	// Optional view bindings are checked under the writer reservation. They
+	// prevent a delayed UI submission from reviewing a different command or
+	// applying policy loaded for a different project.
+	ExpectedCommandHash string
+	ExpectedProjectPath string
 }
 
 // ReviewOutcome describes only committed state. Notifications must use Request,
@@ -76,6 +82,10 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 		request, err := db.GetRequestTx(tx, accepted.RequestID)
 		if err != nil {
 			return err
+		}
+		if (policy.ExpectedCommandHash != "" && request.Command.Hash != policy.ExpectedCommandHash) ||
+			(policy.ExpectedProjectPath != "" && request.ProjectPath != policy.ExpectedProjectPath) {
+			return ErrReviewTargetChanged
 		}
 		now := time.Now().UTC()
 		if request.Status != StatusPending && request.Status != StatusEscalated {

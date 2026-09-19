@@ -5,7 +5,6 @@ package tui
 import (
 	"os"
 	"path/filepath"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -30,6 +29,7 @@ const (
 // Options configures the TUI behavior.
 type Options struct {
 	ProjectPath     string
+	ConfigPath      string
 	Theme           string
 	DisableMouse    bool
 	RefreshInterval int
@@ -129,49 +129,42 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case navigateMsg:
 		return m.handleNavigation(msg)
 
+	case request.ReviewSubmittedMsg:
+		// A late worker result must not navigate away from another request.
+		if m.view == ViewRequestDetail && m.detail != nil && m.detail.Request != nil && m.detail.Request.ID == msg.RequestID {
+			return m.forwardUpdate(msg)
+		}
+		return m, nil
+
 	case tea.KeyMsg:
+		// Form input owns ALL keys until submission/cancellation. In particular,
+		// typing 'b' in a reason is not global navigation and Esc cancels the
+		// form before it leaves the detail view.
+		if m.view == ViewRequestDetail && m.detail != nil && m.detail.Mode != request.DetailModeView {
+			return m.forwardUpdate(msg)
+		}
 		// Handle global navigation keys based on current view
 		if m.view == ViewDashboard {
 			switch msg.String() {
 			case "m":
-				// Navigate to patterns view
 				return m.handleNavigation(navigateMsg{view: ViewPatterns})
 			case "H":
-				// Navigate to history view (uppercase H to avoid conflict with dashboard's 'h' for left focus)
 				return m.handleNavigation(navigateMsg{view: ViewHistory})
 			case "enter":
-				// Navigate to selected request detail
 				if m.dashboard != nil && len(m.dashboard.SelectedRequestID()) > 0 {
 					return m.handleNavigation(navigateMsg{
-						view:      ViewRequestDetail,
-						requestID: m.dashboard.SelectedRequestID(),
+						view: ViewRequestDetail, requestID: m.dashboard.SelectedRequestID(),
 					})
 				}
 			}
 		}
 
-		if m.view == ViewHistory {
+		if m.view == ViewHistory || m.view == ViewPatterns || m.view == ViewRequestDetail {
 			switch msg.String() {
 			case "esc", "b":
 				return m.handleNavigation(navigateMsg{view: ViewDashboard})
 			}
 		}
-
-		if m.view == ViewPatterns {
-			switch msg.String() {
-			case "esc", "b":
-				return m.handleNavigation(navigateMsg{view: ViewDashboard})
-			}
-		}
-
-		if m.view == ViewRequestDetail {
-			switch msg.String() {
-			case "esc", "b":
-				return m.handleNavigation(navigateMsg{view: ViewDashboard})
-			}
-		}
-
-		// Forward to current view
 		return m.forwardUpdate(msg)
 
 	default:
@@ -223,13 +216,8 @@ func (m Model) forwardUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// handleNavigation handles view navigation.
-//
-// Sub-models created here are born after Bubble Tea delivered the initial
-// tea.WindowSizeMsg to the root model, so they would otherwise wait for a
-// size that only arrives on the next terminal resize. Every freshly created
-// view is therefore seeded with the root model's last known size before its
-// first render.
+// handleNavigation handles view navigation. New views inherit the last known
+// terminal size rather than waiting until the terminal is resized again.
 func (m Model) handleNavigation(nav navigateMsg) (tea.Model, tea.Cmd) {
 	m.view = nav.view
 
@@ -244,7 +232,6 @@ func (m Model) handleNavigation(nav navigateMsg) (tea.Model, tea.Cmd) {
 	case ViewRequestDetail:
 		if nav.requestID != "" {
 			m.selectedRequestID = nav.requestID
-			// Load the request and create detail view
 			detail := m.loadRequestDetail(nav.requestID)
 			if detail != nil {
 				m.detail = detail
@@ -253,7 +240,6 @@ func (m Model) handleNavigation(nav navigateMsg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(sizeCmd, m.detail.Init())
 			}
 		}
-		// Fall back to dashboard if request not found
 		m.view = ViewDashboard
 		return m, nil
 
@@ -274,10 +260,7 @@ func (m Model) handleNavigation(nav navigateMsg) (tea.Model, tea.Cmd) {
 }
 
 // seedViewSize replays the root model's last known terminal size into the
-// current view so a view created mid-session lays itself out immediately
-// instead of waiting for the next tea.WindowSizeMsg. It is a no-op until the
-// first real size message has been received. Any command the view returns
-// in response to the size is handed back so the caller can schedule it.
+// current view. It is a no-op until a real size message has been received.
 func (m Model) seedViewSize() (Model, tea.Cmd) {
 	if m.width <= 0 || m.height <= 0 {
 		return m, nil
@@ -294,12 +277,8 @@ func (m *Model) setupDashboardCallbacks() {
 	if m.dashboard == nil {
 		return
 	}
-	m.dashboard.OnPatterns = func() {
-		// Navigate to patterns view (handled via key press in Update)
-	}
-	m.dashboard.OnHistory = func() {
-		// Navigate to history view (handled via key press in Update)
-	}
+	m.dashboard.OnPatterns = func() {}
+	m.dashboard.OnHistory = func() {}
 }
 
 // setupDetailCallbacks wires up request detail callbacks.
@@ -308,10 +287,10 @@ func (m *Model) setupDetailCallbacks() {
 		return
 	}
 	m.detail.OnBack = func() tea.Cmd {
-		return func() tea.Msg {
-			return navigateMsg{view: ViewDashboard}
-		}
+		return func() tea.Msg { return navigateMsg{view: ViewDashboard} }
 	}
+	// Snapshot the model values used to build a submission. The returned
+	// workers capture only options/command identity, never the mutable model.
 	m.detail.OnApprove = func(requestID string, comments string) tea.Cmd {
 		return m.approveRequest(requestID, comments)
 	}
@@ -322,28 +301,20 @@ func (m *Model) setupDetailCallbacks() {
 
 // setupHistoryCallbacks wires up history browser callbacks.
 func (m *Model) setupHistoryCallbacks() {
-	m.history.OnBack = func() {
-		// Will be handled by navigateMsg
-	}
-	m.history.OnSelect = func(requestID string) {
-		// Navigate to request detail
-	}
+	m.history.OnBack = func() {}
+	m.history.OnSelect = func(requestID string) {}
 }
 
 // setupPatternsCallbacks wires up patterns view callbacks.
 func (m *Model) setupPatternsCallbacks() {
-	m.patterns.OnBack = func() {
-		// Will be handled by navigateMsg
-	}
+	m.patterns.OnBack = func() {}
 }
 
 // loadRequestDetail loads a request and creates a detail model.
 func (m *Model) loadRequestDetail(requestID string) *request.DetailModel {
 	dbPath := filepath.Join(m.options.ProjectPath, ".slb", "state.db")
 	dbConn, err := db.OpenWithOptions(dbPath, db.OpenOptions{
-		CreateIfNotExists: false,
-		InitSchema:        false,
-		ReadOnly:          true,
+		CreateIfNotExists: false, InitSchema: false, ReadOnly: true,
 	})
 	if err != nil {
 		return nil
@@ -351,122 +322,31 @@ func (m *Model) loadRequestDetail(requestID string) *request.DetailModel {
 	defer dbConn.Close()
 
 	var currentSession *db.Session
-	if m.options.SessionID != "" {
+	if m.options.SessionID != "" && m.options.SessionKey != "" {
 		s, err := dbConn.GetSession(m.options.SessionID)
-		if err == nil {
+		if err == nil && s.IsActive() && db.ExecutionSessionKeyMatches(s.SessionKey, m.options.SessionKey) {
 			currentSession = s
 		}
 	}
-
 	req, err := dbConn.GetRequest(requestID)
-	if err != nil {
+	if err != nil || req.ProjectPath != m.options.ProjectPath {
 		return nil
 	}
-
-	reviewPtrs, _ := dbConn.ListReviewsForRequest(requestID)
-
-	// Convert []*db.Review to []db.Review for the detail model
-	reviews := make([]db.Review, len(reviewPtrs))
-	for i, r := range reviewPtrs {
+	reviewPtrs, err := dbConn.ListReviewsForRequest(requestID)
+	if err != nil {
+		return nil // An incomplete review snapshot must not enable another vote.
+	}
+	reviews := make([]db.Review, 0, len(reviewPtrs))
+	for _, r := range reviewPtrs {
 		if r != nil {
-			reviews[i] = *r
+			reviews = append(reviews, *r)
 		}
 	}
-
 	detail := request.NewDetailModel(req, reviews)
 	if currentSession != nil {
 		detail.WithSession(currentSession)
 	}
 	return detail
-}
-
-// approveRequest creates a command to approve a request.
-func (m *Model) approveRequest(requestID string, comments string) tea.Cmd {
-	return func() tea.Msg {
-		if m.options.SessionID == "" || m.options.SessionKey == "" {
-			return nil // Cannot approve without session
-		}
-
-		dbPath := filepath.Join(m.options.ProjectPath, ".slb", "state.db")
-		dbConn, err := db.OpenWithOptions(dbPath, db.OpenOptions{
-			CreateIfNotExists: false,
-			InitSchema:        false, // Schema should exist
-			ReadOnly:          false,
-		})
-		if err != nil {
-			return nil
-		}
-		defer dbConn.Close()
-
-		// Get session to populate reviewer info
-		session, err := dbConn.GetSession(m.options.SessionID)
-		if err != nil {
-			return nil
-		}
-
-		now := time.Now().UTC()
-		review := &db.Review{
-			RequestID:          requestID,
-			ReviewerSessionID:  session.ID,
-			ReviewerAgent:      session.AgentName,
-			ReviewerModel:      session.Model,
-			Decision:           db.DecisionApprove,
-			Comments:           comments,
-			SignatureTimestamp: now,
-		}
-
-		// Compute signature
-		review.Signature = db.ComputeReviewSignature(m.options.SessionKey, requestID, db.DecisionApprove, now)
-
-		if err := dbConn.CreateReviewWithValidation(review, m.options.SessionKey); err != nil {
-			// In a real app we'd send an error msg, but for now just log/ignore or return to dash
-			// Ideally we return an error message tea.Msg
-		}
-
-		return navigateMsg{view: ViewDashboard}
-	}
-}
-
-// rejectRequest creates a command to reject a request.
-func (m *Model) rejectRequest(requestID string, reason string) tea.Cmd {
-	return func() tea.Msg {
-		if m.options.SessionID == "" || m.options.SessionKey == "" {
-			return nil
-		}
-
-		dbPath := filepath.Join(m.options.ProjectPath, ".slb", "state.db")
-		dbConn, err := db.OpenWithOptions(dbPath, db.OpenOptions{
-			CreateIfNotExists: false,
-			InitSchema:        false,
-			ReadOnly:          false,
-		})
-		if err != nil {
-			return nil
-		}
-		defer dbConn.Close()
-
-		session, err := dbConn.GetSession(m.options.SessionID)
-		if err != nil {
-			return nil
-		}
-
-		now := time.Now().UTC()
-		review := &db.Review{
-			RequestID:          requestID,
-			ReviewerSessionID:  session.ID,
-			ReviewerAgent:      session.AgentName,
-			ReviewerModel:      session.Model,
-			Decision:           db.DecisionReject,
-			Comments:           reason,
-			SignatureTimestamp: now,
-		}
-
-		review.Signature = db.ComputeReviewSignature(m.options.SessionKey, requestID, db.DecisionReject, now)
-
-		_ = dbConn.CreateReviewWithValidation(review, m.options.SessionKey)
-
-		return navigateMsg{view: ViewDashboard}
-	}
 }
 
 // View implements tea.Model.
@@ -489,25 +369,18 @@ func (m Model) View() string {
 }
 
 // Run starts the TUI with default options.
-func Run() error {
-	return RunWithOptions(DefaultOptions())
-}
+func Run() error { return RunWithOptions(DefaultOptions()) }
 
 // RunWithOptions starts the TUI with custom options.
 func RunWithOptions(opts Options) error {
-	// Apply theme before creating model
 	if opts.Theme != "" {
 		theme.SetTheme(theme.FlavorName(opts.Theme))
 	}
-
 	m := NewWithOptions(opts)
-
-	// Build program options
 	teaOpts := []tea.ProgramOption{tea.WithAltScreen()}
 	if !opts.DisableMouse {
 		teaOpts = append(teaOpts, tea.WithMouseCellMotion())
 	}
-
 	p := tea.NewProgram(m, teaOpts...)
 	_, err := p.Run()
 	return err
