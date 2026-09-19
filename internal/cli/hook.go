@@ -267,8 +267,11 @@ func runHookInstall(cmd *cobra.Command, args []string) error {
 		preToolUse = []any{}
 	}
 
-	// Check if SLB hook already exists
+	// Check if an SLB hook already exists. Legacy Python registrations and
+	// native registrations pointing at an older/moved executable are upgraded
+	// automatically; this is the same managed hook, not an unrelated setting.
 	found := false
+	upgraded := false
 	for i, hook := range preToolUse {
 		if h, ok := hook.(map[string]any); ok {
 			if matcher, ok := h["matcher"].(string); ok && matcher == "Bash" {
@@ -278,8 +281,9 @@ func runHookInstall(cmd *cobra.Command, args []string) error {
 							if cmd, ok := hkMap["command"].(string); ok {
 								if isSLBHookCommand(cmd, hookScriptPath) {
 									found = true
-									if flagHookForce {
+									if flagHookForce || cmd != guardCommand {
 										preToolUse[i] = slbHook
+										upgraded = cmd != guardCommand
 									}
 									break
 								}
@@ -320,7 +324,8 @@ func runHookInstall(cmd *cobra.Command, args []string) error {
 		"hook_script":     hookScriptPath,
 		"hook_command":    guardCommand,
 		"native_guard":    true,
-		"already_existed": found && !flagHookForce,
+		"upgraded":        upgraded,
+		"already_existed": found && !upgraded && !flagHookForce,
 	})
 }
 
