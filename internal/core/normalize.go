@@ -243,6 +243,153 @@ func splitCompoundShellAware(cmd string) []string {
 	return segments
 }
 
+type quotedHeredocSpec struct {
+	delimiter string
+	stripTabs bool
+}
+
+// rewriteQuotedHeredocs makes fully quoted here-document bodies parseable
+// without pretending they are shell syntax. Each body line is shell-quoted as
+// one classification segment: benign data no longer trips the shell parser,
+// while a line that itself looks destructive (for example "rm -rf /" or
+// "DROP DATABASE") remains visible to risk patterns. Unquoted heredocs are
+// left on the conservative parse-error path because their bodies may execute
+// command substitutions.
+func rewriteQuotedHeredocs(raw string) (string, bool) {
+	lines := strings.SplitAfter(raw, "\n")
+	var out strings.Builder
+	var pending []quotedHeredocSpec
+
+	for _, chunk := range lines {
+		line, ending := heredocLineAndEnding(chunk)
+		if len(pending) != 0 {
+			match := line
+			if pending[0].stripTabs {
+				match = strings.TrimLeft(match, "\t")
+			}
+			if match == pending[0].delimiter {
+				pending = pending[1:]
+				out.WriteString(ending)
+				continue
+			}
+			out.WriteString(shellQuote(line))
+			out.WriteString(ending)
+			continue
+		}
+
+		specs, seen, supported := quotedHeredocsInLine(line)
+		if seen && !supported {
+			return raw, false
+		}
+		out.WriteString(chunk)
+		if len(specs) != 0 {
+			pending = append(pending, specs...)
+		}
+	}
+	if len(pending) != 0 {
+		return raw, false
+	}
+	return out.String(), true
+}
+
+func heredocLineAndEnding(chunk string) (string, string) {
+	switch {
+	case strings.HasSuffix(chunk, "\r\n"):
+		return strings.TrimSuffix(chunk, "\r\n"), "\r\n"
+	case strings.HasSuffix(chunk, "\n"):
+		return strings.TrimSuffix(chunk, "\n"), "\n"
+	default:
+		return chunk, ""
+	}
+}
+
+// quotedHeredocsInLine recognizes only delimiters whose entire word is quoted
+// ('EOF', "EOF", or \EOF). Mixed/unquoted words stay fail-closed rather than
+// risking missed expansions. Operators inside shell quotes and <<< here-strings
+// are ignored.
+func quotedHeredocsInLine(line string) ([]quotedHeredocSpec, bool, bool) {
+	var specs []quotedHeredocSpec
+	var single, double, escaped bool
+	seen := false
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if c == '\\' && !single {
+			escaped = true
+			continue
+		}
+		if c == '\'' && !double {
+			single = !single
+			continue
+		}
+		if c == '"' && !single {
+			double = !double
+			continue
+		}
+		if single || double || c != '<' || i+1 >= len(line) || line[i+1] != '<' {
+			continue
+		}
+		if i+2 < len(line) && line[i+2] == '<' {
+			i += 2 // here-string, not a heredoc
+			continue
+		}
+		seen = true
+		j := i + 2
+		stripTabs := false
+		if j < len(line) && line[j] == '-' {
+			stripTabs = true
+			j++
+		}
+		for j < len(line) && (line[j] == ' ' || line[j] == '\t') {
+			j++
+		}
+		if j >= len(line) {
+			return nil, true, false
+		}
+
+		var delimiter string
+		switch line[j] {
+		case '\'', '"':
+			quote := line[j]
+			k := j + 1
+			for ; k < len(line) && line[k] != quote; k++ {
+				if line[k] == '\\' {
+					return nil, true, false
+				}
+			}
+			if k >= len(line) || k == j+1 || !heredocWordBoundary(line, k+1) {
+				return nil, true, false
+			}
+			delimiter = line[j+1 : k]
+			i = k
+		case '\\':
+			k := j + 1
+			for k < len(line) && !strings.ContainsRune(" \t;|&<>", rune(line[k])) {
+				k++
+			}
+			if k == j+1 {
+				return nil, true, false
+			}
+			delimiter = line[j+1 : k]
+			i = k - 1
+		default:
+			// An unquoted heredoc can expand $(), backticks, variables and
+			// escapes. Keep the existing parse-error upgrade until that shell
+			// language is modeled explicitly.
+			return nil, true, false
+		}
+		specs = append(specs, quotedHeredocSpec{delimiter: delimiter, stripTabs: stripTabs})
+	}
+	return specs, seen, !single && !double
+}
+
+func heredocWordBoundary(line string, index int) bool {
+	return index >= len(line) || strings.ContainsRune(" \t;|&<>", rune(line[index]))
+}
+
 // NormalizeCommand parses and normalizes a command for pattern matching.
 func NormalizeCommand(cmd string) *NormalizedCommand {
 	return normalizeCommandDepth(cmd, 0)
@@ -266,6 +413,12 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 		return result
 	}
 
+	var heredocValid bool
+	cmd, heredocValid = rewriteQuotedHeredocs(cmd)
+	if !heredocValid {
+		result.ParseError = true
+	}
+
 	if depth >= maxCommandNesting || len(cmd) > 1<<20 {
 		result.Primary = cmd
 		result.Segments = []string{cmd}
@@ -274,7 +427,7 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 	}
 
 	outer, substitutions, valid := splitExecutableSubstitutions(cmd, depth)
-	result.ParseError = !valid
+	result.ParseError = result.ParseError || !valid
 	result.HasSubshell = len(substitutions) > 0
 	appendInner := func(inner *NormalizedCommand) {
 		result.Segments = append(result.Segments, inner.Segments...)
