@@ -231,13 +231,14 @@ func (db *DB) ensureDelegatedReviewerTx(tx *sql.Tx, targetProject, sessionKey st
 	}
 	sum := sha256.Sum256([]byte(identity.SourceProjectPath + "\x00" + identity.SourceSessionID))
 	id = "xpr-" + hex.EncodeToString(sum[:16])
+	delegationKey := deriveDelegatedReviewKey(sessionKey, targetProject, identity.SourceProjectPath, identity.SourceSessionID)
 	timestamp := now.UTC().Format(time.RFC3339Nano)
 	_, err = tx.Exec(`
 		INSERT OR IGNORE INTO sessions (
 			id, agent_name, program, model, project_path, session_key,
 			started_at, last_active_at, ended_at
 		) VALUES (?, ?, 'cross-project-review', ?, ?, ?, ?, ?, ?)
-	`, id, identity.AgentName, identity.Model, targetProject, sessionKey, timestamp, timestamp, timestamp)
+	`, id, identity.AgentName, identity.Model, targetProject, delegationKey, timestamp, timestamp, timestamp)
 	if err != nil {
 		return "", "", "", "", fmt.Errorf("recording delegated reviewer identity: %w", err)
 	}
@@ -251,10 +252,29 @@ func (db *DB) ensureDelegatedReviewerTx(tx *sql.Tx, targetProject, sessionKey st
 		return "", "", "", "", fmt.Errorf("reading delegated reviewer identity: %w", err)
 	}
 	if !ended.Valid || project != targetProject || agent != identity.AgentName || model != identity.Model ||
-		!hmac.Equal([]byte(sessionKey), []byte(storedKey)) {
+		!hmac.Equal([]byte(delegationKey), []byte(storedKey)) {
 		return "", "", "", "", ErrReviewDelegationMismatch
 	}
 	return id, agent, model, storedKey, nil
+}
+
+func deriveDelegatedReviewKey(sourceSessionKey, targetProject, sourceProject, sourceSessionID string) string {
+	key, err := hex.DecodeString(sourceSessionKey)
+	if err != nil || len(key) == 0 {
+		// Session keys are normally hex-encoded random bytes. Retaining a
+		// deterministic fallback for legacy/custom DBs still avoids storing the
+		// source credential itself in the target project.
+		sum := sha256.Sum256([]byte(sourceSessionKey))
+		key = sum[:]
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte("slb-cross-project-review-v1\x00"))
+	mac.Write([]byte(targetProject))
+	mac.Write([]byte{0})
+	mac.Write([]byte(sourceProject))
+	mac.Write([]byte{0})
+	mac.Write([]byte(sourceSessionID))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func (p ReviewPolicy) validate() error {

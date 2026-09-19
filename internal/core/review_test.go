@@ -1592,6 +1592,9 @@ func TestSubmitCrossProjectReviewAuthorization(t *testing.T) {
 	if err != nil || provenance.EndedAt == nil {
 		t.Fatalf("delegated provenance became active capacity: %+v err=%v", provenance, err)
 	}
+	if provenance.SessionKey == reviewer.SessionKey {
+		t.Fatal("target provenance copied the source session credential")
+	}
 	active, err := target.ListActiveSessions("/target")
 	if err != nil || len(active) != 1 || active[0].ID != requestor.ID {
 		t.Fatalf("target active sessions polluted by delegation: %+v err=%v", active, err)

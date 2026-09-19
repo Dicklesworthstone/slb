@@ -478,6 +478,9 @@ func TestApproveCommand_CrossProject(t *testing.T) {
 	if err != nil || provenance.EndedAt == nil {
 		t.Fatalf("delegated provenance must be ended, session=%+v err=%v", provenance, err)
 	}
+	if provenance.SessionKey == reviewerSess.SessionKey {
+		t.Fatal("target project received the source reviewer session key")
+	}
 	active, err := targetH.DB.ListActiveSessions(targetH.ProjectDir)
 	if err != nil || len(active) != 1 || active[0].ID != requestorSess.ID {
 		t.Fatalf("delegation polluted target active reviewer capacity: %+v err=%v", active, err)
