@@ -30,6 +30,16 @@ func GetDryRunCommand(cmd string) (string, bool) {
 // RunDryRun executes a dry-run variant for spec when supported.
 // If the command type is unsupported, it returns (nil, nil).
 func RunDryRun(spec *db.CommandSpec) (*db.DryRunResult, error) {
+	return RunDryRunContext(context.Background(), spec)
+}
+
+// RunDryRunContext propagates caller cancellation into the bounded preview.
+// External preview tools use the caller's environment and configuration; this
+// is advisory evidence, not a sandbox or an authorization to run the command.
+func RunDryRunContext(parent context.Context, spec *db.CommandSpec) (*db.DryRunResult, error) {
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
 	if spec == nil {
 		return nil, fmt.Errorf("spec is required")
 	}
@@ -47,7 +57,7 @@ func RunDryRun(spec *db.CommandSpec) (*db.DryRunResult, error) {
 		return nil, nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultDryRunTimeout)
+	ctx, cancel := context.WithTimeout(parent, defaultDryRunTimeout)
 	defer cancel()
 
 	out, err := runDryRunProcess(ctx, tokens, spec.Cwd)

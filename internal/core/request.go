@@ -32,6 +32,10 @@ type CreateRequestOptions struct {
 	RedactPatterns []string
 	// ProjectPath overrides the project path (defaults to session's project).
 	ProjectPath string
+	// RequireDryRun refuses admission when a preview cannot complete successfully.
+	RequireDryRun bool
+	// DryRunTimeout optionally shortens the default 30-second preview budget.
+	DryRunTimeout time.Duration
 }
 
 // CreateRequestResult holds the result of creating a request.
@@ -50,6 +54,8 @@ type CreateRequestResult struct {
 	Queued bool
 	// QueueWait is elapsed admission time when Queued is true.
 	QueueWait time.Duration
+	// Preflight describes evidence persisted before the request became visible.
+	Preflight *PreflightReport
 }
 
 // Request creation errors.
@@ -77,6 +83,8 @@ type RequestCreator struct {
 
 // RequestCreatorConfig holds configuration for request creation.
 type RequestCreatorConfig struct {
+	// EnableDryRun collects advisory preview evidence before admitting requests.
+	EnableDryRun bool
 	// BlockedAgents is a list of agent names that cannot create requests.
 	BlockedAgents []string
 	// DynamicQuorumEnabled enables dynamic quorum adjustment.
@@ -100,6 +108,7 @@ type RequestCreatorConfig struct {
 // DefaultRequestCreatorConfig returns the default configuration.
 func DefaultRequestCreatorConfig() *RequestCreatorConfig {
 	return &RequestCreatorConfig{
+		EnableDryRun:               true,
 		BlockedAgents:              []string{},
 		DynamicQuorumEnabled:       false,
 		DynamicQuorumFloor:         1,
@@ -140,6 +149,12 @@ func (rc *RequestCreator) createRequestOnce(ctx context.Context, opts CreateRequ
 	}
 	if opts.Command == "" {
 		return nil, ErrCommandRequired
+	}
+	if opts.DryRunTimeout < 0 {
+		return nil, errors.New("dry-run timeout must not be negative")
+	}
+	if opts.RequireDryRun && !rc.config.EnableDryRun {
+		return nil, fmt.Errorf("%w: dry runs are disabled by configuration", ErrPreflightRequired)
 	}
 
 	// Step 1: Validate session exists and is active
@@ -247,6 +262,12 @@ func (rc *RequestCreator) createRequestOnce(ctx context.Context, opts CreateRequ
 		ExpiresAt:             &requestExpiry,
 	}
 
+	preflight, err := rc.prepareRequestPreflight(ctx, request, opts)
+	if err != nil {
+		return nil, err
+	}
+	// Start the review lifetime after preflight, not before a slow tool runs.
+	requestExpiry = time.Now().UTC().Add(rc.requestLifetime())
 	admission, err := rc.rateLimiter.AdmitRequest(ctx, request)
 	if err != nil {
 		return nil, fmt.Errorf("admitting request: %w", err)
@@ -263,6 +284,7 @@ func (rc *RequestCreator) createRequestOnce(ctx context.Context, opts CreateRequ
 		Skipped:        false,
 		Classification: classification,
 		RateLimit:      admission,
+		Preflight:      preflight,
 	}, nil
 }
 

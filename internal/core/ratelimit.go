@@ -57,6 +57,9 @@ func (c RateLimitConfig) normalized() RateLimitConfig {
 
 // RateLimitResult describes whether a session can submit a new request right now.
 type RateLimitResult struct {
+	// limitError preserves the actual exhausted counters for queue prechecks.
+	// Only the atomic admission may consume capacity or persist a request.
+	limitError         *RateLimitError
 	Allowed            bool            `json:"allowed"`
 	Action             RateLimitAction `json:"action"`
 	RemainingPending   int             `json:"remaining_pending"`
@@ -223,14 +226,15 @@ func (rl *RateLimiter) CheckRateLimit(sessionID string) (*RateLimitResult, error
 	// admission result separately reports each committed counter.
 	result.RemainingPending = 0
 	result.RemainingPerMinute = 0
-	result.Message = (&RateLimitError{
+	result.limitError = &RateLimitError{
 		SessionID:    sessionID,
 		Pending:      pending,
 		MaxPending:   cfg.MaxPendingPerSession,
 		Recent:       recent,
 		MaxPerMinute: cfg.MaxRequestsPerMinute,
 		ResetAt:      resetAt,
-	}).Error()
+	}
+	result.Message = result.limitError.Error()
 
 	switch cfg.Action {
 	case RateLimitActionWarn:
