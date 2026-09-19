@@ -91,9 +91,14 @@ type IPCServer struct {
 	activeConns  atomic.Int32
 	pendingCount atomic.Int32
 
-	subscribers   map[int64]*subscriber
-	subscribersMu sync.RWMutex
-	nextSubID     atomic.Int64
+	subscribers     map[int64]*subscriber
+	subscribersMu   sync.RWMutex
+	nextSubID       atomic.Int64
+	requestSnapshot map[string]Event
+	stateManaged    bool
+	stateReady      bool
+	stateError      string
+	sessionCount    int
 
 	connections   map[net.Conn]struct{}
 	connectionsMu sync.Mutex
@@ -117,6 +122,7 @@ type subscriber struct {
 	events   chan Event
 	done     chan struct{}
 	stopOnce sync.Once
+	initial  []Event
 }
 
 func (sub *subscriber) stop() {
@@ -328,11 +334,17 @@ func (s *IPCServer) handlePing(req RPCRequest) *RPCResponse {
 
 func (s *IPCServer) handleStatus(req RPCRequest) *RPCResponse {
 	s.subscribersMu.RLock()
+	defer s.subscribersMu.RUnlock()
 	subCount := len(s.subscribers)
-	s.subscribersMu.RUnlock()
+	sessions := int(s.activeConns.Load())
+	if s.stateManaged {
+		sessions = s.sessionCount
+	}
 	return &RPCResponse{Result: map[string]any{
 		"uptime_seconds": int64(time.Since(s.startTime).Seconds()),
-		"pending_count":  s.pendingCount.Load(), "active_sessions": s.activeConns.Load(),
+		"pending_count":  s.pendingCount.Load(), "active_sessions": sessions,
+		"active_connections": s.activeConns.Load(), "state_ready": s.stateReady,
+		"state_error": s.stateError,
 		"subscribers": subCount,
 	}, ID: req.ID}
 }
@@ -368,6 +380,11 @@ func (s *IPCServer) handleSubscribe(req RPCRequest, conn net.Conn) *RPCResponse 
 			return &RPCResponse{Error: &Error{Code: ErrCodeInvalidReq, Message: "connection already subscribed"}, ID: req.ID}
 		}
 	}
+	if s.stateManaged && !s.stateReady {
+		s.subscribersMu.Unlock()
+		return &RPCResponse{Error: &Error{Code: ErrCodeInternal, Message: "request state unavailable; use database polling"}, ID: req.ID}
+	}
+	sub.initial = s.snapshotEventsLocked()
 	s.subscribers[id] = sub
 	s.streamWG.Add(1)
 	s.subscribersMu.Unlock()
@@ -386,6 +403,14 @@ func (s *IPCServer) handleSubscribe(req RPCRequest, conn net.Conn) *RPCResponse 
 
 func (s *IPCServer) streamEvents(sub *subscriber) {
 	defer s.removeSubscriber(sub.id)
+	// Bootstrap is separate from the live queue, so >100 existing requests do
+	// not overflow a brand-new subscription before it can read its first event.
+	for _, event := range sub.initial {
+		if s.ctx.Err() != nil || s.writeEvent(sub, event) != nil {
+			return
+		}
+	}
+	sub.initial = nil
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -393,23 +418,34 @@ func (s *IPCServer) streamEvents(sub *subscriber) {
 		case <-sub.done:
 			return
 		case event := <-sub.events:
-			data, err := json.Marshal(map[string]any{"event": event})
-			if err != nil {
-				// A broken stream must disconnect, not silently skip a decision.
-				s.logger.Debug("marshal event failed", "error", err)
-				return
-			}
-			data = append(data, '\n')
-			if _, err := sub.conn.Write(data); err != nil {
+			if err := s.writeEvent(sub, event); err != nil {
 				return
 			}
 		}
 	}
 }
 
+func (s *IPCServer) writeEvent(sub *subscriber, event Event) error {
+	data, err := json.Marshal(map[string]any{"event": event})
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	n, err := sub.conn.Write(data)
+	if err == nil && n != len(data) {
+		return io.ErrShortWrite
+	}
+	return err
+}
+
 func (s *IPCServer) broadcast(event Event) {
 	s.subscribersMu.Lock()
 	defer s.subscribersMu.Unlock()
+	s.broadcastLocked(event)
+}
+
+// Caller holds subscribersMu, including while replacing a cached snapshot.
+func (s *IPCServer) broadcastLocked(event Event) {
 	for id, sub := range s.subscribers {
 		select {
 		case sub.events <- event:
