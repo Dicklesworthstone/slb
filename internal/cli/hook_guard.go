@@ -67,7 +67,11 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
-	queryCtx, cancel := context.WithTimeout(cmd.Context(), 50*time.Millisecond)
+	parent := cmd.Context()
+	if parent == nil {
+		parent = context.Background()
+	}
+	queryCtx, cancel := context.WithTimeout(parent, 50*time.Millisecond)
 	client := daemon.NewIPCClient(daemon.SocketPathForCWD(cwd))
 	live, liveErr := client.HookQuery(queryCtx, daemon.HookQueryParams{
 		Command: command, SessionID: sessionID, CWD: cwd, ExecutionHandoff: true,

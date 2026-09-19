@@ -1001,3 +1001,176 @@ func TestHookCautionPolicyEmbeddedAndLocal(t *testing.T) {
 		t.Fatalf("local ask policy ignored: %+v", got)
 	}
 }
+
+
+func nativeHookOutput(t *testing.T, payload map[string]any, home string) map[string]any {
+	t.Helper()
+	t.Setenv("HOME", home)
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := &cobra.Command{}
+	cmd.SetIn(strings.NewReader(string(data)))
+	var stdout strings.Builder
+	cmd.SetOut(&stdout)
+	if err := runHookGuard(cmd, nil); err != nil {
+		t.Fatalf("native hook guard: %v", err)
+	}
+	var output map[string]any
+	if err := json.Unmarshal([]byte(stdout.String()), &output); err != nil {
+		t.Fatalf("decode native hook output: %v\n%s", err, stdout.String())
+	}
+	return output
+}
+
+func nativeHookPermission(t *testing.T, output map[string]any) (string, map[string]any) {
+	t.Helper()
+	specific, ok := output["hookSpecificOutput"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing hookSpecificOutput: %+v", output)
+	}
+	permission, _ := specific["permissionDecision"].(string)
+	return permission, specific
+}
+
+func TestNativeHookGuardProtocolAndFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		command    any
+		want       string
+		wantAudit  bool
+	}{
+		{"safe", "git stash", "allow", false},
+		{"caution stays in SLB", "rm build.cache", "deny", true},
+		{"dangerous", "rm -rf node_modules", "deny", true},
+		{"invalid command", 42, "ask", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			project := t.TempDir()
+			output := nativeHookOutput(t, map[string]any{
+				"session_id": "provider-session",
+				"cwd": project,
+				"tool_input": map[string]any{"command": tc.command},
+			}, home)
+			permission, _ := nativeHookPermission(t, output)
+			if permission != tc.want {
+				t.Fatalf("permission=%q want=%q output=%+v", permission, tc.want, output)
+			}
+			auditDir := filepath.Join(home, ".slb", "audit", "blocked")
+			entries, err := os.ReadDir(auditDir)
+			if tc.wantAudit {
+				if err != nil || len(entries) != 1 {
+					t.Fatalf("expected one native audit record, entries=%d err=%v", len(entries), err)
+				}
+			} else if err == nil && len(entries) != 0 {
+				t.Fatalf("unexpected audit records: %d", len(entries))
+			}
+		})
+	}
+}
+
+func TestNativeHookGuardExecutionHandoff(t *testing.T) {
+	project := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(project, ".slb"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	hash := strings.Repeat("a", 64)
+	response := &daemon.HookQueryResult{
+		Action: "execute",
+		ExecutionHandoff: &daemon.HookExecutionHandoff{
+			RequestID: "req-123", CommandHash: hash, SessionID: "session-1",
+			DatabasePath: filepath.Join(project, ".slb", "state.db"),
+		},
+	}
+	cmd := &cobra.Command{}
+	var stdout strings.Builder
+	cmd.SetOut(&stdout)
+	toolInput := map[string]any{
+		"command": "rm -rf ./build", "timeout": json.Number("1500"), "description": "preserve me",
+	}
+	if err := emitNativeExecutionHandoff(cmd, response, toolInput, "session-1", project); err != nil {
+		t.Fatal(err)
+	}
+	var output map[string]any
+	if err := json.Unmarshal([]byte(stdout.String()), &output); err != nil {
+		t.Fatal(err)
+	}
+	permission, specific := nativeHookPermission(t, output)
+	if permission != "allow" {
+		t.Fatalf("handoff permission=%q", permission)
+	}
+	updated, ok := specific["updatedInput"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing updated input: %+v", specific)
+	}
+	command, _ := updated["command"].(string)
+	for _, fragment := range []string{"exec ", " execute ", "--expected-command-hash", hash, "--timeout", "1", "req-123"} {
+		if !strings.Contains(command, fragment) {
+			t.Fatalf("handoff command missing %q: %s", fragment, command)
+		}
+	}
+	if updated["description"] != "preserve me" {
+		t.Fatalf("handoff discarded tool input: %+v", updated)
+	}
+
+	response.ExecutionHandoff.DatabasePath = filepath.Join(t.TempDir(), "wrong.db")
+	if err := emitNativeExecutionHandoff(&cobra.Command{}, response, toolInput, "session-1", project); err == nil {
+		t.Fatal("cross-project execution handoff was accepted")
+	}
+}
+
+func TestHookInstallUsesNativeGuard(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetHookFlags()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cmd := newTestHookCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, cmd, "hook", "install", "-j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result["native_guard"] != true {
+		t.Fatalf("install did not report native guard: %+v", result)
+	}
+	configured, _ := result["hook_command"].(string)
+	if !strings.Contains(configured, " hook guard") || !isSLBHookCommand(configured, "") {
+		t.Fatalf("install did not configure native guard: %q", configured)
+	}
+
+	data, err := os.ReadFile(filepath.Join(home, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "python3") {
+		t.Fatalf("installed hot path still invokes Python: %s", data)
+	}
+	if !strings.Contains(string(data), "hook guard") {
+		t.Fatalf("native guard missing from settings: %s", data)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".slb", "hooks", "slb_guard.py")); err != nil {
+		t.Fatalf("standalone fallback guard was not generated: %v", err)
+	}
+}
+
+func TestNativeHookCommandRecognition(t *testing.T) {
+	command, err := nativeHookGuardCommand()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isSLBHookCommand(command, "") {
+		t.Fatalf("current executable guard was not recognized: %q", command)
+	}
+	if isSLBHookCommand("echo hook guard", "") {
+		t.Fatal("unrelated hook guard command was recognized as SLB")
+	}
+	if !isSLBHookCommand("python3 /tmp/slb_guard.py", "/tmp/slb_guard.py") {
+		t.Fatal("legacy Python guard was not recognized")
+	}
+}
