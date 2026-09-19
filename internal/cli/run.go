@@ -409,6 +409,7 @@ func toRequestCreatorConfig(cfg config.Config) *core.RequestCreatorConfig {
 		timeoutMinutes = 30
 	}
 	return &core.RequestCreatorConfig{
+		EnableDryRun:               cfg.General.EnableDryRun,
 		BlockedAgents:              cfg.Agents.Blocked,
 		DynamicQuorumEnabled:       false,
 		DynamicQuorumFloor:         1,

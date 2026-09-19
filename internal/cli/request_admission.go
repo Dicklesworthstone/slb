@@ -17,8 +17,34 @@ import (
 func init() {
 	for _, cmd := range []*cobra.Command{requestCmd, runCmd} {
 		cmd.Flags().Duration("queue-timeout", 0, "maximum wait for request capacity (e.g. 30s); 0 uses the configured request timeout")
+		cmd.Flags().Bool("require-dry-run", false, "require a successful preview before admitting a review request")
+		cmd.Flags().Duration("dry-run-timeout", 0, "shorten the 30s preview budget (e.g. 5s); 0 uses the default")
 		cmd.Long += "\n\nWhen rate_limit_action=queue, wait for capacity before creating a request.\nNo request ID or pending row exists until admission. --queue-timeout bounds\nthis wait separately from --timeout, which bounds waiting for approval."
+		cmd.Long += "\n\nWhen general.enable_dry_run=true, supported commands collect bounded,\nredacted preview evidence before admission. Previews are advisory, never\napprovals or a sandbox for external tools. --require-dry-run refuses a review\nrequest if its preview fails, times out, is unsupported, or is disabled.\nSAFE commands still skip review. --dry-run-timeout can shorten the 30s budget;\nthe admission/queue deadline also bounds preview collection."
 	}
+}
+
+func requestPreflightFlags(cmd *cobra.Command, opts core.CreateRequestOptions) (core.CreateRequestOptions, error) {
+	if cmd.Flags().Lookup("require-dry-run") != nil {
+		required, err := cmd.Flags().GetBool("require-dry-run")
+		if err != nil {
+			return opts, err
+		}
+		opts.RequireDryRun = opts.RequireDryRun || required
+	}
+	if cmd.Flags().Lookup("dry-run-timeout") != nil {
+		timeout, err := cmd.Flags().GetDuration("dry-run-timeout")
+		if err != nil {
+			return opts, err
+		}
+		if timeout != 0 {
+			opts.DryRunTimeout = timeout
+		}
+	}
+	if opts.DryRunTimeout < 0 || opts.DryRunTimeout > 30*time.Second {
+		return opts, errors.New("--dry-run-timeout must be between 0 and 30s")
+	}
+	return opts, nil
 }
 
 func requestQueueTimeout(cmd *cobra.Command) (time.Duration, error) {
@@ -43,6 +69,9 @@ func beginRequestCommand(cmd *cobra.Command) (func(), error) {
 	if _, err := requestQueueTimeout(cmd); err != nil {
 		return nil, err
 	}
+	if _, err := requestPreflightFlags(cmd, core.CreateRequestOptions{}); err != nil {
+		return nil, err
+	}
 	previous := cmd.Context()
 	parent := previous
 	if parent == nil {
@@ -58,6 +87,10 @@ func beginRequestCommand(cmd *cobra.Command) (func(), error) {
 
 func submitRequestWithCapacity(cmd *cobra.Command, creator *core.RequestCreator, opts core.CreateRequestOptions) (*core.CreateRequestResult, error) {
 	timeout, err := requestQueueTimeout(cmd)
+	if err != nil {
+		return nil, err
+	}
+	opts, err = requestPreflightFlags(cmd, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -83,6 +116,9 @@ func submitRequestWithCapacity(cmd *cobra.Command, creator *core.RequestCreator,
 }
 
 func addRequestAdmissionMetadata(resp map[string]any, result *core.CreateRequestResult) {
+	if result.Preflight != nil {
+		resp["preflight"] = result.Preflight
+	}
 	if result.RateLimit != nil {
 		resp["rate_limit"] = result.RateLimit
 	}
@@ -106,6 +142,8 @@ func requestAdmissionFailureResponse(err error) map[string]any {
 		}
 	case hasLimit:
 		code = "rate_limit_exceeded"
+	case errors.Is(err, core.ErrPreflightRequired):
+		code = "preflight_required"
 	}
 	resp := map[string]any{
 		"status": "request_failed", "code": code,

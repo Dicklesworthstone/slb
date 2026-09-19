@@ -66,6 +66,17 @@ func TestCLIAdmissionTimeoutAndCancellation(t *testing.T) {
 			}
 			code := requestAdmissionFailureResponse(err)["code"]
 			expected := map[string]string{"queue-timeout": "queue_timeout", "parent-cancel": "admission_cancelled", "reject": "rate_limit_exceeded"}[name]
+			if name == "queue-timeout" {
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("lost admission deadline: %v", err)
+				}
+				// Under load the deadline may precede the first quota read.
+				// Report that as admission_timeout, not invented queue evidence.
+				var limit *core.RateLimitError
+				if !errors.As(err, &limit) {
+					expected = "admission_timeout"
+				}
+			}
 			if code != expected {
 				t.Fatalf("code=%v want=%s err=%v", code, expected, err)
 			}

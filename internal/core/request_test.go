@@ -1,7 +1,10 @@
 package core
 
 import (
+	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/db"
@@ -451,33 +454,24 @@ func containsSubstring(s, substr string) bool {
 }
 
 func TestCreateRequest_RateLimitActionQueue(t *testing.T) {
-	database := testutil.NewTestDB(t)
-	session := testutil.MakeSession(t, database)
-
-	// Create enough requests to hit limit
-	for i := 0; i < 5; i++ {
-		err := database.CreateRequest(&db.Request{
-			RequestorSessionID: session.ID,
-			Status:             db.StatusPending,
-		})
-		if err != nil {
-			t.Fatalf("failed to create pending request: %v", err)
-		}
+	creator, session, notifier := creatorAdmissionFixture(t, RateLimitActionQueue)
+	creator.config.EnableDryRun = false
+	opts := creatorAdmissionOptions(session)
+	if _, err := creator.CreateRequest(opts); err != nil {
+		t.Fatal(err)
 	}
 
-	config := DefaultRateLimitConfig()
-	config.MaxPendingPerSession = 5
-	config.Action = RateLimitActionQueue // Should block (Allowed=false)
-
-	limiter := NewRateLimiter(database, config)
-	creator := NewRequestCreator(database, limiter, nil, nil)
-
-	_, err := creator.CreateRequest(CreateRequestOptions{
-		SessionID: session.ID,
-		Command:   "rm -rf /tmp/test",
-	})
-
-	if err == nil {
-		t.Error("expected error for rate limit queue action")
+	// Queue mode now waits rather than rejecting immediately. Bound this
+	// caller explicitly; the default admission lifetime is intentionally long.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	result, err := creator.CreateRequestContext(ctx, opts)
+	var limit *RateLimitError
+	if result != nil || !errors.Is(err, context.DeadlineExceeded) || !errors.As(err, &limit) {
+		t.Fatalf("expected bounded queue wait with quota details, got %+v, %v", result, err)
+	}
+	count, countErr := creator.db.CountPendingBySession(session.ID)
+	if countErr != nil || count != 1 || notifier.calls.Load() != 1 {
+		t.Fatalf("timed-out waiter created or notified: count=%d notices=%d err=%v", count, notifier.calls.Load(), countErr)
 	}
 }
