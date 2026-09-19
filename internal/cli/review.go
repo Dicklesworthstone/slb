@@ -2,10 +2,12 @@ package cli
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
+	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/output"
 	"github.com/spf13/cobra"
@@ -55,14 +57,6 @@ var reviewListCmd = &cobra.Command{
 			return err
 		}
 
-		cfg, err := config.Load(config.LoadOptions{
-			ProjectDir: project,
-			ConfigPath: flagConfig,
-		})
-		if err != nil {
-			return fmt.Errorf("loading config: %w", err)
-		}
-
 		dbConn, err := db.Open(GetDB())
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
@@ -70,18 +64,22 @@ var reviewListCmd = &cobra.Command{
 		defer dbConn.Close()
 
 		var requests []*db.Request
-		if flagReviewAll {
+		switch {
+		case flagReviewAll:
 			requests, err = dbConn.ListPendingRequestsAllProjects()
-		} else {
-			if flagReviewPool && cfg.General.CrossProjectReviews && len(cfg.General.ReviewPool) > 0 {
-				paths := dedupeStrings(append([]string{project}, cfg.General.ReviewPool...))
-				requests, err = dbConn.ListPendingRequestsByProjects(paths)
-			} else {
-				requests, err = dbConn.ListPendingRequests(project)
-			}
+		case flagReviewPool:
+			requests, err = dbConn.ListPendingRequestsAllProjects()
+		default:
+			requests, err = dbConn.ListPendingRequests(project)
 		}
 		if err != nil {
 			return fmt.Errorf("listing requests: %w", err)
+		}
+		if flagReviewPool {
+			requests, err = filterRequestsForReviewPool(dbConn, requests, project)
+			if err != nil {
+				return err
+			}
 		}
 
 		if len(requests) == 0 {
@@ -123,7 +121,7 @@ var reviewListCmd = &cobra.Command{
 				MinApprovals:   r.MinApprovals,
 				CreatedAt:      r.CreatedAt.Format(time.RFC3339),
 			}
-			if flagReviewAll {
+			if flagReviewAll || flagReviewPool {
 				summary.ProjectPath = r.ProjectPath
 			}
 			summaries = append(summaries, summary)
@@ -315,4 +313,64 @@ func showRequestDetails(requestID string) error {
 	}
 
 	return nil
+}
+
+
+func filterRequestsForReviewPool(database *db.DB, requests []*db.Request, localProject string) ([]*db.Request, error) {
+	reviewerAgent := ""
+	reviewerSessionID := ""
+	if flagSessionID != "" {
+		session, err := database.GetSession(flagSessionID)
+		if err != nil {
+			return nil, fmt.Errorf("loading reviewer session for review pool: %w", err)
+		}
+		if !session.IsActive() {
+			return nil, core.ErrSessionInactive
+		}
+		reviewerAgent = session.AgentName
+		reviewerSessionID = session.ID
+	} else {
+		reviewerAgent = GetActor()
+	}
+	if reviewerAgent == "" {
+		return nil, fmt.Errorf("--review-pool requires --session-id or an actor identity")
+	}
+
+	localAbs, err := filepath.Abs(localProject)
+	if err != nil {
+		return nil, err
+	}
+	filtered := make([]*db.Request, 0, len(requests))
+	for _, request := range requests {
+		if request == nil || request.RequestorSessionID == reviewerSessionID ||
+			request.RequestorAgent == reviewerAgent {
+			continue
+		}
+		requestAbs, err := filepath.Abs(request.ProjectPath)
+		if err != nil {
+			return nil, fmt.Errorf("resolving request project %q: %w", request.ProjectPath, err)
+		}
+		if filepath.Clean(requestAbs) == filepath.Clean(localAbs) {
+			filtered = append(filtered, request)
+			continue
+		}
+		cfg, err := config.Load(config.LoadOptions{ProjectDir: request.ProjectPath, ConfigPath: flagConfig})
+		if err != nil {
+			return nil, fmt.Errorf("loading cross-project review policy for %q: %w", request.ProjectPath, err)
+		}
+		if !cfg.General.CrossProjectReviews || !stringSliceContains(cfg.General.ReviewPool, reviewerAgent) {
+			continue
+		}
+		filtered = append(filtered, request)
+	}
+	return filtered, nil
+}
+
+func stringSliceContains(values []string, value string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
 }

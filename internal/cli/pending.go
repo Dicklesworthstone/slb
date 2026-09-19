@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/output"
 	"github.com/spf13/cobra"
@@ -32,21 +31,13 @@ By default, shows pending requests for the current project.
 Use --all-projects to see pending requests across all projects.
 Use --review-pool to filter to requests you can review (excludes your own).
 
-When [general.cross_project_reviews] is true and review_pool is configured,
---review-pool will pull requests from those projects in addition to the
-current project.`,
+When [general.cross_project_reviews] is true, review_pool is an allowlist of
+reviewer agent names. --review-pool includes cross-project requests only when
+the target project's policy explicitly contains your reviewer identity.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		project, err := projectPath()
 		if err != nil {
 			return err
-		}
-
-		cfg, err := config.Load(config.LoadOptions{
-			ProjectDir: project,
-			ConfigPath: flagConfig,
-		})
-		if err != nil {
-			return fmt.Errorf("loading config: %w", err)
 		}
 
 		dbConn, err := db.Open(GetDB())
@@ -57,31 +48,19 @@ current project.`,
 
 		var requests []*db.Request
 
-		if flagPendingAllProjects {
+		if flagPendingAllProjects || flagPendingReviewPool {
 			requests, err = dbConn.ListPendingRequestsAllProjects()
 		} else {
-			// Review pool: pull configured project paths if cross-project reviews enabled.
-			if flagPendingReviewPool && cfg.General.CrossProjectReviews && len(cfg.General.ReviewPool) > 0 {
-				paths := dedupeStrings(append([]string{project}, cfg.General.ReviewPool...))
-				requests, err = dbConn.ListPendingRequestsByProjects(paths)
-			} else {
-				requests, err = dbConn.ListPendingRequests(project)
-			}
+			requests, err = dbConn.ListPendingRequests(project)
 		}
-
 		if err != nil {
 			return fmt.Errorf("listing pending requests: %w", err)
 		}
-
-		// Filter to review pool if requested (exclude own requests)
-		if flagPendingReviewPool && flagSessionID != "" {
-			filtered := make([]*db.Request, 0, len(requests))
-			for _, r := range requests {
-				if r.RequestorSessionID != flagSessionID {
-					filtered = append(filtered, r)
-				}
+		if flagPendingReviewPool {
+			requests, err = filterRequestsForReviewPool(dbConn, requests, project)
+			if err != nil {
+				return err
 			}
-			requests = filtered
 		}
 
 		// Build response
