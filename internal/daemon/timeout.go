@@ -30,6 +30,9 @@ type TimeoutHandlerConfig struct {
 	Action        TimeoutAction
 	DesktopNotify bool
 	Logger        *log.Logger
+	// ProjectPath limits a project daemon to its own pending requests. Empty
+	// preserves the explicitly global helper behavior for administrative callers.
+	ProjectPath string
 }
 
 func DefaultTimeoutConfig() TimeoutHandlerConfig {
@@ -130,11 +133,18 @@ func (h *TimeoutHandler) run(ctx context.Context, done chan struct{}) {
 
 func (h *TimeoutHandler) checkAndHandleExpired() { h.checkPending(context.Background()) }
 
+func (h *TimeoutHandler) pendingRequests() ([]*db.Request, error) {
+	if h.config.ProjectPath != "" {
+		return h.db.ListPendingRequests(h.config.ProjectPath)
+	}
+	return h.db.ListPendingRequestsAllProjects()
+}
+
 func (h *TimeoutHandler) checkPending(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
-	pending, err := h.db.ListPendingRequestsAllProjects()
+	pending, err := h.pendingRequests()
 	if err != nil {
 		h.logger.Error("failed to find pending requests", "error", err)
 		return

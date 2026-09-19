@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,8 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+var ErrWatchEventOverflow = errors.New("watch event buffer full; reconcile database state")
+
 // WatchEvent is a debounced file change event emitted by Watcher.
 type WatchEvent struct {
 	Path string
@@ -20,10 +23,8 @@ type WatchEvent struct {
 	At   time.Time
 }
 
-// Watcher watches project-local SLB state files and directories.
-//
-// It debounces noisy sources (notably SQLite WAL writes) and emits consolidated
-// events through Events().
+// Watcher emits bounded filesystem hints. Consumers must reconcile from the
+// database on overflow/error and periodically; hints are not an audit journal.
 type Watcher struct {
 	projectPath string
 	slbDir      string
@@ -48,67 +49,42 @@ type Watcher struct {
 	doneCh    chan struct{}
 }
 
-// NewWatcher creates a watcher for the given project path.
 func NewWatcher(projectPath string) (*Watcher, error) {
 	projectPath = strings.TrimSpace(projectPath)
 	if projectPath == "" {
 		return nil, fmt.Errorf("projectPath is required")
 	}
-
 	slbDir := filepath.Join(projectPath, ".slb")
 	pendingDir := filepath.Join(slbDir, "pending")
 	sessionsDir := filepath.Join(slbDir, "sessions")
 	stateDB := filepath.Join(slbDir, "state.db")
-
-	// Ensure expected directories exist so watchers can be attached even before
-	// requests exist.
 	if err := os.MkdirAll(pendingDir, 0750); err != nil {
 		return nil, fmt.Errorf("creating pending dir: %w", err)
 	}
 	if err := os.MkdirAll(sessionsDir, 0750); err != nil {
 		return nil, fmt.Errorf("creating sessions dir: %w", err)
 	}
-
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, fmt.Errorf("new fsnotify watcher: %w", err)
 	}
-
 	w := &Watcher{
-		projectPath:    projectPath,
-		slbDir:         slbDir,
-		stateDB:        stateDB,
-		pendingDir:     pendingDir,
-		sessionsDir:    sessionsDir,
-		watcher:        fsw,
-		logger:         log.Default().WithPrefix("watcher"),
+		projectPath: projectPath, slbDir: slbDir, stateDB: stateDB,
+		pendingDir: pendingDir, sessionsDir: sessionsDir,
+		watcher: fsw, logger: log.Default().WithPrefix("watcher"),
 		debounceWindow: 100 * time.Millisecond,
-		events:         make(chan WatchEvent, 64),
-		errors:         make(chan error, 16),
-		pending:        make(map[string]fsnotify.Op),
-		stopCh:         make(chan struct{}),
-		doneCh:         make(chan struct{}),
+		events:         make(chan WatchEvent, 64), errors: make(chan error, 16),
+		pending: make(map[string]fsnotify.Op), stopCh: make(chan struct{}), doneCh: make(chan struct{}),
 	}
-
-	// Watch .slb for state.db and other bookkeeping files.
-	if err := fsw.Add(slbDir); err != nil {
-		fsw.Close()
-		return nil, fmt.Errorf("watch %s: %w", slbDir, err)
+	for _, dir := range []string{slbDir, pendingDir, sessionsDir} {
+		if err := fsw.Add(dir); err != nil {
+			_ = fsw.Close()
+			return nil, fmt.Errorf("watch %s: %w", dir, err)
+		}
 	}
-	// Watch pending + sessions directories for request/session file changes.
-	if err := fsw.Add(pendingDir); err != nil {
-		fsw.Close()
-		return nil, fmt.Errorf("watch %s: %w", pendingDir, err)
-	}
-	if err := fsw.Add(sessionsDir); err != nil {
-		fsw.Close()
-		return nil, fmt.Errorf("watch %s: %w", sessionsDir, err)
-	}
-
 	return w, nil
 }
 
-// Events returns a channel of debounced events. It is closed on Stop().
 func (w *Watcher) Events() <-chan WatchEvent {
 	if w == nil {
 		ch := make(chan WatchEvent)
@@ -118,7 +94,6 @@ func (w *Watcher) Events() <-chan WatchEvent {
 	return w.events
 }
 
-// Errors returns a channel of watcher errors. It is closed on Stop().
 func (w *Watcher) Errors() <-chan error {
 	if w == nil {
 		ch := make(chan error)
@@ -128,19 +103,24 @@ func (w *Watcher) Errors() <-chan error {
 	return w.errors
 }
 
-// Start starts the watcher event loop in a goroutine.
 func (w *Watcher) Start(ctx context.Context) error {
 	if w == nil || w.watcher == nil {
 		return fmt.Errorf("watcher is not initialized")
 	}
-
-	w.startOnce.Do(func() {
-		go w.loop(ctx)
-	})
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-w.stopCh:
+		return errors.New("watcher is stopped")
+	default:
+	}
+	w.startOnce.Do(func() { go w.loop(ctx) })
 	return nil
 }
 
-// Stop stops the watcher and closes its channels.
+// Stop also works before Start or after a cancelled Start. Starting the loop
+// against a closed stop channel owns channel closure without a second owner.
 func (w *Watcher) Stop() error {
 	if w == nil {
 		return nil
@@ -148,6 +128,7 @@ func (w *Watcher) Stop() error {
 	w.stopOnce.Do(func() {
 		close(w.stopCh)
 		_ = w.watcher.Close()
+		w.startOnce.Do(func() { go w.loop(context.Background()) })
 		<-w.doneCh
 	})
 	return nil
@@ -157,7 +138,6 @@ func (w *Watcher) loop(ctx context.Context) {
 	defer close(w.doneCh)
 	defer close(w.events)
 	defer close(w.errors)
-
 	for {
 		var timerC <-chan time.Time
 		w.mu.Lock()
@@ -165,7 +145,6 @@ func (w *Watcher) loop(ctx context.Context) {
 			timerC = w.timer.C
 		}
 		w.mu.Unlock()
-
 		select {
 		case <-ctx.Done():
 			w.flush()
@@ -184,10 +163,9 @@ func (w *Watcher) loop(ctx context.Context) {
 				w.flush()
 				return
 			}
-			if !w.isRelevant(ev.Name) {
-				continue
+			if w.isRelevant(ev.Name) {
+				w.record(ev.Name, ev.Op)
 			}
-			w.record(ev.Name, ev.Op)
 		case <-timerC:
 			w.flush()
 		}
@@ -196,53 +174,30 @@ func (w *Watcher) loop(ctx context.Context) {
 
 func (w *Watcher) isRelevant(path string) bool {
 	path = filepath.Clean(path)
-
-	if path == w.stateDB {
+	if path == w.stateDB || strings.HasPrefix(path, w.stateDB+"-") {
 		return true
 	}
-	// SQLite may touch sibling files: state.db-wal, state.db-shm.
-	if strings.HasPrefix(path, w.stateDB+"-") {
+	if strings.HasPrefix(path, w.pendingDir+string(filepath.Separator)) {
 		return true
 	}
-
-	pendingPrefix := w.pendingDir + string(filepath.Separator)
-	if strings.HasPrefix(path, pendingPrefix) {
-		return true
-	}
-
-	sessionsPrefix := w.sessionsDir + string(filepath.Separator)
-	if strings.HasPrefix(path, sessionsPrefix) {
-		return true
-	}
-
-	return false
+	return strings.HasPrefix(path, w.sessionsDir+string(filepath.Separator))
 }
 
 func (w *Watcher) record(path string, op fsnotify.Op) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
 	w.pending[path] |= op
-
+	// Bound the debounce window from the FIRST event. Resetting on every WAL
+	// write starves notifications indefinitely while other agents stay busy.
 	if w.timer == nil {
 		w.timer = time.NewTimer(w.debounceWindow)
-		return
 	}
-
-	if !w.timer.Stop() {
-		select {
-		case <-w.timer.C:
-		default:
-		}
-	}
-	w.timer.Reset(w.debounceWindow)
 }
 
 func (w *Watcher) flush() {
 	w.mu.Lock()
 	pending := w.pending
 	w.pending = make(map[string]fsnotify.Op)
-
 	if w.timer != nil {
 		if !w.timer.Stop() {
 			select {
@@ -253,10 +208,17 @@ func (w *Watcher) flush() {
 		w.timer = nil
 	}
 	w.mu.Unlock()
-
 	now := time.Now().UTC()
+	overflow := false
 	for path, op := range pending {
-		w.events <- WatchEvent{Path: path, Op: op, At: now}
+		select {
+		case w.events <- WatchEvent{Path: path, Op: op, At: now}:
+		default:
+			overflow = true
+		}
+	}
+	if overflow {
+		w.sendError(ErrWatchEventOverflow)
 	}
 }
 
