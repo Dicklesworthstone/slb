@@ -337,10 +337,17 @@ func isSLBHookCommand(command, generatedScript string) bool {
 	parser.ParseEnv = false
 	parser.ParseBacktick = false
 	tokens, err := parser.Parse(command)
-	if err == nil && len(tokens) >= 3 {
+	if err == nil && len(tokens) >= 3 && tokens[1] == "hook" && tokens[2] == "guard" {
 		base := strings.TrimSuffix(strings.ToLower(filepath.Base(tokens[0])), ".exe")
-		if base == "slb" && tokens[1] == "hook" && tokens[2] == "guard" {
+		if base == "slb" {
 			return true
+		}
+		if current, currentErr := os.Executable(); currentErr == nil {
+			if currentAbs, absErr := filepath.Abs(current); absErr == nil {
+				if tokenAbs, tokenErr := filepath.Abs(tokens[0]); tokenErr == nil && filepath.Clean(tokenAbs) == filepath.Clean(currentAbs) {
+					return true
+				}
+			}
 		}
 	}
 	return generatedScript != "" && strings.Contains(command, filepath.Base(generatedScript))
