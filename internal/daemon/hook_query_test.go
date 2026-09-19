@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
 func TestIPCServer_HookQuery_RequiresCommand(t *testing.T) {
@@ -318,6 +320,9 @@ func TestIPCServer_HookHealth(t *testing.T) {
 	if patternCount, _ := result["pattern_count"].(float64); patternCount == 0 {
 		t.Error("expected pattern_count > 0")
 	}
+	if action, _ := result["hook_caution_action"].(string); action != "block" {
+		t.Errorf("hook_caution_action = %q, want block", action)
+	}
 	if _, ok := result["uptime_seconds"]; !ok {
 		t.Error("expected uptime_seconds in result")
 	}
@@ -409,5 +414,32 @@ func TestIPCClientHookQueryRoundTrip(t *testing.T) {
 	}
 	if result.Action != "allow" || result.Tier != "safe" {
 		t.Fatalf("unexpected hook result: %+v", result)
+	}
+}
+
+func TestHookQueryCautionActionPolicy(t *testing.T) {
+	defaultResult := (&IPCServer{}).classifyCommand(HookQueryParams{Command: "rm build.cache"})
+	if defaultResult.Tier != "caution" || defaultResult.Action != "block" {
+		t.Fatalf("default CAUTION escaped SLB queue: %+v", defaultResult)
+	}
+
+	project := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(project, ".slb"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.OpenAndMigrate(filepath.Join(project, ".slb", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, ".slb", "config.toml"),
+		[]byte("[integrations]\nhook_caution_action = 'ask'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	interactive := (&IPCServer{}).classifyCommand(HookQueryParams{Command: "rm build.cache", CWD: project})
+	if interactive.Tier != "caution" || interactive.Action != "ask" {
+		t.Fatalf("explicit ask policy ignored: %+v", interactive)
 	}
 }

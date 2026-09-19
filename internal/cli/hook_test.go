@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/daemon"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 	"github.com/spf13/cobra"
@@ -980,5 +981,23 @@ func TestHookTestCommand_SimulatedFailureUsesFallback(t *testing.T) {
 	if result["action"] != "ask" || result["source"] != "local" ||
 		result["fallback"] != true || result["simulated_failure"] != true {
 		t.Fatalf("simulated failure did not exercise fallback: %+v", result)
+	}
+}
+
+func TestHookCautionPolicyEmbeddedAndLocal(t *testing.T) {
+	engine := core.NewPatternEngine()
+	askScript := generateHookScriptWithCautionAction(engine, "ask")
+	if !strings.Contains(askScript, `HOOK_CAUTION_ACTION = "ask"`) || embeddedHookCautionAction([]byte(askScript)) != "ask" {
+		t.Fatal("generated hook lost explicit CAUTION ask policy")
+	}
+	blockScript := generateHookScriptWithCautionAction(engine, "invalid")
+	if embeddedHookCautionAction([]byte(blockScript)) != "block" {
+		t.Fatal("invalid generated CAUTION policy did not fail closed")
+	}
+	if got := localHookTestResultWithCautionAction("rm build.cache", "", "block"); got["action"] != "block" {
+		t.Fatalf("local block policy ignored: %+v", got)
+	}
+	if got := localHookTestResultWithCautionAction("rm build.cache", "", "ask"); got["action"] != "ask" {
+		t.Fatalf("local ask policy ignored: %+v", got)
 	}
 }

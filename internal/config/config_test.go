@@ -32,6 +32,7 @@ func TestValidate_Errors(t *testing.T) {
 	cfg.RateLimits.RateLimitAction = "bad"
 	cfg.Notifications.DesktopDelaySecs = -1
 	cfg.History.RetentionDays = -1
+	cfg.Integrations.HookCautionAction = "bad"
 	cfg.Patterns.Critical.MinApprovals = -1
 	cfg.Patterns.Dangerous.DynamicQuorumFloor = -1
 	cfg.Patterns.Caution.AutoApproveDelaySeconds = -1
@@ -293,6 +294,7 @@ func TestGetValue(t *testing.T) {
 		{"integrations.agent_mail_enabled", cfg.Integrations.AgentMailEnabled},
 		{"integrations.agent_mail_thread", cfg.Integrations.AgentMailThread},
 		{"integrations.claude_hooks_enabled", cfg.Integrations.ClaudeHooksEnabled},
+		{"integrations.hook_caution_action", cfg.Integrations.HookCautionAction},
 
 		{"agents.trusted_self_approve", cfg.Agents.TrustedSelfApprove},
 		{"agents.trusted_self_approve_delay_seconds", cfg.Agents.TrustedSelfApproveDelaySecs},
