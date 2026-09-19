@@ -215,17 +215,19 @@ type HookHealthParams struct {
 
 // HookHealthResult is the result of a hook health check.
 type HookHealthResult struct {
-	Status       string `json:"status"`
-	Uptime       int64  `json:"uptime_seconds"`
-	PatternHash  string `json:"pattern_hash"`
-	PatternCount int    `json:"pattern_count"`
-	ServerTime   string `json:"server_time"`
-	PolicyError  string `json:"policy_error,omitempty"`
+	Status            string `json:"status"`
+	Uptime            int64  `json:"uptime_seconds"`
+	PatternHash       string `json:"pattern_hash"`
+	PatternCount      int    `json:"pattern_count"`
+	HookCautionAction string `json:"hook_caution_action"`
+	ServerTime        string `json:"server_time"`
+	PolicyError       string `json:"policy_error,omitempty"`
 }
 
 func (s *IPCServer) handleHookHealth(req RPCRequest) *RPCResponse {
 	now := time.Now().UTC()
 	engine := core.GetDefaultEngine()
+	cautionAction := config.DefaultConfig().Integrations.HookCautionAction
 	var policyConn *db.DB
 	if len(req.Params) != 0 {
 		var params HookHealthParams
@@ -241,6 +243,17 @@ func (s *IPCServer) handleHookHealth(req RPCRequest) *RPCResponse {
 				}, ID: req.ID}
 			}
 			engine, policyConn = fresh, conn
+			cfg, cfgErr := config.Load(config.LoadOptions{ProjectDir: projectRootForSocket(params.CWD)})
+			if cfgErr != nil {
+				if policyConn != nil {
+					policyConn.Close()
+				}
+				return &RPCResponse{Result: HookHealthResult{
+					Status: "degraded", Uptime: int64(time.Since(s.startTime).Seconds()),
+					ServerTime: now.Format(time.RFC3339), PolicyError: cfgErr.Error(),
+				}, ID: req.ID}
+			}
+			cautionAction = cfg.Integrations.HookCautionAction
 		}
 	}
 	if policyConn != nil {
@@ -250,7 +263,7 @@ func (s *IPCServer) handleHookHealth(req RPCRequest) *RPCResponse {
 	result := HookHealthResult{
 		Status: "ok", Uptime: int64(time.Since(s.startTime).Seconds()),
 		PatternHash: export.SHA256, PatternCount: export.Metadata.PatternCount,
-		ServerTime: now.Format(time.RFC3339),
+		HookCautionAction: cautionAction, ServerTime: now.Format(time.RFC3339),
 	}
 	return &RPCResponse{Result: result, ID: req.ID}
 }

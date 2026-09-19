@@ -422,6 +422,10 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	currentHash := core.GetDefaultEngine().ComputeHash()
+	currentCautionAction, err := hookCautionAction()
+	if err != nil {
+		return err
+	}
 	status := map[string]any{
 		"hook_script_exists":    false,
 		"hook_script_path":      hookScriptPath,
@@ -430,6 +434,9 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 		"current_pattern_hash":        currentHash,
 		"installed_pattern_hash":      "",
 		"pattern_hash_matches":        false,
+		"current_hook_caution_action": currentCautionAction,
+		"installed_hook_caution_action": "",
+		"hook_caution_action_matches": false,
 		"daemon_reachable":            false,
 		"daemon_status":               "unreachable",
 		"daemon_pattern_hash":         "",
@@ -444,6 +451,9 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 			installedHash := embeddedHookPatternHash(data)
 			status["installed_pattern_hash"] = installedHash
 			status["pattern_hash_matches"] = installedHash != "" && installedHash == currentHash
+			installedAction := embeddedHookCautionAction(data)
+			status["installed_hook_caution_action"] = installedAction
+			status["hook_caution_action_matches"] = installedAction != "" && installedAction == currentCautionAction
 		} else {
 			status["hook_script_read_error"] = readErr.Error()
 		}
@@ -497,6 +507,8 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 			status["daemon_status"] = health.Status
 			status["daemon_pattern_hash"] = health.PatternHash
 			status["daemon_pattern_hash_matches"] = health.PatternHash != "" && health.PatternHash == currentHash
+			status["daemon_hook_caution_action"] = health.HookCautionAction
+			status["daemon_hook_caution_action_matches"] = health.HookCautionAction == currentCautionAction
 			status["daemon_pattern_count"] = health.PatternCount
 			status["daemon_uptime_seconds"] = health.Uptime
 			if health.PolicyError != "" {
@@ -507,10 +519,11 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 
 	scriptOK := status["hook_script_exists"].(bool)
 	settingsOK := status["settings_configured"].(bool)
-	fresh := status["pattern_hash_matches"].(bool)
+	fresh := status["pattern_hash_matches"].(bool) && status["hook_caution_action_matches"].(bool)
 	daemonReachable := status["daemon_reachable"].(bool)
 	daemonHealthy := !daemonReachable ||
-		(status["daemon_status"] == "ok" && status["daemon_pattern_hash_matches"] == true)
+		(status["daemon_status"] == "ok" && status["daemon_pattern_hash_matches"] == true &&
+			status["daemon_hook_caution_action_matches"] == true)
 	switch {
 	case scriptOK && settingsOK && !fresh:
 		status["status"] = "stale"
@@ -538,6 +551,20 @@ func embeddedHookPatternHash(data []byte) string {
 	return ""
 }
 
+func embeddedHookCautionAction(data []byte) string {
+	for _, line := range strings.Split(string(data), "\n") {
+		const prefix = "HOOK_CAUTION_ACTION = "
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		var action string
+		if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, prefix))), &action); err == nil {
+			return action
+		}
+	}
+	return ""
+}
+
 func runHookHealth(cmd *cobra.Command, args []string) error {
 	if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
 		return err
@@ -551,13 +578,18 @@ func runHookHealth(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolving project path: %w", err)
 	}
 	currentHash := core.GetDefaultEngine().ComputeHash()
+	currentCautionAction, err := hookCautionAction()
+	if err != nil {
+		return err
+	}
 	result := map[string]any{
 		"status":               "unreachable",
 		"healthy":              false,
 		"daemon_reachable":     false,
 		"fallback_available":   true,
-		"current_pattern_hash": currentHash,
-		"socket_path":          daemon.SocketPathForCWD(cwd),
+		"current_pattern_hash":       currentHash,
+		"current_hook_caution_action": currentCautionAction,
+		"socket_path":                daemon.SocketPathForCWD(cwd),
 		"cwd":                  cwd,
 	}
 
@@ -572,11 +604,14 @@ func runHookHealth(cmd *cobra.Command, args []string) error {
 	}
 
 	hashMatches := health.PatternHash != "" && health.PatternHash == currentHash
+	actionMatches := health.HookCautionAction == currentCautionAction
 	result["status"] = health.Status
 	result["daemon_reachable"] = true
-	result["healthy"] = health.Status == "ok" && hashMatches
+	result["healthy"] = health.Status == "ok" && hashMatches && actionMatches
 	result["daemon_pattern_hash"] = health.PatternHash
 	result["pattern_hash_matches"] = hashMatches
+	result["daemon_hook_caution_action"] = health.HookCautionAction
+	result["hook_caution_action_matches"] = actionMatches
 	result["pattern_count"] = health.PatternCount
 	result["uptime_seconds"] = health.Uptime
 	result["server_time"] = health.ServerTime
