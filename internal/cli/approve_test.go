@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -419,68 +420,84 @@ func TestBuildAgentMailNotifier_DefaultsToNoopWithNoConfig(t *testing.T) {
 // TestApproveCommand_CrossProject tests approving a request from another project
 // using the --target-project flag.
 func TestApproveCommand_CrossProject(t *testing.T) {
-	// Create two harnesses representing two different projects
-	targetH := testutil.NewHarness(t) // target project where request is created
+	targetH := testutil.NewHarness(t)
+	currentH := testutil.NewHarness(t)
 	resetApproveFlags()
 
-	// Create sessions in the target project
 	requestorSess := testutil.MakeSession(t, targetH.DB,
 		testutil.WithProject(targetH.ProjectDir),
 		testutil.WithAgent("Requestor"),
 		testutil.WithModel("model-a"),
 	)
-	reviewerSess := testutil.MakeSession(t, targetH.DB,
-		testutil.WithProject(targetH.ProjectDir),
+	reviewerSess := testutil.MakeSession(t, currentH.DB,
+		testutil.WithProject(currentH.ProjectDir),
 		testutil.WithAgent("Reviewer"),
 		testutil.WithModel("model-b"),
 	)
-
-	// Create request in target project
 	req := testutil.MakeRequest(t, targetH.DB, requestorSess,
 		testutil.WithCommand("rm -rf ./build", targetH.ProjectDir, true),
 		testutil.WithRisk(db.RiskTierDangerous),
 	)
 	targetH.DB.Exec(`UPDATE requests SET min_approvals = 1, require_different_model = false WHERE id = ?`, req.ID)
 
-	// Now approve from a different "current" directory using --target-project
-	// Use a separate harness to simulate being in a different project
-	currentH := testutil.NewHarness(t) // current project where reviewer is working
+	configPath := filepath.Join(targetH.ProjectDir, ".slb", "config.toml")
+	if err := os.WriteFile(configPath, []byte("[general]\ncross_project_reviews = true\nreview_pool = ['Reviewer']\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
-	cmd := newTestApproveCmd(currentH.DBPath) // Uses current project's DB by default
+	cmd := newTestApproveCmd(currentH.DBPath)
 	stdout, err := executeCommandCapture(t, cmd, "approve", req.ID,
 		"--session-id", reviewerSess.ID,
 		"-k", reviewerSess.SessionKey,
-		"--target-project", targetH.ProjectDir, // Point to target project
+		"-C", currentH.ProjectDir,
+		"--target-project", targetH.ProjectDir,
 		"-j",
 	)
-
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
 	var result map[string]any
 	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
 		t.Fatalf("failed to parse JSON: %v\nstdout: %s", err, stdout)
 	}
-
-	// Verify result
-	if result["request_id"] != req.ID {
-		t.Errorf("expected request_id=%s, got %v", req.ID, result["request_id"])
+	if result["decision"] != "approve" || result["request_status_changed"] != true {
+		t.Fatalf("unexpected cross-project approval result: %+v", result)
 	}
-	if result["decision"] != "approve" {
-		t.Errorf("expected decision=approve, got %v", result["decision"])
-	}
-	if result["request_status_changed"] != true {
-		t.Errorf("expected request_status_changed=true, got %v", result["request_status_changed"])
-	}
-
-	// Verify the request in target project DB is actually approved
 	updatedReq, err := targetH.DB.GetRequest(req.ID)
-	if err != nil {
-		t.Fatalf("failed to get updated request: %v", err)
+	if err != nil || updatedReq.Status != db.StatusApproved {
+		t.Fatalf("target request not approved: status=%v err=%v", updatedReq.Status, err)
 	}
-	if updatedReq.Status != db.StatusApproved {
-		t.Errorf("expected status=approved in target DB, got %s", updatedReq.Status)
+	reviews, err := targetH.DB.ListReviewsForRequest(req.ID)
+	if err != nil || len(reviews) != 1 {
+		t.Fatalf("delegated review missing: len=%d err=%v", len(reviews), err)
+	}
+	if reviews[0].ReviewerAgent != reviewerSess.AgentName || reviews[0].ReviewerSessionID == reviewerSess.ID {
+		t.Fatalf("review did not bind delegated identity: %+v", reviews[0])
+	}
+	provenance, err := targetH.DB.GetSession(reviews[0].ReviewerSessionID)
+	if err != nil || provenance.EndedAt == nil {
+		t.Fatalf("delegated provenance must be ended, session=%+v err=%v", provenance, err)
+	}
+	active, err := targetH.DB.ListActiveSessions(targetH.ProjectDir)
+	if err != nil || len(active) != 1 || active[0].ID != requestorSess.ID {
+		t.Fatalf("delegation polluted target active reviewer capacity: %+v err=%v", active, err)
+	}
+}
+
+func TestApproveCommand_CrossProjectRequiresTargetPolicy(t *testing.T) {
+	targetH := testutil.NewHarness(t)
+	currentH := testutil.NewHarness(t)
+	resetApproveFlags()
+	requestor := testutil.MakeSession(t, targetH.DB, testutil.WithProject(targetH.ProjectDir), testutil.WithAgent("Requestor"))
+	reviewer := testutil.MakeSession(t, currentH.DB, testutil.WithProject(currentH.ProjectDir), testutil.WithAgent("Reviewer"))
+	req := testutil.MakeRequest(t, targetH.DB, requestor)
+
+	cmd := newTestApproveCmd(currentH.DBPath)
+	_, err := executeCommandCapture(t, cmd, "approve", req.ID,
+		"--session-id", reviewer.ID, "-k", reviewer.SessionKey,
+		"-C", currentH.ProjectDir, "--target-project", targetH.ProjectDir, "-j")
+	if err == nil || !strings.Contains(err.Error(), "cross-project review") {
+		t.Fatalf("target policy did not deny delegated review: %v", err)
 	}
 }
 

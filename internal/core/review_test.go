@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -1517,4 +1518,126 @@ func TestGetReviewStatus_Errors(t *testing.T) {
 			t.Error("expected error for nonexistent request")
 		}
 	})
+}
+
+
+func TestSubmitCrossProjectReviewAuthorization(t *testing.T) {
+	source, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	target, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+
+	reviewer := &db.Session{AgentName: "Reviewer", Program: "codex-cli", Model: "model-b", ProjectPath: "/source"}
+	if err := source.CreateSession(reviewer); err != nil {
+		t.Fatal(err)
+	}
+	requestor := &db.Session{AgentName: "Requestor", Program: "claude-code", Model: "model-a", ProjectPath: "/target"}
+	if err := target.CreateSession(requestor); err != nil {
+		t.Fatal(err)
+	}
+	request := &db.Request{
+		ProjectPath: "/target", RequestorSessionID: requestor.ID,
+		RequestorAgent: requestor.AgentName, RequestorModel: requestor.Model,
+		Command: db.CommandSpec{Raw: "rm -rf ./build", Cwd: "/target", Shell: true},
+		RiskTier: db.RiskTierDangerous, Status: db.StatusPending, MinApprovals: 1,
+		Justification: db.Justification{Reason: "test delegated review"},
+	}
+	if err := target.CreateRequest(request); err != nil {
+		t.Fatal(err)
+	}
+	opts := ReviewOptions{
+		SessionID: reviewer.ID, SessionKey: reviewer.SessionKey, RequestID: request.ID,
+		Decision: db.DecisionApprove,
+	}
+
+	disabled := NewReviewService(target, DefaultReviewConfig())
+	if _, err := disabled.SubmitCrossProjectReview(source, "/source", opts); !errors.Is(err, ErrCrossProjectReviewDenied) {
+		t.Fatalf("disabled cross-project review accepted: %v", err)
+	}
+
+	cfg := DefaultReviewConfig()
+	cfg.CrossProjectReviews = true
+	cfg.ReviewPool = []string{"SomeoneElse"}
+	service := NewReviewService(target, cfg)
+	if _, err := service.SubmitCrossProjectReview(source, "/source", opts); !errors.Is(err, ErrCrossProjectReviewDenied) {
+		t.Fatalf("reviewer outside target allowlist accepted: %v", err)
+	}
+
+	cfg.ReviewPool = []string{"Reviewer"}
+	service = NewReviewService(target, cfg)
+	badKey := opts
+	badKey.SessionKey = "not-the-session-key"
+	if _, err := service.SubmitCrossProjectReview(source, "/source", badKey); !errors.Is(err, ErrSessionKeyMismatch) {
+		t.Fatalf("invalid source key accepted: %v", err)
+	}
+
+	result, err := service.SubmitCrossProjectReview(source, "/source", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.RequestStatusChanged || result.NewRequestStatus != db.StatusApproved {
+		t.Fatalf("delegated approval did not resolve request: %+v", result)
+	}
+	if result.Review.ReviewerAgent != reviewer.AgentName || result.Review.ReviewerModel != reviewer.Model ||
+		result.Review.ReviewerSessionID == reviewer.ID {
+		t.Fatalf("delegated identity was not preserved safely: %+v", result.Review)
+	}
+	provenance, err := target.GetSession(result.Review.ReviewerSessionID)
+	if err != nil || provenance.EndedAt == nil {
+		t.Fatalf("delegated provenance became active capacity: %+v err=%v", provenance, err)
+	}
+	active, err := target.ListActiveSessions("/target")
+	if err != nil || len(active) != 1 || active[0].ID != requestor.ID {
+		t.Fatalf("target active sessions polluted by delegation: %+v err=%v", active, err)
+	}
+}
+
+func TestSubmitCrossProjectReviewRejectsEndedSourceSession(t *testing.T) {
+	source, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	target, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+
+	reviewer := &db.Session{AgentName: "Reviewer", Model: "other", ProjectPath: "/source"}
+	if err := source.CreateSession(reviewer); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.EndSession(reviewer.ID); err != nil {
+		t.Fatal(err)
+	}
+	requestor := &db.Session{AgentName: "Requestor", Model: "request-model", ProjectPath: "/target"}
+	if err := target.CreateSession(requestor); err != nil {
+		t.Fatal(err)
+	}
+	request := &db.Request{
+		ProjectPath: "/target", RequestorSessionID: requestor.ID, RequestorAgent: requestor.AgentName,
+		RequestorModel: requestor.Model, Command: db.CommandSpec{Raw: "rm -rf ./build", Cwd: "/target"},
+		RiskTier: db.RiskTierDangerous, Status: db.StatusPending, MinApprovals: 1,
+		Justification: db.Justification{Reason: "test"},
+	}
+	if err := target.CreateRequest(request); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultReviewConfig()
+	cfg.CrossProjectReviews = true
+	cfg.ReviewPool = []string{"Reviewer"}
+	service := NewReviewService(target, cfg)
+	_, err = service.SubmitCrossProjectReview(source, "/source", ReviewOptions{
+		SessionID: reviewer.ID, SessionKey: reviewer.SessionKey, RequestID: request.ID, Decision: db.DecisionApprove,
+	})
+	if !errors.Is(err, ErrSessionInactive) {
+		t.Fatalf("ended source session authorized delegated review: %v", err)
+	}
 }

@@ -2,6 +2,8 @@ package cli
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -345,68 +347,56 @@ func TestRejectCommand_Help(t *testing.T) {
 // TestRejectCommand_CrossProject tests rejecting a request from another project
 // using the --target-project flag.
 func TestRejectCommand_CrossProject(t *testing.T) {
-	// Create two harnesses representing two different projects
-	targetH := testutil.NewHarness(t) // target project where request is created
+	targetH := testutil.NewHarness(t)
+	currentH := testutil.NewHarness(t)
 	resetRejectFlags()
 
-	// Create sessions in the target project
 	requestorSess := testutil.MakeSession(t, targetH.DB,
 		testutil.WithProject(targetH.ProjectDir),
 		testutil.WithAgent("Requestor"),
 		testutil.WithModel("model-a"),
 	)
-	reviewerSess := testutil.MakeSession(t, targetH.DB,
-		testutil.WithProject(targetH.ProjectDir),
+	reviewerSess := testutil.MakeSession(t, currentH.DB,
+		testutil.WithProject(currentH.ProjectDir),
 		testutil.WithAgent("Reviewer"),
 		testutil.WithModel("model-b"),
 	)
-
-	// Create request in target project
 	req := testutil.MakeRequest(t, targetH.DB, requestorSess,
 		testutil.WithCommand("rm -rf ./build", targetH.ProjectDir, true),
 		testutil.WithRisk(db.RiskTierDangerous),
 	)
 	targetH.DB.Exec(`UPDATE requests SET min_approvals = 1, require_different_model = false WHERE id = ?`, req.ID)
+	if err := os.WriteFile(filepath.Join(targetH.ProjectDir, ".slb", "config.toml"),
+		[]byte("[general]\ncross_project_reviews = true\nreview_pool = ['Reviewer']\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
-	// Now reject from a different "current" directory using --target-project
-	currentH := testutil.NewHarness(t) // current project where reviewer is working
-
-	cmd := newTestRejectCmd(currentH.DBPath) // Uses current project's DB by default
+	cmd := newTestRejectCmd(currentH.DBPath)
 	stdout, err := executeCommandCapture(t, cmd, "reject", req.ID,
 		"--session-id", reviewerSess.ID,
 		"-k", reviewerSess.SessionKey,
 		"-r", "Command too risky for cross-project operation",
-		"--target-project", targetH.ProjectDir, // Point to target project
+		"-C", currentH.ProjectDir,
+		"--target-project", targetH.ProjectDir,
 		"-j",
 	)
-
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
 	var result map[string]any
 	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
 		t.Fatalf("failed to parse JSON: %v\nstdout: %s", err, stdout)
 	}
-
-	// Verify result
-	if result["request_id"] != req.ID {
-		t.Errorf("expected request_id=%s, got %v", req.ID, result["request_id"])
+	if result["decision"] != "reject" || result["request_status_changed"] != true {
+		t.Fatalf("unexpected cross-project rejection result: %+v", result)
 	}
-	if result["decision"] != "reject" {
-		t.Errorf("expected decision=reject, got %v", result["decision"])
-	}
-	if result["request_status_changed"] != true {
-		t.Errorf("expected request_status_changed=true, got %v", result["request_status_changed"])
-	}
-
-	// Verify the request in target project DB is actually rejected
 	updatedReq, err := targetH.DB.GetRequest(req.ID)
-	if err != nil {
-		t.Fatalf("failed to get updated request: %v", err)
+	if err != nil || updatedReq.Status != db.StatusRejected {
+		t.Fatalf("target request not rejected: status=%v err=%v", updatedReq.Status, err)
 	}
-	if updatedReq.Status != db.StatusRejected {
-		t.Errorf("expected status=rejected in target DB, got %s", updatedReq.Status)
+	reviews, err := targetH.DB.ListReviewsForRequest(req.ID)
+	if err != nil || len(reviews) != 1 || reviews[0].ReviewerAgent != reviewerSess.AgentName {
+		t.Fatalf("delegated rejection missing: %+v err=%v", reviews, err)
 	}
 }
 
