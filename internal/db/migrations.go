@@ -188,6 +188,11 @@ ALTER TABLE execution_outcomes ADD COLUMN human_rating INTEGER;
 ALTER TABLE execution_outcomes ADD COLUMN human_notes TEXT;
 `,
 	},
+	{
+		Version: 4,
+		Name:    "durable_request_events",
+		Up:      requestEventsSchema,
+	},
 }
 
 // ApplyMigrations applies any pending migrations in order.
@@ -204,10 +209,11 @@ func (db *DB) ApplyMigrations(ctx context.Context) error {
 		return err
 	}
 
-	// Ensure migrations are sorted.
-	sort.Slice(migrations, func(i, j int) bool { return migrations[i].Version < migrations[j].Version })
+	// Connections can migrate concurrently. Never sort a shared global slice.
+	ordered := append([]Migration(nil), migrations...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Version < ordered[j].Version })
 
-	for _, m := range migrations {
+	for _, m := range ordered {
 		if m.Version <= current {
 			continue
 		}
@@ -215,6 +221,22 @@ func (db *DB) ApplyMigrations(ctx context.Context) error {
 		tx, err := db.conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("begin migration %d: %w", m.Version, err)
+		}
+
+		// Reserve the SQLite writer before re-reading the version. A second
+		// CLI may have finished this migration while we waited; running its
+		// DDL/backfill again would fail or create duplicate baseline events.
+		if _, err := tx.ExecContext(ctx, `UPDATE schema_migrations SET version = version WHERE 0`); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("locking migration %d: %w", m.Version, err)
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&current); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("rechecking migration %d: %w", m.Version, err)
+		}
+		if m.Version <= current {
+			_ = tx.Rollback()
+			continue
 		}
 
 		// Special-case migrations that need conditional DDL
@@ -251,6 +273,7 @@ func (db *DB) ApplyMigrations(ctx context.Context) error {
 		}
 
 		if err := tx.Commit(); err != nil {
+			_ = tx.Rollback()
 			return fmt.Errorf("commit migration %d: %w", m.Version, err)
 		}
 	}
