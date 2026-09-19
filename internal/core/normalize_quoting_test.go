@@ -133,3 +133,105 @@ func TestStripSubshellWrapper(t *testing.T) {
 		})
 	}
 }
+
+
+func TestQuotedHeredocBodyParsesWithoutUpgrade(t *testing.T) {
+	cases := []struct {
+		name string
+		cmd  string
+	}{
+		{
+			"python stdin",
+			"python3 - <<'EOF'\nprint(1)\nEOF",
+		},
+		{
+			"compound prefix",
+			"[ -n \"$p\" ] && python3 - \"$p\" <<'EOF'\nprint(1)\nEOF",
+		},
+		{
+			"double quoted delimiter",
+			"python3 - <<\"PY\"\nprint('a | b')\nPY",
+		},
+		{
+			"backslash quoted delimiter",
+			"python3 - <<\\PY\nprint(1)\nPY",
+		},
+		{
+			"tab stripping delimiter",
+			"python3 - <<-'EOF'\n\tprint(1)\n\tEOF",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := NormalizeCommand(tc.cmd)
+			if got.ParseError {
+				t.Fatalf("quoted heredoc was treated as parse error: %#v", got)
+			}
+			classified := NewPatternEngine().ClassifyCommand(tc.cmd, "")
+			if classified.ParseError || classified.MatchedPattern == "parse_error" {
+				t.Fatalf("quoted heredoc was upgraded by classifier: %#v", classified)
+			}
+		})
+	}
+}
+
+func TestQuotedHeredocBodyRemainsVisibleToRiskPatterns(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want RiskTier
+	}{
+		{"destructive shell-looking data", "rm -rf /", RiskTierCritical},
+		{"destructive SQL-looking data", "DROP DATABASE production", RiskTierCritical},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := "cat <<'EOF'\n" + tc.body + "\nEOF"
+			normalized := NormalizeCommand(cmd)
+			if normalized.ParseError {
+				t.Fatalf("quoted heredoc unexpectedly failed to parse: %#v", normalized)
+			}
+			found := false
+			for _, segment := range normalized.Segments {
+				if segment == tc.body {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("literal heredoc body disappeared from classification segments: %q", normalized.Segments)
+			}
+			result := NewPatternEngine().ClassifyCommand(cmd, "")
+			if result.Tier != tc.want {
+				t.Fatalf("body risk was hidden: tier=%q pattern=%q segments=%#v",
+					result.Tier, result.MatchedPattern, normalized.Segments)
+			}
+		})
+	}
+}
+
+func TestUnsupportedOrUnterminatedHeredocStillFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cmd  string
+	}{
+		{
+			"unquoted delimiter may expand substitutions",
+			"python3 - <<EOF\nprint($(whoami))\nEOF",
+		},
+		{
+			"unterminated quoted heredoc",
+			"python3 - <<'EOF'\nprint(1)",
+		},
+		{
+			"mixed quoted delimiter",
+			"python3 - <<E'OF'\nprint(1)\nEOF",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := NormalizeCommand(tc.cmd)
+			if !got.ParseError {
+				t.Fatalf("unsupported heredoc should remain fail-closed: %#v", got)
+			}
+		})
+	}
+}
