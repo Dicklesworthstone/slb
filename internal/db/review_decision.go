@@ -2,7 +2,9 @@ package db
 
 import (
 	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -16,7 +18,19 @@ var (
 	ErrReviewDifferentModel     = errors.New("different model required for approval")
 	ErrReviewInvalidDecision    = errors.New("invalid decision (must be approve or reject)")
 	ErrReviewTargetChanged      = errors.New("request changed since it was displayed; reload before reviewing")
+	ErrReviewDelegationMismatch = errors.New("cross-project reviewer identity mismatch")
 )
+
+// DelegatedReviewerIdentity is a reviewer authenticated in another project's
+// authoritative database. The target stores a deterministic, ended session row
+// solely to satisfy review provenance/FK requirements; it never becomes an
+// active reviewer session or contributes to dynamic quorum.
+type DelegatedReviewerIdentity struct {
+	SourceProjectPath string
+	SourceSessionID   string
+	AgentName         string
+	Model             string
+}
 
 // ReviewPolicy is the policy applied while committing a review. Zero TTLs use
 // finite defaults; negative durations and unknown conflict modes are rejected.
@@ -32,6 +46,7 @@ type ReviewPolicy struct {
 	// applying policy loaded for a different project.
 	ExpectedCommandHash string
 	ExpectedProjectPath string
+	DelegatedReviewer   *DelegatedReviewerIdentity
 }
 
 // ReviewOutcome describes only committed state. Notifications must use Request,
@@ -104,19 +119,35 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 
 		var agent, model, storedKey string
 		var ended sql.NullString
-		err = tx.QueryRow(`SELECT agent_name, COALESCE(model, ''), session_key, ended_at FROM sessions WHERE id = ?`,
-			accepted.ReviewerSessionID).Scan(&agent, &model, &storedKey, &ended)
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrSessionNotFound
-		}
-		if err != nil {
-			return fmt.Errorf("reading review session: %w", err)
-		}
-		if ended.Valid {
-			return ErrReviewSessionInactive
-		}
-		if !hmac.Equal([]byte(sessionKey), []byte(storedKey)) {
-			return ErrReviewSessionKeyMismatch
+		delegated := policy.DelegatedReviewer
+		if delegated != nil {
+			if accepted.ReviewerSessionID != delegated.SourceSessionID {
+				return ErrReviewDelegationMismatch
+			}
+			accepted.ReviewerSessionID, agent, model, storedKey, err =
+				db.ensureDelegatedReviewerTx(tx, request.ProjectPath, sessionKey, delegated, now)
+			if err != nil {
+				return err
+			}
+			// Delegated provenance rows are intentionally ended in the same
+			// transaction; they authenticate a completed foreign review and
+			// must never appear as active target-project capacity.
+			ended.Valid = true
+		} else {
+			err = tx.QueryRow(`SELECT agent_name, COALESCE(model, ''), session_key, ended_at FROM sessions WHERE id = ?`,
+				accepted.ReviewerSessionID).Scan(&agent, &model, &storedKey, &ended)
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrSessionNotFound
+			}
+			if err != nil {
+				return fmt.Errorf("reading review session: %w", err)
+			}
+			if ended.Valid {
+				return ErrReviewSessionInactive
+			}
+			if !hmac.Equal([]byte(sessionKey), []byte(storedKey)) {
+				return ErrReviewSessionKeyMismatch
+			}
 		}
 		// Restarting a session does not create an independent second agent.
 		self := accepted.ReviewerSessionID == request.RequestorSessionID || agent == request.RequestorAgent
@@ -191,6 +222,41 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 	return outcome, nil
 }
 
+func (db *DB) ensureDelegatedReviewerTx(tx *sql.Tx, targetProject, sessionKey string,
+	identity *DelegatedReviewerIdentity, now time.Time,
+) (id, agent, model, storedKey string, err error) {
+	if identity == nil || identity.SourceProjectPath == "" || identity.SourceSessionID == "" ||
+		identity.AgentName == "" || targetProject == "" || identity.SourceProjectPath == targetProject {
+		return "", "", "", "", ErrReviewDelegationMismatch
+	}
+	sum := sha256.Sum256([]byte(identity.SourceProjectPath + "\x00" + identity.SourceSessionID))
+	id = "xpr-" + hex.EncodeToString(sum[:16])
+	timestamp := now.UTC().Format(time.RFC3339Nano)
+	_, err = tx.Exec(`
+		INSERT OR IGNORE INTO sessions (
+			id, agent_name, program, model, project_path, session_key,
+			started_at, last_active_at, ended_at
+		) VALUES (?, ?, 'cross-project-review', ?, ?, ?, ?, ?, ?)
+	`, id, identity.AgentName, identity.Model, targetProject, sessionKey, timestamp, timestamp, timestamp)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("recording delegated reviewer identity: %w", err)
+	}
+	var project string
+	var ended sql.NullString
+	err = tx.QueryRow(`
+		SELECT agent_name, COALESCE(model, ''), session_key, project_path, ended_at
+		FROM sessions WHERE id = ?
+	`, id).Scan(&agent, &model, &storedKey, &project, &ended)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("reading delegated reviewer identity: %w", err)
+	}
+	if !ended.Valid || project != targetProject || agent != identity.AgentName || model != identity.Model ||
+		!hmac.Equal([]byte(sessionKey), []byte(storedKey)) {
+		return "", "", "", "", ErrReviewDelegationMismatch
+	}
+	return id, agent, model, storedKey, nil
+}
+
 func (p ReviewPolicy) validate() error {
 	switch p.ConflictResolution {
 	case "", "any_rejection_blocks", "first_wins", "human_breaks_tie":
@@ -199,6 +265,12 @@ func (p ReviewPolicy) validate() error {
 	}
 	if p.ApprovalTTL < 0 || p.CriticalApprovalTTL < 0 || p.TrustedSelfApproveDelay < 0 {
 		return fmt.Errorf("review policy durations must not be negative")
+	}
+	if p.DelegatedReviewer != nil {
+		d := p.DelegatedReviewer
+		if d.SourceProjectPath == "" || d.SourceSessionID == "" || d.AgentName == "" {
+			return ErrReviewDelegationMismatch
+		}
 	}
 	return nil
 }

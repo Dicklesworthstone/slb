@@ -2,8 +2,10 @@
 package core
 
 import (
+	"crypto/hmac"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
@@ -18,7 +20,8 @@ var (
 	ErrRequireDiffModel   = db.ErrReviewDifferentModel
 	ErrInvalidDecision    = db.ErrReviewInvalidDecision
 	ErrMissingSessionKey  = errors.New("session key required for signature")
-	ErrSessionKeyMismatch = db.ErrReviewSessionKeyMismatch
+	ErrSessionKeyMismatch       = db.ErrReviewSessionKeyMismatch
+	ErrCrossProjectReviewDenied = errors.New("cross-project review is not authorized by target policy")
 )
 
 // ConflictResolution specifies how to handle conflicting reviews.
@@ -64,6 +67,10 @@ type ReviewConfig struct {
 	ApprovalTTL time.Duration
 	// CriticalApprovalTTL is the shorter deadline for critical requests.
 	CriticalApprovalTTL time.Duration
+	// CrossProjectReviews and ReviewPool belong to the target project.
+	// ReviewPool contains reviewer agent names, not project paths.
+	CrossProjectReviews bool
+	ReviewPool          []string
 }
 
 // DefaultReviewConfig returns the default review configuration.
@@ -119,6 +126,54 @@ func (rs *ReviewService) SetNotifier(n integrations.RequestNotifier) {
 // Session authentication, request eligibility, the review, and its resulting
 // status/approval deadline are checked and committed under one DB write lock.
 func (rs *ReviewService) SubmitReview(opts ReviewOptions) (*ReviewResult, error) {
+	return rs.submitReview(opts, nil)
+}
+
+// SubmitCrossProjectReview authenticates the reviewer against the source
+// project's authoritative DB, enforces the target project's agent allowlist,
+// then commits a delegated review to the target. The delegated provenance row
+// is ended at commit and therefore never expands target-project reviewer capacity.
+func (rs *ReviewService) SubmitCrossProjectReview(sourceDB *db.DB, sourceProject string, opts ReviewOptions) (*ReviewResult, error) {
+	if sourceDB == nil || !rs.config.CrossProjectReviews {
+		return nil, ErrCrossProjectReviewDenied
+	}
+	session, err := sourceDB.GetSession(opts.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	if !session.IsActive() {
+		return nil, ErrSessionInactive
+	}
+	sourceAbs, err := filepath.Abs(sourceProject)
+	if err != nil {
+		return nil, ErrCrossProjectReviewDenied
+	}
+	sessionAbs, err := filepath.Abs(session.ProjectPath)
+	if err != nil || filepath.Clean(sourceAbs) != filepath.Clean(sessionAbs) {
+		return nil, ErrCrossProjectReviewDenied
+	}
+	if opts.SessionKey == "" || !hmac.Equal([]byte(opts.SessionKey), []byte(session.SessionKey)) {
+		return nil, ErrSessionKeyMismatch
+	}
+	allowed := false
+	for _, agent := range rs.config.ReviewPool {
+		if agent == session.AgentName {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return nil, ErrCrossProjectReviewDenied
+	}
+	return rs.submitReview(opts, &db.DelegatedReviewerIdentity{
+		SourceProjectPath: filepath.Clean(sourceAbs),
+		SourceSessionID: session.ID,
+		AgentName: session.AgentName,
+		Model: session.Model,
+	})
+}
+
+func (rs *ReviewService) submitReview(opts ReviewOptions, delegated *db.DelegatedReviewerIdentity) (*ReviewResult, error) {
 	if opts.SessionID == "" {
 		return nil, errors.New("session_id is required")
 	}
@@ -138,6 +193,7 @@ func (rs *ReviewService) SubmitReview(opts ReviewOptions) (*ReviewResult, error)
 		TrustedSelfApproveDelay: rs.config.TrustedSelfApproveDelay,
 		ApprovalTTL:             rs.config.ApprovalTTL,
 		CriticalApprovalTTL:     rs.config.CriticalApprovalTTL,
+		DelegatedReviewer:       delegated,
 	})
 	if errors.Is(err, db.ErrReviewSessionInactive) {
 		return nil, ErrSessionInactive

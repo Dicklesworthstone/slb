@@ -65,17 +65,29 @@ database contains the request you want to reject.
 			return fmt.Errorf("--reason is required for rejections")
 		}
 
-		// Determine project and database path
-		project, err := projectPath()
-		if err != nil && flagRejectTargetProject == "" {
+		// Determine source project before switching to a target database.
+		sourceProject, err := projectPath()
+		if err != nil {
 			return err
 		}
+		sourceDBPath := GetDB()
+		project := sourceProject
 
-		// Use target project if specified (for cross-project rejections)
-		dbPath := GetDB()
+		// Use target project if specified (for cross-project rejections).
+		dbPath := sourceDBPath
+		crossProject := false
 		if flagRejectTargetProject != "" {
-			project = flagRejectTargetProject
-			dbPath = filepath.Join(flagRejectTargetProject, ".slb", "state.db")
+			targetAbs, absErr := filepath.Abs(flagRejectTargetProject)
+			if absErr != nil {
+				return fmt.Errorf("resolving target project: %w", absErr)
+			}
+			sourceAbs, absErr := filepath.Abs(sourceProject)
+			if absErr != nil {
+				return fmt.Errorf("resolving source project: %w", absErr)
+			}
+			project = filepath.Clean(targetAbs)
+			crossProject = filepath.Clean(sourceAbs) != project
+			dbPath = filepath.Join(project, ".slb", "state.db")
 		}
 
 		// Open database
@@ -105,7 +117,19 @@ database contains the request you want to reject.
 			return err
 		}
 		reviewSvc.SetNotifier(buildAgentMailNotifier(project))
-		result, err := reviewSvc.SubmitReview(opts)
+		var result *core.ReviewResult
+		if crossProject {
+			sourceDB, openErr := db.OpenWithOptions(sourceDBPath, db.OpenOptions{
+				CreateIfNotExists: false, InitSchema: false, ReadOnly: true,
+			})
+			if openErr != nil {
+				return fmt.Errorf("opening source reviewer database: %w", openErr)
+			}
+			defer sourceDB.Close()
+			result, err = reviewSvc.SubmitCrossProjectReview(sourceDB, sourceProject, opts)
+		} else {
+			result, err = reviewSvc.SubmitReview(opts)
+		}
 		if err != nil {
 			return fmt.Errorf("submitting rejection: %w", err)
 		}
