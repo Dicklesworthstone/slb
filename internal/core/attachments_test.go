@@ -7,11 +7,13 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
@@ -125,7 +127,7 @@ func TestCappedBuffer_PartialWrite(t *testing.T) {
 func TestCappedBuffer_AlreadyFull(t *testing.T) {
 	b := &cappedBuffer{max: 5}
 	if _, err := b.Write([]byte("hello")); err != nil {
-		t.Fatalf("First Write failed: %v", err)
+		t.Fatalf("Write failed: %v", err)
 	}
 	// Buffer is exactly full now (remaining = 0)
 	n, err := b.Write([]byte("x"))
@@ -597,4 +599,327 @@ func TestCappedBuffer_Write(t *testing.T) {
 			t.Errorf("expected buffer length 5, got %d", buf.buf.Len())
 		}
 	})
+}
+
+func TestAttachmentFileLimits(t *testing.T) {
+	for _, loader := range []struct {
+		name string
+		load func(string, *AttachmentConfig) (*db.Attachment, error)
+	}{
+		{"file", LoadAttachmentFromFile},
+		{"screenshot", LoadScreenshot},
+		{"excerpt", func(path string, cfg *AttachmentConfig) (*db.Attachment, error) {
+			return CreateLogExcerpt(path, 1, 0, cfg)
+		}},
+	} {
+		t.Run(loader.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "fixture.txt")
+			if loader.name == "screenshot" {
+				path = filepath.Join(t.TempDir(), "fixture.png")
+				writeTinyPNG(t, path, 2, 2)
+			} else if err := os.WriteFile(path, []byte("alpha\nbeta"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, limit := range []int64{0, -1, 1<<63 - 1, info.Size(), info.Size() - 1} {
+				cfg := DefaultAttachmentConfig()
+				cfg.MaxFileSize = limit
+				att, err := loader.load(path, &cfg)
+				if limit > 0 && limit < info.Size() {
+					var ae *AttachmentError
+					if att != nil || !errors.As(err, &ae) || !strings.Contains(ae.Message, "too large") {
+						t.Errorf("limit %d: expected typed size error and no attachment, got %#v, %v", limit, att, err)
+					}
+				} else if err != nil || att == nil {
+					t.Errorf("limit %d: expected attachment, got %#v, %v", limit, att, err)
+				}
+			}
+			cfg := DefaultAttachmentConfig()
+			cfg.AllowedFileTypes = []string{".pdf"}
+			if att, err := loader.load(path, &cfg); err == nil || att != nil {
+				t.Fatalf("file-type restriction ignored: %#v, %v", att, err)
+			}
+			cfg.AllowedFileTypes = []string{strings.ToUpper(strings.TrimPrefix(filepath.Ext(path), "."))}
+			if _, err := loader.load(path, &cfg); err != nil {
+				t.Fatalf("case-insensitive extension without dot: %v", err)
+			}
+		})
+	}
+}
+
+func TestAttachmentImageValidation(t *testing.T) {
+	for _, loader := range []struct {
+		name string
+		load func(string, *AttachmentConfig) (*db.Attachment, error)
+	}{
+		{"file", LoadAttachmentFromFile},
+		{"screenshot", LoadScreenshot},
+	} {
+		t.Run(loader.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "image.jpg")
+			writeTinyPNG(t, path, 8, 2) // MIME must describe the bytes, not the suffix.
+			cfg := DefaultAttachmentConfig()
+			cfg.MaxImageSize = 4
+			if att, err := loader.load(path, &cfg); err == nil || att != nil {
+				t.Errorf("image dimension limit ignored: %#v, %v", att, err)
+			}
+			cfg.MaxImageSize = 8
+			att, err := loader.load(path, &cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(att.Content, "data:image/png;base64,") || att.Metadata["width"] != 8 || att.Metadata["height"] != 2 {
+				t.Errorf("incorrect image metadata: %#v", att)
+			}
+			corrupt := filepath.Join(t.TempDir(), "corrupt.png")
+			if err := os.WriteFile(corrupt, []byte("not an image"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if att, err := loader.load(corrupt, nil); err == nil || att != nil {
+				t.Errorf("corrupt image accepted: %#v, %v", att, err)
+			}
+		})
+	}
+}
+
+func TestCreateLogExcerpt_LargeSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large.log")
+	if err := os.WriteFile(path, []byte(strings.Repeat("x", 128*1024)+"\nok\nlast"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultAttachmentConfig()
+	cfg.MaxFileSize = 7
+	for _, tc := range []struct {
+		start, end int
+		want, span string
+	}{
+		{2, 3, "ok\nlast", "2-3"},
+		{2, 2, "ok", "2-2"},
+		{20, 30, "last", "3-3"},
+	} {
+		att, err := CreateLogExcerpt(path, tc.start, tc.end, &cfg)
+		if err != nil {
+			t.Fatalf("small excerpt from large log: %v", err)
+		}
+		if att.Content != tc.want || att.Metadata["lines"] != tc.span || att.Metadata["total_lines"] != 3 {
+			t.Errorf("range %d-%d: %#v", tc.start, tc.end, att)
+		}
+	}
+	if att, err := CreateLogExcerpt(path, 1, 1, &cfg); err == nil || att != nil {
+		t.Fatalf("oversized selected line was not rejected: attachment present=%v, error=%v", att != nil, err)
+	}
+}
+
+func TestReadAttachmentContent_Bounded(t *testing.T) {
+	for _, tc := range []struct {
+		data  string
+		limit int64
+		valid bool
+	}{
+		{"", 4, true},
+		{"123", 4, true},
+		{"1234", 4, true},
+		{"12345", 4, false},
+		{strings.Repeat("x", 128*1024), 4, false},
+		{"12345", 0, true},
+		{"12345", -1, true},
+		{"12345", 1<<63 - 1, true},
+	} {
+		reader := strings.NewReader(tc.data)
+		data, err := readAttachmentContent(reader, tc.limit)
+		if tc.valid {
+			if err != nil || string(data) != tc.data {
+				t.Errorf("limit %d: read %q, %v", tc.limit, data, err)
+			}
+		} else {
+			if err == nil || data != nil {
+				t.Errorf("limit %d: oversized input accepted", tc.limit)
+			}
+			if consumed := len(tc.data) - reader.Len(); int64(consumed) > tc.limit+1 {
+				t.Errorf("read %d bytes with limit %d", consumed, tc.limit)
+			}
+		}
+	}
+	readErr := errors.New("read failed")
+	for _, reader := range []io.Reader{
+		iotest.ErrReader(readErr),
+		io.MultiReader(strings.NewReader("1234"), iotest.ErrReader(readErr)),
+	} {
+		if data, err := readAttachmentContent(reader, 4); data != nil || !errors.Is(err, readErr) {
+			t.Errorf("read failure was hidden: %q, %v", data, err)
+		}
+	}
+}
+
+func TestCreateLogExcerpt_RangeCompatibility(t *testing.T) {
+	for _, content := range []string{"", "\n", "a", "a\n", "a\r\nb\n", "one\n\nthree", strings.Repeat("x", 8192) + "\nlast\n"} {
+		path := filepath.Join(t.TempDir(), "range.log")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(content, "\n")
+		for _, start := range []int{-1, 0, 1, 2, 3, 10} {
+			for _, end := range []int{-1, 0, 1, 2, 3, 10} {
+				// Reference the original slicing contract independently of the
+				// streaming implementation, including clamping past EOF.
+				first, last := start, end
+				if first < 1 {
+					first = 1
+				}
+				if last < 1 || last > len(lines) {
+					last = len(lines)
+				}
+				if first > last {
+					first = last
+				}
+				want := strings.Join(lines[first-1:last], "\n")
+				cfg := DefaultAttachmentConfig()
+				cfg.MaxFileSize = 8
+				att, err := CreateLogExcerpt(path, start, end, &cfg)
+				if len(want) > 8 {
+					if err == nil || att != nil {
+						t.Fatalf("range %d-%d: oversized excerpt accepted", start, end)
+					}
+					continue
+				}
+				if err != nil {
+					t.Fatalf("range %d-%d: %v", start, end, err)
+				}
+				if att.Content != want || att.Metadata["total_lines"] != len(lines) {
+					t.Errorf("range %d-%d: got %#v, want %q", start, end, att, want)
+				}
+			}
+		}
+	}
+}
+
+func TestAttachmentRejectsNonRegularFiles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "directory.png")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, load := range []func(string, *AttachmentConfig) (*db.Attachment, error){
+		LoadAttachmentFromFile, LoadScreenshot,
+		func(path string, cfg *AttachmentConfig) (*db.Attachment, error) {
+			return CreateLogExcerpt(path, 1, 0, cfg)
+		},
+	} {
+		att, err := load(path, nil)
+		var ae *AttachmentError
+		if att != nil || !errors.As(err, &ae) || !strings.Contains(ae.Message, "regular file") {
+			t.Fatalf("expected typed non-file error, got %#v, %v", att, err)
+		}
+	}
+}
+
+func TestCappedBuffer_EmptyWriteAtLimit(t *testing.T) {
+	b := &cappedBuffer{max: 4}
+	if _, err := b.Write([]byte("1234")); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := b.Write(nil); n != 0 || err != nil || b.Truncated() {
+		t.Fatalf("empty write reported truncation: n=%d, err=%v, truncated=%v", n, err, b.Truncated())
+	}
+}
+
+func TestRunContextCommand_SingleStreamTruncation(t *testing.T) {
+	for _, command := range []string{"echo abcdefghij", "echo abcdefghij 1>&2"} {
+		cfg := DefaultAttachmentConfig()
+		cfg.MaxOutputSize = 4
+		att, err := RunContextCommand(context.Background(), command, &cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if att.Content != "abcd\n... [truncated]" || att.Metadata["truncated"] != true {
+			t.Errorf("truncation must be visible in content and metadata: %#v", att)
+		}
+	}
+}
+
+func TestRunContextCommand_DescendantPipeBounds(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell process fixtures")
+	}
+	t.Setenv("SHELL", "/bin/sh")
+	for _, tc := range []struct {
+		name, command string
+		timeout       time.Duration
+		cancel        bool
+		exitCode      int
+	}{
+		{"deadline", "sleep 3 & wait", 50 * time.Millisecond, false, -1},
+		{"cancellation", "sleep 3 & wait", 0, true, -1},
+		{"successful shell leaves pipes", "sleep 3 & exit 0", 0, false, -1},
+		{"failed shell leaves pipes", "sleep 3 & exit 7", 0, false, 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultAttachmentConfig()
+			cfg.MaxCommandRuntime = tc.timeout
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.cancel {
+				timer := time.AfterFunc(50*time.Millisecond, cancel)
+				defer timer.Stop()
+			}
+			start := time.Now()
+			att, err := RunContextCommand(ctx, tc.command, &cfg)
+			elapsed := time.Since(start)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if elapsed >= 2*time.Second {
+				t.Errorf("inherited output pipes defeated the lifetime bound: %s", elapsed)
+			}
+			if att.Metadata["exit_code"] != tc.exitCode {
+				t.Errorf("exit_code=%v, want %d", att.Metadata["exit_code"], tc.exitCode)
+			}
+			if got := att.Metadata["timed_out"] == true; got != (tc.timeout > 0) {
+				t.Errorf("timed_out=%v for %#v", got, att.Metadata)
+			}
+			if tc.cancel && att.Metadata["cancelled"] != true {
+				t.Errorf("cancellation was not disclosed: %#v", att.Metadata)
+			}
+			if tc.exitCode == -1 && att.Metadata["error"] == nil {
+				t.Errorf("transport/cancellation failure was not disclosed: %#v", att.Metadata)
+			}
+		})
+	}
+}
+
+func TestRunContextCommand_CancelsDescendantWork(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX process-group cancellation")
+	}
+	t.Setenv("SHELL", "/bin/sh")
+	marker := filepath.Join(t.TempDir(), "must-not-be-written")
+	t.Setenv("SLB_TEST_CONTEXT_MARKER", marker)
+	cfg := DefaultAttachmentConfig()
+	cfg.MaxCommandRuntime = 50 * time.Millisecond
+	att, err := RunContextCommand(context.Background(), `(sleep 1; printf leaked > "$SLB_TEST_CONTEXT_MARKER") & wait`, &cfg)
+	if err != nil || att == nil || att.Metadata["timed_out"] != true {
+		t.Fatalf("expected timed-out attachment, got %#v, %v", att, err)
+	}
+	// A bounded pipe wait alone is insufficient: ordinary descendants must
+	// also stop working after their context has been cancelled.
+	time.Sleep(1200 * time.Millisecond)
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("descendant continued after cancellation: stat error=%v", err)
+	}
+}
+
+func TestRunContextCommand_NonzeroExitPreservesOutput(t *testing.T) {
+	command := "echo evidence; exit 7"
+	if runtime.GOOS == "windows" {
+		command = "echo evidence & exit 7"
+	}
+	att, err := RunContextCommand(nil, command, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if att.Metadata["exit_code"] != 7 || !strings.Contains(att.Content, "evidence") || att.Metadata["timed_out"] == true {
+		t.Fatalf("lost ordinary child result: %#v", att)
+	}
 }

@@ -2,6 +2,7 @@
 package core
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -11,6 +12,7 @@ import (
 	_ "image/gif"  // Register GIF format
 	_ "image/jpeg" // Register JPEG format
 	_ "image/png"  // Register PNG format
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,7 +25,8 @@ import (
 
 // AttachmentConfig holds configuration for attachment handling.
 type AttachmentConfig struct {
-	// MaxFileSize is the maximum size for file attachments (default 1MB).
+	// MaxFileSize bounds file/image bytes and selected log excerpts (default 1MB).
+	// Nonpositive values mean no size limit.
 	MaxFileSize int64
 	// MaxOutputSize is the maximum output size for context commands (default 100KB).
 	MaxOutputSize int64
@@ -32,7 +35,8 @@ type AttachmentConfig struct {
 	MaxCommandRuntime time.Duration
 	// MaxImageSize is the maximum dimension for images (default 4096x4096).
 	MaxImageSize int
-	// AllowedFileTypes restricts file types (empty means all allowed).
+	// AllowedFileTypes restricts filename extensions (empty means all allowed).
+	// Extensions are case-insensitive and may include the leading dot.
 	AllowedFileTypes []string
 }
 
@@ -75,27 +79,7 @@ func LoadAttachmentFromFile(path string, config *AttachmentConfig) (*db.Attachme
 		}
 	}
 
-	// Check file exists and get info
-	info, err := os.Stat(absPath)
-	if err != nil {
-		return nil, &AttachmentError{
-			Type:    db.AttachmentTypeFile,
-			Path:    path,
-			Message: fmt.Sprintf("stat: %v", err),
-		}
-	}
-
-	// Check size
-	if config.MaxFileSize > 0 && info.Size() > config.MaxFileSize {
-		return nil, &AttachmentError{
-			Type:    db.AttachmentTypeFile,
-			Path:    path,
-			Message: fmt.Sprintf("file too large: %d bytes (max %d)", info.Size(), config.MaxFileSize),
-		}
-	}
-
-	// Read content
-	content, err := os.ReadFile(absPath)
+	content, err := readAttachmentFile(absPath, config)
 	if err != nil {
 		return nil, &AttachmentError{
 			Type:    db.AttachmentTypeFile,
@@ -107,27 +91,18 @@ func LoadAttachmentFromFile(path string, config *AttachmentConfig) (*db.Attachme
 	// Detect if this is an image
 	attachType := db.AttachmentTypeFile
 	if isImageFile(absPath) {
-		attachType = db.AttachmentTypeScreenshot
+		return screenshotFromContent(absPath, content, config)
 	} else if isDiffFile(absPath) || isDiffContent(content) {
 		attachType = db.AttachmentTypeGitDiff
 	}
 
-	// For images, encode as base64 data URI
-	var contentStr string
-	if attachType == db.AttachmentTypeScreenshot {
-		mimeType := detectImageMimeType(absPath)
-		contentStr = fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(content))
-	} else {
-		contentStr = string(content)
-	}
-
 	return &db.Attachment{
 		Type:    attachType,
-		Content: contentStr,
+		Content: string(content),
 		Metadata: map[string]any{
 			"source":   absPath,
 			"filename": filepath.Base(absPath),
-			"size":     info.Size(),
+			"size":     int64(len(content)),
 		},
 	}, nil
 }
@@ -157,18 +132,21 @@ func LoadScreenshot(path string, config *AttachmentConfig) (*db.Attachment, erro
 		}
 	}
 
-	// Open and validate image dimensions
-	f, err := os.Open(absPath)
+	content, err := readAttachmentFile(absPath, config)
 	if err != nil {
 		return nil, &AttachmentError{
 			Type:    db.AttachmentTypeScreenshot,
 			Path:    path,
-			Message: fmt.Sprintf("opening file: %v", err),
+			Message: fmt.Sprintf("reading file: %v", err),
 		}
 	}
-	defer f.Close()
+	return screenshotFromContent(absPath, content, config)
+}
 
-	imgConfig, _, err := image.DecodeConfig(f)
+// Validate and encode the same bounded snapshot, rather than reopening a path
+// after checking its image header. Both file and screenshot flags use this.
+func screenshotFromContent(path string, content []byte, config *AttachmentConfig) (*db.Attachment, error) {
+	imgConfig, format, err := image.DecodeConfig(bytes.NewReader(content))
 	if err != nil {
 		return nil, &AttachmentError{
 			Type:    db.AttachmentTypeScreenshot,
@@ -187,30 +165,91 @@ func LoadScreenshot(path string, config *AttachmentConfig) (*db.Attachment, erro
 		}
 	}
 
-	// Read and encode
-	content, err := os.ReadFile(absPath)
-	if err != nil {
-		return nil, &AttachmentError{
-			Type:    db.AttachmentTypeScreenshot,
-			Path:    path,
-			Message: fmt.Sprintf("reading file: %v", err),
-		}
-	}
-
-	mimeType := detectImageMimeType(absPath)
+	mimeType := detectImageMimeType("image." + format)
 	dataURI := fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(content))
 
 	return &db.Attachment{
 		Type:    db.AttachmentTypeScreenshot,
 		Content: dataURI,
 		Metadata: map[string]any{
-			"source":      absPath,
-			"filename":    filepath.Base(absPath),
+			"source":      path,
+			"filename":    filepath.Base(path),
+			"size":        int64(len(content)),
 			"width":       imgConfig.Width,
 			"height":      imgConfig.Height,
 			"description": "",
 		},
 	}, nil
+}
+
+// openAttachmentFile rejects ordinary non-file inputs before opening them:
+// opening a FIFO can block, and reading a device can be unbounded. Recheck the
+// opened descriptor too. This is not a sandbox against concurrent path swaps.
+func openAttachmentFile(path string, config *AttachmentConfig) (*os.File, error) {
+	if len(config.AllowedFileTypes) > 0 {
+		ext := strings.TrimPrefix(filepath.Ext(path), ".")
+		allowed := false
+		for _, candidate := range config.AllowedFileTypes {
+			candidate = strings.TrimPrefix(strings.TrimSpace(candidate), ".")
+			if candidate != "" && strings.EqualFold(candidate, ext) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return nil, fmt.Errorf("file type %q is not allowed", filepath.Ext(path))
+		}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("attachment source is not a regular file")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err = f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		_ = f.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("attachment source is not a regular file")
+	}
+	return f, nil
+}
+
+func readAttachmentFile(path string, config *AttachmentConfig) ([]byte, error) {
+	f, err := openAttachmentFile(path, config)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return readAttachmentContent(f, config.MaxFileSize)
+}
+
+// Bound the actual read, not just an earlier Stat size. Read a separate probe
+// byte to distinguish exact-limit files without overflowing a MaxInt64 limit.
+func readAttachmentContent(r io.Reader, limit int64) ([]byte, error) {
+	if limit <= 0 {
+		return io.ReadAll(r)
+	}
+	content, err := io.ReadAll(io.LimitReader(r, limit))
+	if err != nil {
+		return nil, err
+	}
+	var probe [1]byte
+	n, err := io.ReadFull(r, probe[:])
+	if n > 0 {
+		return nil, fmt.Errorf("file too large (max %d bytes)", limit)
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	return content, nil
 }
 
 type cappedBuffer struct {
@@ -220,7 +259,7 @@ type cappedBuffer struct {
 }
 
 func (b *cappedBuffer) Write(p []byte) (int, error) {
-	if b == nil {
+	if b == nil || len(p) == 0 {
 		return len(p), nil
 	}
 	if b.max <= 0 {
@@ -300,8 +339,22 @@ func RunContextCommand(ctx context.Context, command string, config *AttachmentCo
 	stderr := &cappedBuffer{max: config.MaxOutputSize}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	// Context attachments are noninteractive. Reuse execution's process-group
+	// cancellation, and bound pipe draining even when the shell exits first.
+	cmd.WaitDelay = time.Second
+	stopGroup := configureCommandCancellation(cmd, false)
 
 	runErr := cmd.Run()
+	if runErr != nil {
+		if stopGroup != nil {
+			if stopErr := stopGroup(); stopErr != nil && !errors.Is(stopErr, os.ErrProcessDone) {
+				runErr = errors.Join(runErr, fmt.Errorf("stopping context command process group: %w", stopErr))
+			}
+		}
+		if execCtx.Err() != nil {
+			runErr = errors.Join(runErr, execCtx.Err())
+		}
+	}
 
 	duration := time.Since(startTime)
 
@@ -337,7 +390,12 @@ func RunContextCommand(ctx context.Context, command string, config *AttachmentCo
 	truncated := stdout.Truncated() || stderr.Truncated()
 	if config.MaxOutputSize > 0 && int64(len(outputStr)) > config.MaxOutputSize {
 		truncated = true
-		outputStr = outputStr[:config.MaxOutputSize] + "\n... [truncated]"
+		outputStr = outputStr[:config.MaxOutputSize]
+	}
+	// The per-stream buffers may already have discarded data, leaving exactly
+	// MaxOutputSize bytes. Disclose that loss even without a second stream.
+	if truncated {
+		outputStr += "\n... [truncated]"
 	}
 
 	meta := map[string]any{
@@ -348,10 +406,13 @@ func RunContextCommand(ctx context.Context, command string, config *AttachmentCo
 	if timedOut {
 		meta["timed_out"] = true
 	}
+	if errors.Is(runErr, context.Canceled) {
+		meta["cancelled"] = true
+	}
 	if truncated {
 		meta["truncated"] = true
 	}
-	if runErr != nil && (timedOut || exitCode == -1) {
+	if runErr != nil {
 		meta["error"] = runErr.Error()
 	}
 
@@ -378,7 +439,7 @@ func CreateLogExcerpt(path string, startLine, endLine int, config *AttachmentCon
 		}
 	}
 
-	content, err := os.ReadFile(absPath)
+	f, err := openAttachmentFile(absPath, config)
 	if err != nil {
 		return nil, &AttachmentError{
 			Type:    db.AttachmentTypeFile,
@@ -386,30 +447,65 @@ func CreateLogExcerpt(path string, startLine, endLine int, config *AttachmentCon
 			Message: fmt.Sprintf("reading file: %v", err),
 		}
 	}
+	defer f.Close()
 
-	lines := strings.Split(string(content), "\n")
-
-	// Adjust line numbers (1-indexed to 0-indexed)
+	// Match the existing 1-based clamping semantics, including an empty final
+	// line after a trailing newline. Stream skipped lines without retaining
+	// the entire log (or allocating an unbounded buffer for a single line).
 	if startLine < 1 {
 		startLine = 1
 	}
-	if endLine < 1 || endLine > len(lines) {
-		endLine = len(lines)
-	}
-	if startLine > endLine {
+	if endLine > 0 && startLine > endLine {
 		startLine = endLine
 	}
-
-	// Extract lines
-	excerpt := strings.Join(lines[startLine-1:endLine], "\n")
+	reader := bufio.NewReader(f)
+	line := cappedBuffer{max: config.MaxFileSize}
+	excerpt := cappedBuffer{max: config.MaxFileSize}
+	totalLines, first, last := 1, 0, 0
+	for {
+		chunk, readErr := reader.ReadSlice('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, bufio.ErrBufferFull) {
+			return nil, &AttachmentError{Type: db.AttachmentTypeFile, Path: path, Message: fmt.Sprintf("reading file: %v", readErr)}
+		}
+		if len(chunk) > 0 && chunk[len(chunk)-1] == '\n' {
+			chunk = chunk[:len(chunk)-1]
+		}
+		_, _ = line.Write(chunk) // cappedBuffer always consumes writes without error.
+		selected := totalLines >= startLine && (endLine < 1 || totalLines <= endLine)
+		if selected && line.Truncated() {
+			return nil, &AttachmentError{Type: db.AttachmentTypeFile, Path: path, Message: fmt.Sprintf("log excerpt too large (max %d bytes)", config.MaxFileSize)}
+		}
+		if errors.Is(readErr, bufio.ErrBufferFull) {
+			continue
+		}
+		// A requested start past EOF clamps to the last line.
+		if selected || (errors.Is(readErr, io.EOF) && first == 0) {
+			if first == 0 {
+				first = totalLines
+			} else {
+				_, _ = excerpt.Write([]byte("\n"))
+			}
+			_, _ = excerpt.Write([]byte(line.String()))
+			if line.Truncated() || excerpt.Truncated() {
+				return nil, &AttachmentError{Type: db.AttachmentTypeFile, Path: path, Message: fmt.Sprintf("log excerpt too large (max %d bytes)", config.MaxFileSize)}
+			}
+			last = totalLines
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		totalLines++
+		line.buf.Reset()
+		line.truncated = false
+	}
 
 	return &db.Attachment{
 		Type:    db.AttachmentTypeFile, // Log excerpts are a type of file attachment
-		Content: excerpt,
+		Content: excerpt.String(),
 		Metadata: map[string]any{
 			"file":        absPath,
-			"lines":       fmt.Sprintf("%d-%d", startLine, endLine),
-			"total_lines": len(lines),
+			"lines":       fmt.Sprintf("%d-%d", first, last),
+			"total_lines": totalLines,
 			"type":        "log_excerpt",
 		},
 	}, nil
