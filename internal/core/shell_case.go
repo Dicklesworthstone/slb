@@ -7,19 +7,18 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 )
 
-// normalizeCaseCommand uses shell grammar only for scripts containing a case
-// clause. A case pattern's ')' is not a subshell delimiter, and its '|' is not
-// a pipeline. Removing those characters without parsing the surrounding shell
-// would both accept malformed commands and hide executable arms (GitHub #16).
+// normalizeCaseCommand handles shell control flow through the AST path first
+// introduced for case clauses. Splitting punctuation alone leaves "then rm",
+// "do rm", or "! rm" in executable position and hides the actual command from
+// anchored risk patterns. Inspect all conditions, branches and function bodies;
+// do not try to predict which branch runs or whether a function will be called.
 //
 // The boolean reports a syntax error. The caller retains its conservative
 // legacy normalization on error, so stronger risk matches are not discarded.
-// A nil result without an error leaves non-case commands on their existing path.
+// Simple commands keep their existing token/wrapper normalization. In
+// particular, extracted calls must not recursively re-enter this AST path.
 func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
-	if !strings.Contains(raw, "case") && !strings.Contains(strings.ReplaceAll(raw, "\\\n", ""), "case") {
-		return nil, false
-	}
-	if strings.IndexByte(raw, 0) >= 0 {
+	if depth >= maxCommandNesting || len(raw) > 1<<20 || strings.IndexByte(raw, 0) >= 0 {
 		return nil, true
 	}
 	file, err := syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(raw), "")
@@ -31,7 +30,7 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 	var executable []syntax.Node
 	var stack []bool
 	nesting := depth
-	hasCase := false
+	hasControlFlow := false
 	walkCaseSyntax(file, func(node syntax.Node) bool {
 		if node == nil {
 			if stack[len(stack)-1] {
@@ -41,14 +40,21 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 			return true
 		}
 		compound := false
-		switch node.(type) {
-		case *syntax.CaseClause:
-			hasCase = true
+		switch node := node.(type) {
+		case *syntax.Stmt:
+			// Negation changes an exit status, not the effects of the command.
+			hasControlFlow = hasControlFlow || node.Negated
+		case *syntax.CaseClause, *syntax.Block, *syntax.IfClause,
+			*syntax.WhileClause, *syntax.ForClause, *syntax.FuncDecl,
+			*syntax.TimeClause, *syntax.CoprocClause:
+			hasControlFlow = true
 			compound = true
+		case *syntax.ArithmCmd, *syntax.TestClause, *syntax.LetClause:
+			// These contain expressions rather than executable word lists,
+			// but substitutions in those expressions still execute commands.
+			hasControlFlow = true
 		case *syntax.Subshell, *syntax.CmdSubst, *syntax.ProcSubst:
 			result.HasSubshell = true
-			compound = true
-		case *syntax.Block, *syntax.IfClause, *syntax.WhileClause, *syntax.ForClause, *syntax.FuncDecl:
 			compound = true
 		case *syntax.CallExpr, *syntax.DeclClause, *syntax.Redirect:
 			executable = append(executable, node)
@@ -70,7 +76,7 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 		}
 		return true
 	})
-	if !hasCase {
+	if !hasControlFlow {
 		return nil, false
 	}
 
@@ -87,7 +93,7 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 					continue
 				}
 				// A computed executable or an unmodeled shell-code loader
-				// cannot be cleared by an otherwise benign case arm. Check
+				// cannot be cleared by otherwise benign control flow. Check
 				// after wrapper removal so sudo/command/builtin cannot hide it.
 				name := words[0]
 				if strings.ContainsAny(name, "$`*?{") || (strings.Contains(name, "[") && strings.Contains(name, "]")) ||
@@ -133,7 +139,7 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 					}
 				}
 			}
-			// Do not turn previously blocked case scripts into an unchecked
+			// Do not turn structured shell scripts into an unchecked
 			// file-clobbering primitive. Discarding output is understood; other
 			// file writes remain conservative until redirection risk is modeled.
 			switch node.Op {
@@ -158,8 +164,8 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 		}
 	}
 	if len(result.Segments) == 0 {
-		// Empty cases and arms execute no command. Do not classify literal
-		// selector/pattern text as code, or mark the entire script allowlisted.
+		// Empty cases and arithmetic/test expressions may execute no command.
+		// Do not classify literal expression text as code or allowlist the script.
 		result.Segments = []string{":"}
 	}
 	result.Primary = result.Segments[0]
