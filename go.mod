@@ -17,6 +17,7 @@ require (
 	go.yaml.in/yaml/v3 v3.0.4
 	golang.org/x/term v0.39.0
 	modernc.org/sqlite v1.44.2
+	mvdan.cc/sh/v3 v3.10.0
 )
 
 require (

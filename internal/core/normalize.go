@@ -413,6 +413,22 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 		return result
 	}
 
+	// Parse case grammar before rewriting heredoc bodies or splitting shell
+	// punctuation. In particular, a case pattern's ')' does not close a
+	// subshell. Enforce the input limits before invoking either parser.
+	if depth >= maxCommandNesting || len(cmd) > 1<<20 {
+		result.Primary = cmd
+		result.Segments = []string{cmd}
+		result.ParseError = true
+		return result
+	}
+	if parsed, invalid := normalizeCaseCommand(cmd, depth); parsed != nil {
+		parsed.Original = result.Original
+		return parsed
+	} else {
+		result.ParseError = invalid
+	}
+
 	var heredocValid bool
 	cmd, heredocValid = rewriteQuotedHeredocs(cmd)
 	if !heredocValid {
