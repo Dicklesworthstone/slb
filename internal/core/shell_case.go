@@ -1,6 +1,7 @@
 package core
 
 import (
+	"sort"
 	"strings"
 
 	"mvdan.cc/sh/v3/syntax"
@@ -31,7 +32,7 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 	var stack []bool
 	nesting := depth
 	hasCase := false
-	syntax.Walk(file, func(node syntax.Node) bool {
+	walkCaseSyntax(file, func(node syntax.Node) bool {
 		if node == nil {
 			if stack[len(stack)-1] {
 				nesting--
@@ -51,6 +52,13 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 			compound = true
 		case *syntax.CallExpr, *syntax.DeclClause, *syntax.Redirect:
 			executable = append(executable, node)
+		case *syntax.ExtGlob:
+			// The parser stores an extglob's pattern as opaque text, not
+			// expansion nodes. Literal extglobs are supported; dynamic ones
+			// must not hide executable expansions from classification.
+			if strings.ContainsAny(raw[node.Pos().Offset():node.End().Offset()], "$`") {
+				result.ParseError = true
+			}
 		}
 		if compound && nesting+1 >= maxCommandNesting {
 			result.ParseError = true
@@ -66,12 +74,29 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 		return nil, false
 	}
 
-	appendCommand := func(command string) {
+	appendCommand := func(command string, executable bool) {
 		inner := normalizeCommandDepth(command, depth+1)
 		result.Segments = append(result.Segments, inner.Segments...)
 		result.StrippedWrappers = append(result.StrippedWrappers, inner.StrippedWrappers...)
 		result.HasSubshell = result.HasSubshell || inner.HasSubshell
 		result.ParseError = result.ParseError || inner.ParseError
+		if executable {
+			for _, segment := range inner.Segments {
+				words := strings.Fields(segment)
+				if len(words) == 0 {
+					continue
+				}
+				// A computed executable or an unmodeled shell-code loader
+				// cannot be cleared by an otherwise benign case arm. Check
+				// after wrapper removal so sudo/command/builtin cannot hide it.
+				name := words[0]
+				if strings.ContainsAny(name, "$`*?{") || (strings.Contains(name, "[") && strings.Contains(name, "]")) ||
+					strings.Contains(name, "__slb_substitution__") ||
+					name == "eval" || name == "source" || name == "." || name == "exec" {
+					result.ParseError = true
+				}
+			}
+		}
 	}
 	for _, node := range executable {
 		switch node := node.(type) {
@@ -89,11 +114,11 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 				result.ParseError = result.ParseError || !valid
 				words = append(words, text)
 			}
-			appendCommand(strings.Join(words, " "))
+			appendCommand(strings.Join(words, " "), true)
 		case *syntax.DeclClause:
 			text, valid := caseNodeText(raw, node)
 			result.ParseError = result.ParseError || !valid
-			appendCommand(text)
+			appendCommand(text, true)
 		case *syntax.Redirect:
 			if node.Hdoc != nil {
 				// Preserve the quoted-heredoc policy: literal body lines stay
@@ -104,7 +129,7 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 				body := raw[node.Hdoc.Pos().Offset():node.Hdoc.End().Offset()]
 				for _, line := range strings.Split(body, "\n") {
 					if strings.TrimSpace(line) != "" {
-						appendCommand(shellQuote(line))
+						appendCommand(shellQuote(line), false)
 					}
 				}
 			}
@@ -142,6 +167,26 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 	return result, false
 }
 
+// walkCaseSyntax includes parameter-slice arithmetic. The pinned syntax.Walk
+// traverses ParamExp.Index/Repl/Exp but omits Slice.Offset and Slice.Length,
+// which can also contain command substitutions (including in case selectors).
+func walkCaseSyntax(root syntax.Node, visit func(syntax.Node) bool) {
+	syntax.Walk(root, func(node syntax.Node) bool {
+		if !visit(node) {
+			return false
+		}
+		if param, ok := node.(*syntax.ParamExp); ok && param.Slice != nil {
+			if param.Slice.Offset != nil {
+				walkCaseSyntax(param.Slice.Offset, visit)
+			}
+			if param.Slice.Length != nil {
+				walkCaseSyntax(param.Slice.Length, visit)
+			}
+		}
+		return true
+	})
+}
+
 // caseNodeText preserves literal quoting while replacing executable expansions
 // with inert words. The main AST walk independently visits every expansion's
 // commands, including those in selectors, patterns, arithmetic and redirects.
@@ -151,33 +196,47 @@ func caseNodeText(raw string, node syntax.Node) (string, bool) {
 	if start > end || end > uint(len(raw)) {
 		return "", false
 	}
-	var out strings.Builder
-	cursor := start
 	valid := true
-	syntax.Walk(node, func(part syntax.Node) bool {
+	type replacement struct {
+		start, end uint
+		text       string
+	}
+	var replacements []replacement
+	walkCaseSyntax(node, func(part syntax.Node) bool {
 		if part == nil {
 			return true
 		}
-		replacement := ""
+		text := ""
 		switch part.(type) {
 		case *syntax.CmdSubst, *syntax.ProcSubst:
-			replacement = "__slb_substitution__"
+			text = "__slb_substitution__"
 		case *syntax.ArithmExp:
-			replacement = "0"
+			text = "0"
 		}
-		if replacement == "" {
+		if text == "" {
 			return true
 		}
 		lo, hi := part.Pos().Offset(), part.End().Offset()
-		if lo < cursor || hi < lo || hi > end {
+		if lo < start || hi < lo || hi > end {
 			valid = false
 			return false
 		}
-		out.WriteString(raw[cursor:lo])
-		out.WriteString(replacement)
-		cursor = hi
+		replacements = append(replacements, replacement{lo, hi, text})
 		return false
 	})
+	// AST traversal order need not be source order (e.g. assignment indexes
+	// versus values, or supplemental slice expressions).
+	sort.Slice(replacements, func(i, j int) bool { return replacements[i].start < replacements[j].start })
+	var out strings.Builder
+	cursor := start
+	for _, item := range replacements {
+		if item.start < cursor {
+			return "", false
+		}
+		out.WriteString(raw[cursor:item.start])
+		out.WriteString(item.text)
+		cursor = item.end
+	}
 	out.WriteString(raw[cursor:end])
 	return out.String(), valid
 }

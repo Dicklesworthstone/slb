@@ -22,6 +22,8 @@ func TestClassifyCaseStatements(t *testing.T) {
 		"fallthrough":          `case "$x" in a) echo a ;& b) echo b ;;& *) echo other;; esac`,
 		"nested":               `case "$x" in a) case "$y" in b) echo b;; esac;; esac`,
 		"conditionals":         `if true; then case "$x" in a) if true; then echo a; fi;; esac; fi`,
+		"test builtin":         `case "$x" in a) [ -d /tmp ] && echo a;; esac`,
+		"test executable":      `case "$x" in a) /usr/bin/[ -d /tmp ] && echo a;; esac`,
 		"loop":                 `for d in /proc/[0-9]*; do case "$d" in */1) echo "$d";; esac; done`,
 		"compound":             `echo before && case "$x" in a) echo a | cat;; esac; echo after`,
 		"subshell":             `(case "$x" in a) echo a;; esac)`,
@@ -30,6 +32,8 @@ func TestClassifyCaseStatements(t *testing.T) {
 		"process substitution": `cat <(case "$x" in a) echo a;; esac)`,
 		"selector expansion":   `case "$(printf a)" in a) echo a;; esac`,
 		"pattern expansion":    `case "$x" in "$(printf a)") echo a;; esac`,
+		"selector slice":       `case "${x:0:1}" in a) echo a;; esac`,
+		"slice expansion":      `case "${x:$(printf 0):$(printf 1)}" in a) echo a;; esac`,
 		"arithmetic":           `case "$x" in a) echo "$((1+2))";; esac`,
 		"fd redirects":         `case "$x" in a) echo a 2>/dev/null;; esac 2>&1`,
 		"input redirect":       `case "$x" in a) cat </proc/1/status;; esac`,
@@ -63,6 +67,10 @@ func TestClassifyCaseStatementsPreservesDanger(t *testing.T) {
 		"loop":                  `case "$x" in a) for d in /tmp; do rm -rf /; done;; esac`,
 		"selector":              `case "$(rm -rf /)" in a) ls;; esac`,
 		"pattern":               `case "$x" in "$(rm -rf /)") ls;; esac`,
+		"selector slice offset": `case "${x:$(rm -rf /)}" in a) ls;; esac`,
+		"selector slice length": `case "${x:0:$(rm -rf /)}" in a) ls;; esac`,
+		"pattern slice":         `case "$x" in "${y:$(rm -rf /)}") ls;; esac`,
+		"case in slice":         `echo "${x:$(case a in a) rm -rf /;; esac)}"`,
 		"backtick pattern":      "case \"$x\" in \"`rm -rf /`\") ls;; esac",
 		"body substitution":     `case "$x" in a) echo "$(rm -rf /)";; esac`,
 		"arithmetic expansion":  `case "$x" in a) echo "$((1+$(rm -rf /)))";; esac`,
@@ -89,6 +97,31 @@ func TestClassifyCaseStatementsPreservesDanger(t *testing.T) {
 			got := engine.ClassifyCommand(command, "")
 			if got.ParseError || got.Tier != RiskTierCritical || !got.NeedsApproval || got.IsSafe || got.MinApprovals < 1 {
 				t.Fatalf("destructive case command lost its classification: %#v\ncommand: %s", got, command)
+			}
+		})
+	}
+}
+
+func TestClassifyCaseUnresolvedExecutionFailClosed(t *testing.T) {
+	engine := NewPatternEngine()
+	for _, command := range []string{
+		`case "$x" in @($(rm -rf /)|a)) echo a;; esac`,
+		"case \"$x\" in @(`rm -rf /`|a)) echo a;; esac",
+		`case "$x" in a) "$cmd" -rf /;; esac`,
+		`case "$x" in a) sudo "$cmd" -rf /;; esac`,
+		`case "$x" in a) "$(printf rm)" -rf /;; esac`,
+		`case "$x" in a) r{m,mdir} -rf /;; esac`,
+		`case "$x" in a) $'r\x6d' -rf /;; esac`,
+		`case "$x" in a) eval 'rm -rf /';; esac`,
+		`case "$x" in a) builtin eval "$script";; esac`,
+		`case "$x" in a) source "$script";; esac`,
+		`case "$x" in a) . "$script";; esac`,
+		`case "$x" in a) exec "$cmd";; esac`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			got := engine.ClassifyCommand(command, "")
+			if !got.ParseError || !got.NeedsApproval || got.IsSafe {
+				t.Fatalf("unresolved execution in case failed open: %#v", got)
 			}
 		})
 	}
