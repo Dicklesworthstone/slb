@@ -4,6 +4,7 @@
 package audit
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -195,6 +196,23 @@ func Prune(directory string, before time.Time, dryRun bool) (int, error) {
 }
 
 func walk(directory string, visit func(string, Event) error) error {
+	return walkContext(context.Background(), directory, visit)
+}
+
+// Visit streams validated records without a newest-N limit. Consumers can
+// scope before aggregating, so unrelated project traffic cannot hide events.
+// Ordering is unspecified. Returning an error stops the scan immediately.
+func Visit(ctx context.Context, directory string, visit func(Event) error) error {
+	if visit == nil {
+		return errors.New("audit visitor is required")
+	}
+	return walkContext(ctx, directory, func(_ string, event Event) error { return visit(event) })
+}
+
+func walkContext(ctx context.Context, directory string, visit func(string, Event) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if directory == "" {
 		return errors.New("audit directory is required")
 	}
@@ -209,6 +227,9 @@ func walk(directory string, visit func(string, Event) error) error {
 	for {
 		entries, readErr := dir.ReadDir(128)
 		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if !entry.Type().IsRegular() || !strings.HasSuffix(entry.Name(), ".jsonl") || strings.HasPrefix(entry.Name(), ".") {
 				continue
 			}
