@@ -2,6 +2,7 @@
 package db
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -665,8 +666,15 @@ func TestCreateReviewWithValidation_RequireDifferentModel(t *testing.T) {
 		Signature:          sig1,
 		SignatureTimestamp: ts1,
 	}
-	if err := db.CreateReviewWithValidation(r1, sameModel.SessionKey); err != nil {
-		t.Fatalf("CreateReviewWithValidation (same model) failed: %v", err)
+	// A same-model approval is rejected outright rather than recorded as a
+	// non-counting review: the request keeps waiting for a different model.
+	if err := db.CreateReviewWithValidation(r1, sameModel.SessionKey); !errors.Is(err, ErrReviewDifferentModel) {
+		t.Fatalf("CreateReviewWithValidation (same model) error = %v, want %v", err, ErrReviewDifferentModel)
+	}
+	if reviews, err := db.ListReviewsForRequest(req.ID); err != nil {
+		t.Fatalf("ListReviewsForRequest failed: %v", err)
+	} else if len(reviews) != 0 {
+		t.Fatalf("same-model approval must not be recorded, got %d reviews", len(reviews))
 	}
 	stillPending, err := db.GetRequest(req.ID)
 	if err != nil {

@@ -12,11 +12,11 @@ import (
 // proof. It deliberately excludes argv, attachments, raw secrets and session keys.
 type WatchRequestState struct {
 	ID, ProjectPath, Command, CommandHash, Requestor string
-	Status                                        RequestStatus
-	RiskTier                                      RiskTier
-	MinApprovals, Approvals, Rejections             int
-	ExitCode                                      *int
-	CreatedAt, ResolvedAt                          string
+	Status                                           RequestStatus
+	RiskTier                                         RiskTier
+	MinApprovals, Approvals, Rejections              int
+	ExitCode                                         *int
+	CreatedAt, ResolvedAt                            string
 }
 
 type ProjectWatchState struct {
@@ -33,7 +33,7 @@ func (db *DB) ReadProjectWatchState(ctx context.Context, project string, since t
 	if project == "" {
 		return nil, errors.New("watch project is required")
 	}
-	tx, err := db.conn.BeginTx(ctx, nil)
+	tx, err := db.conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}

@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 )
@@ -22,7 +23,7 @@ func (db *DB) ReadRequestReviewSnapshot(ctx context.Context, project, id, sessio
 	if project == "" || id == "" {
 		return nil, errors.New("project and request ID are required")
 	}
-	tx, err := db.conn.BeginTx(ctx, nil)
+	tx, err := db.conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}

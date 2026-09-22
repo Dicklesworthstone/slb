@@ -63,7 +63,18 @@ func OpenWithOptions(path string, opts OpenOptions) (*DB, error) {
 
 	// Build connection string with pragmas
 	// Note: modernc.org/sqlite uses different pragma syntax
-	mode := ""
+	// Writers begin every transaction with BEGIN IMMEDIATE. A deferred
+	// transaction whose first statement reads and then writes (the claim and
+	// review paths lock a row with a self-assigning UPDATE) is refused with
+	// SQLITE_BUSY the moment another connection committed in between, and the
+	// busy handler is deliberately not consulted for that lock upgrade, so
+	// concurrent claimers lost with "database is locked" instead of waiting
+	// their turn. Taking the write lock up front makes contenders queue on
+	// busy_timeout and serializes them, which is what the single-winner
+	// contract needs. Read-only transactions opt out with
+	// sql.TxOptions{ReadOnly: true}, and read-only handles cannot take the
+	// lock at all, so they keep deferred transactions.
+	mode := "&_txlock=immediate"
 	if opts.ReadOnly {
 		mode = "&mode=ro"
 	}

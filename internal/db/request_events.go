@@ -127,7 +127,7 @@ func (db *DB) ReadRequestEvents(ctx context.Context, project, after string, limi
 			return nil, ErrRequestEventScope
 		}
 	}
-	tx, err := db.conn.BeginTx(ctx, nil)
+	tx, err := db.conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
@@ -200,7 +200,7 @@ func (db *DB) RequestEventHead(ctx context.Context, project string) (string, err
 	if project == "" {
 		return "", errors.New("request event project is required")
 	}
-	tx, err := db.conn.BeginTx(ctx, nil)
+	tx, err := db.conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return "", err
 	}

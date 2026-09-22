@@ -955,7 +955,7 @@ func TestApproveFormSubmission(t *testing.T) {
 	approveCalled := false
 	model.OnApprove = func(id string, comments string) tea.Cmd {
 		approveCalled = true
-		return nil
+		return func() tea.Msg { return nil }
 	}
 
 	// Submit the form
@@ -968,6 +968,9 @@ func TestApproveFormSubmission(t *testing.T) {
 	}
 	if model.Mode != DetailModeView {
 		t.Error("should return to view mode after submit")
+	}
+	if !model.ReviewPending {
+		t.Error("submission should be pending until the callback's result arrives")
 	}
 }
 
@@ -1013,7 +1016,7 @@ func TestRejectFormSubmission(t *testing.T) {
 	rejectCalled := false
 	model.OnReject = func(id string, reason string) tea.Cmd {
 		rejectCalled = true
-		return nil
+		return func() tea.Msg { return nil }
 	}
 
 	// Submit the form
@@ -1027,6 +1030,9 @@ func TestRejectFormSubmission(t *testing.T) {
 	}
 	if model.Mode != DetailModeView {
 		t.Error("should return to view mode after submit")
+	}
+	if !model.ReviewPending {
+		t.Error("submission should be pending until the callback's result arrives")
 	}
 }
 
@@ -1094,10 +1100,12 @@ func TestRenderFooterWithCanExecute(t *testing.T) {
 	req.Status = db.StatusApproved
 
 	m := NewDetailModel(req, nil)
+	m.OnExecute = func(requestID string) tea.Cmd { return nil }
 	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 
 	view := m.View()
-	// When canExecute() is true, the footer should show [x] execute
+	// When canExecute() is true and an execute handler is wired, the footer
+	// should show [x] execute
 	if !strings.Contains(view, "execute") {
 		t.Error("Footer should show execute option when canExecute() is true")
 	}
