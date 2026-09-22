@@ -2,7 +2,7 @@ package cli
 
 import (
 	"fmt"
-	"time"
+	"os"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/core"
@@ -19,8 +19,9 @@ var (
 )
 
 func init() {
-	// -s and -t belong to root persistent flags.
-	executeCmd.Flags().StringVar(&flagExecuteSessionID, "session-id", "", "executor session ID (required)")
+	// This local flag shadows the root session flag, so it must preserve -s
+	// itself. Timeout has no -t shorthand: -t remains the persistent --toon.
+	executeCmd.Flags().StringVarP(&flagExecuteSessionID, "session-id", "s", "", "executor session ID (required)")
 	executeCmd.Flags().IntVar(&flagExecuteTimeout, "timeout", 300, "execution timeout in seconds")
 	executeCmd.Flags().BoolVar(&flagExecuteBackground, "background", false, "run in background, return immediately")
 	executeCmd.Flags().StringVar(&flagExecuteLogDir, "log-dir", ".slb/logs", "directory for execution logs")
@@ -48,6 +49,12 @@ var executeCmd = &cobra.Command{
 The command runs in your current shell environment, inheriting all environment
 variables (AWS credentials, KUBECONFIG, virtualenv, etc.).
 
+With --background, a detached supervisor keeps logs and records completion after
+this CLI exits. Startup is confirmed only after the approval claim and process
+start. stdin is /dev/null; interactive commands require foreground execution.
+Use slb status or slb show for the eventual exit status. Startup errors may be
+ambiguous: never retry the raw command or reset its approval.
+
 Gate conditions are validated before execution:
 - Request must be in APPROVED status
 - Approval must not be expired
@@ -61,8 +68,19 @@ Examples:
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		requestID := args[0]
-		if flagExecuteSessionID == "" {
+		sessionID := flagExecuteSessionID
+		if sessionID == "" {
+			sessionID = flagSessionID // Root's -s shorthand.
+		}
+		if sessionID == "" {
+			sessionID = os.Getenv("SLB_SESSION_ID")
+		}
+		if sessionID == "" {
 			return fmt.Errorf("--session-id is required")
+		}
+		executionTimeout, err := executionTimeoutDuration(flagExecuteTimeout)
+		if err != nil {
+			return err
 		}
 		expectedHash, err := cmd.Flags().GetString("expected-command-hash")
 		if err != nil {
@@ -86,19 +104,22 @@ Examples:
 		if err != nil {
 			return fmt.Errorf("loading config: %w", err)
 		}
-		if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
+		engine, err := core.LoadCommandPolicy(dbConn, config.LoadOptions{ProjectDir: req.ProjectPath, ConfigPath: flagConfig})
+		if err != nil {
 			return fmt.Errorf("loading custom patterns: %w", err)
 		}
 
-		executor := core.NewExecutor(dbConn, nil).WithNotifier(buildAgentMailNotifier(req.ProjectPath))
+		executor := core.NewExecutor(dbConn, engine).WithNotifier(buildAgentMailNotifier(req.ProjectPath))
 		format := GetOutput()
 		structured := format == "json" || format == "yaml" || format == "toon"
+		if flagExecuteBackground {
+			return launchBackgroundExecution(cmd, dbConn, req, sessionID, expectedHash, executionTimeout, cfg)
+		}
 		result, execErr := executor.ExecuteApprovedRequest(cmd.Context(), core.ExecuteOptions{
 			RequestID:           requestID,
 			ExpectedCommandHash: expectedHash,
-			SessionID:           flagExecuteSessionID,
-			Timeout:             time.Duration(flagExecuteTimeout) * time.Second,
-			Background:          flagExecuteBackground,
+			SessionID:           sessionID,
+			Timeout:             executionTimeout,
 			LogDir:              flagExecuteLogDir,
 			SuppressOutput:      structured,
 			CaptureRollback:     cfg.General.EnableRollbackCapture,
