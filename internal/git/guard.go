@@ -28,15 +28,16 @@ type RefUpdate struct {
 // of proposed ref updates. Remote locations are hashed, never displayed: URLs
 // can contain credentials. This authorizes a hook, not the eventual Git outcome.
 type GitAssessment struct {
-	Operation        string      `json:"operation"`
-	Repository       string      `json:"repository"`
-	Snapshot         string      `json:"snapshot"`
-	Tree             string      `json:"tree,omitempty"`
-	Head             string      `json:"head,omitempty"`
-	TargetHash       string      `json:"target_hash,omitempty"`
-	Updates          []RefUpdate `json:"updates,omitempty"`
-	Reasons          []string    `json:"reasons"`
-	RequiresApproval bool        `json:"requires_approval"`
+	Operation        string          `json:"operation"`
+	Repository       string          `json:"repository"`
+	Snapshot         string          `json:"snapshot"`
+	Tree             string          `json:"tree,omitempty"`
+	Head             string          `json:"head,omitempty"`
+	TargetHash       string          `json:"target_hash,omitempty"`
+	Updates          []RefUpdate     `json:"updates,omitempty"`
+	Rebase           *RebaseSnapshot `json:"rebase,omitempty"`
+	Reasons          []string        `json:"reasons"`
+	RequiresApproval bool            `json:"requires_approval"`
 }
 
 func gitGuardOutput(ctx context.Context, repo string, args ...string) (string, error) {
@@ -72,7 +73,8 @@ func sealAssessment(a *GitAssessment) error {
 		Head       string
 		TargetHash string
 		Updates    []RefUpdate
-	}{1, a.Operation, a.Repository, a.Tree, a.Head, a.TargetHash, a.Updates}
+		Rebase     *RebaseSnapshot `json:",omitempty"`
+	}{1, a.Operation, a.Repository, a.Tree, a.Head, a.TargetHash, a.Updates, a.Rebase}
 	data, err := json.Marshal(identity)
 	if err != nil {
 		return err
