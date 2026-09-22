@@ -184,26 +184,45 @@ type MailConfig struct {
 	SenderToken                  string `json:"-"`
 }
 
-func NewAgentMailRoute(cfg MailConfig, renderer *Renderer) (Route, error) {
+func validateMailConfig(cfg MailConfig) (MailConfig, error) {
 	if err := validateEndpoint(cfg.URL); err != nil {
-		return Route{}, err
+		return cfg, err
 	}
-	if !filepath.IsAbs(cfg.Project) || cfg.Sender == "" || len(cfg.Recipients) == 0 || len(cfg.Recipients) > 50 || renderer == nil {
-		return Route{}, errors.New("Agent Mail requires a project, registered sender, recipients and renderer")
+	if !filepath.IsAbs(cfg.Project) || cfg.Sender == "" || len(cfg.Recipients) == 0 || len(cfg.Recipients) > 50 {
+		return cfg, errors.New("Agent Mail requires a project, registered sender and recipients")
 	}
 	cfg.Recipients = append([]string(nil), cfg.Recipients...)
-	for _, name := range append(append([]string(nil), cfg.Recipients...), cfg.Sender) {
+	names := append(append([]string(nil), cfg.Recipients...), cfg.Sender)
+	if cfg.HumanRecipient != "" {
+		names = append(names, cfg.HumanRecipient)
+	}
+	for _, name := range names {
 		if strings.TrimSpace(name) == "" || strings.ContainsAny(name, "\x00\r\n") {
-			return Route{}, errors.New("invalid Agent Mail identity")
+			return cfg, errors.New("invalid Agent Mail identity")
 		}
 	}
 	if cfg.Thread == "" {
 		cfg.Thread = "SLB-Reviews"
 	}
-	client := notificationHTTPClient()
+	return cfg, nil
+}
+
+func mailDestinationID(kind string, cfg MailConfig) string {
 	idFields := []string{cfg.URL, cfg.Project, cfg.Sender, cfg.Thread, cfg.HumanRecipient}
 	idFields = append(idFields, cfg.Recipients...)
-	return Route{ID: destinationID("agent-mail", idFields...), Send: func(ctx context.Context, a Alert) error {
+	return destinationID(kind, idFields...)
+}
+
+func NewAgentMailRoute(cfg MailConfig, renderer *Renderer) (Route, error) {
+	cfg, err := validateMailConfig(cfg)
+	if err != nil {
+		return Route{}, err
+	}
+	if renderer == nil {
+		return Route{}, errors.New("Agent Mail requires an alert renderer")
+	}
+	client := notificationHTTPClient()
+	return Route{ID: mailDestinationID("agent-mail", cfg), Send: func(ctx context.Context, a Alert) error {
 		subject, body, err := renderer.Render(a)
 		if err != nil {
 			return err
@@ -211,66 +230,76 @@ func NewAgentMailRoute(cfg MailConfig, renderer *Renderer) (Route, error) {
 		if filepath.Clean(a.Project) != filepath.Clean(cfg.Project) {
 			return errors.New("Agent Mail project mismatch")
 		}
-		initial, session, err := mcpPost(ctx, client, cfg, "", "", 1, "initialize", map[string]any{
-			"protocolVersion": "2025-11-25", "capabilities": map[string]any{}, "clientInfo": map[string]string{"name": "slb-blocked-alerts", "version": "1.0"},
-		})
-		if err != nil {
-			return err
-		}
-		var initialized struct {
-			ProtocolVersion string `json:"protocolVersion"`
-		}
-		if err := json.Unmarshal(initial, &initialized); err != nil {
-			return errors.New("invalid MCP initialize result")
-		}
-		version := initialized.ProtocolVersion
-		if version != "2025-11-25" && version != "2025-06-18" && version != "2025-03-26" {
-			return errors.New("unsupported MCP protocol version")
-		}
-		if session != "" {
-			defer closeMCPSession(ctx, client, cfg, session, version)
-		}
-		if _, _, err := mcpPost(ctx, client, cfg, session, version, 0, "notifications/initialized", nil); err != nil {
-			return err
-		}
-		args := map[string]any{"project_key": cfg.Project, "sender_name": cfg.Sender, "to": cfg.Recipients,
-			"subject": subject, "body_md": body, "thread_id": cfg.Thread, "importance": a.Importance(),
-			"ack_required": a.Repeated, "format": "json"}
-		if cfg.SenderToken != "" {
-			args["sender_token"] = cfg.SenderToken
-		}
-		if a.Repeated && cfg.HumanRecipient != "" {
-			args["cc"] = []string{cfg.HumanRecipient}
-		}
-		result, _, err := mcpPost(ctx, client, cfg, session, version, 2, "tools/call", map[string]any{"name": "send_message", "arguments": args})
-		if err != nil {
-			return err
-		}
-		var tool struct {
-			IsError    bool                          `json:"isError"`
-			Structured json.RawMessage               `json:"structuredContent"`
-			Content    []struct{ Type, Text string } `json:"content"`
-		}
-		if err := json.Unmarshal(result, &tool); err != nil || tool.IsError {
-			return errors.New("Agent Mail send_message failed")
-		}
-		payload := tool.Structured
-		if len(payload) == 0 || string(payload) == "null" {
-			for _, content := range tool.Content {
-				if content.Type == "text" {
-					payload = json.RawMessage(content.Text)
-					break
-				}
+		return sendAgentMail(ctx, client, cfg, subject, body, a.Importance(), a.Repeated)
+	}}, nil
+}
+
+// sendAgentMail is shared by blocked alerts and request lifecycle delivery.
+// The content/routing policy stays with each caller; the actual protocol and
+// positive send_message confirmation have a single implementation.
+func sendAgentMail(ctx context.Context, client *http.Client, cfg MailConfig, subject, body, importance string, acknowledgment bool) error {
+	if len(body) > maxBodyBytes || len(subject) > 512 {
+		return errors.New("Agent Mail message exceeds size limit")
+	}
+	initial, session, err := mcpPost(ctx, client, cfg, "", "", 1, "initialize", map[string]any{
+		"protocolVersion": "2025-11-25", "capabilities": map[string]any{}, "clientInfo": map[string]string{"name": "slb-notifications", "version": "1.0"},
+	})
+	if err != nil {
+		return err
+	}
+	var initialized struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	if err := json.Unmarshal(initial, &initialized); err != nil {
+		return errors.New("invalid MCP initialize result")
+	}
+	version := initialized.ProtocolVersion
+	if version != "2025-11-25" && version != "2025-06-18" && version != "2025-03-26" {
+		return errors.New("unsupported MCP protocol version")
+	}
+	if session != "" {
+		defer closeMCPSession(ctx, client, cfg, session, version)
+	}
+	if _, _, err := mcpPost(ctx, client, cfg, session, version, 0, "notifications/initialized", nil); err != nil {
+		return err
+	}
+	args := map[string]any{"project_key": cfg.Project, "sender_name": cfg.Sender, "to": cfg.Recipients,
+		"subject": subject, "body_md": body, "thread_id": cfg.Thread, "importance": importance,
+		"ack_required": acknowledgment, "format": "json"}
+	if cfg.SenderToken != "" {
+		args["sender_token"] = cfg.SenderToken
+	}
+	if acknowledgment && cfg.HumanRecipient != "" {
+		args["cc"] = []string{cfg.HumanRecipient}
+	}
+	result, _, err := mcpPost(ctx, client, cfg, session, version, 2, "tools/call", map[string]any{"name": "send_message", "arguments": args})
+	if err != nil {
+		return err
+	}
+	var tool struct {
+		IsError    bool                          `json:"isError"`
+		Structured json.RawMessage               `json:"structuredContent"`
+		Content    []struct{ Type, Text string } `json:"content"`
+	}
+	if err := json.Unmarshal(result, &tool); err != nil || tool.IsError {
+		return errors.New("Agent Mail send_message failed")
+	}
+	payload := tool.Structured
+	if len(payload) == 0 || string(payload) == "null" {
+		for _, content := range tool.Content {
+			if content.Type == "text" {
+				payload = json.RawMessage(content.Text)
+				break
 			}
 		}
-		var delivered struct {
-			Count int `json:"count"`
-		}
-		if err := json.Unmarshal(payload, &delivered); err != nil || delivered.Count < 1 {
-			return errors.New("Agent Mail did not confirm delivery")
-		}
-		return nil
-	}}, nil
+	}
+	var delivered struct {
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal(payload, &delivered); err != nil || delivered.Count < 1 {
+		return errors.New("Agent Mail did not confirm delivery")
+	}
+	return nil
 }
 
 func mcpPost(ctx context.Context, client *http.Client, cfg MailConfig, session, version string, id int, method string, params any) (json.RawMessage, string, error) {
