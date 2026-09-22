@@ -38,8 +38,14 @@ type ExecuteOptions struct {
 	SessionID string
 	// Timeout is the maximum execution duration (default 5 minutes).
 	Timeout time.Duration
-	// Background runs the command in background, returning immediately.
+	// Background cannot be implemented by an in-process goroutine: the CLI
+	// must launch a detached supervisor, which calls this method synchronously.
+	// True is rejected rather than silently running in the foreground.
 	Background bool
+	// OnStarted runs after the atomic approval claim and successful process
+	// start, before waiting for completion. It must return promptly. An error
+	// cancels/reaps the child and records failure; it never restores approval.
+	OnStarted func(ExecutionStart) error
 	// LogDir is the directory for execution logs (default .slb/logs/).
 	LogDir string
 	// SuppressOutput prevents streaming command output to stdout (still logged to file).
@@ -50,6 +56,13 @@ type ExecuteOptions struct {
 	CaptureRollback bool
 	// MaxRollbackSizeMB limits filesystem rollback capture (0 uses config default).
 	MaxRollbackSizeMB int
+}
+
+// ExecutionStart is an observation, not another transferable execution permit.
+// LogPath belongs to the already committed claim; PID is the actual command.
+type ExecutionStart struct {
+	RequestID, CommandHash, LogPath string
+	PID                             int
 }
 
 // ExecutionResult holds the result of command execution.
@@ -114,6 +127,9 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 	}
 	if opts.Timeout < 0 {
 		return nil, errors.New("execution timeout must not be negative")
+	}
+	if opts.Background {
+		return nil, errors.New("background execution requires the detached slb execute --background supervisor")
 	}
 
 	// Set defaults
@@ -250,7 +266,13 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 	if !opts.SuppressOutput {
 		streamWriter = os.Stdout
 	}
-	cmdResult, err := RunCommand(execCtx, &request.Command, logPath, streamWriter)
+	var onStarted func(int) error
+	if opts.OnStarted != nil {
+		onStarted = func(pid int) error {
+			return opts.OnStarted(ExecutionStart{RequestID: request.ID, CommandHash: request.Command.Hash, LogPath: logPath, PID: pid})
+		}
+	}
+	cmdResult, err := runCommand(execCtx, &request.Command, logPath, streamWriter, onStarted)
 	if cmdResult != nil {
 		// Cancellation and I/O failures can still have output and a real exit
 		// status. Preserve these before handling the error.

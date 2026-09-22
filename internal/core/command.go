@@ -32,6 +32,13 @@ type CommandResult struct {
 // Once a process starts, its result is returned even on cancellation or I/O error.
 // A non-zero child exit status is not itself a Go error.
 func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, stream io.Writer) (*CommandResult, error) {
+	return runCommand(ctx, spec, logPath, stream, nil)
+}
+
+// onStarted is for a supervising caller, after os/exec successfully starts the
+// command. A failed acknowledgment cancels and reaps the command; it cannot
+// undo side effects already performed before the acknowledgment was lost.
+func runCommand(ctx context.Context, spec *db.CommandSpec, logPath string, stream io.Writer, onStarted func(int) error) (*CommandResult, error) {
 	if spec == nil {
 		return nil, fmt.Errorf("command specification is required")
 	}
@@ -42,6 +49,8 @@ func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, strea
 	// outcome when a terminal interrupt or supervisor termination arrives.
 	ctx, stopSignals := signal.NotifyContext(ctx, commandSignals()...)
 	defer stopSignals()
+	ctx, cancelCommand := context.WithCancel(ctx)
+	defer cancelCommand()
 	startTime := time.Now()
 
 	// Open log file for writing.
@@ -112,8 +121,21 @@ func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, strea
 		}
 		return nil, fmt.Errorf("starting command: %w", err)
 	}
+	var startErr error
 	if logFile != nil {
-		fmt.Fprintf(logFile, "[started pid=%d]\n", cmd.Process.Pid)
+		_, startErr = fmt.Fprintf(logFile, "[started pid=%d]\n", cmd.Process.Pid)
+		if startErr == nil && onStarted != nil {
+			startErr = logFile.Sync()
+		}
+	}
+	if startErr == nil && onStarted != nil {
+		startErr = ctx.Err()
+		if startErr == nil {
+			startErr = onStarted(cmd.Process.Pid)
+		}
+	}
+	if startErr != nil {
+		cancelCommand()
 	}
 	err := cmd.Wait()
 	// Stop remaining group members on failure, including a shell that exits
@@ -148,6 +170,9 @@ func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, strea
 	}
 	if stopErr != nil {
 		err = errors.Join(err, fmt.Errorf("stopping command process group: %w", stopErr))
+	}
+	if startErr != nil {
+		err = errors.Join(err, fmt.Errorf("acknowledging command startup: %w", startErr))
 	}
 
 	if logFile != nil {
