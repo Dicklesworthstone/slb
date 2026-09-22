@@ -14,12 +14,12 @@ import (
 
 // Review errors.
 var (
-	ErrRequestNotPending  = db.ErrReviewNotPending
-	ErrSelfReview         = db.ErrSelfReview
-	ErrAlreadyReviewed    = db.ErrReviewExists
-	ErrRequireDiffModel   = db.ErrReviewDifferentModel
-	ErrInvalidDecision    = db.ErrReviewInvalidDecision
-	ErrMissingSessionKey  = errors.New("session key required for signature")
+	ErrRequestNotPending        = db.ErrReviewNotPending
+	ErrSelfReview               = db.ErrSelfReview
+	ErrAlreadyReviewed          = db.ErrReviewExists
+	ErrRequireDiffModel         = db.ErrReviewDifferentModel
+	ErrInvalidDecision          = db.ErrReviewInvalidDecision
+	ErrMissingSessionKey        = errors.New("session key required for signature")
 	ErrSessionKeyMismatch       = db.ErrReviewSessionKeyMismatch
 	ErrCrossProjectReviewDenied = errors.New("cross-project review is not authorized by target policy")
 )
@@ -167,9 +167,9 @@ func (rs *ReviewService) SubmitCrossProjectReview(sourceDB *db.DB, sourceProject
 	}
 	return rs.submitReview(opts, &db.DelegatedReviewerIdentity{
 		SourceProjectPath: filepath.Clean(sourceAbs),
-		SourceSessionID: session.ID,
-		AgentName: session.AgentName,
-		Model: session.Model,
+		SourceSessionID:   session.ID,
+		AgentName:         session.AgentName,
+		Model:             session.Model,
 	})
 }
 

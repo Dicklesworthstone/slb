@@ -134,7 +134,6 @@ func TestStripSubshellWrapper(t *testing.T) {
 	}
 }
 
-
 func TestQuotedHeredocBodyParsesWithoutUpgrade(t *testing.T) {
 	cases := []struct {
 		name string

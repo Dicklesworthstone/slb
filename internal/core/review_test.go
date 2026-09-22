@@ -1520,7 +1520,6 @@ func TestGetReviewStatus_Errors(t *testing.T) {
 	})
 }
 
-
 func TestSubmitCrossProjectReviewAuthorization(t *testing.T) {
 	source, err := db.Open(":memory:")
 	if err != nil {
@@ -1544,7 +1543,7 @@ func TestSubmitCrossProjectReviewAuthorization(t *testing.T) {
 	request := &db.Request{
 		ProjectPath: "/target", RequestorSessionID: requestor.ID,
 		RequestorAgent: requestor.AgentName, RequestorModel: requestor.Model,
-		Command: db.CommandSpec{Raw: "rm -rf ./build", Cwd: "/target", Shell: true},
+		Command:  db.CommandSpec{Raw: "rm -rf ./build", Cwd: "/target", Shell: true},
 		RiskTier: db.RiskTierDangerous, Status: db.StatusPending, MinApprovals: 1,
 		Justification: db.Justification{Reason: "test delegated review"},
 	}

@@ -219,7 +219,7 @@ func decideAndAuditNativeHook(cmd *cobra.Command, command, sessionID, cwd, actio
 		if err == nil {
 			err = audit.Record(directory, audit.Event{
 				CommandRedacted: core.ApplyRedaction(command, nil),
-				CommandHash: audit.CommandHash(command, cwd), CWD: cwd, SessionID: sessionID,
+				CommandHash:     audit.CommandHash(command, cwd), CWD: cwd, SessionID: sessionID,
 				Action: action, Tier: tier, MatchedPattern: matchedPattern,
 				MinApprovals: minApprovals, Source: source,
 			})
@@ -306,7 +306,7 @@ func emitNativeExecutionHandoff(cmd *cobra.Command, response *daemon.HookQueryRe
 	return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{
 		"hookSpecificOutput": map[string]any{
 			"hookEventName": "PreToolUse", "permissionDecision": "allow",
-			"updatedInput": updated,
+			"updatedInput":      updated,
 			"additionalContext": "SLB is executing the reviewed request once and recording its outcome.",
 		},
 	})

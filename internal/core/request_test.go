@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
-	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 )
 

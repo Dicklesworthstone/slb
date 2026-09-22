@@ -17,8 +17,8 @@ import (
 )
 
 var (
-	flagHookGlobal    bool
-	flagHookMerge     bool
+	flagHookGlobal          bool
+	flagHookMerge           bool
 	flagHookForce           bool
 	flagHookOutputDir       string
 	flagHookLocalOnly       bool
@@ -441,20 +441,20 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	status := map[string]any{
-		"hook_script_exists":    false,
-		"hook_script_path":      hookScriptPath,
-		"settings_configured":   false,
-		"settings_path":         settingsPath,
-		"current_pattern_hash":        currentHash,
-		"installed_pattern_hash":      "",
-		"pattern_hash_matches":        false,
-		"current_hook_caution_action": currentCautionAction,
+		"hook_script_exists":            false,
+		"hook_script_path":              hookScriptPath,
+		"settings_configured":           false,
+		"settings_path":                 settingsPath,
+		"current_pattern_hash":          currentHash,
+		"installed_pattern_hash":        "",
+		"pattern_hash_matches":          false,
+		"current_hook_caution_action":   currentCautionAction,
 		"installed_hook_caution_action": "",
-		"hook_caution_action_matches": false,
-		"daemon_reachable":            false,
-		"daemon_status":               "unreachable",
-		"daemon_pattern_hash":         "",
-		"daemon_pattern_hash_matches": false,
+		"hook_caution_action_matches":   false,
+		"daemon_reachable":              false,
+		"daemon_status":                 "unreachable",
+		"daemon_pattern_hash":           "",
+		"daemon_pattern_hash_matches":   false,
 	}
 
 	if info, err := os.Stat(hookScriptPath); err == nil {
@@ -597,14 +597,14 @@ func runHookHealth(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	result := map[string]any{
-		"status":               "unreachable",
-		"healthy":              false,
-		"daemon_reachable":     false,
-		"fallback_available":   true,
-		"current_pattern_hash":       currentHash,
+		"status":                      "unreachable",
+		"healthy":                     false,
+		"daemon_reachable":            false,
+		"fallback_available":          true,
+		"current_pattern_hash":        currentHash,
 		"current_hook_caution_action": currentCautionAction,
-		"socket_path":                daemon.SocketPathForCWD(cwd),
-		"cwd":                  cwd,
+		"socket_path":                 daemon.SocketPathForCWD(cwd),
+		"cwd":                         cwd,
 	}
 
 	healthCtx, cancel := context.WithTimeout(cmd.Context(), 50*time.Millisecond)
@@ -665,9 +665,9 @@ func runHookTest(cmd *cobra.Command, args []string) error {
 			return output.New(output.Format(GetOutput())).Write(map[string]any{
 				"command": command, "action": live.Action, "message": live.Message,
 				"tier": live.Tier, "matched_pattern": live.MatchedPattern,
-				"min_approvals": live.MinApprovals,
+				"min_approvals":  live.MinApprovals,
 				"needs_approval": live.Action == "block" || live.Action == "execute",
-				"request_id": live.RequestID, "source": "daemon", "fallback": false,
+				"request_id":     live.RequestID, "source": "daemon", "fallback": false,
 			})
 		}
 		daemonErr = queryErr

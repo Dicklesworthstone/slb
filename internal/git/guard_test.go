@@ -102,7 +102,7 @@ func TestAssessPushEffects(t *testing.T) {
 	missing := strings.Repeat("1", 40)
 	for _, tt := range []struct {
 		name, local, from, ref, to string
-		blocked                   bool
+		blocked                    bool
 	}{
 		{"fast forward", "refs/heads/dev", newOID, "refs/heads/dev", old, false},
 		{"rewind", "refs/heads/dev", old, "refs/heads/dev", newOID, true},

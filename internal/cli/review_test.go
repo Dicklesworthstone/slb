@@ -747,7 +747,6 @@ func TestReviewShowCommand_TextOutputWithSafetyArgument(t *testing.T) {
 	}
 }
 
-
 func TestReviewListCommand_ReviewPoolUsesAgentAllowlist(t *testing.T) {
 	h := testutil.NewHarness(t)
 	resetReviewFlags()

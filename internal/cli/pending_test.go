@@ -260,7 +260,6 @@ func TestDedupeStrings(t *testing.T) {
 	}
 }
 
-
 func TestPendingCommand_ReviewPoolUsesAgentAllowlist(t *testing.T) {
 	h := testutil.NewHarness(t)
 	resetPendingFlags()

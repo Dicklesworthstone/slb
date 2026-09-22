@@ -517,7 +517,7 @@ var keyKinds = map[string]valueKind{
 	"integrations.agent_mail_enabled":   kindBool,
 	"integrations.agent_mail_thread":    kindString,
 	"integrations.claude_hooks_enabled": kindBool,
-	"integrations.hook_caution_action": kindString,
+	"integrations.hook_caution_action":  kindString,
 
 	"agents.trusted_self_approve":               kindStringSlice,
 	"agents.trusted_self_approve_delay_seconds": kindInt,

@@ -315,7 +315,6 @@ func showRequestDetails(requestID string) error {
 	return nil
 }
 
-
 func filterRequestsForReviewPool(database *db.DB, requests []*db.Request, localProject string) ([]*db.Request, error) {
 	reviewerAgent := ""
 	reviewerSessionID := ""

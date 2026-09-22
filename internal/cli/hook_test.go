@@ -1002,7 +1002,6 @@ func TestHookCautionPolicyEmbeddedAndLocal(t *testing.T) {
 	}
 }
 
-
 func nativeHookOutput(t *testing.T, payload map[string]any, home string) map[string]any {
 	t.Helper()
 	t.Setenv("HOME", home)
@@ -1036,10 +1035,10 @@ func nativeHookPermission(t *testing.T, output map[string]any) (string, map[stri
 
 func TestNativeHookGuardProtocolAndFallback(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		command    any
-		want       string
-		wantAudit  bool
+		name      string
+		command   any
+		want      string
+		wantAudit bool
 	}{
 		{"safe", "git stash", "allow", false},
 		{"caution stays in SLB", "rm build.cache", "deny", true},
@@ -1051,7 +1050,7 @@ func TestNativeHookGuardProtocolAndFallback(t *testing.T) {
 			project := t.TempDir()
 			output := nativeHookOutput(t, map[string]any{
 				"session_id": "provider-session",
-				"cwd": project,
+				"cwd":        project,
 				"tool_input": map[string]any{"command": tc.command},
 			}, home)
 			permission, _ := nativeHookPermission(t, output)
@@ -1174,7 +1173,6 @@ func TestNativeHookCommandRecognition(t *testing.T) {
 		t.Fatal("legacy Python guard was not recognized")
 	}
 }
-
 
 func TestHookInstallAutoUpgradesLegacyPythonGuard(t *testing.T) {
 	h := testutil.NewHarness(t)
