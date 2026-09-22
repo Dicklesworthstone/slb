@@ -13,7 +13,7 @@ import (
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
-func gitHookApprovalFixture(t *testing.T) (*db.DB, GitHookIntent, *db.Request, *db.Session) {
+func gitHookApprovalFixture(t *testing.T, operation ...string) (*db.DB, GitHookIntent, *db.Request, *db.Session) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	project := t.TempDir()
@@ -30,18 +30,32 @@ func gitHookApprovalFixture(t *testing.T) (*db.DB, GitHookIntent, *db.Request, *
 		}
 	}
 	intent := GitHookIntent{Operation: "pre-commit", ProjectPath: project, Snapshot: strings.Repeat("a", 64), Evidence: "staged file deletion"}
+	if len(operation) != 0 {
+		intent.Operation = operation[0]
+	}
+	reviewers := []*db.Session{reviewer}
+	if intent.Operation == "pre-rebase" {
+		writeExecutionPolicy(t, project, "[patterns.critical]\nmin_approvals = 2\ndynamic_quorum = false\n")
+		second := &db.Session{AgentName: "second-hook-reviewer", Program: "test", Model: "model-c", ProjectPath: project}
+		if err := database.CreateSession(second); err != nil {
+			t.Fatal(err)
+		}
+		reviewers = append(reviewers, second)
+	}
 	expires := time.Now().UTC().Add(time.Hour)
-	request := &db.Request{ProjectPath: project, Command: intent.CommandSpec(), RiskTier: db.RiskTierDangerous, Status: db.StatusApproved,
+	request := &db.Request{ProjectPath: project, Command: intent.CommandSpec(), RiskTier: intent.riskFloor(), Status: db.StatusApproved,
 		RequestorSessionID: requester.ID, RequestorAgent: requester.AgentName, RequestorModel: requester.Model,
-		MinApprovals: 1, ApprovalExpiresAt: &expires, Justification: db.Justification{Reason: "reviewed staged deletion"}}
+		MinApprovals: len(reviewers), ApprovalExpiresAt: &expires, Justification: db.Justification{Reason: "reviewed Git snapshot"}}
 	if err := database.CreateRequest(request); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	review := &db.Review{RequestID: request.ID, ReviewerSessionID: reviewer.ID, ReviewerAgent: reviewer.AgentName, ReviewerModel: reviewer.Model,
-		Decision: db.DecisionApprove, SignatureTimestamp: now, Signature: db.ComputeReviewSignature(reviewer.SessionKey, request.ID, db.DecisionApprove, now)}
-	if err := database.CreateReview(review); err != nil {
-		t.Fatal(err)
+	for _, reviewer := range reviewers {
+		review := &db.Review{RequestID: request.ID, ReviewerSessionID: reviewer.ID, ReviewerAgent: reviewer.AgentName, ReviewerModel: reviewer.Model,
+			Decision: db.DecisionApprove, SignatureTimestamp: now, Signature: db.ComputeReviewSignature(reviewer.SessionKey, request.ID, db.DecisionApprove, now)}
+		if err := database.CreateReview(review); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return database, intent, request, requester
 }
@@ -141,7 +155,7 @@ func TestCreateGitHookRequestCannotBorrowAllowlist(t *testing.T) {
 	cfg := DefaultRequestCreatorConfig()
 	cfg.AgentMailEnabled = false
 	creator := NewRequestCreator(database, nil, engine, cfg)
-	for _, operation := range []string{"pre-commit", "pre-push"} {
+	for _, operation := range []string{"pre-commit", "pre-push", "pre-rebase"} {
 		intent.Operation = operation
 		request, err := creator.CreateGitHookRequest(context.Background(), intent, session.ID, "review requested")
 		if err != nil {
@@ -153,6 +167,9 @@ func TestCreateGitHookRequestCannotBorrowAllowlist(t *testing.T) {
 		if request.Command.Hash != intent.CommandSpec().Hash {
 			t.Fatal("snapshot command changed")
 		}
+		if operation == "pre-rebase" && (request.RiskTier != db.RiskTierCritical || !strings.Contains(request.Justification.SafetyArgument, "--onto")) {
+			t.Fatalf("rebase scope or critical floor lost: %+v", request)
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -162,5 +179,46 @@ func TestCreateGitHookRequestCannotBorrowAllowlist(t *testing.T) {
 	intent.Snapshot = "not-a-hash"
 	if _, err := creator.CreateGitHookRequest(context.Background(), intent, session.ID, ""); err == nil {
 		t.Fatal("invalid snapshot admitted")
+	}
+}
+
+func TestGitRebaseAuthorizationGates(t *testing.T) {
+	for _, kind := range []string{"success-and-replay", "stale-ref-state", "wrong-operation", "critical-quorum", "safe-allowlist", "expired"} {
+		t.Run(kind, func(t *testing.T) {
+			database, intent, request, session := gitHookApprovalFixture(t, "pre-rebase")
+			validate := func(context.Context) error { return nil }
+			switch kind {
+			case "stale-ref-state":
+				validate = func(context.Context) error { return errors.New("Git snapshot changed") }
+			case "wrong-operation":
+				intent.Operation = "pre-push"
+			case "critical-quorum":
+				writeExecutionPolicy(t, intent.ProjectPath, "[patterns.critical]\nmin_approvals = 3\ndynamic_quorum = false\n")
+			case "safe-allowlist":
+				writeExecutionPolicy(t, intent.ProjectPath, "[patterns.safe]\npatterns = ['.*']\n[patterns.critical]\nmin_approvals = 3\ndynamic_quorum = false\n")
+			case "expired":
+				if _, err := database.Exec("UPDATE requests SET approval_expires_at = '2000-01-01T00:00:00Z' WHERE id = ?", request.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			executor := NewExecutor(database, NewPatternEngine())
+			result, err := executor.AuthorizeGitHook(context.Background(), intent, request.ID, session.ID, validate)
+			if kind == "success-and-replay" {
+				if err != nil || result.Status != db.StatusExecuted {
+					t.Fatalf("valid rebase approval: %+v %v", result, err)
+				}
+				if _, err := executor.AuthorizeGitHook(context.Background(), intent, request.ID, session.ID, validate); err == nil {
+					t.Fatal("replayed rebase authorization")
+				}
+			} else {
+				if err == nil {
+					t.Fatal("invalid rebase approval accepted")
+				}
+				stored, err := database.GetRequest(request.ID)
+				if err != nil || stored.Status != db.StatusApproved || stored.Execution != nil {
+					t.Fatalf("failed rebase gate consumed approval: %+v %v", stored, err)
+				}
+			}
+		})
 	}
 }

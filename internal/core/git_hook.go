@@ -18,8 +18,8 @@ import (
 )
 
 // GitHookIntent is an approval-only action. It must never execute a second Git
-// command from inside a hook. The snapshot is computed from Git's index tree or
-// complete pre-push ref-update protocol; Evidence is display-only context.
+// command from inside a hook. Snapshots describe the index, pre-push updates,
+// or hook-visible rebase branch state; Evidence is display-only context.
 type GitHookIntent struct {
 	Operation   string `json:"operation"`
 	ProjectPath string `json:"project_path"`
@@ -28,7 +28,7 @@ type GitHookIntent struct {
 }
 
 func (intent GitHookIntent) validate() error {
-	if intent.Operation != "pre-commit" && intent.Operation != "pre-push" {
+	if intent.Operation != "pre-commit" && intent.Operation != "pre-push" && intent.Operation != "pre-rebase" {
 		return errors.New("unsupported Git hook operation")
 	}
 	decoded, err := hex.DecodeString(intent.Snapshot)
@@ -51,7 +51,9 @@ func (intent GitHookIntent) CommandSpec() db.CommandSpec {
 }
 
 func (intent GitHookIntent) riskFloor() db.RiskTier {
-	if intent.Operation == "pre-push" {
+	// Rebase's native protocol omits destination and editing options. Even a
+	// private branch needs critical review; no safe/no-op inference is sound.
+	if intent.Operation == "pre-push" || intent.Operation == "pre-rebase" {
 		return db.RiskTierCritical
 	}
 	return db.RiskTierDangerous
@@ -108,6 +110,9 @@ func (rc *RequestCreator) CreateGitHookRequest(ctx context.Context, intent GitHo
 			Goal:           "Authorize exactly one native Git hook invocation for this snapshot.",
 			SafetyArgument: "Approval permits the hook to return, not proof that Git succeeded. Changed snapshots require a new review. Retry Git after approval; do not run slb execute on this token.",
 		},
+	}
+	if intent.Operation == "pre-rebase" {
+		request.Justification.SafetyArgument += " Rebase approval covers hook-visible branch state, not a complete command: Git does not expose --onto, the interactive todo, exec commands or --update-refs. Review the intended rewrite separately."
 	}
 	if _, err := rc.rateLimiter.AdmitRequest(ctx, request); err != nil {
 		return nil, err

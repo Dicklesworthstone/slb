@@ -22,14 +22,16 @@ import (
 
 func init() {
 	rootCmd.AddCommand(newGitHooksCmd(), newGitCheckCmd())
-	hookCmd.AddCommand(newNativeGitHookCmd("pre-commit"), newNativeGitHookCmd("pre-push"))
+	hookCmd.AddCommand(newNativeGitHookCmd("pre-commit"), newNativeGitHookCmd("pre-push"), newNativeGitHookCmd("pre-rebase"))
 }
 
 func newGitHooksCmd() *cobra.Command {
-	command := &cobra.Command{Use: "git-hooks", Short: "Install native Git approval hooks", Long: `Protect staged deletions/type changes and destructive or protected-ref pushes.
+	command := &cobra.Command{Use: "git-hooks", Short: "Install native Git approval hooks", Long: `Protect staged deletions/type changes, destructive or protected-ref pushes, and rebases.
 Uses Git's effective hooks directory, including worktrees and core.hooksPath.
 Existing foreign hooks are never overwritten. Uninstall preserves disabled backups.
 Git must be able to find slb on PATH; missing SLB blocks the operation.
+Rebases require critical review of hook-visible branch state. Git does not
+expose --onto, interactive edits, exec commands or --update-refs to this hook.
 
 These hooks do not intercept checkout, reset or clean. Client-side hooks are not
 an access-control boundary. Run 'slb hook install' for Claude Code interception.`}
@@ -57,7 +59,7 @@ an access-control boundary. Run 'slb hook install' for Claude Code interception.
 			}
 			return writeGitHookOutput(cmd, statuses)
 		}}
-		child.Flags().StringSliceVar(&names, "hooks", []string{"pre-commit", "pre-push"}, "selected native Git hooks")
+		child.Flags().StringSliceVar(&names, "hooks", []string{"pre-commit", "pre-push", "pre-rebase"}, "selected native Git hooks")
 		command.AddCommand(child)
 	}
 	// This token can appear in a reviewed request, but never releases a hook
@@ -69,12 +71,21 @@ an access-control boundary. Run 'slb hook install' for Claude Code interception.
 }
 
 func newGitCheckCmd() *cobra.Command {
-	var operation, remote, location, reason string
+	var operation, remote, location, upstream, branch, reason string
 	var request, exitCode, newRequest bool
 	command := &cobra.Command{Use: "git-check", Short: "Inspect a native Git operation without running it", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
 		ctx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
 		defer cancel()
-		assessment, revalidate, err := assessNativeGit(ctx, operation, remote, location, cmd.InOrStdin())
+		first, second := remote, location
+		if operation == "rebase" || operation == "pre-rebase" {
+			if remote != "" || location != "" {
+				return errors.New("rebase uses --upstream and --branch, not --remote or --location")
+			}
+			first, second = upstream, branch
+		} else if upstream != "" || branch != "" {
+			return errors.New("--upstream and --branch require --operation=rebase")
+		}
+		assessment, revalidate, err := assessNativeGit(ctx, operation, first, second, cmd.InOrStdin())
 		if err != nil {
 			return err
 		}
@@ -96,9 +107,11 @@ func newGitCheckCmd() *cobra.Command {
 		}
 		return nil
 	}}
-	command.Flags().StringVar(&operation, "operation", "commit", "commit or push (push reads Git's pre-push protocol from stdin)")
+	command.Flags().StringVar(&operation, "operation", "commit", "commit, push or rebase (push reads Git's pre-push protocol from stdin)")
 	command.Flags().StringVar(&remote, "remote", "", "pre-push remote name")
 	command.Flags().StringVar(&location, "location", "", "pre-push remote location (stored only as a hash)")
+	command.Flags().StringVar(&upstream, "upstream", "", "rebase upstream revision; use --upstream=--root for a root rebase")
+	command.Flags().StringVar(&branch, "branch", "", "optional rebase branch/commit (default: current HEAD)")
 	command.Flags().StringVar(&reason, "reason", "", "rationale for a requested Git authorization")
 	command.Flags().BoolVar(&request, "request", false, "submit or show approval for this exact snapshot without consuming it")
 	command.Flags().BoolVar(&newRequest, "new-request", false, "explicitly submit a new review after rejection or expiry")
@@ -111,15 +124,21 @@ func newNativeGitHookCmd(operation string) *cobra.Command {
 	if operation == "pre-push" {
 		command.Args = cobra.ExactArgs(2)
 		command.Use += " <remote> <location>"
+	} else if operation == "pre-rebase" {
+		command.Args = cobra.RangeArgs(1, 2)
+		command.Use += " <upstream> [branch]"
 	}
 	command.RunE = func(cmd *cobra.Command, args []string) error {
 		ctx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
 		defer cancel()
-		remote, location := "", ""
-		if len(args) == 2 {
-			remote, location = args[0], args[1]
+		first, second := "", ""
+		if len(args) > 0 {
+			first = args[0]
 		}
-		assessment, revalidate, err := assessNativeGit(ctx, operation, remote, location, cmd.InOrStdin())
+		if len(args) > 1 {
+			second = args[1]
+		}
+		assessment, revalidate, err := assessNativeGit(ctx, operation, first, second, cmd.InOrStdin())
 		if err != nil {
 			return fmt.Errorf("SLB: unable to assess Git operation; blocked: %w", err)
 		}
@@ -146,7 +165,9 @@ func writeGitHookOutput(cmd *cobra.Command, value any) error {
 	return output.New(output.Format(format)).Write(value)
 }
 
-func assessNativeGit(ctx context.Context, operation, remote, location string, input io.Reader) (*gitutil.GitAssessment, func(context.Context) error, error) {
+// first/second are the operation's native hook arguments: remote/location for
+// push or upstream/optional branch for rebase. Commit has neither.
+func assessNativeGit(ctx context.Context, operation, first, second string, input io.Reader) (*gitutil.GitAssessment, func(context.Context) error, error) {
 	repo, err := os.Getwd()
 	if err != nil {
 		return nil, nil, err
@@ -171,16 +192,20 @@ func assessNativeGit(ctx context.Context, operation, remote, location string, in
 			if err != nil {
 				return nil, err
 			}
-			return gitutil.AssessPush(ctx, repo, remote, location, bytes.NewReader(protocol), protected)
+			return gitutil.AssessPush(ctx, repo, first, second, bytes.NewReader(protocol), protected)
+		}
+	case "rebase", "pre-rebase":
+		assess = func(ctx context.Context) (*gitutil.GitAssessment, error) {
+			return gitutil.AssessRebase(ctx, repo, first, second)
 		}
 	default:
-		return nil, nil, errors.New("operation must be commit or push")
+		return nil, nil, errors.New("operation must be commit, push or rebase")
 	}
 	assessment, err := assess(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	// Recheck captured input/index under the approval claim's writer reservation.
+	// Recheck captured input/index/refs under the claim's writer reservation.
 	revalidate := func(ctx context.Context) error {
 		current, err := assess(ctx)
 		if err != nil {

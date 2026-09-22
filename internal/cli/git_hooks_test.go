@@ -212,3 +212,126 @@ func TestNativeGitSafeOperationNeedsNoSLBDatabase(t *testing.T) {
 		t.Fatalf("safe Git operation required initialization: %+v %v", result, err)
 	}
 }
+
+func TestNativeGitRebaseCLIRequestReviewRetry(t *testing.T) {
+	for _, stale := range []bool{false, true} {
+		t.Run(map[bool]string{false: "valid", true: "stale-refs"}[stale], func(t *testing.T) {
+			repo, database, _, reviewer := nativeCLIFixture(t)
+			t.Setenv("SLB_GIT_NEW_REQUEST", "")
+			t.Setenv("SLB_GIT_REASON", "Review branch rewrite")
+			nativeCLIGit(t, repo, "add", "tracked.txt")
+			nativeCLIGit(t, repo, "switch", "-c", "topic")
+			nativeCLIGit(t, repo, "commit", "--allow-empty", "-m", "topic")
+			configText := "[integrations]\nagent_mail_enabled = false\n[patterns.critical]\nmin_approvals = 2\ndynamic_quorum = false\n"
+			if err := os.WriteFile(filepath.Join(repo, ".slb", "config.toml"), []byte(configText), 0600); err != nil {
+				t.Fatal(err)
+			}
+			secondReviewer := &db.Session{AgentName: "SecondGitReviewer", Program: "test", Model: "model-c", ProjectPath: repo}
+			if err := database.CreateSession(secondReviewer); err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			assessment, revalidate, err := assessNativeGit(ctx, "rebase", "main", "", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			first, err := processNativeGitHook(ctx, assessment, revalidate, true, false, "review rewrite")
+			if err != nil || first.Allowed || first.RequestID == "" {
+				t.Fatalf("rebase admission: %+v %v", first, err)
+			}
+			request, err := database.GetRequest(first.RequestID)
+			if err != nil || request.RiskTier != db.RiskTierCritical || request.MinApprovals != 2 || !strings.Contains(request.Justification.ExpectedEffect, "rebase_branch_snapshot") {
+				t.Fatalf("invalid rebase review: %+v %v", request, err)
+			}
+			pending, err := processNativeGitHook(ctx, assessment, revalidate, true, false, "")
+			if err != nil || pending.RequestID != first.RequestID || pending.Allowed {
+				t.Fatalf("pending rebase duplicated: %+v %v", pending, err)
+			}
+			approveNativeCLIRequest(t, database, first.RequestID, reviewer)
+			if _, err := processNativeGitHook(ctx, assessment, revalidate, true, false, ""); err == nil {
+				t.Fatal("one approval satisfied two-review quorum")
+			}
+			approveNativeCLIRequest(t, database, first.RequestID, secondReviewer)
+			preview, err := processNativeGitHook(ctx, assessment, revalidate, false, false, "")
+			if err != nil || preview.Allowed || preview.Status != db.StatusApproved {
+				t.Fatalf("preview consumed rebase: %+v %v", preview, err)
+			}
+			if stale {
+				head := nativeCLIGit(t, repo, "rev-parse", "HEAD")
+				nativeCLIGit(t, repo, "update-ref", "refs/remotes/origin/topic", head)
+				if _, err := processNativeGitHook(ctx, assessment, revalidate, true, false, ""); err == nil {
+					t.Fatal("stale ref snapshot accepted")
+				}
+				stored, err := database.GetRequest(first.RequestID)
+				if err != nil || stored.Status != db.StatusApproved || stored.Execution != nil {
+					t.Fatalf("stale check consumed approval: %+v %v", stored, err)
+				}
+				return
+			}
+			var stdout, stderr bytes.Buffer
+			command := newNativeGitHookCmd("pre-rebase")
+			command.SetArgs([]string{"--", "main"})
+			command.SetOut(&stdout)
+			command.SetErr(&stderr)
+			if err := command.Execute(); err != nil {
+				t.Fatalf("approved native rebase: %v (%s)", err, stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("hook polluted stdout: %s", stdout.String())
+			}
+			stored, err := database.GetRequest(first.RequestID)
+			if err != nil || stored.Status != db.StatusExecuted {
+				t.Fatalf("approval not consumed: %+v %v", stored, err)
+			}
+			replay, err := processNativeGitHook(ctx, assessment, revalidate, true, false, "")
+			if err != nil || replay.Allowed || replay.RequestID == first.RequestID {
+				t.Fatalf("replayed native rebase: %+v %v", replay, err)
+			}
+		})
+	}
+}
+
+func TestNativeGitRebaseDiagnosticsAndArguments(t *testing.T) {
+	_, _, _, _ = nativeCLIFixture(t)
+	previousOutput, previousJSON, previousTOON := flagOutput, flagJSON, flagTOON
+	flagOutput, flagJSON, flagTOON = "json", true, false
+	t.Cleanup(func() { flagOutput, flagJSON, flagTOON = previousOutput, previousJSON, previousTOON })
+	for _, tc := range []struct {
+		args  []string
+		valid bool
+	}{
+		{[]string{"--operation=rebase", "--upstream=main"}, true},
+		{[]string{"--operation=rebase", "--upstream=--root", "--branch=main"}, true},
+		{[]string{"--operation=rebase"}, false},
+		{[]string{"--operation=rebase", "--upstream=main", "--remote=origin"}, false},
+		{[]string{"--operation=commit", "--upstream=main"}, false},
+	} {
+		var stdout bytes.Buffer
+		command := newGitCheckCmd()
+		command.SetArgs(tc.args)
+		command.SetOut(&stdout)
+		err := command.Execute()
+		if !tc.valid {
+			if err == nil {
+				t.Fatalf("accepted invalid diagnostic: %v", tc.args)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		var assessment gitutil.GitAssessment
+		if err := json.Unmarshal(stdout.Bytes(), &assessment); err != nil {
+			t.Fatal(err)
+		}
+		if assessment.Rebase == nil || !assessment.RequiresApproval || assessment.Rebase.Scope != "rebase_branch_snapshot" {
+			t.Fatalf("wrong rebase diagnostic: %+v", assessment)
+		}
+	}
+	command := newNativeGitHookCmd("pre-rebase")
+	for _, args := range [][]string{nil, {"one", "two", "three"}} {
+		if err := command.Args(command, args); err == nil {
+			t.Fatalf("invalid native rebase arity accepted: %v", args)
+		}
+	}
+}

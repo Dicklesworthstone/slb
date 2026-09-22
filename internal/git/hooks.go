@@ -24,12 +24,12 @@ type HookStatus struct {
 
 func hookNames(names []string) ([]string, error) {
 	if len(names) == 0 {
-		names = []string{"pre-commit", "pre-push"}
+		names = []string{"pre-commit", "pre-push", "pre-rebase"}
 	}
 	seen := make(map[string]bool)
 	for _, name := range names {
-		if name != "pre-commit" && name != "pre-push" {
-			return nil, fmt.Errorf("unsupported Git hook %q; supported: pre-commit, pre-push", name)
+		if name != "pre-commit" && name != "pre-push" && name != "pre-rebase" {
+			return nil, fmt.Errorf("unsupported Git hook %q; supported: pre-commit, pre-push, pre-rebase", name)
 		}
 		if seen[name] {
 			return nil, fmt.Errorf("duplicate Git hook %q", name)

@@ -40,6 +40,9 @@ func TestNativeHooksLifecycle(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if len(statuses) != 3 || statuses[2].Name != "pre-rebase" {
+				t.Fatalf("default hooks omit rebase: %+v", statuses)
+			}
 			for _, status := range statuses {
 				if !status.Installed || !status.Managed || !status.Executable {
 					t.Fatalf("invalid status: %+v", status)
@@ -115,7 +118,7 @@ func TestNativeHooksPreserveForeignAndSymlink(t *testing.T) {
 			}
 		})
 	}
-	for _, names := range [][]string{{"../escape"}, {"pre-rebase"}, {"pre-push", "pre-push"}} {
+	for _, names := range [][]string{{"../escape"}, {"post-rewrite"}, {"pre-push", "pre-push"}} {
 		if _, err := InstallNativeHooks(context.Background(), hookTestRepo(t), names); err == nil {
 			t.Fatal("accepted invalid hooks", names)
 		}
@@ -166,5 +169,86 @@ func TestNativeProtectedBranches(t *testing.T) {
 	hookTestGit(t, repo, "config", "--add", "slb.protectedBranch", "invalid branch")
 	if _, err := NativeProtectedBranches(context.Background(), repo); err == nil {
 		t.Fatal("invalid protected branch ignored")
+	}
+}
+
+// Exercise Git itself, not just a shell calling the hook. The fake SLB records
+// the exact hook protocol and refuses authorization, so Git must keep HEAD.
+func TestNativeRebaseHookInterceptsGit(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"current", []string{"--force-rebase", "main"}, []string{"main"}},
+		{"explicit", []string{"--force-rebase", "main", "topic"}, []string{"main", "topic"}},
+		{"root", []string{"--root"}, []string{"--root"}},
+		{"interactive-root", []string{"--interactive", "--root", "topic"}, []string{"--root", "topic"}},
+		{"onto-not-exposed", []string{"--force-rebase", "--onto", "HEAD", "main", "topic"}, []string{"main", "topic"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := hookTestRepo(t)
+			hookTestGit(t, repo, "commit", "--allow-empty", "-m", "base")
+			hookTestGit(t, repo, "switch", "-c", "topic")
+			hookTestGit(t, repo, "commit", "--allow-empty", "-m", "topic")
+			head := hookTestGit(t, repo, "rev-parse", "HEAD")
+			statuses, err := InstallNativeHooks(context.Background(), repo, []string{"pre-rebase"})
+			if err != nil || len(statuses) != 1 || !statuses[0].Managed {
+				t.Fatalf("install: %+v %v", statuses, err)
+			}
+			bin := t.TempDir()
+			capture := filepath.Join(t.TempDir(), "arguments")
+			script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SLB_REBASE_TEST_ARGS\"\nexit 17\n"
+			if err := os.WriteFile(filepath.Join(bin, "slb"), []byte(script), 0755); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command("git", append([]string{"-C", repo, "rebase"}, tc.args...)...)
+			command.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "SLB_REBASE_TEST_ARGS="+capture, "GIT_EDITOR=false", "GIT_SEQUENCE_EDITOR=false")
+			data, err := command.CombinedOutput()
+			if err == nil || !strings.Contains(string(data), "pre-rebase hook refused") {
+				t.Fatalf("Git ignored rejection: %s %v", data, err)
+			}
+			actual, err := os.ReadFile(capture)
+			want := strings.Join(append([]string{"hook", "pre-rebase", "--"}, tc.want...), "\n") + "\n"
+			if err != nil || string(actual) != want {
+				t.Fatalf("protocol: %q want %q (%v)", actual, want, err)
+			}
+			if after := hookTestGit(t, repo, "rev-parse", "HEAD"); after != head {
+				t.Fatal("rejected rebase changed HEAD")
+			}
+		})
+	}
+}
+
+func TestNativeRebaseHookMissingBinaryAndForeignHook(t *testing.T) {
+	repo := hookTestRepo(t)
+	statuses, err := InstallNativeHooks(context.Background(), repo, []string{"pre-rebase"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("/bin/sh", statuses[0].Path, "--root")
+	command.Env = append(os.Environ(), "PATH="+t.TempDir())
+	if out, err := command.CombinedOutput(); err == nil || !strings.Contains(string(out), "blocked") {
+		t.Fatalf("missing binary allowed rebase: %s %v", out, err)
+	}
+	// Existing foreign pre-rebase scripts must survive both install/uninstall.
+	foreignRepo := hookTestRepo(t)
+	dir, err := NativeHookDirectory(context.Background(), foreignRepo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "pre-rebase")
+	content := "#!/bin/sh\necho existing rebase policy >&2\nexit 1\n"
+	if err := os.WriteFile(path, []byte(content), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InstallNativeHooks(context.Background(), foreignRepo, nil); err == nil {
+		t.Fatal("replaced foreign rebase gate")
+	}
+	if _, err := UninstallNativeHooks(context.Background(), foreignRepo, nil); err == nil {
+		t.Fatal("uninstalled foreign rebase gate")
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != content {
+		t.Fatalf("foreign gate changed: %q %v", data, err)
 	}
 }
