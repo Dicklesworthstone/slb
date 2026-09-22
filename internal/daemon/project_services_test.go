@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -12,8 +15,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/audit"
 	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/db"
+	blockedalerts "github.com/Dicklesworthstone/slb/internal/notifications"
 	"github.com/charmbracelet/log"
 )
 
@@ -190,5 +195,123 @@ func TestProjectPendingProcessorSelectsOnlyItsOwnRequests(t *testing.T) {
 	requests, err = global.pendingRequests()
 	if err != nil || len(requests) != 2 {
 		t.Fatalf("explicitly global processor lost requests: %+v %v", requests, err)
+	}
+}
+
+func TestProjectServicesDeliversOfflineBlockedAuditFromTOML(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
+	project := t.TempDir()
+	canonical, err := filepath.EvalSymlinks(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project = canonical
+	database, err := db.OpenAndMigrate(filepath.Join(project, ".slb", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	delivered := make(chan blockedalerts.Alert, 4)
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Event string              `json:"event"`
+			Alert blockedalerts.Alert `json:"alert"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.Event != "blocked_command" {
+			t.Errorf("invalid blocked-alert payload: %+v %v", payload, err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		select {
+		case delivered <- payload.Alert:
+		default:
+			t.Error("unexpected blocked-alert delivery flood")
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer endpoint.Close()
+	text := fmt.Sprintf(`[daemon]
+use_file_watcher = false
+[notifications]
+desktop_enabled = false
+webhook_url = %q
+[notifications.blocked]
+enabled = true
+window_seconds = 180
+repeat_threshold = 4
+cooldown_seconds = 45
+max_per_minute = 6
+[integrations]
+agent_mail_enabled = false
+`, endpoint.URL)
+	if err := os.WriteFile(filepath.Join(project, ".slb", "config.toml"), []byte(text), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.LoadOptions{ProjectDir: project})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Notifications.Blocked.Enabled || cfg.Notifications.Blocked.RepeatThreshold != 4 || cfg.Notifications.Blocked.WindowSeconds != 180 {
+		t.Fatalf("nested blocked config was not loaded: %+v", cfg.Notifications.Blocked)
+	}
+	directory, err := audit.DefaultDirectory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// There are no pending requests; this must come from the offline audit.
+	if err := audit.Record(directory, audit.Event{Timestamp: time.Now().UTC(), CWD: project,
+		CommandHash: audit.CommandHash("private command", project), CommandRedacted: "[REDACTED]",
+		Action: "block", Tier: "dangerous", Source: "offline", SessionID: "external-session-label"}); err != nil {
+		t.Fatal(err)
+	}
+	server, _ := deliveryServer(t)
+	stop, err := startProjectServices(context.Background(), database, project, cfg, []*IPCServer{server}, log.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	select {
+	case alert := <-delivered:
+		if alert.CommandRedacted != "[REDACTED]" || alert.Project != project || alert.Attempts != 1 || alert.WindowSeconds != 180 {
+			t.Fatalf("incorrect daemon alert: %+v", alert)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("daemon did not deliver its startup blocked-audit catch-up")
+	}
+	if server.verifier == nil || server.pendingCount.Load() != 0 {
+		t.Fatal("blocked alert changed approval state or lost the verifier")
+	}
+	joined := make(chan struct{})
+	go func() { stop(); close(joined) }()
+	select {
+	case <-joined:
+	case <-time.After(2 * time.Second):
+		t.Fatal("daemon did not join blocked-alert worker")
+	}
+}
+
+func TestProjectServicesInvalidAlertConfigDoesNotDisableNotary(t *testing.T) {
+	project := t.TempDir()
+	database, err := db.OpenAndMigrate(filepath.Join(project, ".slb", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	server, _ := deliveryServer(t)
+	cfg := config.DefaultConfig()
+	cfg.Daemon.UseFileWatcher = false
+	cfg.Notifications.DesktopEnabled = false
+	cfg.Notifications.Blocked = blockedalerts.Config{Enabled: true, WindowSeconds: -1}
+	stop, err := startProjectServices(context.Background(), database, project, cfg, []*IPCServer{server}, log.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	if server.verifier == nil {
+		t.Fatal("optional alert configuration disabled the verifier")
+	}
+	if _, err := os.Stat(filepath.Join(project, ".slb", "notifications")); !os.IsNotExist(err) {
+		t.Fatalf("invalid alert config touched delivery state: %v", err)
 	}
 }
