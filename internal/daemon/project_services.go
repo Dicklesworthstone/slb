@@ -68,8 +68,17 @@ func startProjectServices(parent context.Context, database *db.DB, project strin
 			logger.Warn("blocked-command alerts unavailable; audit records retained", "error", err)
 		}
 	}
+	var requestNotifications *blockedalerts.RequestService
+	if cfg.Notifications.Requests.Enabled {
+		var err error
+		requestNotifications, err = blockedalerts.NewRequestService(project, cfg.Notifications.Requests,
+			requestJournalSource{database: database}, os.Getenv("SLB_AGENT_MAIL_TOKEN"), os.Getenv("SLB_AGENT_MAIL_SENDER_TOKEN"))
+		if err != nil {
+			logger.Warn("request notifications unavailable; journal retained", "error", err)
+		}
+	}
 	var workers sync.WaitGroup
-	workers.Add(3)
+	workers.Add(4)
 	go func() {
 		defer workers.Done()
 		runRequestStateMonitor(ctx, database, project, servers, watcher, logger)
@@ -96,6 +105,16 @@ func startProjectServices(parent context.Context, database *db.DB, project strin
 				logger.Info("blocked-command alert delivery", "sent", report.Sent, "deferred", report.Deferred)
 			}
 			lastError = ""
+		})
+	}()
+	go func() {
+		defer workers.Done()
+		lastError := ""
+		requestNotifications.Run(ctx, func(err error) {
+			if err.Error() != lastError {
+				logger.Warn("request notification delivery degraded; journal retained", "error", err)
+			}
+			lastError = err.Error()
 		})
 	}()
 	var once sync.Once

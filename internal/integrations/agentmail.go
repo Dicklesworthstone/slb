@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
@@ -18,12 +19,15 @@ const (
 	ImportanceUrgent = "urgent"
 )
 
-// AgentMailClient sends notifications via the Agent Mail MCP CLI if available.
-// This is a best-effort integration; failures are logged and do not block workflow.
+// AgentMailClient sends best-effort legacy CLI notifications only when durable
+// request-journal delivery is disabled. Journal mode performs no synchronous
+// transport: the committed mutation is the notification source of truth.
 type AgentMailClient struct {
-	projectKey string
-	threadID   string
-	sender     string
+	projectKey      string
+	threadID        string
+	sender          string
+	journalDelivery bool
+	configErr       error
 }
 
 // NewAgentMailClient constructs a client.
@@ -34,16 +38,19 @@ func NewAgentMailClient(projectKey, threadID, sender string) *AgentMailClient {
 	if sender == "" {
 		sender = "SLB-System"
 	}
+	cfg, err := config.Load(config.LoadOptions{ProjectDir: projectKey})
 	return &AgentMailClient{
-		projectKey: projectKey,
-		threadID:   threadID,
-		sender:     sender,
+		projectKey:      projectKey,
+		threadID:        threadID,
+		sender:          sender,
+		journalDelivery: cfg.Notifications.Requests.Enabled,
+		configErr:       err,
 	}
 }
 
 // NotifyNewRequest sends a notification when a request is created.
 func (c *AgentMailClient) NotifyNewRequest(req *db.Request) error {
-	subject := fmt.Sprintf("[SLB] %s: %s", strings.ToUpper(string(req.RiskTier)), truncate(req.Command.Raw, 60))
+	subject := fmt.Sprintf("[SLB] %s: %s", strings.ToUpper(string(req.RiskTier)), truncate(safeDisplay(req), 60))
 	body := fmt.Sprintf("## Command Approval Request\n\n**ID**: %s\n**Risk**: %s\n**Command**: `%s`\n\n### Justification\n- Reason: %s\n- Expected: %s\n- Goal: %s\n- Safety: %s\n\n---\nTo review: `slb review %s`\nTo approve: `slb approve %s --session-id <your-session> --session-key <key>`\nTo reject: `slb reject %s --session-id <your-session> --session-key <key>`\n",
 		req.ID, req.RiskTier, safeDisplay(req),
 		req.Justification.Reason,
@@ -57,7 +64,7 @@ func (c *AgentMailClient) NotifyNewRequest(req *db.Request) error {
 
 // NotifyRequestApproved sends a notification on approval.
 func (c *AgentMailClient) NotifyRequestApproved(req *db.Request, review *db.Review) error {
-	subject := fmt.Sprintf("[SLB] APPROVED: %s", truncate(req.Command.Raw, 60))
+	subject := fmt.Sprintf("[SLB] APPROVED: %s", truncate(safeDisplay(req), 60))
 	body := fmt.Sprintf("Request %s approved by %s (%s) at %s\n\nCommand: `%s`\n",
 		req.ID, review.ReviewerAgent, review.ReviewerModel, review.CreatedAt.Format(time.RFC3339), safeDisplay(req))
 	return c.send(subject, body, ImportanceNormal)
@@ -65,7 +72,7 @@ func (c *AgentMailClient) NotifyRequestApproved(req *db.Request, review *db.Revi
 
 // NotifyRequestRejected sends a notification on rejection.
 func (c *AgentMailClient) NotifyRequestRejected(req *db.Request, review *db.Review) error {
-	subject := fmt.Sprintf("[SLB] REJECTED: %s", truncate(req.Command.Raw, 60))
+	subject := fmt.Sprintf("[SLB] REJECTED: %s", truncate(safeDisplay(req), 60))
 	body := fmt.Sprintf("Request %s rejected by %s (%s) at %s\n\nComments: %s\nCommand: `%s`\n",
 		req.ID, review.ReviewerAgent, review.ReviewerModel, review.CreatedAt.Format(time.RFC3339), review.Comments, safeDisplay(req))
 	return c.send(subject, body, ImportanceNormal)
@@ -73,7 +80,7 @@ func (c *AgentMailClient) NotifyRequestRejected(req *db.Request, review *db.Revi
 
 // NotifyRequestExecuted sends a notification on execution completion.
 func (c *AgentMailClient) NotifyRequestExecuted(req *db.Request, exec *db.Execution, exitCode int) error {
-	subject := fmt.Sprintf("[SLB] EXECUTED (%d): %s", exitCode, truncate(req.Command.Raw, 60))
+	subject := fmt.Sprintf("[SLB] EXECUTED (%d): %s", exitCode, truncate(safeDisplay(req), 60))
 	execTime := ""
 	if exec != nil && exec.ExecutedAt != nil {
 		execTime = exec.ExecutedAt.Format(time.RFC3339)
@@ -129,6 +136,9 @@ func safeDisplay(req *db.Request) string {
 	if req.Command.DisplayRedacted != "" {
 		return req.Command.DisplayRedacted
 	}
+	if req.Command.ContainsSensitive {
+		return "[sensitive command omitted]"
+	}
 	return req.Command.Raw
 }
 
@@ -142,8 +152,16 @@ func truncate(s string, max int) string {
 	return s[:max-3] + "..."
 }
 
-// send uses the Agent Mail CLI if present; otherwise returns nil (best effort).
+// send uses the Agent Mail CLI only for the legacy best-effort route. In
+// journal mode the caller has committed the request/review mutation already;
+// returning nil means no synchronous send is needed, NOT confirmed delivery.
 func (c *AgentMailClient) send(subject, body, importance string) error {
+	if c.configErr != nil {
+		return fmt.Errorf("loading notification policy: %w", c.configErr)
+	}
+	if c.journalDelivery {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 

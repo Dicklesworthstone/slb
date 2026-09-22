@@ -53,11 +53,12 @@ type RateLimitConfig struct {
 
 // NotificationsConfig holds notification settings.
 type NotificationsConfig struct {
-	Blocked          notifications.Config `toml:"blocked" mapstructure:"blocked"`
-	DesktopEnabled   bool                 `toml:"desktop_enabled" mapstructure:"desktop_enabled"`
-	DesktopDelaySecs int                  `toml:"desktop_delay_seconds" mapstructure:"desktop_delay_seconds"`
-	WebhookURL       string               `toml:"webhook_url" mapstructure:"webhook_url"`
-	EmailEnabled     bool                 `toml:"email_enabled" mapstructure:"email_enabled"`
+	Blocked          notifications.Config          `toml:"blocked" mapstructure:"blocked"`
+	Requests         notifications.RequestSettings `toml:"requests" mapstructure:"requests"`
+	DesktopEnabled   bool                          `toml:"desktop_enabled" mapstructure:"desktop_enabled"`
+	DesktopDelaySecs int                           `toml:"desktop_delay_seconds" mapstructure:"desktop_delay_seconds"`
+	WebhookURL       string                        `toml:"webhook_url" mapstructure:"webhook_url"`
+	EmailEnabled     bool                          `toml:"email_enabled" mapstructure:"email_enabled"`
 }
 
 // HistoryConfig holds history/audit persistence settings.
