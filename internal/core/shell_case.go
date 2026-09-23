@@ -28,6 +28,9 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 
 	result := &NormalizedCommand{Original: raw, Segments: []string{}}
 	var executable []syntax.Node
+	// Each redirection's statement, so a here-string can be judged by the
+	// command that consumes it.
+	redirectOwner := map[*syntax.Redirect]*syntax.Stmt{}
 	var stack []bool
 	nesting := depth
 	hasControlFlow := false
@@ -44,6 +47,9 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 		case *syntax.Stmt:
 			// Negation changes an exit status, not the effects of the command.
 			hasControlFlow = hasControlFlow || node.Negated
+			for _, redirect := range node.Redirs {
+				redirectOwner[redirect] = node
+			}
 		case *syntax.CaseClause, *syntax.Block, *syntax.IfClause,
 			*syntax.WhileClause, *syntax.ForClause, *syntax.FuncDecl,
 			*syntax.TimeClause, *syntax.CoprocClause:
@@ -79,6 +85,7 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 	if !hasControlFlow {
 		return nil, false
 	}
+	literals := collectLiteralVariables(file, raw)
 
 	appendCommand := func(command string, executable bool) {
 		inner := normalizeCommandDepth(command, depth+1)
@@ -111,18 +118,18 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 			// occur between arguments but are not children of CallExpr.
 			var words []string
 			for _, assign := range node.Assigns {
-				text, valid := caseNodeText(raw, assign)
+				text, valid := caseNodeText(raw, assign, literals)
 				result.ParseError = result.ParseError || !valid
 				words = append(words, text)
 			}
 			for _, arg := range node.Args {
-				text, valid := caseNodeText(raw, arg)
+				text, valid := caseNodeText(raw, arg, literals)
 				result.ParseError = result.ParseError || !valid
 				words = append(words, text)
 			}
 			appendCommand(strings.Join(words, " "), true)
 		case *syntax.DeclClause:
-			text, valid := caseNodeText(raw, node)
+			text, valid := caseNodeText(raw, node, literals)
 			result.ParseError = result.ParseError || !valid
 			appendCommand(text, true)
 		case *syntax.Redirect:
@@ -145,8 +152,13 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 			switch node.Op {
 			case syntax.WordHdoc:
 				// A here-string may be a program for an interpreter. Do not
-				// silently drop its contents while extracting executable calls.
-				result.ParseError = true
+				// silently drop its contents while extracting executable calls,
+				// unless the command reading it only treats stdin as data
+				// (`read -r a b <<< "$line"`). Substitutions inside the word are
+				// visited and classified independently by the walk above.
+				if !hereStringDataConsumer(redirectOwner[node]) {
+					result.ParseError = true
+				}
 			case syntax.DplIn, syntax.DplOut:
 				// >&word is also Bash's legacy file-output syntax. Only
 				// literal descriptor duplication, closing and moving are known.
@@ -193,11 +205,36 @@ func walkCaseSyntax(root syntax.Node, visit func(syntax.Node) bool) {
 	})
 }
 
+// hereStringDataConsumers read a here-string as data and cannot execute it.
+// Deliberately excluded: shells and interpreters, and tools whose options or
+// scripts can execute input (mapfile/readarray -C callbacks, sed's e command,
+// awk's system(), xargs, sort --compress-program, tee writing files, ...).
+var hereStringDataConsumers = map[string]bool{
+	"read": true, "cat": true, "grep": true, "egrep": true, "fgrep": true,
+	"wc": true, "head": true, "tail": true, "cut": true, "tr": true, "uniq": true,
+	"rev": true, "jq": true, "base64": true,
+}
+
+func hereStringDataConsumer(stmt *syntax.Stmt) bool {
+	if stmt == nil {
+		return false
+	}
+	call, ok := stmt.Cmd.(*syntax.CallExpr)
+	if !ok || len(call.Args) == 0 {
+		return false
+	}
+	// The command word itself must be a literal: a computed or wrapped
+	// command could be anything.
+	return hereStringDataConsumers[call.Args[0].Lit()]
+}
+
 // caseNodeText preserves literal quoting while replacing executable expansions
-// with inert words. The main AST walk independently visits every expansion's
-// commands, including those in selectors, patterns, arithmetic and redirects.
+// with inert words. Plain references to script-local literal variables are
+// replaced by their values (see collectLiteralVariables). The main AST walk
+// independently visits every expansion's commands, including those in
+// selectors, patterns, arithmetic and redirects.
 // No shell, environment expansion or command substitution is ever executed.
-func caseNodeText(raw string, node syntax.Node) (string, bool) {
+func caseNodeText(raw string, node syntax.Node, literals literalVariables) (string, bool) {
 	start, end := node.Pos().Offset(), node.End().Offset()
 	if start > end || end > uint(len(raw)) {
 		return "", false
@@ -213,11 +250,13 @@ func caseNodeText(raw string, node syntax.Node) (string, bool) {
 			return true
 		}
 		text := ""
-		switch part.(type) {
+		switch part := part.(type) {
 		case *syntax.CmdSubst, *syntax.ProcSubst:
 			text = "__slb_substitution__"
 		case *syntax.ArithmExp:
 			text = "0"
+		case *syntax.ParamExp:
+			text, _ = literals.resolve(part)
 		}
 		if text == "" {
 			return true
