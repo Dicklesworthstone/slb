@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"bufio"
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/daemon"
@@ -678,7 +681,9 @@ func TestHookInstallCommand_Idempotent(t *testing.T) {
 				for _, hk := range hookList {
 					if hkMap, ok := hk.(map[string]any); ok {
 						if cmd, ok := hkMap["command"].(string); ok {
-							if strings.Contains(cmd, "slb_guard.py") {
+							// The installed guard is native ("<slb> hook guard");
+							// count any SLB registration, native or legacy.
+							if isSLBHookCommand(cmd, filepath.Join(tmpHome, ".slb", "hooks", "slb_guard.py")) {
 								slbCount++
 							}
 						}
@@ -1240,5 +1245,165 @@ func TestHookInstallAutoUpgradesLegacyPythonGuard(t *testing.T) {
 	}
 	if result["upgraded"] != false || result["already_existed"] != true {
 		t.Fatalf("current native registration was not idempotent: %+v", result)
+	}
+}
+
+// fakeHookDaemon answers hook_query on the project's socket after delay; a
+// negative delay accepts the connection but never answers (a stalled daemon).
+func fakeHookDaemon(t *testing.T, project string, delay time.Duration) {
+	t.Helper()
+	socketPath := daemon.SocketPathForCWD(project)
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen %s: %v", socketPath, err)
+	}
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		close(done)
+		_ = listener.Close()
+		_ = os.Remove(socketPath)
+	})
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				scanner := bufio.NewScanner(conn)
+				for scanner.Scan() {
+					var req struct {
+						ID     int64  `json:"id"`
+						Method string `json:"method"`
+					}
+					if json.Unmarshal(scanner.Bytes(), &req) != nil {
+						return
+					}
+					if delay < 0 {
+						<-done
+						return
+					}
+					select {
+					case <-time.After(delay):
+					case <-done:
+						return
+					}
+					reply, _ := json.Marshal(map[string]any{"id": req.ID, "result": map[string]any{
+						"action": "allow", "message": "No matching pattern", "tier": "",
+					}})
+					if _, err := conn.Write(append(reply, '\n')); err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+}
+
+func shortProjectDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "slbhq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
+}
+
+// GitHub #21: a healthy daemon that needs more than the old fixed 50ms must
+// still answer; an unmatched command must not become a human prompt.
+func TestNativeHookGuardWaitsForSlowButHealthyDaemon(t *testing.T) {
+	home := t.TempDir()
+	project := shortProjectDir(t)
+	fakeHookDaemon(t, project, 80*time.Millisecond)
+	output := nativeHookOutput(t, map[string]any{
+		"session_id": "provider-session", "cwd": project,
+		"tool_input": map[string]any{"command": "frobnicate --report"},
+	}, home)
+	if permission, specific := nativeHookPermission(t, output); permission != "allow" {
+		t.Fatalf("slow daemon answer was discarded: permission=%q %+v", permission, specific)
+	}
+}
+
+// A stalled daemon still falls back to the fail-closed local policy, within
+// the configured deadline, and the audit record says it was a deadline.
+func TestNativeHookGuardDeadlineFallsBackFailClosedAndIsDiagnosable(t *testing.T) {
+	home := t.TempDir()
+	project := shortProjectDir(t)
+	fakeHookDaemon(t, project, -1)
+	t.Setenv("SLB_HOOK_QUERY_TIMEOUT_MS", "40")
+	started := time.Now()
+	output := nativeHookOutput(t, map[string]any{
+		"session_id": "provider-session", "cwd": project,
+		"tool_input": map[string]any{"command": "frobnicate --report"},
+	}, home)
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("guard did not honor the configured deadline: %s", elapsed)
+	}
+	permission, specific := nativeHookPermission(t, output)
+	if permission != "ask" {
+		t.Fatalf("stalled daemon must fall back to confirmation, got %q %+v", permission, specific)
+	}
+	reason, _ := specific["permissionDecisionReason"].(string)
+	if !strings.Contains(reason, "did not answer within 40ms") || !strings.Contains(reason, "hook_query_timeout_ms") {
+		t.Fatalf("fallback reason does not explain the deadline: %q", reason)
+	}
+	entries, err := os.ReadDir(filepath.Join(home, ".slb", "audit", "blocked"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected one audit record, entries=%d err=%v", len(entries), err)
+	}
+	record, err := os.ReadFile(filepath.Join(home, ".slb", "audit", "blocked", entries[0].Name()))
+	if err != nil || !strings.Contains(string(record), `"source":"hook_native_timeout"`) {
+		t.Fatalf("audit record does not identify a deadline: %s (%v)", record, err)
+	}
+
+	// Dangerous commands are still denied on the deadline path.
+	output = nativeHookOutput(t, map[string]any{
+		"session_id": "provider-session", "cwd": project,
+		"tool_input": map[string]any{"command": "rm -rf node_modules"},
+	}, home)
+	if permission, _ := nativeHookPermission(t, output); permission != "deny" {
+		t.Fatalf("dangerous command not denied after deadline: %q", permission)
+	}
+}
+
+func TestNativeHookGuardUnreachableDaemonIsRecordedOffline(t *testing.T) {
+	home := t.TempDir()
+	project := shortProjectDir(t)
+	output := nativeHookOutput(t, map[string]any{
+		"session_id": "provider-session", "cwd": project,
+		"tool_input": map[string]any{"command": "frobnicate --report"},
+	}, home)
+	if permission, _ := nativeHookPermission(t, output); permission != "ask" {
+		t.Fatalf("unreachable daemon must fall back to confirmation, got %q", permission)
+	}
+	entries, err := os.ReadDir(filepath.Join(home, ".slb", "audit", "blocked"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected one audit record, entries=%d err=%v", len(entries), err)
+	}
+	record, _ := os.ReadFile(filepath.Join(home, ".slb", "audit", "blocked", entries[0].Name()))
+	if !strings.Contains(string(record), `"source":"hook_native_offline"`) {
+		t.Fatalf("unreachable daemon not recorded as offline: %s", record)
+	}
+}
+
+func TestHookQueryTimeoutConfig(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	project := t.TempDir()
+	if got := hookQueryTimeout(project); got != 250*time.Millisecond {
+		t.Fatalf("default hook query timeout = %s, want 250ms", got)
+	}
+	t.Setenv("SLB_HOOK_QUERY_TIMEOUT_MS", "900")
+	if got := hookQueryTimeout(project); got != 900*time.Millisecond {
+		t.Fatalf("configured hook query timeout = %s, want 900ms", got)
+	}
+	t.Setenv("SLB_HOOK_QUERY_TIMEOUT_MS", "5")
+	if got := hookQueryTimeout(project); got != 250*time.Millisecond {
+		t.Fatalf("out-of-range timeout must use the default, got %s", got)
 	}
 }

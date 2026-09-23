@@ -57,6 +57,10 @@ func Validate(cfg Config) error {
 	if !oneOf(cfg.Integrations.HookCautionAction, "block", "ask") {
 		errs = append(errs, "integrations.hook_caution_action must be one of block|ask")
 	}
+	if cfg.Integrations.HookQueryTimeoutMS < MinHookQueryTimeoutMS || cfg.Integrations.HookQueryTimeoutMS > MaxHookQueryTimeoutMS {
+		errs = append(errs, fmt.Sprintf("integrations.hook_query_timeout_ms must be between %d and %d",
+			MinHookQueryTimeoutMS, MaxHookQueryTimeoutMS))
+	}
 
 	validateTier := func(name string, tier PatternTierConfig) {
 		if tier.MinApprovals < 0 {

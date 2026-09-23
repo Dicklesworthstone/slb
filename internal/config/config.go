@@ -95,7 +95,20 @@ type IntegrationsConfig struct {
 	// block keeps the command inside SLB's request/auto-approval workflow;
 	// ask delegates the decision to Claude Code's human permission prompt.
 	HookCautionAction string `toml:"hook_caution_action" mapstructure:"hook_caution_action"`
+	// HookQueryTimeoutMS bounds how long the native Claude Code hook waits
+	// for the project daemon before using the local fail-closed fallback.
+	HookQueryTimeoutMS int `toml:"hook_query_timeout_ms" mapstructure:"hook_query_timeout_ms"`
 }
+
+// Native hook daemon-query deadline bounds. The daemon loads the project
+// policy per query (typically 10-30ms); 250ms absorbs a momentary stall while
+// staying far inside Claude Code's hook budget. A deadline still falls back to
+// the local, fail-closed classifier.
+const (
+	DefaultHookQueryTimeoutMS = 250
+	MinHookQueryTimeoutMS     = 10
+	MaxHookQueryTimeoutMS     = 10000
+)
 
 // AgentsConfig holds agent-specific allow/deny lists.
 type AgentsConfig struct {

@@ -45,6 +45,9 @@ type HookQueryResult struct {
 	AuditError       string                `json:"audit_error,omitempty"`
 }
 
+// slowHookQueryThreshold is well above the typical 10-30ms policy load.
+var slowHookQueryThreshold = 100 * time.Millisecond
+
 func (s *IPCServer) handleHookQuery(req RPCRequest) *RPCResponse {
 	var params HookQueryParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -53,7 +56,15 @@ func (s *IPCServer) handleHookQuery(req RPCRequest) *RPCResponse {
 	if params.Command == "" {
 		return &RPCResponse{Error: &Error{Code: ErrCodeInvalidParams, Message: "command is required"}, ID: req.ID}
 	}
+	started := time.Now()
 	result := s.classifyCommand(params)
+	// Native hook clients wait integrations.hook_query_timeout_ms (default
+	// 250ms) before falling back to local policy. Make slow answers visible
+	// in the daemon log so a client-side fallback can be correlated.
+	if elapsed := time.Since(started); elapsed >= slowHookQueryThreshold && s.logger != nil {
+		s.logger.Warn("slow hook query", "elapsed_ms", elapsed.Milliseconds(), "cwd", params.CWD,
+			"action", result.Action)
+	}
 	if result.Action == "block" || result.Action == "ask" {
 		directory, err := audit.DefaultDirectory()
 		if err == nil {

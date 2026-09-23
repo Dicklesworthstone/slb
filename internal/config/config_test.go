@@ -295,6 +295,7 @@ func TestGetValue(t *testing.T) {
 		{"integrations.agent_mail_thread", cfg.Integrations.AgentMailThread},
 		{"integrations.claude_hooks_enabled", cfg.Integrations.ClaudeHooksEnabled},
 		{"integrations.hook_caution_action", cfg.Integrations.HookCautionAction},
+		{"integrations.hook_query_timeout_ms", cfg.Integrations.HookQueryTimeoutMS},
 
 		{"agents.trusted_self_approve", cfg.Agents.TrustedSelfApprove},
 		{"agents.trusted_self_approve_delay_seconds", cfg.Agents.TrustedSelfApproveDelaySecs},

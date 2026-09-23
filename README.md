@@ -711,7 +711,10 @@ Payload includes request details, classification, and event type.
 ### Fail-Closed Behavior
 
 When components fail:
-- Daemon unreachable → Block dangerous commands (hook)
+- Daemon unreachable, or no answer within `integrations.hook_query_timeout_ms`
+  (default 250ms) → the hook classifies locally: dangerous/critical commands are
+  blocked and commands no pattern covers require confirmation. The audit source
+  is `hook_native_timeout` for a deadline and `hook_native_offline` otherwise
 - Parse error → Upgrade tier by one level
 - Approval expired → Require new approval
 - Hash mismatch → Reject execution
@@ -743,6 +746,7 @@ All config options can be set via environment:
 | `SLB_WEBHOOK_URL` | Webhook notification URL |
 | `SLB_DAEMON_TCP_ADDR` | TCP listen address |
 | `SLB_TRUSTED_SELF_APPROVE` | Comma-separated trusted agents |
+| `SLB_HOOK_QUERY_TIMEOUT_MS` | Native hook daemon-query deadline in ms (10-10000, default 250) |
 
 ## Agent Event Streaming
 

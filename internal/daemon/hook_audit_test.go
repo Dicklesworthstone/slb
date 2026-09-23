@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/Dicklesworthstone/slb/internal/audit"
+	"github.com/charmbracelet/log"
 )
 
 func TestHookQueryRecordsBlockedButNotSafeDecisions(t *testing.T) {
@@ -72,4 +73,29 @@ func TestHookAuditFailureDoesNotAllowBlockedCommand(t *testing.T) {
 	if result.Action != "block" || result.AuditRecorded || result.AuditError == "" {
 		t.Fatalf("audit failure relaxed or disappeared from verdict: %+v", result)
 	}
+}
+
+// GitHub #21: a hook query slow enough to push native clients onto their
+// local fallback is logged with its elapsed time.
+func TestSlowHookQueryIsLogged(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	previous := slowHookQueryThreshold
+	slowHookQueryThreshold = 0
+	t.Cleanup(func() { slowHookQueryThreshold = previous })
+
+	var logs strings.Builder
+	server := &IPCServer{logger: log.New(&logs)}
+	params, err := json.Marshal(HookQueryParams{Command: "git status", CWD: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.handleHookQuery(RPCRequest{Params: params, ID: 1})
+	if !strings.Contains(logs.String(), "slow hook query") || !strings.Contains(logs.String(), "elapsed_ms") {
+		t.Fatalf("slow hook query was not logged: %q", logs.String())
+	}
+
+	// A zero-value server (no logger) must not panic on the slow path.
+	(&IPCServer{}).handleHookQuery(RPCRequest{Params: params, ID: 2})
 }

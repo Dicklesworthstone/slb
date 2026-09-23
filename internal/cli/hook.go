@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/core"
@@ -29,7 +28,7 @@ func init() {
 	// hook install flags
 	hookInstallCmd.Flags().BoolVarP(&flagHookGlobal, "global", "g", false, "install globally for all projects")
 	hookInstallCmd.Flags().BoolVar(&flagHookMerge, "merge", true, "preserve existing hooks (default)")
-	hookInstallCmd.Flags().BoolVarP(&flagHookForce, "force", "f", false, "overwrite existing hooks")
+	hookInstallCmd.Flags().BoolVarP(&flagHookForce, "force", "f", false, "reset SLB's own hook entry to its canonical form (other hooks are never touched)")
 
 	// hook generate flags.
 	// Named --output-dir (not --output): the persistent --output/-o is the
@@ -90,7 +89,14 @@ var hookInstallCmd = &cobra.Command{
 This command:
 1. Generates the standalone fallback script at ~/.slb/hooks/slb_guard.py
 2. Configures Claude Code to call the native 'slb hook guard' entrypoint
-3. Preserves existing hooks (use --force to overwrite)
+
+Only SLB's own hook object in ~/.claude/settings.json is edited. An existing
+SLB registration (native or legacy Python) is updated in place; otherwise the
+guard is appended to the existing "Bash" PreToolUse entry, or a new one is
+added. Other hooks - including ones sharing the "Bash" entry - other entries,
+key order and indentation are preserved, and the file is not rewritten when
+nothing changes. --force resets SLB's own hook object (e.g. drops a custom
+"timeout") but still leaves every other hook alone.
 
 Use --global to install for all projects (user-level settings).`,
 	RunE: runHookInstall,
@@ -101,9 +107,9 @@ var hookUninstallCmd = &cobra.Command{
 	Short: "Remove hook from Claude Code settings",
 	Long: `Remove the SLB hook from Claude Code settings.
 
-This removes the hook configuration from settings.json but does not delete
-the hook script file. Use this if you want to temporarily disable SLB
-hook integration.`,
+This removes only SLB's own hook objects from settings.json; sibling hooks in
+the same matcher entry are kept. It does not delete the hook script file. Use
+this if you want to temporarily disable SLB hook integration.`,
 	RunE: runHookUninstall,
 }
 
@@ -124,8 +130,8 @@ var hookHealthCmd = &cobra.Command{
 	Use:   "health",
 	Short: "Check real-time hook daemon health and policy parity",
 	Long: `Check whether the project hook daemon is reachable within the hook's
-50ms latency budget and whether it is enforcing the same effective policy as
-the local fallback snapshot source.
+latency budget (integrations.hook_query_timeout_ms, default 250ms) and whether
+it is enforcing the same effective policy as the local fallback snapshot source.
 
 An unreachable daemon is reported as degraded-but-fallback-capable rather than
 as a command error, because the generated hook is designed to operate offline.`,
@@ -220,24 +226,6 @@ func runHookInstall(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to write hook script: %w", err)
 	}
 
-	// Get settings.json path
-	settingsPath := filepath.Join(home, ".claude", "settings.json")
-
-	// Read existing settings or create new
-	var settings map[string]any
-	data, err := os.ReadFile(settingsPath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("failed to read settings: %w", err)
-		}
-		// Create new settings
-		settings = make(map[string]any)
-	} else {
-		if err := json.Unmarshal(data, &settings); err != nil {
-			return fmt.Errorf("failed to parse settings: %w", err)
-		}
-	}
-
 	// The installed hot path is native. Keep writing the Python guard above as
 	// an explicit standalone fallback/debugging artifact, but do not pay a
 	// Python startup/import penalty on every Bash tool call.
@@ -245,88 +233,47 @@ func runHookInstall(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("resolving native hook command: %w", err)
 	}
-	slbHook := map[string]any{
-		"matcher": "Bash",
-		"hooks": []map[string]any{
-			{
-				"type":    "command",
-				"command": guardCommand,
-			},
-		},
-	}
 
-	// Get or create hooks section
-	hooks, ok := settings["hooks"].(map[string]any)
-	if !ok {
-		hooks = make(map[string]any)
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	settings, err := loadClaudeSettings(settingsPath)
+	if err != nil {
+		return err
 	}
-
-	// Get or create PreToolUse array
-	preToolUse, ok := hooks["PreToolUse"].([]any)
-	if !ok {
-		preToolUse = []any{}
+	// Legacy Python registrations and native registrations pointing at an
+	// older/moved executable are the same managed hook: upgrade them in place.
+	// Only SLB's own hook object is edited; sibling hooks sharing its matcher
+	// entry, other entries and all other settings are preserved (GitHub #18).
+	isSLB := func(command string) bool { return isSLBHookCommand(command, hookScriptPath) }
+	change, err := installSLBHook(settings, guardCommand, isSLB, flagHookForce)
+	if err != nil {
+		return fmt.Errorf("updating %s: %w", settingsPath, err)
 	}
-
-	// Check if an SLB hook already exists. Legacy Python registrations and
-	// native registrations pointing at an older/moved executable are upgraded
-	// automatically; this is the same managed hook, not an unrelated setting.
-	found := false
-	upgraded := false
-	for i, hook := range preToolUse {
-		if h, ok := hook.(map[string]any); ok {
-			if matcher, ok := h["matcher"].(string); ok && matcher == "Bash" {
-				if hookList, ok := h["hooks"].([]any); ok {
-					for _, hk := range hookList {
-						if hkMap, ok := hk.(map[string]any); ok {
-							if cmd, ok := hkMap["command"].(string); ok {
-								if isSLBHookCommand(cmd, hookScriptPath) {
-									found = true
-									if flagHookForce || cmd != guardCommand {
-										preToolUse[i] = slbHook
-										upgraded = cmd != guardCommand
-									}
-									break
-								}
-							}
-						}
-					}
-				}
-			}
+	if change.changed {
+		if err := settings.save(); err != nil {
+			return err
 		}
 	}
 
-	if !found {
-		preToolUse = append(preToolUse, slbHook)
+	result := map[string]any{
+		"status":                  "installed",
+		"settings_path":           settingsPath,
+		"settings_changed":        change.changed,
+		"hook_script":             hookScriptPath,
+		"hook_command":            guardCommand,
+		"native_guard":            true,
+		"upgraded":                change.upgraded,
+		"already_existed":         change.found && !change.upgraded,
+		"matcher":                 change.entryMatcher,
+		"sibling_hooks_preserved": change.siblingHooks,
 	}
-
-	hooks["PreToolUse"] = preToolUse
-	settings["hooks"] = hooks
-
-	// Ensure .claude directory exists
-	if err := os.MkdirAll(filepath.Dir(settingsPath), 0755); err != nil {
-		return fmt.Errorf("failed to create .claude directory: %w", err)
+	if change.upgraded {
+		result["previous_command"] = change.previousCommand
 	}
-
-	// Write settings
-	newData, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal settings: %w", err)
+	if change.duplicatesRemoved > 0 {
+		result["duplicate_slb_hooks_removed"] = change.duplicatesRemoved
 	}
-
-	if err := os.WriteFile(settingsPath, newData, 0644); err != nil {
-		return fmt.Errorf("failed to write settings: %w", err)
-	}
-
 	out := output.New(output.Format(GetOutput()))
-	return out.Write(map[string]any{
-		"status":          "installed",
-		"settings_path":   settingsPath,
-		"hook_script":     hookScriptPath,
-		"hook_command":    guardCommand,
-		"native_guard":    true,
-		"upgraded":        upgraded,
-		"already_existed": found && !upgraded && !flagHookForce,
-	})
+	return out.Write(result)
 }
 
 func runHookUninstall(cmd *cobra.Command, args []string) error {
@@ -336,89 +283,42 @@ func runHookUninstall(cmd *cobra.Command, args []string) error {
 	}
 
 	settingsPath := filepath.Join(home, ".claude", "settings.json")
-
-	// Read existing settings
-	data, err := os.ReadFile(settingsPath)
+	settings, err := loadClaudeSettings(settingsPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			out := output.New(output.Format(GetOutput()))
-			return out.Write(map[string]any{
-				"status":  "not_installed",
-				"message": "Claude Code settings.json not found",
-			})
-		}
-		return fmt.Errorf("failed to read settings: %w", err)
+		return err
 	}
-
-	var settings map[string]any
-	if err := json.Unmarshal(data, &settings); err != nil {
-		return fmt.Errorf("failed to parse settings: %w", err)
-	}
-
-	// Remove SLB hook from PreToolUse
-	hooks, ok := settings["hooks"].(map[string]any)
-	if !ok {
-		out := output.New(output.Format(GetOutput()))
-		return out.Write(map[string]any{
-			"status":  "not_installed",
-			"message": "No hooks configured",
-		})
-	}
-
-	preToolUse, ok := hooks["PreToolUse"].([]any)
-	if !ok {
-		out := output.New(output.Format(GetOutput()))
-		return out.Write(map[string]any{
-			"status":  "not_installed",
-			"message": "No PreToolUse hooks configured",
-		})
-	}
-
-	// Filter out SLB hooks
-	var filtered []any
-	removed := false
-	for _, hook := range preToolUse {
-		if h, ok := hook.(map[string]any); ok {
-			if matcher, ok := h["matcher"].(string); ok && matcher == "Bash" {
-				if hookList, ok := h["hooks"].([]any); ok {
-					isSLB := false
-					for _, hk := range hookList {
-						if hkMap, ok := hk.(map[string]any); ok {
-							if configured, ok := hkMap["command"].(string); ok {
-								if isSLBHookCommand(configured, filepath.Join(home, ".slb", "hooks", "slb_guard.py")) {
-									isSLB = true
-									removed = true
-									break
-								}
-							}
-						}
-					}
-					if isSLB {
-						continue
-					}
-				}
-			}
-		}
-		filtered = append(filtered, hook)
-	}
-
-	hooks["PreToolUse"] = filtered
-	settings["hooks"] = hooks
-
-	// Write settings
-	newData, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal settings: %w", err)
-	}
-
-	if err := os.WriteFile(settingsPath, newData, 0644); err != nil {
-		return fmt.Errorf("failed to write settings: %w", err)
-	}
-
 	out := output.New(output.Format(GetOutput()))
+	if !settings.exists {
+		return out.Write(map[string]any{
+			"status":  "not_installed",
+			"message": "Claude Code settings.json not found",
+		})
+	}
+
+	// Remove only SLB's own hook objects. Sibling hooks in the same matcher
+	// entry stay; an entry is dropped only if SLB's hook was its last one.
+	hookScriptPath := filepath.Join(home, ".slb", "hooks", "slb_guard.py")
+	removed, err := uninstallSLBHook(settings, func(command string) bool {
+		return isSLBHookCommand(command, hookScriptPath)
+	})
+	if err != nil {
+		return fmt.Errorf("updating %s: %w", settingsPath, err)
+	}
+	if removed == 0 {
+		return out.Write(map[string]any{
+			"status":  "not_installed",
+			"removed": false,
+			"message": "No SLB PreToolUse hook configured",
+		})
+	}
+	if err := settings.save(); err != nil {
+		return err
+	}
 	return out.Write(map[string]any{
-		"status":  "uninstalled",
-		"removed": removed,
+		"status":        "uninstalled",
+		"removed":       true,
+		"removed_count": removed,
+		"settings_path": settingsPath,
 	})
 }
 
@@ -473,33 +373,21 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	data, err := os.ReadFile(settingsPath)
-	if err == nil {
-		var settings map[string]any
-		if err := json.Unmarshal(data, &settings); err == nil {
-			if hooks, ok := settings["hooks"].(map[string]any); ok {
-				if preToolUse, ok := hooks["PreToolUse"].([]any); ok {
-					for _, hook := range preToolUse {
-						if h, ok := hook.(map[string]any); ok {
-							if matcher, ok := h["matcher"].(string); ok && matcher == "Bash" {
-								if hookList, ok := h["hooks"].([]any); ok {
-									for _, hk := range hookList {
-										if hkMap, ok := hk.(map[string]any); ok {
-											if configured, ok := hkMap["command"].(string); ok {
-												if isSLBHookCommand(configured, hookScriptPath) {
-													status["settings_configured"] = true
-													status["configured_command"] = configured
-													status["native_guard"] = strings.Contains(configured, "hook guard")
-												}
-											}
-										}
-									}
-								}
-							}
-						}
-					}
-				}
+	if settings, err := loadClaudeSettings(settingsPath); err != nil {
+		status["settings_error"] = err.Error()
+	} else if _, entries, _, err := settings.preToolUse(); err != nil {
+		status["settings_error"] = err.Error()
+	} else {
+		for _, location := range findSLBHooks(entries, func(command string) bool {
+			return isSLBHookCommand(command, hookScriptPath)
+		}) {
+			if !location.coversBash {
+				continue
 			}
+			status["settings_configured"] = true
+			status["configured_command"] = location.command
+			status["native_guard"] = strings.Contains(location.command, "hook guard")
+			break
 		}
 	}
 
@@ -509,7 +397,7 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 	} else if cwd, absErr := filepath.Abs(project); absErr != nil {
 		status["daemon_error"] = absErr.Error()
 	} else {
-		healthCtx, cancel := context.WithTimeout(cmd.Context(), 50*time.Millisecond)
+		healthCtx, cancel := context.WithTimeout(cmd.Context(), hookQueryTimeout(hookGuardProjectRoot(cwd)))
 		client := daemon.NewIPCClient(daemon.SocketPathForCWD(cwd))
 		health, healthErr := client.HookHealth(healthCtx, cwd)
 		cancel()
@@ -607,7 +495,7 @@ func runHookHealth(cmd *cobra.Command, args []string) error {
 		"cwd":                         cwd,
 	}
 
-	healthCtx, cancel := context.WithTimeout(cmd.Context(), 50*time.Millisecond)
+	healthCtx, cancel := context.WithTimeout(cmd.Context(), hookQueryTimeout(hookGuardProjectRoot(cwd)))
 	client := daemon.NewIPCClient(daemon.SocketPathForCWD(cwd))
 	health, healthErr := client.HookHealth(healthCtx, cwd)
 	cancel()
@@ -654,7 +542,7 @@ func runHookTest(cmd *cobra.Command, args []string) error {
 
 	var daemonErr error
 	if !flagHookLocalOnly && !flagHookSimulateFailure {
-		queryCtx, cancel := context.WithTimeout(cmd.Context(), 50*time.Millisecond)
+		queryCtx, cancel := context.WithTimeout(cmd.Context(), hookQueryTimeout(hookGuardProjectRoot(cwd)))
 		client := daemon.NewIPCClient(daemon.SocketPathForCWD(cwd))
 		live, queryErr := client.HookQuery(queryCtx, daemon.HookQueryParams{
 			Command: command, SessionID: flagSessionID, CWD: cwd, ExecutionHandoff: true,

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -71,7 +72,8 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 	if parent == nil {
 		parent = context.Background()
 	}
-	queryCtx, cancel := context.WithTimeout(parent, 50*time.Millisecond)
+	queryTimeout := hookQueryTimeout(hookGuardProjectRoot(cwd))
+	queryCtx, cancel := context.WithTimeout(parent, queryTimeout)
 	client := daemon.NewIPCClient(daemon.SocketPathForCWD(cwd))
 	live, liveErr := client.HookQuery(queryCtx, daemon.HookQueryParams{
 		Command: command, SessionID: sessionID, CWD: cwd, ExecutionHandoff: true,
@@ -91,14 +93,41 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 			live.Tier, live.MinApprovals, live.MatchedPattern, "hook_native_daemon", live.AuditRecorded)
 	}
 
+	// The local fallback stays fail-closed whatever the cause. A deadline on a
+	// daemon that is running is recorded distinctly from an unreachable
+	// daemon, so a slow daemon can be told apart from a missing one.
+	source := "hook_native_offline"
+	timedOut := errors.Is(liveErr, context.DeadlineExceeded)
+	if timedOut {
+		source = "hook_native_timeout"
+	}
 	fallback, err := classifyNativeHookFallback(command, cwd)
 	if err != nil {
 		return decideAndAuditNativeHook(cmd, command, sessionID, cwd, "block",
 			"SLB: classification failed; command blocked until policy is available.",
-			"unknown", 0, "policy_load_error", "hook_native_offline", false)
+			"unknown", 0, "policy_load_error", source, false)
 	}
-	return decideAndAuditNativeHook(cmd, command, sessionID, cwd, fallback.Action, fallback.Message,
-		fallback.Tier, fallback.MinApprovals, fallback.MatchedPattern, "hook_native_offline", false)
+	message := fallback.Message
+	if timedOut && fallback.Action != "allow" {
+		message = fmt.Sprintf("SLB: daemon did not answer within %s (integrations.hook_query_timeout_ms); used local policy. %s",
+			queryTimeout, message)
+	}
+	return decideAndAuditNativeHook(cmd, command, sessionID, cwd, fallback.Action, message,
+		fallback.Tier, fallback.MinApprovals, fallback.MatchedPattern, source, false)
+}
+
+// hookQueryTimeout is the configured daemon-query deadline for a project.
+// Config errors fall back to the default: the offline path loads the same
+// config and fails closed on it.
+func hookQueryTimeout(projectRoot string) time.Duration {
+	ms := config.DefaultHookQueryTimeoutMS
+	if cfg, err := config.Load(config.LoadOptions{ProjectDir: projectRoot}); err == nil {
+		ms = cfg.Integrations.HookQueryTimeoutMS
+	}
+	if ms < config.MinHookQueryTimeoutMS || ms > config.MaxHookQueryTimeoutMS {
+		ms = config.DefaultHookQueryTimeoutMS
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 func readHookGuardInput(r io.Reader) (map[string]any, error) {

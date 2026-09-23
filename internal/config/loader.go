@@ -110,6 +110,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("integrations.agent_mail_thread", def.Integrations.AgentMailThread)
 	v.SetDefault("integrations.claude_hooks_enabled", def.Integrations.ClaudeHooksEnabled)
 	v.SetDefault("integrations.hook_caution_action", def.Integrations.HookCautionAction)
+	v.SetDefault("integrations.hook_query_timeout_ms", def.Integrations.HookQueryTimeoutMS)
 
 	v.SetDefault("agents.trusted_self_approve", def.Agents.TrustedSelfApprove)
 	v.SetDefault("agents.trusted_self_approve_delay_seconds", def.Agents.TrustedSelfApproveDelaySecs)
@@ -356,6 +357,8 @@ func GetValue(cfg Config, key string) (any, bool) {
 				return c.ClaudeHooksEnabled, true
 			case "hook_caution_action":
 				return c.HookCautionAction, true
+			case "hook_query_timeout_ms":
+				return c.HookQueryTimeoutMS, true
 			default:
 				return nil, false
 			}
@@ -514,10 +517,11 @@ var keyKinds = map[string]valueKind{
 	"patterns.safe.auto_approve_delay_seconds": kindInt,
 	"patterns.safe.patterns":                   kindStringSlice,
 
-	"integrations.agent_mail_enabled":   kindBool,
-	"integrations.agent_mail_thread":    kindString,
-	"integrations.claude_hooks_enabled": kindBool,
-	"integrations.hook_caution_action":  kindString,
+	"integrations.agent_mail_enabled":    kindBool,
+	"integrations.agent_mail_thread":     kindString,
+	"integrations.claude_hooks_enabled":  kindBool,
+	"integrations.hook_caution_action":   kindString,
+	"integrations.hook_query_timeout_ms": kindInt,
 
 	"agents.trusted_self_approve":               kindStringSlice,
 	"agents.trusted_self_approve_delay_seconds": kindInt,
@@ -569,6 +573,7 @@ var envBindings = []struct {
 	{"SLB_AGENT_MAIL_THREAD", "integrations.agent_mail_thread", kindString},
 	{"SLB_CLAUDE_HOOKS_ENABLED", "integrations.claude_hooks_enabled", kindBool},
 	{"SLB_HOOK_CAUTION_ACTION", "integrations.hook_caution_action", kindString},
+	{"SLB_HOOK_QUERY_TIMEOUT_MS", "integrations.hook_query_timeout_ms", kindInt},
 
 	{"SLB_TRUSTED_SELF_APPROVE", "agents.trusted_self_approve", kindStringSlice},
 	{"SLB_TRUSTED_SELF_APPROVE_DELAY_SECONDS", "agents.trusted_self_approve_delay_seconds", kindInt},
