@@ -15,7 +15,6 @@ import (
 	"github.com/Dicklesworthstone/slb/internal/background"
 	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
-	"github.com/spf13/cobra"
 )
 
 // Invoke the real worker handler in a separate test process. This exercises
@@ -257,31 +256,32 @@ func TestBackgroundJobRequiresStartupObserverAndTimeoutBounds(t *testing.T) {
 }
 
 func TestBackgroundExecutionSessionShorthandDoesNotShadowTOON(t *testing.T) {
-	// Use the production flag object, not an independently redeclared copy.
-	flag := executeCmd.Flags().Lookup("session-id")
-	if flag == nil || flag.Shorthand != "s" {
-		t.Fatal("execute shadows the root session flag without preserving -s")
+	// Use the production command objects, not an independently redeclared copy.
+	// execute must not declare a local --session-id: a local flag of that name
+	// shadows the root persistent --session-id/-s (cobra skips the persistent
+	// flag by name), which is the collision the production-tree guard rejects.
+	if local := executeCmd.LocalNonPersistentFlags().Lookup("session-id"); local != nil {
+		t.Fatalf("execute declares a local --session-id (shorthand %q) that shadows the root flag", local.Shorthand)
 	}
-	previous, changed := flag.Value.String(), flag.Changed
+	prevSession, prevTOON := flagSessionID, flagTOON
 	t.Cleanup(func() {
-		if err := flag.Value.Set(previous); err != nil {
-			t.Error(err)
+		flagSessionID, flagTOON = prevSession, prevTOON
+		// Persistent flags are merged into execute's set during parsing, so
+		// look them up afterwards to clear the parse state on the shared objects.
+		for _, name := range []string{"session-id", "toon"} {
+			if f := executeCmd.Flags().Lookup(name); f != nil {
+				f.Changed = false
+			}
 		}
-		flag.Changed = changed
 	})
-	var parentSession string
-	var toon bool
-	root := &cobra.Command{Use: "slb", SilenceUsage: true, SilenceErrors: true}
-	root.PersistentFlags().StringVarP(&parentSession, "session-id", "s", "", "session")
-	root.PersistentFlags().BoolVarP(&toon, "toon", "t", false, "structured output")
-	child := &cobra.Command{Use: "execute", Run: func(*cobra.Command, []string) {}}
-	child.Flags().AddFlag(flag)
-	root.AddCommand(child)
-	root.SetArgs([]string{"execute", "-s", "worker-session", "-t"})
-	if err := root.Execute(); err != nil {
+	flagSessionID, flagTOON = "", false
+	if err := executeCmd.ParseFlags([]string{"-s", "worker-session", "-t"}); err != nil {
 		t.Fatal(err)
 	}
-	if flagExecuteSessionID != "worker-session" || parentSession != "" || !toon {
-		t.Fatal("session shorthand or TOON selection was lost")
+	if flagSessionID != "worker-session" || !flagTOON {
+		t.Fatalf("session shorthand or TOON selection was lost: session=%q toon=%v", flagSessionID, flagTOON)
+	}
+	if got := executeCmd.Flags().Lookup("session-id"); got == nil || got.Shorthand != "s" {
+		t.Fatal("execute does not accept -s for the root --session-id")
 	}
 }

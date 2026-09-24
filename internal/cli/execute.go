@@ -12,16 +12,16 @@ import (
 )
 
 var (
-	flagExecuteSessionID  string
 	flagExecuteTimeout    int
 	flagExecuteBackground bool
 	flagExecuteLogDir     string
 )
 
 func init() {
-	// This local flag shadows the root session flag, so it must preserve -s
-	// itself. Timeout has no -t shorthand: -t remains the persistent --toon.
-	executeCmd.Flags().StringVarP(&flagExecuteSessionID, "session-id", "s", "", "executor session ID (required)")
+	// The executor session comes from the root persistent --session-id/-s.
+	// Declaring a local --session-id here would shadow it (cobra skips the
+	// persistent flag by name), so none is declared. Timeout has no -t
+	// shorthand: -t remains the persistent --toon.
 	executeCmd.Flags().IntVar(&flagExecuteTimeout, "timeout", 300, "execution timeout in seconds")
 	executeCmd.Flags().BoolVar(&flagExecuteBackground, "background", false, "run in background, return immediately")
 	executeCmd.Flags().StringVar(&flagExecuteLogDir, "log-dir", ".slb/logs", "directory for execution logs")
@@ -68,10 +68,7 @@ Examples:
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		requestID := args[0]
-		sessionID := flagExecuteSessionID
-		if sessionID == "" {
-			sessionID = flagSessionID // Root's -s shorthand.
-		}
+		sessionID := flagSessionID // Root persistent --session-id / -s.
 		if sessionID == "" {
 			sessionID = os.Getenv("SLB_SESSION_ID")
 		}

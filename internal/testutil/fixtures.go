@@ -154,3 +154,41 @@ func randHex(n int) string {
 	}
 	return hex.EncodeToString(b)[:n]
 }
+
+// ApproveRequest records the evidence a real review leaves behind: one signed
+// approval per required reviewer (distinct agents on a different model from
+// the requestor, in the request's project), then moves the request to
+// APPROVED with an approval TTL. Setting the status bit alone is not an
+// approval: execution re-verifies these signatures inside its claim.
+func ApproveRequest(t *testing.T, database *db.DB, req *db.Request) []*db.Session {
+	t.Helper()
+
+	n := req.MinApprovals
+	if n < 1 {
+		n = 1
+	}
+	now := time.Now().UTC()
+	reviewers := make([]*db.Session, 0, n)
+	for i := 0; i < n; i++ {
+		reviewer := MakeSession(t, database,
+			WithProject(req.ProjectPath),
+			WithAgent("Reviewer-"+randHex(6)),
+			WithModel("reviewer-model"),
+		)
+		review := &db.Review{
+			RequestID:          req.ID,
+			ReviewerSessionID:  reviewer.ID,
+			ReviewerAgent:      reviewer.AgentName,
+			ReviewerModel:      reviewer.Model,
+			Decision:           db.DecisionApprove,
+			SignatureTimestamp: now,
+			Signature:          db.ComputeReviewSignature(reviewer.SessionKey, req.ID, db.DecisionApprove, now),
+		}
+		RequireNoError(t, database.CreateReview(review), "create review")
+		reviewers = append(reviewers, reviewer)
+	}
+	_, err := database.Exec(`UPDATE requests SET status = ?, approval_expires_at = ? WHERE id = ?`,
+		string(db.StatusApproved), now.Add(time.Hour).Format(time.RFC3339), req.ID)
+	RequireNoError(t, err, "approve request")
+	return reviewers
+}

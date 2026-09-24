@@ -24,20 +24,21 @@ func newTestExecuteCmd(dbPath string) *cobra.Command {
 	root.PersistentFlags().BoolVarP(&flagTOON, "toon", "t", false, "toon output")
 	root.PersistentFlags().StringVarP(&flagProject, "project", "C", "", "project directory")
 	root.PersistentFlags().StringVarP(&flagConfig, "config", "c", "", "config file")
+	root.PersistentFlags().StringVarP(&flagSessionID, "session-id", "s", "", "session ID")
 
-	// Create a fresh executeCmd. Mirror production: no -s/-t local shorthand
-	// (-s and -t are owned by the persistent flags). Session is passed via the
-	// long --session-id flag; -t is the persistent --toon, so --timeout is used.
+	// Mirror production: execute declares no local --session-id (the executor
+	// session is the root persistent --session-id/-s) and no -t shorthand
+	// (-t is the persistent --toon, so --timeout is long-only).
 	execCmd := &cobra.Command{
 		Use:   "execute <request-id>",
 		Short: "Execute an approved request",
 		Args:  cobra.ExactArgs(1),
 		RunE:  executeCmd.RunE,
 	}
-	execCmd.Flags().StringVar(&flagExecuteSessionID, "session-id", "", "executor session ID")
 	execCmd.Flags().IntVar(&flagExecuteTimeout, "timeout", 300, "timeout seconds")
 	execCmd.Flags().BoolVar(&flagExecuteBackground, "background", false, "run in background")
 	execCmd.Flags().StringVar(&flagExecuteLogDir, "log-dir", ".slb/logs", "log directory")
+	execCmd.Flags().String("expected-command-hash", "", "require the observed command hash")
 
 	root.AddCommand(execCmd)
 
@@ -51,7 +52,7 @@ func resetExecuteFlags() {
 	flagTOON = false
 	flagProject = ""
 	flagConfig = ""
-	flagExecuteSessionID = ""
+	flagSessionID = ""
 	flagExecuteTimeout = 300
 	flagExecuteBackground = false
 	flagExecuteLogDir = ".slb/logs"
@@ -150,7 +151,7 @@ func TestExecuteCommand_ExecutesApprovedRequest(t *testing.T) {
 	req.Command.Hash = db.ComputeCommandHash(req.Command)
 	h.DB.Exec(`UPDATE requests SET command_hash = ? WHERE id = ?`, req.Command.Hash, req.ID)
 	// Approve the request
-	h.DB.UpdateRequestStatus(req.ID, db.StatusApproved)
+	testutil.ApproveRequest(t, h.DB, req)
 
 	cmd := newTestExecuteCmd(h.DBPath)
 	stdout, err := executeCommandCapture(t, cmd, "execute", req.ID,
@@ -214,7 +215,7 @@ func TestExecuteCommand_HonorsCustomPattern(t *testing.T) {
 	)
 	req.Command.Hash = db.ComputeCommandHash(req.Command)
 	h.DB.Exec(`UPDATE requests SET command_hash = ?, risk_tier = ? WHERE id = ?`, req.Command.Hash, string(db.RiskTierCaution), req.ID)
-	h.DB.UpdateRequestStatus(req.ID, db.StatusApproved)
+	testutil.ApproveRequest(t, h.DB, req)
 
 	// Project later escalates this command to CRITICAL via a custom pattern.
 	if _, err := h.DB.InsertCustomPattern("critical", "slbcustompat_execute", "test custom pattern", "test"); err != nil {
@@ -287,7 +288,7 @@ func TestExecuteCommand_CustomTimeout(t *testing.T) {
 	// Recompute hash using core.ComputeCommandHash
 	req.Command.Hash = db.ComputeCommandHash(req.Command)
 	h.DB.Exec(`UPDATE requests SET command_hash = ? WHERE id = ?`, req.Command.Hash, req.ID)
-	h.DB.UpdateRequestStatus(req.ID, db.StatusApproved)
+	testutil.ApproveRequest(t, h.DB, req)
 
 	cmd := newTestExecuteCmd(h.DBPath)
 	stdout, err := executeCommandCapture(t, cmd, "execute", req.ID,
