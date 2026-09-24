@@ -92,6 +92,34 @@ func TestSubshellIsUnwrappedNotDowngraded(t *testing.T) {
 	}
 }
 
+// POSIX sh (dash) runs ((X)) as the nested subshells ( (X) ), so a command
+// that is also a valid Bash arithmetic expression must still be classified by
+// what it executes there. Before the fix `((rm -rf /home))` parsed as pure
+// arithmetic, normalized to ":" and needed no approval at all.
+func TestDoubleParenArithmeticKeepsPOSIXSubshellReading(t *testing.T) {
+	engine := NewPatternEngine()
+	for _, tc := range []struct {
+		cmd  string
+		tier RiskTier
+	}{
+		{"((rm -rf /home))", RiskTierCritical},
+		{"(( rm -rf /home ))", RiskTierCritical},
+		{"((git reset --hard))", RiskTierCritical},
+		{"echo ok && ((rm -rf /etc))", RiskTierCritical},
+	} {
+		t.Run(tc.cmd, func(t *testing.T) {
+			got := engine.ClassifyCommand(tc.cmd, "")
+			if got.Tier != tc.tier || !got.NeedsApproval {
+				t.Fatalf("ClassifyCommand(%q) = tier %q needs_approval=%v, want %q", tc.cmd, got.Tier, got.NeedsApproval, tc.tier)
+			}
+		})
+	}
+	// Pure arithmetic is still not mistaken for an approved-safe command.
+	if got := engine.ClassifyCommand("((i++))", ""); got.IsSafe {
+		t.Fatalf("arithmetic command classified as safe: %+v", got)
+	}
+}
+
 func TestMalformedInputStillReportsParseError(t *testing.T) {
 	// The upgrade exists for genuinely unparseable input and must survive.
 	for _, cmd := range []string{

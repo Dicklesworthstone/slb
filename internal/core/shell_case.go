@@ -55,7 +55,15 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 			*syntax.TimeClause, *syntax.CoprocClause:
 			hasControlFlow = true
 			compound = true
-		case *syntax.ArithmCmd, *syntax.TestClause, *syntax.LetClause:
+		case *syntax.ArithmCmd:
+			// Bash and zsh evaluate ((X)) as arithmetic, but POSIX sh (dash,
+			// the /bin/sh used to run shell commands on many systems) parses
+			// it as the nested subshells ( (X) ) and executes X. Classify the
+			// commands of that reading too; substitutions inside the
+			// arithmetic are still visited below.
+			hasControlFlow = true
+			executable = append(executable, node)
+		case *syntax.TestClause, *syntax.LetClause:
 			// These contain expressions rather than executable word lists,
 			// but substitutions in those expressions still execute commands.
 			hasControlFlow = true
@@ -113,6 +121,15 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 	}
 	for _, node := range executable {
 		switch node := node.(type) {
+		case *syntax.ArithmCmd:
+			start, end := node.Left.Offset()+2, node.Right.Offset()
+			if !strings.HasPrefix(raw[node.Left.Offset():], "((") || start > end {
+				result.ParseError = true
+				continue
+			}
+			if inner := strings.TrimSpace(raw[start:end]); inner != "" {
+				appendCommand(inner, true)
+			}
 		case *syntax.CallExpr:
 			// Build from words, not the call's source range: redirections can
 			// occur between arguments but are not children of CallExpr.
