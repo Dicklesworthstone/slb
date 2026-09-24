@@ -8,6 +8,67 @@ SLB is a cross-platform CLI that implements a **two-person rule** for running po
 
 ---
 
+## [v0.5.0] -- 2026-09-24
+
+Compare: [`v0.4.1...v0.5.0`](https://github.com/Dicklesworthstone/slb/compare/v0.4.1...v0.5.0)
+
+Minor release: several defaults changed (see **Behavior changes**), and approvals, execution and hooks were rebuilt around signed, single-use, atomically verified evidence.
+
+### Behavior changes
+
+- **CAUTION stays inside SLB by default**: the hook now blocks CAUTION commands and points to `slb request` instead of raising a Claude Code permission prompt. The old interactive behavior is `integrations.hook_caution_action = "ask"` ([`f37f6ee`](https://github.com/Dicklesworthstone/slb/commit/f37f6ee08327c052e14c33e65db81d13c44246a2))
+- **Native hook replaces the Python guard**: `slb hook install` installs a native PreToolUse guard and migrates legacy Python registrations automatically; the generated Python script remains the offline fallback ([`5a4923e`](https://github.com/Dicklesworthstone/slb/commit/5a4923e19efe3ff750fc428dd3aafc3c88a1bad8), [`0c18ce5`](https://github.com/Dicklesworthstone/slb/commit/0c18ce5974a33e4c3f32f202ae83ab82e0491b38))
+- **Automatic CAUTION approval is a policy decision, not a review**: `slb watch --auto-approve-caution` and daemonless waiters approve only due, zero-quorum CAUTION requests (default delay 30s) from an active requester; no reviewer record is fabricated ([`cf22a99`](https://github.com/Dicklesworthstone/slb/commit/cf22a99847857c8d42c595e1833258cfe0ad3b73), [`f8e5c7c`](https://github.com/Dicklesworthstone/slb/commit/f8e5c7c23f10b4b7b6c950179d8b906529e71e03))
+- **Status alone is not an approval**: execution re-verifies signed reviewer evidence, quorum, TTL and current policy inside a single-use claim; the executor session must belong to the request's project ([`1ffd2d7`](https://github.com/Dicklesworthstone/slb/commit/1ffd2d7bf0a7f77dd2a36999487afe47acba3741), [`f4fb378`](https://github.com/Dicklesworthstone/slb/commit/f4fb378c5fc1a4b153c304b5ef3050d1da56f374), [`d25815f`](https://github.com/Dicklesworthstone/slb/commit/d25815f8864c4061db4c12c100e157f0ad597198))
+- **Unloadable policy blocks**: a broken live policy or offline classifier is a hard denial, not a prompt ([`b084d38`](https://github.com/Dicklesworthstone/slb/commit/b084d388d430d2773ba7bee80fb3e71b5d2f364d), [`7672955`](https://github.com/Dicklesworthstone/slb/commit/76729550cd56d9c5986942b9628ead3933079c8f))
+- **Explicit `SLB_HOST` is authoritative**: a failing TCP target no longer falls back to the local Unix daemon ([`f95ab24`](https://github.com/Dicklesworthstone/slb/commit/f95ab24c7590db370d6af59d2fc99caec75f3f7e))
+- **Native Git operations need approval**: destructive Git changes and native rebases are assessed against immutable snapshots and require signed single-use authorization via installable Git hooks ([`d67767d`](https://github.com/Dicklesworthstone/slb/commit/d67767d5f81591dcae9ff723e4ea214739277134), [`8c035be`](https://github.com/Dicklesworthstone/slb/commit/8c035be4e97ec024335a79542730b333afe43a73), [`7fb32b7`](https://github.com/Dicklesworthstone/slb/commit/7fb32b73336320595a950cfde9e14aa94927db5a), [`28a731b`](https://github.com/Dicklesworthstone/slb/commit/28a731b283d5adf17c92c7ce4568ee83d1b763c0), [`c7eb3cb`](https://github.com/Dicklesworthstone/slb/commit/c7eb3cb9a5f0ac3e2747b4d3869cf7a8d0f5ea4b))
+
+### Classification
+
+- Ordinary shell syntax no longer becomes an approval prompt ([#14](https://github.com/Dicklesworthstone/slb/issues/14)), and case statements, heredocs and shell control flow are parsed through the AST without weakening checks ([#16](https://github.com/Dicklesworthstone/slb/issues/16), [`f8603e6`](https://github.com/Dicklesworthstone/slb/commit/f8603e63c2ba6fffcc8cb6103f886af319760e48), [`4d726da`](https://github.com/Dicklesworthstone/slb/commit/4d726dac5eefced1620702b8d07dab6582dfbe24), [`c5103df`](https://github.com/Dicklesworthstone/slb/commit/c5103df3f8c4a281ca67c7d9bfe59eb770b5a53d), [`f9e3642`](https://github.com/Dicklesworthstone/slb/commit/f9e36425dd9fc683173c16a1af6d908dd563f3c4))
+- Script-local literal variables and data here-strings in control flow are resolved when provably literal, which also exposes danger hidden behind a variable ([#20](https://github.com/Dicklesworthstone/slb/issues/20), [`e11a01a`](https://github.com/Dicklesworthstone/slb/commit/e11a01aa12cb5647230476186bf63bf6d52e193a), [`de2688b`](https://github.com/Dicklesworthstone/slb/commit/de2688b732027f1e9877068a4b6e875fe235439c))
+- `((X))` is classified by what POSIX sh runs (the nested subshells `( (X) )`), so a destructive command that is also valid arithmetic can no longer pass unclassified ([`751ee81`](https://github.com/Dicklesworthstone/slb/commit/751ee819a1fb10a155c5346cf4a9ab59e5e63cd5))
+- Executable substitutions, complete shell bodies and execution wrappers are inspected before allowing a command ([`13e9841`](https://github.com/Dicklesworthstone/slb/commit/13e98411c679661761095aeac70c615234cddabe), [`fccc8e3`](https://github.com/Dicklesworthstone/slb/commit/fccc8e368aebff5307ccbbf865bdf6a546654154))
+
+### Hooks
+
+- `slb hook install` edits only SLB's own entry in Claude settings and keeps sibling hooks ([#18](https://github.com/Dicklesworthstone/slb/issues/18), [`0351e52`](https://github.com/Dicklesworthstone/slb/commit/0351e524076bb4ba79a406645254f1230c85d41f)); a dangling `settings.json` symlink is preserved ([`b63dad6`](https://github.com/Dicklesworthstone/slb/commit/b63dad6dc7f55111298de51188174dbe6bba8a1e))
+- The daemon query deadline is configurable instead of a fixed 50 ms ([#21](https://github.com/Dicklesworthstone/slb/issues/21), [`0351e52`](https://github.com/Dicklesworthstone/slb/commit/0351e524076bb4ba79a406645254f1230c85d41f))
+- Approved Bash calls are handed to the atomic executor through single-use handoffs; hooks expose health, degraded mode and stale-snapshot diagnostics, and audit offline decisions ([`cb27c56`](https://github.com/Dicklesworthstone/slb/commit/cb27c56b0279bc58adf5c9acaf4da7a966ab9b4d), [`8dbef1b`](https://github.com/Dicklesworthstone/slb/commit/8dbef1b8f712af7af89e9ceaa5078428a2297ff3), [`351d577`](https://github.com/Dicklesworthstone/slb/commit/351d5777ff4e3507db33aa928142d59b41d4a462), [`258c930`](https://github.com/Dicklesworthstone/slb/commit/258c93044e0950b5af1dc9907c8e756ba7ea69c5), [`33e54f2`](https://github.com/Dicklesworthstone/slb/commit/33e54f2f07d2f15408c55b0b7f28b718f551f65d), [`3340e1d`](https://github.com/Dicklesworthstone/slb/commit/3340e1d936f5214865dcc176c2c927e35a4c7803))
+
+### Requests, review and execution
+
+- Cross-process atomic request admission with bounded, cancellable queueing and truthful quota diagnostics ([`c16e20a`](https://github.com/Dicklesworthstone/slb/commit/c16e20af8d287b10997ddb1307af43bfa49f64b1), [`f95c354`](https://github.com/Dicklesworthstone/slb/commit/f95c35448a56b2ccf9721f1bfe06dd8ea47f43d3), [`9d6d5da`](https://github.com/Dicklesworthstone/slb/commit/9d6d5da35d50d6b8ceedd25ed276b460486a1573))
+- Bounded preflight evidence (dry-run previews) captured before review admission and exposed in the CLI ([`9d67508`](https://github.com/Dicklesworthstone/slb/commit/9d675087c919cd83b76086c0b8257b4dea14248d), [`532b65c`](https://github.com/Dicklesworthstone/slb/commit/532b65cbea8c7360edc54a3f1abed1c3d127f117), [`177c6f4`](https://github.com/Dicklesworthstone/slb/commit/177c6f4aae127b54698c4602da276ac3d6c0f0ac), [`91636eb`](https://github.com/Dicklesworthstone/slb/commit/91636eb7370ccd0221ebead10747eafa9ca67493), [`6402944`](https://github.com/Dicklesworthstone/slb/commit/64029441e125099d5f00a752d4efc3dbbe64dd77))
+- Reviews are authenticated and resolved in one write transaction; policy decisions and human review proposals apply atomically ([`9da612c`](https://github.com/Dicklesworthstone/slb/commit/9da612c0fd7b6dd1af0f0b0239a7340147870935), [`00ce294`](https://github.com/Dicklesworthstone/slb/commit/00ce294f1b6193ebceb58eb2f459c57b208feeca), [`d6e3ad0`](https://github.com/Dicklesworthstone/slb/commit/d6e3ad080517d26e5ca6336a1afc769306e7e347), [`fb568d0`](https://github.com/Dicklesworthstone/slb/commit/fb568d0bd30d6342cefd1ecc50a87aafa682b35d))
+- `slb execute --background` runs approved requests under a detached supervisor that records completion after the CLI exits ([`b7397b0`](https://github.com/Dicklesworthstone/slb/commit/b7397b0ad79d51a54cad87adba466a33ed844da3), [`9039ce8`](https://github.com/Dicklesworthstone/slb/commit/9039ce83aab028a0569fcb7bcc98457c466b9631), [`4b530fd`](https://github.com/Dicklesworthstone/slb/commit/4b530fd07b260db8665acaad6cd4c6a29aba5d36))
+- Child exit codes propagate to the CLI; output capture is bounded and timed-out process trees are stopped ([`1e463ec`](https://github.com/Dicklesworthstone/slb/commit/1e463ec411c581e727a713ebaf1ba330e252e517), [`3295054`](https://github.com/Dicklesworthstone/slb/commit/3295054ba3578bfe9aa687057d97789d92e09b7c), [`787b10b`](https://github.com/Dicklesworthstone/slb/commit/787b10bff50aed166f51f985f161d9f4a1048884), [`2a1e618`](https://github.com/Dicklesworthstone/slb/commit/2a1e618b6689a08372c94fa7a05d7ab92d42476f))
+- `execute` takes the session from the global `--session-id`/`-s` instead of a shadowing local flag ([`019df09`](https://github.com/Dicklesworthstone/slb/commit/019df09ca393f095c1b81ad6df4737ad82b53913))
+- Cross-project delegated reviews; `review_pool` names reviewer agents ([`abb23a7`](https://github.com/Dicklesworthstone/slb/commit/abb23a76d5a392078836b0b5636977170cdd40dd), [`654c244`](https://github.com/Dicklesworthstone/slb/commit/654c244e21ad03c223c6e124bf81d677b8883d8b), [`c4d6262`](https://github.com/Dicklesworthstone/slb/commit/c4d62625ba18ab5c3b55fe2d70e5b12d3009f9eb))
+
+### Daemon, events and notifications
+
+- Durable request-lifecycle journal with resumable cursors: `slb events` replays and follows it, and the daemon delivers committed events after downtime ([`5f791f9`](https://github.com/Dicklesworthstone/slb/commit/5f791f9fb24d0eb63ac957df6fa076e6837cafed), [`a23baa8`](https://github.com/Dicklesworthstone/slb/commit/a23baa8ce833bf0884baa9b45934cec3b929959e), [`b668408`](https://github.com/Dicklesworthstone/slb/commit/b668408807f4ce0e92de39e3d1c75a9ad4b81785))
+- Opt-in blocked-command alerts and journal notices via Agent Mail MCP and webhooks, rate-limited with offline catch-up ([`f275b76`](https://github.com/Dicklesworthstone/slb/commit/f275b76f7b3f22fcafaa1db4ff423573ea708be5), [`ceedb81`](https://github.com/Dicklesworthstone/slb/commit/ceedb810474487937ca2c33efef3934908d1b59e), [`503c07c`](https://github.com/Dicklesworthstone/slb/commit/503c07c17736ae10891c56ce0a20019092498910), [`51f1440`](https://github.com/Dicklesworthstone/slb/commit/51f14400e169b278b3ad42c1c03bb9ada215c696), [`3ffc1a9`](https://github.com/Dicklesworthstone/slb/commit/3ffc1a903ee4f3b97432b524e4958a8da0950320))
+- Searchable JSONL audit of blocked hook decisions ([`b40731e`](https://github.com/Dicklesworthstone/slb/commit/b40731e5e5527d7b024d290bd8b0147bd2b51ca8))
+- Exclusive daemon process ownership and fenced Unix-socket cleanup; loss-explicit IPC subscriptions ([`7e21bc0`](https://github.com/Dicklesworthstone/slb/commit/7e21bc0382932453e5ea6e6861720b7d3d48bb3c), [`ea36df9`](https://github.com/Dicklesworthstone/slb/commit/ea36df9d29aced4f6975b4bd0cc9ae2512c05d67), [`8df9e41`](https://github.com/Dicklesworthstone/slb/commit/8df9e41ee35f384ee1dfb60bc6f3f6f79621603a), [`19d2296`](https://github.com/Dicklesworthstone/slb/commit/19d229611db28849c75dd8ac228f407b9f39c70a))
+
+### Rollback
+
+- Git snapshots restore the tracked index/worktree and untracked files after `git clean`, and recover without the request database ([`2f4cd1e`](https://github.com/Dicklesworthstone/slb/commit/2f4cd1e099eb10d4fff64db778866b5964fc922c), [`1d061c7`](https://github.com/Dicklesworthstone/slb/commit/1d061c73ca51ee93a4ac837a1ba17691d772848f), [`d0592ba`](https://github.com/Dicklesworthstone/slb/commit/d0592babed82349a8d90aa08487e82281f847beb), [`9ff4d1f`](https://github.com/Dicklesworthstone/slb/commit/9ff4d1f8f64ec378f640468ca83f14657967fa8e))
+
+### TUI
+
+- Interactive review submissions work and stay policy-bound; escalations remain actionable ([`7f4c923`](https://github.com/Dicklesworthstone/slb/commit/7f4c92369215b4c855da87c29acb9410a3e1c89a), [`81134bb`](https://github.com/Dicklesworthstone/slb/commit/81134bbc86915e1b9661f2788659801f25afe09a))
+
+### Build & Tests
+
+- The full suite is green again on Linux and macOS: stale tests updated to the contracts above, test isolation and macOS socket-path/symlink issues fixed ([`e0d122f`](https://github.com/Dicklesworthstone/slb/commit/e0d122fe1d8e309c009a43d07c3ccf4a7e0c7a10), [`ca84c5d`](https://github.com/Dicklesworthstone/slb/commit/ca84c5dd482c15e2f9c45beab501f0a43b95cdaa))
+- Concurrent claims serialize with `BEGIN IMMEDIATE` ([`4a3ec32`](https://github.com/Dicklesworthstone/slb/commit/4a3ec32803c50013cb021c832b4548a733aef8b6))
+
+---
+
 ## [v0.4.1] -- 2026-09-07
 
 Compare: [`v0.4.0...v0.4.1`](https://github.com/Dicklesworthstone/slb/compare/v0.4.0...v0.4.1)
