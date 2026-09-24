@@ -3,6 +3,7 @@ package core
 import (
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"mvdan.cc/sh/v3/syntax"
@@ -30,9 +31,12 @@ import (
 //   - every other occurrence of the name in the raw script is a plain
 //     `$NAME` / `${NAME}` read, so no read/for/printf -v/declare/export,
 //     `${NAME:=x}`, comment or string mentions it;
+//   - no word passed to an assigning builtin contains the name after quote
+//     removal (`printf -v X\Y`, `read -aXY`, `unset X\Y` name XY without
+//     spelling it as an identifier);
 //   - the script contains no construct that can assign a variable whose name
 //     is computed at run time (dynamic declare/read/printf -v/..., namerefs,
-//     indirect expansion assignments) and never mentions IFS.
+//     indirect expansion assignments), no trap/enable, and never names IFS.
 type literalVariable struct {
 	value string
 	after uint // byte offset from which the assignment is in effect
@@ -48,6 +52,12 @@ var variableAssigningBuiltins = map[string]bool{
 	"wait": true, "eval": true, "source": true, ".": true, "let": true, "unset": true,
 	"export": true, "declare": true, "typeset": true, "local": true, "readonly": true,
 }
+
+// Builtins that run code the scan cannot see in the current shell: a trap
+// action is evaluated like eval (e.g. on every command with DEBUG), and
+// enable -f loads a builtin from a shared object. Their mere presence
+// disables resolution.
+var codeLoadingBuiltins = map[string]bool{"trap": true, "enable": true}
 
 // resolve returns the literal value of a plain parameter expansion, if the
 // expansion refers to a resolvable variable read after its assignment.
@@ -90,7 +100,8 @@ func collectLiteralVariables(file *syntax.File, raw string) literalVariables {
 			value, ok := literalWordValue(assign.Value)
 			// A value naming a variable-assigning builtin would hide a
 			// dynamic assignment from the scan below; leave it computed.
-			if !ok || !literalVariableValue.MatchString(value) || variableAssigningBuiltins[filepath.Base(value)] {
+			base := filepath.Base(value)
+			if !ok || !literalVariableValue.MatchString(value) || variableAssigningBuiltins[base] || codeLoadingBuiltins[base] {
 				continue
 			}
 			candidates[assign.Name.Value] = append(candidates[assign.Name.Value],
@@ -103,6 +114,7 @@ func collectLiteralVariables(file *syntax.File, raw string) literalVariables {
 
 	dynamicAssignment := false
 	plainReads := map[string]int{}
+	var assignerWords []string // static words of calls to assigning builtins
 	syntax.Walk(file, func(node syntax.Node) bool {
 		switch node := node.(type) {
 		case *syntax.ParamExp:
@@ -132,25 +144,60 @@ func collectLiteralVariables(file *syntax.File, raw string) literalVariables {
 				}
 			}
 		case *syntax.CallExpr:
+			// Judge words by the value bash sees after quote removal, not by
+			// their source spelling: `printf -v X\Y v`, `pr""intf -vXY v`,
+			// `read X{Y,Z}` and `unset X\Y` all name XY although XY never
+			// appears as an identifier in the raw text.
 			assigning, computed := false, false
+			var values []string
 			for _, arg := range node.Args {
-				if lit := arg.Lit(); lit != "" {
-					assigning = assigning || variableAssigningBuiltins[lit]
-				} else {
+				value, ok := staticWordValue(arg)
+				if !ok {
 					computed = true
+					continue
+				}
+				assigning = assigning || variableAssigningBuiltins[value]
+				dynamicAssignment = dynamicAssignment || codeLoadingBuiltins[value]
+				values = append(values, value)
+			}
+			// mapfile/readarray -C evaluates its callback text like eval.
+			callback := false
+			for _, value := range values {
+				callback = callback || (strings.HasPrefix(value, "-") && strings.Contains(value, "C"))
+			}
+			if callback && (slices.Contains(values, "mapfile") || slices.Contains(values, "readarray")) {
+				dynamicAssignment = true
+			}
+			if assigning {
+				if computed {
+					dynamicAssignment = true
+				} else {
+					assignerWords = append(assignerWords, values...)
 				}
 			}
-			dynamicAssignment = dynamicAssignment || (assigning && computed)
 		}
 		return !dynamicAssignment
 	})
 	if dynamicAssignment {
 		return nil
 	}
+	// A name can be passed to an assigning builtin inside a longer word
+	// (`printf -vIFS x`, `read -aXY`), so any substring match counts.
+	assignedBy := func(name string) bool {
+		for _, word := range assignerWords {
+			if strings.Contains(word, name) {
+				return true
+			}
+		}
+		return false
+	}
+	if assignedBy("IFS") {
+		return nil
+	}
 
 	vars := literalVariables{}
 	for name, assigned := range candidates {
-		if len(assigned) != 1 {
+		if len(assigned) != 1 || assignedBy(name) {
 			continue
 		}
 		// Every mention of the name must be the assignment or a plain read.
@@ -194,6 +241,62 @@ func literalWordValue(word *syntax.Word) (string, bool) {
 		}
 	}
 	return out.String(), out.Len() > 0
+}
+
+// staticWordValue returns the value bash gives word after quote removal, when
+// that value cannot depend on expansion: no parameter, command, arithmetic or
+// ANSI-C/locale quoting, and no unquoted brace, glob or tilde characters
+// (rejected even when escaped, to stay conservative).
+func staticWordValue(word *syntax.Word) (string, bool) {
+	var out strings.Builder
+	for _, part := range word.Parts {
+		switch part := part.(type) {
+		case *syntax.Lit:
+			if strings.ContainsAny(part.Value, "{}*?[~") {
+				return "", false
+			}
+			value := part.Value
+			for i := 0; i < len(value); i++ {
+				if value[i] != '\\' || i+1 == len(value) {
+					out.WriteByte(value[i])
+					continue
+				}
+				i++
+				if value[i] != '\n' { // backslash-newline is a line continuation
+					out.WriteByte(value[i])
+				}
+			}
+		case *syntax.SglQuoted:
+			if part.Dollar {
+				return "", false
+			}
+			out.WriteString(part.Value)
+		case *syntax.DblQuoted:
+			if part.Dollar {
+				return "", false
+			}
+			for _, inner := range part.Parts {
+				lit, ok := inner.(*syntax.Lit)
+				if !ok {
+					return "", false
+				}
+				value := lit.Value
+				for i := 0; i < len(value); i++ {
+					if value[i] == '\\' && i+1 < len(value) && strings.IndexByte("$`\"\\\n", value[i+1]) >= 0 {
+						i++
+						if value[i] != '\n' {
+							out.WriteByte(value[i])
+						}
+						continue
+					}
+					out.WriteByte(value[i])
+				}
+			}
+		default:
+			return "", false
+		}
+	}
+	return out.String(), true
 }
 
 // identifierCount counts maximal [A-Za-z0-9_] runs in raw equal to name.

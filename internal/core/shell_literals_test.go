@@ -16,6 +16,9 @@ func TestClassifyControlFlowLiteralVariablesAndHereStrings(t *testing.T) {
 		"reporter gh loop": `for spec in "repo 1" "repo 2"; do read -r r n <<< "$spec"; gh api "repos/x/$r/issues/$n"; done`,
 		"grep here-string": `if grep -q x <<< "$v"; then echo y; fi`,
 		"cat here-string":  `while true; do cat <<< "$v"; break; done`,
+		"printf no -v":     `S=/bin/ls; if true; then $S /; fi; printf '%s\n' done`,
+		"read other name":  `S=/bin/ls; read -r a b <<< "1 2"; if true; then $S /; fi`,
+		"command -v check": `S=/bin/ls; if command -v "$S" >/dev/null; then $S /; fi`,
 	}
 	for name, command := range benign {
 		t.Run(name, func(t *testing.T) {
@@ -80,6 +83,26 @@ func TestClassifyControlFlowUnprovableStaysParseError(t *testing.T) {
 		"computed here-string":    `for s in a; do $R <<< "x"; done`,
 		"wrapped here-string":     `for s in a; do command bash <<< "echo hi"; done`,
 		"loop here-string":        `while read -r l; do $l; done <<< "$cmds"`,
+		// Names spelled so the identifier never appears in the raw text.
+		"escaped printf -v":    `XY=/bin/ls; printf -v X\Y rm; if true; then $XY -rf /srv; fi`,
+		"attached printf -v":   `XY=/bin/ls; printf -vXY rm; if true; then $XY -rf /srv; fi`,
+		"quoted printf -v":     `XY=/bin/ls; printf -v 'X''Y' rm; if true; then $XY -rf /srv; fi`,
+		"escaped read":         `XY=/bin/ls; read X\Y <<< rm; if true; then $XY -rf /srv; fi`,
+		"attached read -a":     `XY=/bin/ls; read -aXY <<< rm; if true; then $XY -rf /srv; fi`,
+		"brace read":           `XY=/bin/ls; read X{Y,Z} <<< "rm x"; if true; then $XY -rf /srv; fi`,
+		"escaped unset":        `XY=/bin/ls; unset X\Y; if true; then $XY rm -rf /srv; fi`,
+		"attached wait -p":     `XY=/bin/ls; wait -pXY; if true; then $XY -rf /srv; fi`,
+		"line continuation":    "XY=/bin/ls; printf -v X\\\nY rm; if true; then $XY -rf /srv; fi",
+		"escaped builtin name": `XY=/bin/ls; pr\intf -v X\Y rm; if true; then $XY -rf /srv; fi`,
+		"quoted builtin name":  `XY=/bin/ls; pr""intf -v X\Y rm; if true; then $XY -rf /srv; fi`,
+		"wrapped printf":       `XY=/bin/ls; builtin printf -v X\Y rm; if true; then $XY -rf /srv; fi`,
+		"wrapped glob builtin": `XY=/bin/ls; builtin prin?f -v X\Y rm; if true; then $XY -rf /srv; fi`,
+		"trap action":          `XY=/bin/ls; trap 'printf -v X\Y rm' DEBUG; if true; then $XY -rf /srv; fi`,
+		"attached ifs":         `S=/bin/rmX-rfX/srv; printf -vIFS X; if true; then $S; fi`,
+		"escaped ifs":          `S=/bin/rmX-rfX/srv; read I\FS <<< X; if true; then $S; fi`,
+		"trap value":           `S=trap; if true; then $S x DEBUG; fi`,
+		"mapfile -C name":      `XY=/bin/ls; mapfile -C 'printf -v X\Y rm' -c 1 a < /etc/hosts; if true; then $XY -rf /srv; fi`,
+		"readarray -tC name":   `XY=/bin/ls; readarray -tC 'printf -v X\Y rm' -c 1 a < /etc/hosts; if true; then $XY -rf /srv; fi`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			got := engine.ClassifyCommand(command, "")
