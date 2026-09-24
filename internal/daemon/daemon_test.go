@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -475,5 +476,54 @@ func TestLoadDaemonCustomPatterns_MergesRowsIntoEngine(t *testing.T) {
 	after := len(engine.AllPatterns()["dangerous"])
 	if before != after {
 		t.Errorf("loadDaemonCustomPatterns is not idempotent: dangerous-tier count %d -> %d", before, after)
+	}
+}
+
+// startupCancelledContext is already cancelled but reports no error on its
+// first Err() call, so RunDaemon gets past its entry check and the shutdown
+// request lands while startup is reconciling project state. This makes the
+// timing that TestStartDaemonWithOptions_DaemonModeRunsAndStops can hit on a
+// loaded host deterministic.
+type startupCancelledContext struct {
+	context.Context
+	checked atomic.Bool
+}
+
+func (c *startupCancelledContext) Err() error {
+	if c.checked.CompareAndSwap(false, true) {
+		return nil
+	}
+	return c.Context.Err()
+}
+
+func TestRunDaemon_ShutdownDuringStartupIsCleanStop(t *testing.T) {
+	project := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(project, ".slb"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, ".slb", "config.toml"), []byte("[daemon]\nuse_file_watcher = false\n[notifications]\ndesktop_enabled = false\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(project); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(old) }()
+
+	tmp := shortSocketDir(t)
+	pidFile := filepath.Join(tmp, "slb.pid")
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = RunDaemon(&startupCancelledContext{Context: cancelled}, ServerOptions{
+		SocketPath: filepath.Join(tmp, "s.sock"), PIDFile: pidFile, Logger: log.New(io.Discard),
+	})
+	if err != nil {
+		t.Fatalf("shutdown requested during startup reported a daemon failure: %v", err)
+	}
+	if _, err := os.Stat(pidFile); !os.IsNotExist(err) {
+		t.Fatalf("pid file left behind after startup shutdown: %v", err)
 	}
 }

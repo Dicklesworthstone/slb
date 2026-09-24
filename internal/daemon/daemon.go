@@ -6,6 +6,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -167,6 +168,12 @@ func RunDaemon(ctx context.Context, opts ServerOptions) error {
 	}
 	stopServices, err := startProjectServices(signalCtx, database, projectPath, cfg, servers, logger)
 	if err != nil {
+		// A shutdown request (signal or caller cancellation) that arrives while
+		// startup is still reconciling state is a clean stop, exactly as it is
+		// once the daemon is serving. Any other startup failure is reported.
+		if signalCtx.Err() != nil && errors.Is(err, context.Canceled) {
+			return nil
+		}
 		return err
 	}
 	defer stopServices()
