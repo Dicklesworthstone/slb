@@ -238,10 +238,8 @@ func (f *claudeSettingsFile) save() error {
 	if f.trailingNewline {
 		data = append(data, '\n')
 	}
-	target := f.path
-	if resolved, err := filepath.EvalSymlinks(f.path); err == nil {
-		target = resolved
-	} else if !os.IsNotExist(err) {
+	target, err := settingsWriteTarget(f.path)
+	if err != nil {
 		return fmt.Errorf("failed to resolve settings path: %w", err)
 	}
 	mode := os.FileMode(0o600)
@@ -282,6 +280,35 @@ func (f *claudeSettingsFile) save() error {
 	}
 	committed = true
 	return nil
+}
+
+// settingsWriteTarget follows path through any chain of symlinks, including a
+// final link whose target does not exist yet (a dotfile manager's link to a
+// file it has not created), so the write lands on the link's target and the
+// link itself survives.
+func settingsWriteTarget(path string) (string, error) {
+	target := path
+	for hops := 0; hops < 40; hops++ {
+		info, err := os.Lstat(target)
+		if os.IsNotExist(err) {
+			return target, nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			return target, nil
+		}
+		link, err := os.Readlink(target)
+		if err != nil {
+			return "", err
+		}
+		if !filepath.IsAbs(link) {
+			link = filepath.Join(filepath.Dir(target), link)
+		}
+		target = link
+	}
+	return "", fmt.Errorf("too many levels of symbolic links: %s", path)
 }
 
 // preToolUse returns hooks.PreToolUse. Missing or null sections are reported

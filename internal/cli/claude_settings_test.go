@@ -365,6 +365,31 @@ func TestHookInstallWritesThroughSettingsSymlink(t *testing.T) {
 	}
 }
 
+// A dotfile manager may link settings.json to a file it has not created yet.
+// The install must create the link's target, not replace the link.
+func TestHookInstallWritesThroughDanglingSettingsSymlink(t *testing.T) {
+	h := testutil.NewHarness(t)
+	home, settingsPath := setupHookHome(t, "")
+	if err := os.MkdirAll(filepath.Join(home, "dotfiles"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "dotfiles", "claude-settings.json"), settingsPath); err != nil {
+		t.Fatal(err)
+	}
+	runHookCLI(t, h.DBPath, "install")
+	info, err := os.Lstat(settingsPath)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("dangling settings symlink was replaced: %v %v", info, err)
+	}
+	data, err := os.ReadFile(filepath.Join(home, "dotfiles", "claude-settings.json"))
+	if err != nil || !strings.Contains(string(data), "hook guard") {
+		t.Fatalf("symlink target not created with the hook: %s %v", data, err)
+	}
+}
+
 func TestMatcherCoversBash(t *testing.T) {
 	for matcher, want := range map[string]bool{
 		"": true, "*": true, "Bash": true, "Bash|PowerShell": true, ".*": true,
