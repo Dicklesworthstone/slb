@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
+	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/output"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
@@ -57,8 +58,11 @@ func TestRunSafeCommand_Failure(t *testing.T) {
 	flagOutput = "text"
 	exitCode, err := runSafeCommand(cmd, out, "sh -c 'exit 42'", tmpDir, tmpDir)
 
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	// Since 3295054 a nonzero child exit is reported as a commandExitError so
+	// the entry point exits with the child's status after deferred cleanup.
+	var exitErr commandExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 42 {
+		t.Fatalf("expected commandExitError with code 42, got %T %v", err, err)
 	}
 	if exitCode != 42 {
 		t.Errorf("expected exit code 42, got %d", exitCode)
@@ -133,8 +137,10 @@ func TestRunApprovedRequest_Success(t *testing.T) {
 	// Create an approved request
 	req := testutil.MakeRequest(t, h.DB, sess,
 		testutil.WithCommand("echo approved", h.ProjectDir, true),
-		testutil.WithStatus(db.StatusApproved),
 	)
+	// Execution re-verifies signed review evidence; the status bit alone is
+	// not an approval (f4fb378).
+	testutil.ApproveRequest(t, h.DB, req)
 
 	outBuf := &bytes.Buffer{}
 	out := output.New(output.FormatText, output.WithOutput(outBuf))
@@ -202,12 +208,16 @@ func TestRunApprovedRequest_ValidationFailure(t *testing.T) {
 	flagOutput = "text"
 	exitCode, err := runApprovedRequest(context.Background(), out, h.DB, cfg, h.ProjectDir, req.ID)
 
-	if err != nil {
-		// It might return error if write fails?
-		// No, it returns 1, nil usually.
+	// Since 3295054 a refused request reports the not-executed sentinel (-1)
+	// and returns the gate error, which the entry point turns into exit 1.
+	if !errors.Is(err, core.ErrRequestNotApproved) {
+		t.Fatalf("expected ErrRequestNotApproved, got %v", err)
 	}
-	if exitCode != 1 {
-		t.Errorf("expected exit code 1 for validation failure, got %d", exitCode)
+	if exitCode != -1 {
+		t.Errorf("expected not-executed exit code -1 for validation failure, got %d", exitCode)
+	}
+	if updated, gerr := h.DB.GetRequest(req.ID); gerr != nil || updated.Status != db.StatusPending {
+		t.Fatalf("refused request changed state: %+v %v", updated, gerr)
 	}
 }
 
@@ -221,8 +231,8 @@ func TestRunApprovedRequest_ExecutionFailure(t *testing.T) {
 	// Create an approved request that fails
 	req := testutil.MakeRequest(t, h.DB, sess,
 		testutil.WithCommand("sh -c 'exit 42'", h.ProjectDir, true),
-		testutil.WithStatus(db.StatusApproved),
 	)
+	testutil.ApproveRequest(t, h.DB, req)
 
 	outBuf := &bytes.Buffer{}
 	out := output.New(output.FormatText, output.WithOutput(outBuf))
@@ -231,8 +241,9 @@ func TestRunApprovedRequest_ExecutionFailure(t *testing.T) {
 	flagOutput = "text"
 	exitCode, err := runApprovedRequest(context.Background(), out, h.DB, cfg, h.ProjectDir, req.ID)
 
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	var exitErr commandExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 42 {
+		t.Fatalf("expected commandExitError with code 42, got %T %v", err, err)
 	}
 	if exitCode != 42 {
 		t.Errorf("expected exit code 42, got %d", exitCode)

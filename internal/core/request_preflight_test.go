@@ -190,7 +190,11 @@ func TestRequestPreflightCancellationTimeoutAndNoEarlyVisibility(t *testing.T) {
 			preflightTool(t, "printf started > \"$PREFLIGHT_STARTED\"; while [ ! -f \"$PREFLIGHT_RELEASE\" ]; do sleep 0.01; done; printf preview")
 			opts := creatorAdmissionOptions(session)
 			if strings.HasPrefix(mode, "timeout") {
-				opts.DryRunTimeout = 80 * time.Millisecond
+				// Long enough for the preview process to reach its
+				// synchronization point (macOS process start alone can exceed
+				// 80ms), still far below the 2s the test waits for completion;
+				// the release file is never written in timeout modes.
+				opts.DryRunTimeout = 750 * time.Millisecond
 			}
 			opts.RequireDryRun = mode == "timeout-required"
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -309,7 +313,9 @@ func TestRequestPreflightSupportedToolTransformations(t *testing.T) {
 		t.Skip("POSIX preview fixtures")
 	}
 	for _, tc := range []struct{ name, command, want string }{
-		{"kubectl", "kubectl delete pod obsolete --dry-run=none", "delete --dry-run=client -o yaml pod obsolete"},
+		// "kubectl delete pod" is a builtin SAFE pattern (controllers recreate
+		// pods), so it is skipped without a request; use a deployment.
+		{"kubectl", "kubectl delete deployment obsolete --dry-run=none", "delete --dry-run=client -o yaml deployment obsolete"},
 		{"terraform", "terraform destroy -auto-approve", "plan -destroy -input=false"},
 		{"git", "git reset --hard HEAD~1", "diff --no-ext-diff --no-textconv HEAD~1..HEAD"},
 		{"helm", "helm uninstall old-release --namespace team", "get manifest old-release --namespace=team"},
@@ -328,6 +334,9 @@ func TestRequestPreflightSupportedToolTransformations(t *testing.T) {
 			result, err := creator.CreateRequest(opts)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if result.Request == nil || result.Preflight == nil || result.Request.DryRun == nil {
+				t.Fatalf("no request/preflight evidence was produced: %+v", result)
 			}
 			if result.Preflight.Status != "succeeded" || !strings.HasSuffix(result.Request.DryRun.Output, tc.want) {
 				t.Fatalf("incorrect preapproval argv: %+v", result.Request.DryRun)

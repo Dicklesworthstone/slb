@@ -151,11 +151,21 @@ func TestRunWatchPolling_AutoApproveCaution(t *testing.T) {
 
 	sess := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir))
 	req := testutil.MakeRequest(t, h.DB, sess,
-		testutil.WithCommand("echo caution", h.ProjectDir, true),
+		testutil.WithCommand("git branch -d obsolete", h.ProjectDir, true),
 		testutil.WithRisk(db.RiskTierCaution),
 		testutil.WithStatus(db.StatusPending),
 		testutil.WithMinApprovals(0),
 	)
+	// Since cf22a99 auto-approval re-classifies the command under current
+	// policy (it must still be CAUTION, which "echo" is not) and honors the
+	// configured CAUTION delay (30s by default). Use a real CAUTION command,
+	// backdate the request so it is due, and isolate user config.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
+	if _, err := h.DB.Exec(`UPDATE requests SET created_at = ? WHERE id = ?`,
+		time.Now().UTC().Add(-2*time.Minute).Format(time.RFC3339), req.ID); err != nil {
+		t.Fatal(err)
+	}
 
 	oldInterval := flagWatchPollInterval
 	flagWatchPollInterval = 10 * time.Millisecond
@@ -191,7 +201,11 @@ func TestRunWatchPolling_AutoApproveCaution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updated.Status != db.StatusApproved {
-		t.Error("expected request to be auto-approved")
+	if updated.Status != db.StatusApproved || updated.ApprovalExpiresAt == nil {
+		t.Errorf("expected request to be auto-approved with an approval TTL: %+v", updated)
+	}
+	reviews, err := h.DB.ListReviewsForRequest(req.ID)
+	if err != nil || len(reviews) != 0 {
+		t.Errorf("auto-approval must not manufacture reviews: %d %v", len(reviews), err)
 	}
 }

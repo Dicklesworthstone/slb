@@ -2,9 +2,11 @@ package cli
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -776,13 +778,14 @@ func TestHookGenerateCommand_GeneratedScriptShapeIsCorrect(t *testing.T) {
 		t.Errorf("expected raw-string `r'^rm\\s+-[rf]{2}'` in generated script; not found")
 	}
 
-	// (b) #4 follow-on: classify() must use p.search, not p.match.
-	// Anchored matching loses every mid-command hit.
-	if strings.Contains(script, "if p.match(command):") {
-		t.Errorf("regression #4 follow-on: classify() uses anchored p.match; should use unanchored p.search")
+	// (b) #4 follow-on: classify() must use search, not match. Anchored
+	// matching loses every mid-command hit. 33e54f2 renamed the loop
+	// variable from p to pattern.
+	if strings.Contains(script, ".match(command)") {
+		t.Errorf("regression #4 follow-on: classify() uses anchored .match; should use unanchored .search")
 	}
-	if !strings.Contains(script, "if p.search(command):") {
-		t.Errorf("expected p.search in classify(); not found")
+	if !strings.Contains(script, "if pattern.search(command):") {
+		t.Errorf("expected pattern.search in classify(); not found")
 	}
 
 	// (c) #5: hookSpecificOutput shape is the only one Claude Code
@@ -804,12 +807,48 @@ func TestHookGenerateCommand_GeneratedScriptShapeIsCorrect(t *testing.T) {
 	if !strings.Contains(script, "def _emit_decision(") {
 		t.Errorf("expected _emit_decision helper in generated script")
 	}
-	// The defensive default for unknown actions sets permission
-	// to "ask"; the previous broken implementation defaulted
-	// to "allow" (fail-open).
-	if !strings.Contains(script, `permission = "ask"`) {
-		t.Errorf("expected fail-closed default `permission = \"ask\"` for unknown actions; not found")
+	// The defensive default for unknown actions is "ask"; the previous
+	// broken implementation defaulted to "allow" (fail-open). Since
+	// 33e54f2 the mapping lives in _normalized_action, so exercise the
+	// generated functions themselves rather than pinning their source.
+	if !strings.Contains(script, "def _normalized_action(") {
+		t.Errorf("expected _normalized_action helper in generated script")
 	}
+	for action, want := range map[string]string{
+		"'allow'": "allow", "'block'": "deny", "'deny'": "deny",
+		"'weird'": "ask", "None": "ask", "42": "ask", "''": "ask",
+	} {
+		stdout := runGeneratedHookPython(t, filepath.Join(tmpDir, "slb_guard.py"), "g['_emit_decision']("+action+", 'reason')")
+		var result struct {
+			Output struct {
+				Permission string `json:"permissionDecision"`
+			} `json:"hookSpecificOutput"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+			t.Fatalf("_emit_decision(%s) produced invalid JSON %q: %v", action, stdout, err)
+		}
+		if result.Output.Permission != want {
+			t.Errorf("_emit_decision(%s) = %q, want %q (unknown verdicts must fail closed)", action, result.Output.Permission, want)
+		}
+	}
+}
+
+// runGeneratedHookPython loads a generated guard without running its main()
+// and evaluates expr with the module globals bound to g, returning stdout.
+func runGeneratedHookPython(t *testing.T, scriptPath, expr string, args ...string) string {
+	t.Helper()
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 is required to exercise the generated hook")
+	}
+	program := "import runpy, sys\ng = runpy.run_path(sys.argv[1], run_name='slb_guard_test')\n" + expr + "\n"
+	command := exec.Command(python, append([]string{"-c", program, scriptPath}, args...)...)
+	var stdout, stderr bytes.Buffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	if err := command.Run(); err != nil {
+		t.Fatalf("generated hook evaluation failed: %v\n%s", err, stderr.String())
+	}
+	return strings.TrimSpace(stdout.String())
 }
 
 // The generated script must walk up from CWD looking for .slb/
@@ -832,10 +871,41 @@ func TestHookGenerateCommand_SocketPathWalksUpToProjectRoot(t *testing.T) {
 	script := string(body)
 
 	if !strings.Contains(script, "_project_root_for_socket(") {
-		t.Errorf("regression #3: generated script does not include _project_root_for_socket helper")
+		t.Fatalf("regression #3: generated script does not include _project_root_for_socket helper")
 	}
-	if !strings.Contains(script, `os.path.isdir(candidate)`) {
-		t.Errorf("regression #3: _project_root_for_socket is not walking up looking for .slb/")
+	// Exercise the walk-up itself (33e54f2 reshaped its source): from a
+	// nested directory it must return the nearest ancestor holding .slb/,
+	// and without any .slb/ ancestor it must fall back to the start dir.
+	root := t.TempDir()
+	nested := filepath.Join(root, "a", "b")
+	if err := os.MkdirAll(filepath.Join(root, ".slb"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(nested, 0700); err != nil {
+		t.Fatal(err)
+	}
+	loose := t.TempDir()
+	got := runGeneratedHookPython(t, filepath.Join(tmpDir, "slb_guard.py"),
+		"print(g['_project_root_for_socket'](sys.argv[2]))\nprint(g['_project_root_for_socket'](sys.argv[3]))", nested, loose)
+	lines := strings.Split(got, "\n")
+	resolvedRoot, _ := filepath.EvalSymlinks(root)
+	if len(lines) != 2 || (lines[0] != root && lines[0] != resolvedRoot) {
+		t.Errorf("regression #3: _project_root_for_socket(%q) = %q, want project root %q", nested, got, root)
+	}
+	// The fallback is the start dir unless the host itself has a .slb
+	// directory somewhere above the temp dir; mirror the walk in Go.
+	wantLoose := loose
+	for dir := loose; ; dir = filepath.Dir(dir) {
+		if info, err := os.Stat(filepath.Join(dir, ".slb")); err == nil && info.IsDir() {
+			wantLoose = dir
+			break
+		}
+		if filepath.Dir(dir) == dir {
+			break
+		}
+	}
+	if len(lines) == 2 && lines[1] != wantLoose {
+		t.Errorf("_project_root_for_socket without .slb in the fixture = %q, want %q", lines[1], wantLoose)
 	}
 }
 

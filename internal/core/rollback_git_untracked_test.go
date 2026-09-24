@@ -54,7 +54,14 @@ func TestGitCleanRollbackRecoversUntrackedContents(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !strings.HasPrefix(data.RollbackPath, filepath.Join(root, ".git")+string(os.PathSeparator)) {
+			// Git reports the resolved repository path (on macOS the temp
+			// dir /var/... is a symlink to /private/var/...).
+			resolvedRoot, err := filepath.EvalSymlinks(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(data.RollbackPath, filepath.Join(root, ".git")+string(os.PathSeparator)) &&
+				!strings.HasPrefix(data.RollbackPath, filepath.Join(resolvedRoot, ".git")+string(os.PathSeparator)) {
 				t.Fatalf("recovery data would be swept away by git clean: %s", data.RollbackPath)
 			}
 			// Only this disposable fixture worktree is cleaned.

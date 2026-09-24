@@ -810,7 +810,9 @@ func TestIPCClient_SubscribeReceivesEvents_Unix(t *testing.T) {
 	}
 }
 
-func TestIPCClient_ConnectFallsBackToUnixWhenSLBHostInvalid(t *testing.T) {
+// An invalid explicit SLB_HOST is an error, not a cue to use the local Unix
+// daemon (f95ab24). Clearing SLB_HOST reaches the same local daemon.
+func TestIPCClient_InvalidSLBHostDoesNotFallBackToUnix(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unix socket tests not supported on windows")
 	}
@@ -837,9 +839,15 @@ func TestIPCClient_ConnectFallsBackToUnixWhenSLBHostInvalid(t *testing.T) {
 
 	client := NewIPCClient(socketPath)
 	t.Cleanup(func() { _ = client.Close() })
+	if err := client.Ping(callCtx); err == nil {
+		t.Fatal("invalid SLB_HOST silently fell back to the local Unix daemon")
+	}
 
-	if err := client.Ping(callCtx); err != nil {
-		t.Fatalf("Ping (expected unix fallback): %v", err)
+	t.Setenv("SLB_HOST", "")
+	local := NewIPCClient(socketPath)
+	t.Cleanup(func() { _ = local.Close() })
+	if err := local.Ping(callCtx); err != nil {
+		t.Fatalf("Ping over Unix without SLB_HOST: %v", err)
 	}
 }
 

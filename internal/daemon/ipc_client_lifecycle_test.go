@@ -314,7 +314,7 @@ func TestIPCClientExplicitTCPNeverFallsBackToLocal(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix local fallback test")
 	}
-	path := filepath.Join(t.TempDir(), "local.sock")
+	path := filepath.Join(shortSocketDir(t), "local.sock")
 	listener, err := net.Listen("unix", path)
 	if err != nil {
 		t.Fatal(err)

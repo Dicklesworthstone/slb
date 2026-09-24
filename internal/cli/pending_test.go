@@ -41,6 +41,13 @@ func resetPendingFlags() {
 	flagConfig = ""
 	flagPendingAllProjects = false
 	flagPendingReviewPool = false
+	// newTestPendingCmd reuses the production pendingCmd, whose --help flag
+	// value survives across executions. A prior `pending --help` test would
+	// otherwise make every later invocation print help instead of running.
+	if help := pendingCmd.Flags().Lookup("help"); help != nil {
+		_ = help.Value.Set("false")
+		help.Changed = false
+	}
 }
 
 func TestPendingCommand_ListsPendingRequests(t *testing.T) {
@@ -304,7 +311,7 @@ func TestPendingCommand_ReviewPoolUsesAgentAllowlist(t *testing.T) {
 	}
 	var result []map[string]any
 	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
-		t.Fatal(err)
+		t.Fatalf("%v\nstdout: %s", err, stdout)
 	}
 	seen := map[string]bool{}
 	for _, item := range result {

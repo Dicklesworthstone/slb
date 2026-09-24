@@ -64,6 +64,10 @@ func resetReviewFlags() {
 	flagConfig = ""
 	flagReviewAll = false
 	flagReviewPool = false
+	// --review-pool resolves the reviewer from the persistent --session-id
+	// before the actor (654c244); never inherit either from an earlier test.
+	flagSessionID = ""
+	flagActor = ""
 }
 
 func TestReviewListCommand_ListsPendingRequests(t *testing.T) {

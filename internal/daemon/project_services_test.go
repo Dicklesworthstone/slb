@@ -94,7 +94,14 @@ func TestRunDaemonPublishesExistingStateAndStops(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix socket integration")
 	}
-	project := t.TempDir()
+	// The daemon resolves its project from the working directory after the
+	// Chdir below, which yields the symlink-free path (on macOS the temp dir
+	// /var/... is really /private/var/...). Store the request under that
+	// same path, as a CLI running in the project would.
+	project, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(filepath.Join(project, ".slb"), 0700); err != nil {
 		t.Fatal(err)
 	}

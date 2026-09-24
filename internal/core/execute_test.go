@@ -997,9 +997,10 @@ func TestExecuteApprovedRequest(t *testing.T) {
 		}
 		defer dbConn.Close()
 
+		tmpDir := t.TempDir()
 		session := &db.Session{
 			ID:          "test-session",
-			ProjectPath: "/tmp/test",
+			ProjectPath: tmpDir,
 			AgentName:   "test-agent",
 			Program:     "test-program",
 			Model:       "test-model",
@@ -1008,7 +1009,6 @@ func TestExecuteApprovedRequest(t *testing.T) {
 			t.Fatalf("CreateSession error = %v", err)
 		}
 
-		tmpDir := t.TempDir()
 		// Use a cross-platform 'true' command which exits with 0
 		truePath := testutil.TruePath()
 		cmdSpec := db.CommandSpec{
@@ -1071,9 +1071,10 @@ func TestExecuteApprovedRequest(t *testing.T) {
 		}
 		defer dbConn.Close()
 
+		tmpDir := t.TempDir()
 		session := &db.Session{
 			ID:          "test-session",
-			ProjectPath: "/tmp/test",
+			ProjectPath: tmpDir,
 			AgentName:   "test-agent",
 			Program:     "test-program",
 			Model:       "test-model",
@@ -1082,7 +1083,6 @@ func TestExecuteApprovedRequest(t *testing.T) {
 			t.Fatalf("CreateSession error = %v", err)
 		}
 
-		tmpDir := t.TempDir()
 		// Use a cross-platform 'false' command which exits with 1
 		falsePath := testutil.FalsePath()
 		cmdSpec := db.CommandSpec{
@@ -1143,9 +1143,10 @@ func TestExecuteApprovedRequest(t *testing.T) {
 		}
 		defer dbConn.Close()
 
+		tmpDir := t.TempDir()
 		session := &db.Session{
 			ID:          "test-session",
-			ProjectPath: "/tmp/test",
+			ProjectPath: tmpDir,
 			AgentName:   "test-agent",
 			Program:     "test-program",
 			Model:       "test-model",
@@ -1154,7 +1155,6 @@ func TestExecuteApprovedRequest(t *testing.T) {
 			t.Fatalf("CreateSession error = %v", err)
 		}
 
-		tmpDir := t.TempDir()
 		truePath := testutil.TruePath()
 		cmdSpec := db.CommandSpec{
 			Raw:  truePath,
@@ -1208,9 +1208,10 @@ func TestExecuteApprovedRequest(t *testing.T) {
 		}
 		defer dbConn.Close()
 
+		tmpDir := t.TempDir()
 		session := &db.Session{
 			ID:          "test-session",
-			ProjectPath: "/tmp/test",
+			ProjectPath: tmpDir,
 			AgentName:   "test-agent",
 			Program:     "test-program",
 			Model:       "test-model",
@@ -1219,7 +1220,6 @@ func TestExecuteApprovedRequest(t *testing.T) {
 			t.Fatalf("CreateSession error = %v", err)
 		}
 
-		tmpDir := t.TempDir()
 		// Use sleep binary directly
 		cmdSpec := db.CommandSpec{
 			Raw:  "sleep 10",
@@ -1284,9 +1284,10 @@ func TestExecuteApprovedRequest(t *testing.T) {
 		}
 		defer dbConn.Close()
 
+		tmpDir := t.TempDir()
 		session := &db.Session{
 			ID:          "test-session",
-			ProjectPath: "/tmp/test",
+			ProjectPath: tmpDir,
 			AgentName:   "test-agent",
 			Program:     "test-program",
 			Model:       "test-model",
@@ -1295,7 +1296,6 @@ func TestExecuteApprovedRequest(t *testing.T) {
 			t.Fatalf("CreateSession error = %v", err)
 		}
 
-		tmpDir := t.TempDir()
 		// Change to tmpDir so default ".slb/logs" is created there
 		oldWd, _ := os.Getwd()
 		_ = os.Chdir(tmpDir)
@@ -1350,9 +1350,10 @@ func TestExecuteApprovedRequest(t *testing.T) {
 		}
 		defer dbConn.Close()
 
+		tmpDir := t.TempDir()
 		session := &db.Session{
 			ID:          "test-session",
-			ProjectPath: "/tmp/test",
+			ProjectPath: tmpDir,
 			AgentName:   "test-agent",
 			Program:     "test-program",
 			Model:       "test-model",
@@ -1361,7 +1362,6 @@ func TestExecuteApprovedRequest(t *testing.T) {
 			t.Fatalf("CreateSession error = %v", err)
 		}
 
-		tmpDir := t.TempDir()
 		// Create a test file to capture for rollback
 		testFile := filepath.Join(tmpDir, "test.txt")
 		if err := os.WriteFile(testFile, []byte("original content"), 0644); err != nil {
@@ -1430,9 +1430,10 @@ func TestExecuteApprovedRequest(t *testing.T) {
 		}
 		defer dbConn.Close()
 
+		tmpDir := t.TempDir()
 		session := &db.Session{
 			ID:          "test-session",
-			ProjectPath: "/tmp/test",
+			ProjectPath: tmpDir,
 			AgentName:   "test-agent",
 			Program:     "test-program",
 			Model:       "test-model",
@@ -1441,7 +1442,6 @@ func TestExecuteApprovedRequest(t *testing.T) {
 			t.Fatalf("CreateSession error = %v", err)
 		}
 
-		tmpDir := t.TempDir()
 		truePath := testutil.TruePath()
 		cmdSpec := db.CommandSpec{
 			Raw:  truePath,
@@ -1490,9 +1490,10 @@ func TestExecuteApprovedRequest(t *testing.T) {
 		}
 		defer dbConn.Close()
 
+		tmpDir := t.TempDir()
 		session := &db.Session{
 			ID:          "test-session",
-			ProjectPath: "/tmp/test",
+			ProjectPath: tmpDir,
 			AgentName:   "test-agent",
 			Program:     "test-program",
 			Model:       "test-model",
@@ -1501,7 +1502,6 @@ func TestExecuteApprovedRequest(t *testing.T) {
 			t.Fatalf("CreateSession error = %v", err)
 		}
 
-		tmpDir := t.TempDir()
 		truePath := testutil.TruePath()
 		cmdSpec := db.CommandSpec{
 			Raw:  truePath,

@@ -20,7 +20,10 @@ func runHookRuntime(t *testing.T, home, setup, input string) (string, string) {
 	if err != nil {
 		t.Skip("python3 is required for hook runtime integration tests")
 	}
-	preamble := "__name__ = 'slb_runtime_test'\nAUDIT_REDACTION_PATTERNS = [r'(?i)token=[^ ]+']\n"
+	// The generator embeds these constants ahead of the runtime (f37f6ee added
+	// HOOK_CAUTION_ACTION; "block" is the generated default). Tests override
+	// them in setup when a case depends on a different value.
+	preamble := "__name__ = 'slb_runtime_test'\nAUDIT_REDACTION_PATTERNS = [r'(?i)token=[^ ]+']\nHOOK_CAUTION_ACTION = 'block'\n"
 	script := preamble + hookRuntime + "\n" + setup + "\nmain()\n"
 	command := exec.Command(python, "-c", script)
 	command.Dir = t.TempDir()
@@ -150,16 +153,23 @@ threading.Thread(target=respond, daemon=True).start()
 }
 
 func TestHookRuntimeRedactionFailureOmitsCommand(t *testing.T) {
-	home := t.TempDir()
-	stdout, _ := runHookRuntime(t, home,
-		"AUDIT_REDACTION_PATTERNS = ['[invalid']\nquery_slb_daemon = lambda *args: None\nclassify = lambda command: ('caution', 0)",
-		`{"tool_input":{"command":"sensitive-command-value"}}`)
-	if hookPermission(t, stdout) != "ask" {
-		t.Fatal("caution decision changed")
-	}
-	events, err := audit.Query(filepath.Join(home, ".slb", "audit", "blocked"), audit.Filter{})
-	if err != nil || len(events) != 1 || strings.Contains(events[0].CommandRedacted, "sensitive-command-value") {
-		t.Fatalf("redaction failure leaked command: %+v, %v", events, err)
+	// The CAUTION verdict follows the embedded hook_caution_action (f37f6ee:
+	// "block" by default, "ask" opt-in); a redaction failure must change
+	// neither the verdict nor leak the command into the audit record.
+	for _, tc := range []struct{ action, permission string }{{"block", "deny"}, {"ask", "ask"}} {
+		t.Run(tc.action, func(t *testing.T) {
+			home := t.TempDir()
+			stdout, _ := runHookRuntime(t, home,
+				"HOOK_CAUTION_ACTION = '"+tc.action+"'\nAUDIT_REDACTION_PATTERNS = ['[invalid']\nquery_slb_daemon = lambda *args: None\nclassify = lambda command: ('caution', 0)",
+				`{"tool_input":{"command":"sensitive-command-value"}}`)
+			if got := hookPermission(t, stdout); got != tc.permission {
+				t.Fatalf("caution decision changed: got %q, want %q", got, tc.permission)
+			}
+			events, err := audit.Query(filepath.Join(home, ".slb", "audit", "blocked"), audit.Filter{})
+			if err != nil || len(events) != 1 || strings.Contains(events[0].CommandRedacted, "sensitive-command-value") {
+				t.Fatalf("redaction failure leaked command: %+v, %v", events, err)
+			}
+		})
 	}
 }
 

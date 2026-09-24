@@ -36,6 +36,18 @@ func hookApprovalFixture(t *testing.T) (*db.DB, *db.Request, HookQueryParams) {
 	if err := conn.CreateRequest(req); err != nil {
 		t.Fatal(err)
 	}
+	// The status bit is not an approval: handoff eligibility re-verifies
+	// signed reviewer evidence (f4fb378), so record one authentic approval.
+	reviewer := &db.Session{AgentName: "HookReviewer", Model: "reviewer-model", Program: "test", ProjectPath: root}
+	if err := conn.CreateSession(reviewer); err != nil {
+		t.Fatal(err)
+	}
+	signedAt := time.Now().UTC()
+	if err := conn.CreateReview(&db.Review{RequestID: req.ID, ReviewerSessionID: reviewer.ID, ReviewerAgent: reviewer.AgentName,
+		ReviewerModel: reviewer.Model, Decision: db.DecisionApprove, SignatureTimestamp: signedAt,
+		Signature: db.ComputeReviewSignature(reviewer.SessionKey, req.ID, db.DecisionApprove, signedAt)}); err != nil {
+		t.Fatal(err)
+	}
 	return conn, req, HookQueryParams{Command: req.Command.Raw, SessionID: session.ID, CWD: cwd, ExecutionHandoff: true}
 }
 
@@ -146,7 +158,9 @@ func TestHookPolicyReloadsWithoutLeakingAcrossProjects(t *testing.T) {
 	if _, err := conn.InsertCustomPattern("dangerous", "[invalid", "invalid rule", "human"); err != nil {
 		t.Fatal(err)
 	}
-	if result := srv.classifyCommand(params); result.Action != "ask" {
+	// Since b084d38 an unloadable live policy is an infrastructure failure
+	// and a hard denial, not an interactive fallback.
+	if result := srv.classifyCommand(params); result.Action != "block" || result.MatchedPattern != "policy_load_error" || result.ExecutionHandoff != nil {
 		t.Fatalf("invalid policy failed open: %+v", result)
 	}
 }

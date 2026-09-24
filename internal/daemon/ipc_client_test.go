@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -375,12 +376,15 @@ func TestToRequestStreamEvent_WrongPayloadType(t *testing.T) {
 	}
 }
 
-func TestIPCClient_Connect_TCPFallback(t *testing.T) {
+// Since f95ab24 an explicit SLB_HOST is authoritative: when the TCP daemon is
+// unreachable, Connect must fail rather than silently use the local Unix
+// daemon (which may belong to a different trust domain). Without SLB_HOST the
+// same client reaches the local daemon.
+func TestIPCClient_Connect_ExplicitTCPFailureDoesNotFallBack(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unix socket tests not supported on windows")
 	}
 
-	// Set up environment for TCP connection attempt that will fail
 	t.Setenv("SLB_HOST", "127.0.0.1:65534") // High port unlikely to be in use
 	t.Setenv("SLB_SESSION_KEY", "test-key")
 
@@ -393,18 +397,26 @@ func TestIPCClient_Connect_TCPFallback(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = srv.Start(ctx) }()
+	defer func() { _ = srv.Stop() }()
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Should fall back to Unix socket when TCP fails
 	client := NewIPCClient(socketPath)
 	err = client.Connect(ctx)
-	if err != nil {
-		t.Fatalf("Connect should fall back to Unix socket: %v", err)
+	_ = client.Close()
+	if err == nil {
+		t.Fatal("explicit SLB_HOST failure silently fell back to the local Unix daemon")
+	}
+	if !strings.Contains(err.Error(), "127.0.0.1:65534") {
+		t.Fatalf("error does not identify the explicit TCP target: %v", err)
 	}
 
-	_ = client.Close()
-	_ = srv.Stop()
+	t.Setenv("SLB_HOST", "")
+	local := NewIPCClient(socketPath)
+	defer local.Close()
+	if err := local.Connect(ctx); err != nil {
+		t.Fatalf("local Unix daemon unreachable without SLB_HOST: %v", err)
+	}
 }
 
 func TestIPCClient_ConnectTCP_HandshakeWriteError(t *testing.T) {

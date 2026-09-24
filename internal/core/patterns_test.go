@@ -2,6 +2,7 @@
 package core
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -1055,12 +1056,23 @@ func TestExportClaudeHook_HandlesApostrophePatterns(t *testing.T) {
 		t.Fatalf("apostrophe pattern emitted as raw single-quoted string — would be a Python syntax error.\nExcerpt:\n%s",
 			extractFirstNLines(out, 80))
 	}
-	// SHOULD emit the non-raw escaped form — both the apostrophes
-	// and the backslash before \s are escaped.
-	expected := `re.compile('^echo\\s+\'unsafe\'', re.IGNORECASE)`
+	// SHOULD emit a non-raw escaped literal. Since 6c2bdd7 that literal
+	// is a JSON (double-quoted, ASCII-escaped) string, which is also a
+	// valid Python literal: the backslash before \s is escaped and the
+	// apostrophes need no escaping.
+	expected := `re.compile("^echo\\s+'unsafe'", re.IGNORECASE)`
 	if !strings.Contains(out, expected) {
 		t.Fatalf("expected escaped form %q in claude-hook output; not found.\nExcerpt:\n%s",
 			expected, extractFirstNLines(out, 80))
+	}
+	// And the literal must round-trip to the original regex under Python.
+	if python, err := exec.LookPath("python3"); err == nil {
+		program := "import ast, sys\nprint(ast.literal_eval(sys.argv[1]), end='')"
+		literal := expected[len("re.compile(") : len(expected)-len(", re.IGNORECASE)")]
+		got, err := exec.Command(python, "-c", program, literal).Output()
+		if err != nil || string(got) != `^echo\s+'unsafe'` {
+			t.Fatalf("Python reads the exported literal as %q (%v), want the original pattern", got, err)
+		}
 	}
 }
 
@@ -1083,12 +1095,13 @@ func TestExportClaudeHook_UsesSearchNotMatch(t *testing.T) {
 
 	// .search is the unanchored matcher; .match is anchored to
 	// position 0. The hook should use .search.
-	if strings.Contains(out, "if p.match(command):") {
-		t.Errorf("ExportClaudeHook still uses p.match(); should use p.search() (issue #4 follow-on).\n" +
+	// 6c2bdd7 renamed the loop variable from p to pattern.
+	if strings.Contains(out, ".match(command)") {
+		t.Errorf("ExportClaudeHook still uses .match(); should use .search() (issue #4 follow-on).\n" +
 			"Anchored matching loses mid-command hits like `DROP DATABASE` inside `psql -c '...'`.")
 	}
-	if !strings.Contains(out, "if p.search(command):") {
-		t.Errorf("ExportClaudeHook does not use p.search(); generated classify() may be broken.")
+	if !strings.Contains(out, "if pattern.search(command):") {
+		t.Errorf("ExportClaudeHook does not use pattern.search(); generated classify() may be broken.")
 	}
 }
 

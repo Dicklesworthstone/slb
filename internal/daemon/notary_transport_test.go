@@ -40,7 +40,7 @@ func TestNotaryRPC_ClaimAndCompleteOverUnix(t *testing.T) {
 		t.Skip("Unix sockets")
 	}
 	database, v, p := notaryFixture(t)
-	path := filepath.Join(t.TempDir(), "n.sock")
+	path := filepath.Join(shortSocketDir(t), "n.sock")
 	srv, err := NewIPCServer(path, log.New(io.Discard))
 	if err != nil {
 		t.Fatal(err)
