@@ -281,15 +281,18 @@ func TestRequestServiceRunCancelsInflightTransport(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() { service.Run(ctx, nil); close(done) }()
+	// Generous scheduling bounds: on a heavily loaded host (load average in
+	// the hundreds) reaching the first send took over a second. The
+	// assertions below are unchanged; only the wait for scheduling grew.
 	select {
 	case <-started:
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("worker did not start")
 	}
 	cancel()
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("worker failed to join")
 	}
 	state, err := readRequestDeliveryState(d.StatePath, d.Project)
