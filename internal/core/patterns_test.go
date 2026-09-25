@@ -997,6 +997,15 @@ func TestClassifyCommand_RedirectionsAndQuotedOperatorsDoNotHideArguments(t *tes
 			}
 		}
 	}
+	// `&>` takes no fd: the glued `1` is a file rm deletes, so the command
+	// must not read as the allowlisted log-only rm.
+	for _, dir := range []string{"", cwd} {
+		got := engine.ClassifyCommand(`rm -f 1&>/dev/null a.log`, dir)
+		want := engine.ClassifyCommand(`rm -f 1 a.log`, dir)
+		if got.Tier != want.Tier || got.IsSafe {
+			t.Errorf("rm -f 1&>/dev/null a.log (cwd %q): tier=%q safe=%v, want %q like rm -f 1 a.log", dir, got.Tier, got.IsSafe, want.Tier)
+		}
+	}
 	for _, cmd := range []string{
 		"echo hi > out.txt",
 		"go test ./... 2>&1 | tail -20",
@@ -1027,6 +1036,10 @@ func TestStripRedirections(t *testing.T) {
 		"exec {fd}>/tmp/x a":          "exec   a",
 		"echo {1x}>g x{y}>h":          "echo {1x}  x{y} ",
 		"cmd a1>f '2'>g":              "cmd a1  '2' ",
+		// `&>`/`&>>` take no fd, so a glued number or {name} is an argument.
+		"cmd 1&>f a":      "cmd 1  a",
+		"cmd {x}&>>f a":   "cmd {x}  a",
+		"cmd 2>&1 3<&0 a": "cmd     a",
 		// Unterminated quote in a target: unchanged, so the tokenizer
 		// still reports the parse error instead of it being dropped.
 		`git push >"x --force`: `git push >"x --force`,

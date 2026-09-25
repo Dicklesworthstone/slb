@@ -581,8 +581,10 @@ func stripRedirections(part string) string {
 
 		// A word written immediately before the operator that is an fd
 		// number (`2>`) or a named fd (`{fd}>`) is part of the redirection,
-		// not an argument.
-		if word := out[wordStart:]; isRedirectionFD(word) {
+		// not an argument. `&>` and `&>>` take no fd: bash passes a word
+		// glued to them as an argument (`rm -f 1&>/dev/null a.log` removes
+		// `1`), so it must stay visible.
+		if word := out[wordStart:]; r != '&' && isRedirectionFD(word) {
 			out = out[:wordStart]
 		}
 		opStart := i
