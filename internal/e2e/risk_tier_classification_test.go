@@ -34,6 +34,7 @@ func TestRiskTierClassification_CommandMatrix(t *testing.T) {
 		{"git push --force main", "git push --force origin main", db.RiskTierCritical, 2, true},
 		{"DROP DATABASE", "psql -c 'DROP DATABASE production'", db.RiskTierCritical, 2, true},
 		{"TRUNCATE TABLE", "TRUNCATE TABLE users", db.RiskTierCritical, 2, true},
+		{"TRUNCATE without TABLE", "psql -c 'TRUNCATE users'", db.RiskTierCritical, 2, true}, // GH #22
 
 		// DANGEROUS tier (1 approval required)
 		{"rm -rf local", "rm -rf ./build", db.RiskTierDangerous, 1, true},

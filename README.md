@@ -209,7 +209,7 @@ tcp_require_auth = true
 |---------|-------------|
 | `rm -rf /...` | Recursive delete on system paths |
 | `DROP DATABASE/SCHEMA` | SQL database destruction |
-| `TRUNCATE TABLE` | SQL data destruction |
+| `TRUNCATE [TABLE] [ONLY] ...` | SQL data destruction (TABLE is optional) |
 | `terraform destroy` | Infrastructure destruction |
 | `kubectl delete node/namespace/pv/pvc` | Kubernetes critical resources |
 | `git push --force` | Force push (not with-lease) |

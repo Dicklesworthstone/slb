@@ -986,6 +986,63 @@ func TestClassifyCommand_SQLDetection(t *testing.T) {
 		}
 	})
 
+	// GH #22: TABLE is optional in TRUNCATE, so every spelling of the
+	// statement must get the same CRITICAL verdict as TRUNCATE TABLE.
+	t.Run("SQL truncate without TABLE is critical", func(t *testing.T) {
+		for _, cmd := range []string{
+			"TRUNCATE users",
+			"truncate users;",
+			"TRUNCATE ONLY users",
+			"TRUNCATE users, orders",
+			"TRUNCATE public.users * CASCADE",
+			"TRUNCATE users RESTART IDENTITY CASCADE",
+			`psql -c 'TRUNCATE users'`,
+			`psql -c 'truncate users'`,
+			`psql -c 'TRUNCATE ONLY users'`,
+			`psql -c 'TRUNCATE users, orders'`,
+			`psql -c 'TRUNCATE users RESTART IDENTITY CASCADE'`,
+			`psql -d app -c "BEGIN; TRUNCATE users; COMMIT"`,
+			`psql --command="TRUNCATE \"Users\""`,
+			`PGPASSWORD=x /usr/bin/psql -h db -c 'TRUNCATE users'`,
+			`sudo -u postgres psql -c 'TRUNCATE users'`,
+			`docker exec pg psql -c 'TRUNCATE users'`,
+			`mysql -e 'TRUNCATE users'`,
+			"mysql -e 'TRUNCATE `app`.`users`'",
+			`mariadb app -e "truncate users"`,
+			`sqlite3 app.db 'TRUNCATE users'`,
+			`echo 'TRUNCATE users;' | psql`,
+			`bash -c "psql -c 'TRUNCATE users'"`,
+			`psql -c 'TRUNCATE TABLE users'`,
+		} {
+			result := engine.ClassifyCommand(cmd, "")
+			if result.Tier != RiskTierCritical || result.MinApprovals != 2 {
+				t.Errorf("%s: tier=%q min_approvals=%d (pattern %q), want critical/2",
+					cmd, result.Tier, result.MinApprovals, result.MatchedPattern)
+			}
+		}
+	})
+
+	t.Run("non-SQL uses of truncate are not critical", func(t *testing.T) {
+		for _, cmd := range []string{
+			"truncate -s 0 app.log",
+			"truncate --size=0 app.log",
+			"truncate app.log -s 0",
+			"truncate -r ref.bin out.bin",
+			"rg truncate src",
+			"grep -rn truncate internal",
+			"grep -e truncate src/",
+			`rg -n "truncate(" internal/core`,
+			`git commit -m "truncate long lines in the table view"`,
+			"go test ./internal/git -run TestTruncateForCommit",
+			`psql -c 'SELECT truncate_len FROM settings'`,
+		} {
+			result := engine.ClassifyCommand(cmd, "")
+			if result.Tier == RiskTierCritical {
+				t.Errorf("%s: classified critical by %q", cmd, result.MatchedPattern)
+			}
+		}
+	})
+
 	t.Run("SQL drop is dangerous or critical", func(t *testing.T) {
 		result := engine.ClassifyCommand("mysql -e 'DROP TABLE users'", "")
 		if result.Tier != RiskTierDangerous && result.Tier != RiskTierCritical {

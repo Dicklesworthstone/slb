@@ -25,7 +25,7 @@
 
 - `rm -rf /...`
 - `DROP DATABASE/SCHEMA`
-- `TRUNCATE TABLE`
+- `TRUNCATE [TABLE] [ONLY] ...` (SQL context; TABLE is optional)
 - `terraform destroy`
 - `kubectl delete node/namespace/pv/pvc`
 - `git push --force`

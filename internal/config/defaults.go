@@ -1,5 +1,27 @@
 package config
 
+// SQL TRUNCATE without the optional TABLE keyword:
+//
+//	TRUNCATE [TABLE] [ONLY] name [*] [, ...] [RESTART|CONTINUE IDENTITY] [CASCADE|RESTRICT]
+//
+// The word alone is too common to match (`rg truncate src`, the coreutil
+// `truncate -s 0 f` / `truncate f -s 0`), so a short form is critical only in
+// a SQL context: inside a SQL client's command line, as a whole statement, or
+// terminated by ';'. The rules must hold both for the daemon's normalized
+// segments (shell quotes removed) and for the raw command seen by the exported
+// offline hook (quotes kept), and must stay valid Python `re` syntax.
+const (
+	sqlIdent        = `[\w.$"` + "`" + `\[\]]+`
+	sqlTruncateList = `(?:ONLY\s+)?` + sqlIdent + `(?:\s*\*)?(?:\s*,\s*(?:ONLY\s+)?` + sqlIdent + `(?:\s*\*)?)*` +
+		`(?:\s+(?:RESTART|CONTINUE)\s+IDENTITY)?(?:\s+(?:CASCADE|RESTRICT))?`
+
+	sqlTruncateInSQLClient = `(?:^|[\s/])(?:psql|pgcli|mysql|mariadb|mycli|mysqlsh|sqlite3|litecli|duckdb|sqlcmd|sqlplus|` +
+		`clickhouse|clickhouse-client|cockroach|cqlsh|snowsql|usql|vsql|trino|presto|beeline|spark-sql|impala-shell)` +
+		`\s.*\bTRUNCATE\s+[\w"` + "`" + `\[\\]`
+	sqlTruncateBareStatement       = `^\s*TRUNCATE\s+` + sqlTruncateList + `\s*;?\s*$`
+	sqlTruncateTerminatedStatement = `\bTRUNCATE\s+` + sqlTruncateList + `\s*;`
+)
+
 // Built-in defaults are also the PatternEngine's source of truth. Never keep
 // a second, weaker allowlist in configuration than the one used at runtime.
 var (
@@ -11,6 +33,12 @@ var (
 		`DROP\s+DATABASE`,
 		`DROP\s+SCHEMA`,
 		`TRUNCATE\s+TABLE`,
+		// TABLE is optional in PostgreSQL and MySQL/MariaDB (GH #22), so the
+		// short forms must land in the same tier. The coreutil `truncate`
+		// shares the word; see sqlTruncate* for how these rules avoid it.
+		sqlTruncateInSQLClient,
+		sqlTruncateBareStatement,
+		sqlTruncateTerminatedStatement,
 		`DELETE\s+FROM\s+[\w.` + "`" + `"\[\]]+\s*(;|$|--|/\*)`,
 		`^terraform\s+destroy\s*$`,
 		`^terraform\s+destroy\s+-auto-approve`,

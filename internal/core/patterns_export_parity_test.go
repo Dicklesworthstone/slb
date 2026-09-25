@@ -52,6 +52,15 @@ func TestExportClaudeHook_ParityWithGoClassifier(t *testing.T) {
 		"gcloud projects undelete p --quiet",
 		"gcloud projects delete p --quiet",
 		"git status",
+		// GH #22: TRUNCATE without the optional TABLE keyword.
+		"TRUNCATE users",
+		"TRUNCATE ONLY users, orders CASCADE",
+		"psql -c 'TRUNCATE users'",
+		"mysql -e 'truncate users'",
+		"echo 'TRUNCATE users;' | psql",
+		"truncate -s 0 app.log",
+		"truncate app.log -s 0",
+		"rg truncate src",
 	}
 
 	// Python prints "<tier>\t<command>" per line; map Go tiers onto the
