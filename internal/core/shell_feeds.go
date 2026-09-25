@@ -45,6 +45,14 @@ var stdinInterpreters = map[string]map[string]bool{
 
 var pythonInlineFlags = map[string]bool{"-c": true, "-m": true}
 
+// Interpreter options whose value is a separate word, so that value is not
+// mistaken for a script operand (`python3 -W ignore - <<EOF`).
+var interpreterValueFlags = map[string]bool{
+	"-W": true, "-X": true, "-Q": true, // python
+	"-r": true, "--require": true, "--import": true, "--loader": true, // node
+	"-I": true, // perl/ruby include path
+}
+
 func interpreterInlineFlags(name string) (map[string]bool, bool) {
 	if name == "python" || strings.HasPrefix(name, "python2") || strings.HasPrefix(name, "python3") {
 		return pythonInlineFlags, true
@@ -435,6 +443,10 @@ func (a *feedAnalysis) checkInterpreter(tokens []string, words []*syntax.Word, i
 		if inline[arg] || (len(arg) > 2 && inline[arg[:2]] && !strings.HasPrefix(arg, "--")) {
 			return // inline code or a module, not a stdin program
 		}
+		if interpreterValueFlags[arg] {
+			i++ // the option's value
+			continue
+		}
 		if !strings.HasPrefix(arg, "-") {
 			return // script file operand
 		}
@@ -499,6 +511,11 @@ func (a *feedAnalysis) redirectInput(r *syntax.Redirect) (string, bool) {
 			out.WriteString(lit.Value)
 		}
 		return out.String(), true
+	}
+	if r.Op == syntax.RdrIn {
+		if target, _, ok := a.staticWord(r.Word); ok && target == "/dev/null" {
+			return "", true
+		}
 	}
 	return "", false // files and descriptors are not visible here
 }

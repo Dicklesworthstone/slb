@@ -66,6 +66,7 @@ func TestExecutionFeedsUnknownProgramsAreAtLeastCaution(t *testing.T) {
 		`echo 'print(1)' | python3`,
 		`echo 'system("rm -rf /srv")' | perl`,
 		`echo 'x' | node -`,
+		"python3 -W ignore - <<'EOF'\nprint(1)\nEOF",
 	} {
 		t.Run(command, func(t *testing.T) {
 			got := engine.ClassifyCommand(command, cwd)
@@ -107,6 +108,9 @@ func TestExecutionFeedsLeaveBenignCommandsAlone(t *testing.T) {
 		`command -v bash`,
 		`git log --oneline | head -5`,
 		`go test ./... 2>&1 | tail -5`,
+		`python3 script.py < input.txt`,
+		`python3 -W ignore script.py`,
+		`bash < /dev/null`,
 	} {
 		t.Run(command, func(t *testing.T) {
 			got := engine.ClassifyCommand(command, cwd)
