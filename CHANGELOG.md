@@ -8,6 +8,30 @@ SLB is a cross-platform CLI that implements a **two-person rule** for running po
 
 ---
 
+## [v0.5.2] -- 2026-09-25
+
+Compare: [`v0.5.1...v0.5.2`](https://github.com/Dicklesworthstone/slb/compare/v0.5.1...v0.5.2)
+
+Safety patch release: commands hidden behind variables, stdin feeds and `eval` are classified by what they run. **Classification is stricter**; see below.
+
+### Classification
+
+- A command word built from a provably literal script-local variable is classified as the resolved command: `X=rm; $X -rf /srv` is CRITICAL, as is `X=/srv; rm -rf $X` ([`047b97f`](https://github.com/Dicklesworthstone/slb/commit/047b97ffe083a76dff78c4fbf7b799748ece1452))
+- A shell reading its program from stdin gets that program classified when it is statically known, recursively: here-strings, here-docs, pipes from `echo`/`printf`/`cat`/`base64 -d`, including inside loops and subshells (`bash <<< "..."`, `echo "..." | bash`, `base64 -d <<< ... | sh`, `for s in a; do cat <<< "..." | bash; done`) ([`047b97f`](https://github.com/Dicklesworthstone/slb/commit/047b97ffe083a76dff78c4fbf7b799748ece1452))
+- A shell `-c` operand that is a single command substitution with a statically known result is classified (`sh -c "$(printf '...')"`); `eval` with literal arguments is classified as the code it runs ([`047b97f`](https://github.com/Dicklesworthstone/slb/commit/047b97ffe083a76dff78c4fbf7b799748ece1452))
+
+### Stricter classification (behavior change)
+
+Code whose content cannot be determined statically is now at least CAUTION (`unresolved_execution`) instead of "no pattern". With the default `hook_caution_action = "block"` the hook blocks these and points to `slb request`; an explicit `slb request` escalates them to DANGEROUS like any unmatched command, and they are never auto-approved. This covers:
+
+- a computed command word that is not a script-local literal: `"$CMD" ...`, `$(which x) ...`, and variables derived from the environment such as `TC=$HOME/.rustup/...; $TC/bin/cargo ...`
+- shells or interpreters fed an unknown program on stdin: `curl ... | bash`, `bash < script.sh`, `bash <(curl ...)`, `sh -c "$VAR ..."`, `eval "$X"`
+- **every non-shell interpreter reading its program from stdin**, whatever the payload: `python3 - <<'EOF' ... EOF`, `python - <<< "..."`, `echo ... | perl`, `node -`. Shell risk patterns cannot judge those programs. Scripts run from a file (`python3 script.py`) and inline `-c`/`-e` code are unchanged.
+
+Measured on 25,000 recorded agent commands: 1,621 (6.5%) change from no tier to CAUTION, about 1,150 of them stdin interpreter programs (mostly `python3 - <<'PY'` edits) and about 420 `$HOME`-derived command words. Set `integrations.hook_caution_action = "ask"` to be prompted instead of blocked.
+
+---
+
 ## [v0.5.1] -- 2026-09-25
 
 Compare: [`v0.5.0...v0.5.1`](https://github.com/Dicklesworthstone/slb/compare/v0.5.0...v0.5.1)
