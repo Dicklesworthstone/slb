@@ -955,6 +955,69 @@ func TestClassifyCommand_CommandResolution(t *testing.T) {
 	})
 }
 
+// Every real caller passes a cwd, which re-tokenized each normalized segment
+// and stopped at the first ';', '|', '&', '<' or '>' it found. Those come from
+// inside quoted arguments (the quotes are already gone), and the normalizer's
+// own tokenizer likewise stopped at the first redirection, so everything after
+// it was never matched.
+func TestClassifyCommand_RedirectionsAndQuotedOperatorsDoNotHideArguments(t *testing.T) {
+	engine := NewPatternEngine()
+	cwd := t.TempDir()
+	for _, tc := range []struct {
+		cmd  string
+		tier RiskTier
+	}{
+		{`psql -c 'SELECT 1; DROP DATABASE prod'`, RiskTierCritical},
+		{`mysql -e "SELECT 1 | 2; DELETE FROM users"`, RiskTierCritical},
+		{`psql -c "SELECT 1 WHERE 2 > 1; TRUNCATE TABLE users"`, RiskTierCritical},
+		{`psql >/dev/null -c 'DROP DATABASE prod'`, RiskTierCritical},
+		{`psql 2>&1 -c 'DROP DATABASE prod'`, RiskTierCritical},
+		{`git push >/dev/null --force origin main`, RiskTierCritical},
+		{`</dev/null git push --force origin main`, RiskTierCritical},
+		{`git push &>/dev/null --force origin main`, RiskTierCritical},
+		{`rm >/dev/null -rf /etc`, RiskTierCritical},
+		{`git reset 2>/dev/null --hard HEAD~3`, RiskTierDangerous},
+	} {
+		for _, dir := range []string{"", cwd} {
+			result := engine.ClassifyCommand(tc.cmd, dir)
+			if result.Tier != tc.tier {
+				t.Errorf("%s (cwd %q): tier=%q (pattern %q), want %q", tc.cmd, dir, result.Tier, result.MatchedPattern, tc.tier)
+			}
+		}
+	}
+	for _, cmd := range []string{
+		"echo hi > out.txt",
+		"go test ./... 2>&1 | tail -20",
+		"cat < in.txt",
+		`grep -q x <<< "$v"`,
+		"echo a >&2",
+		"ls 2>/dev/null",
+	} {
+		result := engine.ClassifyCommand(cmd, cwd)
+		if result.NeedsApproval {
+			t.Errorf("%s: tier=%q (pattern %q), want no approval", cmd, result.Tier, result.MatchedPattern)
+		}
+	}
+}
+
+func TestStripRedirections(t *testing.T) {
+	for in, want := range map[string]string{
+		"git push >/dev/null --force": "git push   --force",
+		"cmd 2>&1 arg":                "cmd   arg",
+		"cmd a2>f b":                  "cmd a2  b",
+		"</dev/null cmd":              "  cmd",
+		"cmd &>>log arg":              "cmd   arg",
+		"psql <<< 'TRUNCATE users'":   "psql  'TRUNCATE users' ",
+		"psql <<-EOF":                 "psql  ",
+		`echo "a > b" '<c>' d\>e`:     `echo "a > b" '<c>' d\>e`,
+		"cmd >'my file' arg":          "cmd   arg",
+	} {
+		if got := stripRedirections(in); got != want {
+			t.Errorf("stripRedirections(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestClassifyCommand_SQLDetection(t *testing.T) {
 	engine := NewPatternEngine()
 
@@ -1013,11 +1076,31 @@ func TestClassifyCommand_SQLDetection(t *testing.T) {
 			`echo 'TRUNCATE users;' | psql`,
 			`bash -c "psql -c 'TRUNCATE users'"`,
 			`psql -c 'TRUNCATE TABLE users'`,
+			// Review of GH #22: statement input and flag spellings the first
+			// version of the rules missed.
+			`psql -c'TRUNCATE users'`,
+			`mysql -e"truncate users"`,
+			`psql -c 'SELECT 1; TRUNCATE users'`,
+			`psql -c 'TRUNCATE/**/users'`,
+			`psql.exe -c 'TRUNCATE users'`,
+			`psql <<< 'TRUNCATE users'`,
+			`psql<<<'TRUNCATE users'`,
+			`mysql app <<< "truncate users"`,
+			`psql -q 2>&1 -c 'TRUNCATE users'`,
+			`echo 'TRUNCATE users' | psql`,
+			`printf 'TRUNCATE users\n' | psql app`,
+			"psql app <<'SQL'\nBEGIN;\ntruncate users\nSQL",
+			"cat <<EOF | psql\nTRUNCATE users\nEOF",
+			"TRUNCATE users -- clear before import",
 		} {
-			result := engine.ClassifyCommand(cmd, "")
-			if result.Tier != RiskTierCritical || result.MinApprovals != 2 {
-				t.Errorf("%s: tier=%q min_approvals=%d (pattern %q), want critical/2",
-					cmd, result.Tier, result.MinApprovals, result.MatchedPattern)
+			// The hook, daemon and request paths always pass the caller's
+			// cwd, which re-tokenizes each segment; check both.
+			for _, cwd := range []string{"", t.TempDir()} {
+				result := engine.ClassifyCommand(cmd, cwd)
+				if result.Tier != RiskTierCritical || result.MinApprovals != 2 {
+					t.Errorf("%s (cwd %q): tier=%q min_approvals=%d (pattern %q), want critical/2",
+						cmd, cwd, result.Tier, result.MinApprovals, result.MatchedPattern)
+				}
 			}
 		}
 	})
@@ -1035,10 +1118,19 @@ func TestClassifyCommand_SQLDetection(t *testing.T) {
 			`git commit -m "truncate long lines in the table view"`,
 			"go test ./internal/git -run TestTruncateForCommit",
 			`psql -c 'SELECT truncate_len FROM settings'`,
+			"cargo test truncate_long",
+			"git log --grep truncate",
+			`git commit -m "Truncate long lines"`,
+			`sed -i 's/truncate/cut/' f.go`,
+			"truncate -s 0 app.log 2>/dev/null",
+			"truncate app.log --size 0",
+			"truncate out.bin --reference=ref.bin",
 		} {
-			result := engine.ClassifyCommand(cmd, "")
-			if result.Tier == RiskTierCritical {
-				t.Errorf("%s: classified critical by %q", cmd, result.MatchedPattern)
+			for _, cwd := range []string{"", t.TempDir()} {
+				result := engine.ClassifyCommand(cmd, cwd)
+				if result.Tier == RiskTierCritical {
+					t.Errorf("%s (cwd %q): classified critical by %q", cmd, cwd, result.MatchedPattern)
+				}
 			}
 		}
 	})

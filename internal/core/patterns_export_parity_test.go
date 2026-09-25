@@ -61,6 +61,13 @@ func TestExportClaudeHook_ParityWithGoClassifier(t *testing.T) {
 		"truncate -s 0 app.log",
 		"truncate app.log -s 0",
 		"rg truncate src",
+		"psql -c'TRUNCATE users'",
+		"psql <<< 'TRUNCATE users'",
+		"printf 'TRUNCATE users\\n' | psql",
+		"sh -c 'echo TRUNCATE users | psql'",
+		"TRUNCATE users -- clear",
+		"cargo test truncate_long",
+		"truncate app.log --size 0",
 	}
 
 	// Python prints "<tier>\t<command>" per line; map Go tiers onto the

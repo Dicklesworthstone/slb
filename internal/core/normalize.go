@@ -466,9 +466,20 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 			parser := shellwords.NewParser()
 			parser.ParseEnv = false
 			parser.ParseBacktick = false
+			// The tokenizer stops at the first unquoted redirection, so
+			// `git push >/dev/null --force origin main` used to classify as
+			// plain `git push`. Remove redirections first; a here-string's
+			// word is kept because it is the command's input
+			// (`psql <<< 'TRUNCATE users'`).
+			part = stripRedirections(part)
 			tokens, err := parser.Parse(part)
 			if err != nil {
 				result.ParseError = true
+				tokens = strings.Fields(part)
+			} else if parser.Position >= 0 {
+				// Stopped at an operator the splitters left in place (e.g.
+				// inside a partial subshell): keep every word rather than
+				// silently dropping the rest of the command.
 				tokens = strings.Fields(part)
 			}
 			tokens, wrappers, valid := unwrapCommandTokens(tokens)
@@ -501,6 +512,111 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 	}
 
 	return result
+}
+
+// stripRedirections removes unquoted I/O redirections (`>f`, `2>&1`, `&>>f`,
+// `<in`, `<<EOF`, `>|f`, `<>f`) from one simple command, wherever they appear
+// among its words, so the tokenizer sees every argument. The target word of a
+// redirection is dropped, except for a here-string (`<<< word`), whose word is
+// kept as an argument: it is data fed to the command and may be the dangerous
+// part (`psql <<< 'TRUNCATE users'`). Process and command substitutions have
+// already been replaced by splitExecutableSubstitutions.
+func stripRedirections(part string) string {
+	runes := []rune(part)
+	var out strings.Builder
+	inSingle, inDouble, escaped := false, false, false
+	wordStart := true // at the start of a shell word (fd numbers glue to it)
+	isSpace := func(r rune) bool { return r == ' ' || r == '\t' }
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if escaped {
+			out.WriteRune(r)
+			escaped, wordStart = false, false
+			continue
+		}
+		if r == '\\' && !inSingle {
+			out.WriteRune(r)
+			escaped, wordStart = true, false
+			continue
+		}
+		if r == '\'' && !inDouble {
+			inSingle = !inSingle
+			out.WriteRune(r)
+			wordStart = false
+			continue
+		}
+		if r == '"' && !inSingle {
+			inDouble = !inDouble
+			out.WriteRune(r)
+			wordStart = false
+			continue
+		}
+		isRedirect := !inSingle && !inDouble &&
+			(r == '<' || r == '>' || (r == '&' && i+1 < len(runes) && runes[i+1] == '>'))
+		if !isRedirect {
+			out.WriteRune(r)
+			wordStart = isSpace(r)
+			continue
+		}
+
+		// An fd number written immediately before the operator (`2>`) is part
+		// of the redirection, not an argument.
+		if !wordStart {
+			s := []rune(out.String())
+			j := len(s)
+			for j > 0 && s[j-1] >= '0' && s[j-1] <= '9' {
+				j--
+			}
+			if j < len(s) && (j == 0 || isSpace(s[j-1])) {
+				out.Reset()
+				out.WriteString(string(s[:j]))
+			}
+		}
+		opStart := i
+		for i < len(runes) && strings.ContainsRune("<>&|", runes[i]) {
+			i++
+		}
+		op := string(runes[opStart:i])
+		if strings.HasPrefix(op, "<<") && op != "<<<" && i < len(runes) && runes[i] == '-' {
+			i++ // <<- heredoc
+		}
+		for i < len(runes) && isSpace(runes[i]) {
+			i++
+		}
+		// The target word ends at unquoted whitespace or the next operator.
+		targetStart := i
+		wSingle, wDouble, wEscaped := false, false, false
+		for ; i < len(runes); i++ {
+			c := runes[i]
+			if wEscaped {
+				wEscaped = false
+				continue
+			}
+			if c == '\\' && !wSingle {
+				wEscaped = true
+				continue
+			}
+			if c == '\'' && !wDouble {
+				wSingle = !wSingle
+				continue
+			}
+			if c == '"' && !wSingle {
+				wDouble = !wDouble
+				continue
+			}
+			if !wSingle && !wDouble && (isSpace(c) || c == '<' || c == '>') {
+				break
+			}
+		}
+		out.WriteRune(' ')
+		if op == "<<<" {
+			out.WriteString(string(runes[targetStart:i]))
+			out.WriteRune(' ')
+		}
+		i-- // the loop increment resumes at the terminator
+		wordStart = true
+	}
+	return out.String()
 }
 
 // expandSubshellSegments replaces any segment that is entirely one subshell
@@ -711,8 +827,13 @@ func ResolvePathsInCommand(cmd, cwd string) string {
 	parser.ParseEnv = false
 	parser.ParseBacktick = false
 	tokens, err := parser.Parse(cmd)
-	if err != nil {
-		// Fallback to simple fields if parsing fails
+	if err != nil || parser.Position >= 0 {
+		// Fall back to simple fields if parsing fails, or if the tokenizer
+		// stopped at a shell operator. The input is an already-normalized
+		// segment whose quotes are gone, so `;`, `|`, `&`, `<` and `>` here
+		// came from inside a quoted argument (`psql -c 'SELECT 1; DROP
+		// DATABASE prod'`). Stopping there silently dropped the rest of the
+		// command before pattern matching.
 		tokens = strings.Fields(cmd)
 	}
 

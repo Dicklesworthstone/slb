@@ -6,20 +6,35 @@ package config
 //
 // The word alone is too common to match (`rg truncate src`, the coreutil
 // `truncate -s 0 f` / `truncate f -s 0`), so a short form is critical only in
-// a SQL context: inside a SQL client's command line, as a whole statement, or
-// terminated by ';'. The rules must hold both for the daemon's normalized
-// segments (shell quotes removed) and for the raw command seen by the exported
-// offline hook (quotes kept), and must stay valid Python `re` syntax.
+// a SQL context: inside a SQL client's command line (including stdin fed by a
+// here-string or heredoc), as a whole statement line, terminated by ';', or
+// echoed/printed (usually into a client's stdin, which runs an unterminated
+// final statement at EOF). The rules must hold both for the daemon's
+// normalized segments (shell quotes removed, one line each) and for the raw,
+// possibly multi-line command seen by the exported offline hook (quotes
+// kept), and must stay valid Python `re` syntax.
 const (
 	sqlIdent        = `[\w.$"` + "`" + `\[\]]+`
 	sqlTruncateList = `(?:ONLY\s+)?` + sqlIdent + `(?:\s*\*)?(?:\s*,\s*(?:ONLY\s+)?` + sqlIdent + `(?:\s*\*)?)*` +
 		`(?:\s+(?:RESTART|CONTINUE)\s+IDENTITY)?(?:\s+(?:CASCADE|RESTRICT))?`
+	// A SQL comment start. `--` must be followed by whitespace or the end so
+	// that coreutil long options (`truncate f --size 0`) are not comments.
+	sqlComment = `(?:--(?:\s|$)|/\*)`
+	// End of an echoed statement: ';', a SQL comment, a closing quote or a
+	// following shell operator (raw command), a literal \n (printf), or the
+	// end of the line/command.
+	sqlTruncateStatementEnd = `\s*(?:;|` + sqlComment + `|['"|&)]|\\n|$|[\r\n])`
 
-	sqlTruncateInSQLClient = `(?:^|[\s/])(?:psql|pgcli|mysql|mariadb|mycli|mysqlsh|sqlite3|litecli|duckdb|sqlcmd|sqlplus|` +
+	// No \b before TRUNCATE: a flag glued to its value (`psql -c'TRUNCATE
+	// users'`) normalizes to `-cTRUNCATE`. The keyword may be followed by
+	// whitespace and a name, a comment, or a quoted identifier.
+	sqlTruncateInSQLClient = `(?:^|[^\w.-])(?:psql|pgcli|mysql|mariadb|mycli|mysqlsh|sqlite3|litecli|duckdb|sqlcmd|sqlplus|` +
 		`clickhouse|clickhouse-client|cockroach|cqlsh|snowsql|usql|vsql|trino|presto|beeline|spark-sql|impala-shell)` +
-		`\s.*\bTRUNCATE\s+[\w"` + "`" + `\[\\]`
-	sqlTruncateBareStatement       = `^\s*TRUNCATE\s+` + sqlTruncateList + `\s*;?\s*$`
+		`(?:\.exe)?(?:\s|<)[\s\S]*TRUNCATE(?:\s+[\w"` + "`" + `\[\\]|\s*` + sqlComment + `|["` + "`" + `\[])`
+	sqlTruncateBareStatement = `(?:^|[\r\n])\s*TRUNCATE\s+` + sqlTruncateList +
+		`\s*;?\s*(?:` + sqlComment + `[^\r\n]*)?(?:$|[\r\n])`
 	sqlTruncateTerminatedStatement = `\bTRUNCATE\s+` + sqlTruncateList + `\s*;`
+	sqlTruncateEchoedStatement     = `(?:^|[^\w.-])(?:echo|printf)\s[^|;&]*\bTRUNCATE\s+` + sqlTruncateList + sqlTruncateStatementEnd
 )
 
 // Built-in defaults are also the PatternEngine's source of truth. Never keep
@@ -39,6 +54,7 @@ var (
 		sqlTruncateInSQLClient,
 		sqlTruncateBareStatement,
 		sqlTruncateTerminatedStatement,
+		sqlTruncateEchoedStatement,
 		`DELETE\s+FROM\s+[\w.` + "`" + `"\[\]]+\s*(;|$|--|/\*)`,
 		`^terraform\s+destroy\s*$`,
 		`^terraform\s+destroy\s+-auto-approve`,
