@@ -8,6 +8,27 @@ SLB is a cross-platform CLI that implements a **two-person rule** for running po
 
 ---
 
+## [v0.5.1] -- 2026-09-25
+
+Compare: [`v0.5.0...v0.5.1`](https://github.com/Dicklesworthstone/slb/compare/v0.5.0...v0.5.1)
+
+Safety patch release: closes classifier bypasses reported in [#22](https://github.com/Dicklesworthstone/slb/issues/22) (thanks to @JYeswak).
+
+### Classification
+
+- `TRUNCATE` without the optional `TABLE` keyword is CRITICAL when it appears in a SQL context: a SQL client's command line (`psql -c 'TRUNCATE users'`, glued `-c'...'`, `psql.exe`), input fed to a client (here-strings, pipes, heredoc bodies), a bare statement following the TRUNCATE grammar, or a `;`-terminated statement. The coreutil `truncate -s 0 f` and plain searches such as `rg truncate src` stay unclassified. The exported Python hook carries the same rules ([`b1461b8`](https://github.com/Dicklesworthstone/slb/commit/b1461b8a1f38637df119effd8ed39607dffade3c), [`b008758`](https://github.com/Dicklesworthstone/slb/commit/b008758d685082bc71890e00557f819a08a22b58))
+- Shell operators inside quoted arguments no longer hide the rest of the command: `psql -c 'SELECT 1; DROP DATABASE prod'` is classified by its full text ([`b008758`](https://github.com/Dicklesworthstone/slb/commit/b008758d685082bc71890e00557f819a08a22b58))
+- Redirections no longer hide arguments: `git push >/dev/null --force origin main`, `</dev/null git push --force ...`, `psql 2>&1 -c 'DROP DATABASE prod'`, `>|` and named fds (`{fd}>f`) are classified by the command's real argv ([`b008758`](https://github.com/Dicklesworthstone/slb/commit/b008758d685082bc71890e00557f819a08a22b58), [`5f59f44`](https://github.com/Dicklesworthstone/slb/commit/5f59f44da6e352b2d7623cbfd650143f9a58f44d))
+- A here-string's word is no longer spliced into the argument list, so `kubectl delete <<<'pod x' namespace prod` and `rm <<<'-f a.log' -rf /etc` cannot pose as allowlisted commands ([`5f59f44`](https://github.com/Dicklesworthstone/slb/commit/5f59f44da6e352b2d7623cbfd650143f9a58f44d))
+- A number glued to `&>`/`&>>` stays an argument (bash's `&>` takes no fd), so `rm -f 1&>/dev/null a.log` is no longer read as the log-only `rm -f a.log` ([`fb5ae4c`](https://github.com/Dicklesworthstone/slb/commit/fb5ae4c0c9c48b5097d28a29f54785d0290c3b15))
+- Redirection stripping is linear (a 1 MB command classified in ~4 minutes, now 0.1 s), and the bare TRUNCATE rule no longer backtracks quadratically in the exported Python hook ([`5f59f44`](https://github.com/Dicklesworthstone/slb/commit/5f59f44da6e352b2d7623cbfd650143f9a58f44d))
+
+### Upgrade note
+
+A config file that sets `patterns.critical.patterns` replaces the built-in CRITICAL list rather than extending it. If yours does, add the new TRUNCATE rules from `internal/config/defaults.go` yourself.
+
+---
+
 ## [v0.5.0] -- 2026-09-24
 
 Compare: [`v0.4.1...v0.5.0`](https://github.com/Dicklesworthstone/slb/compare/v0.4.1...v0.5.0)
