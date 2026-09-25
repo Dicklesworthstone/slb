@@ -26,6 +26,10 @@ type NormalizedCommand struct {
 	StrippedWrappers []string
 	// ParseError indicates if parsing failed (triggers tier upgrade).
 	ParseError bool
+	// Opaque indicates executed code that cannot be determined statically: a
+	// computed command word, or a shell/interpreter reading an unknown or
+	// non-shell program from stdin. It raises the tier to at least CAUTION.
+	Opaque bool
 }
 
 // Command wrapper prefixes to strip
@@ -403,7 +407,40 @@ func heredocWordBoundary(line string, index int) bool {
 
 // NormalizeCommand parses and normalizes a command for pattern matching.
 func NormalizeCommand(cmd string) *NormalizedCommand {
-	return normalizeCommandDepth(cmd, 0)
+	return normalizeWithFeeds(cmd, 0)
+}
+
+// normalizeWithFeeds adds execution-feed analysis (see shell_feeds.go) to the
+// normalizer. The feed analysis parses the whole command once, including its
+// substitutions and compound bodies, so the normalizer's own recursion into
+// those parts does not repeat it; only newly reconstructed program text (a
+// here-string payload, a -c body, an eval argument) is analyzed again.
+func normalizeWithFeeds(cmd string, depth int) *NormalizedCommand {
+	result := normalizeCommandDepth(cmd, depth)
+	if strings.TrimSpace(cmd) == "" {
+		return result
+	}
+	segments, opaque, parseErr := analyzeExecutionFeeds(strings.TrimSpace(cmd), depth)
+	if len(segments) == 0 && !opaque && !parseErr {
+		return result
+	}
+	seen := make(map[string]bool, len(result.Segments))
+	for _, segment := range result.Segments {
+		seen[segment] = true
+	}
+	for _, segment := range segments {
+		if !seen[segment] {
+			seen[segment] = true
+			result.Segments = append(result.Segments, segment)
+		}
+	}
+	result.Opaque = result.Opaque || opaque
+	result.ParseError = result.ParseError || parseErr
+	result.IsCompound = len(result.Segments) > 1
+	if result.Primary == "" && len(result.Segments) > 0 {
+		result.Primary = result.Segments[0]
+	}
+	return result
 }
 
 const maxCommandNesting = 32

@@ -200,7 +200,11 @@ func (rc *RequestCreator) createRequestOnce(ctx context.Context, opts CreateRequ
 	// Commands deliberately submitted to SLB default to dangerous when the
 	// normalizer cannot recognize the operation (GH #9). Use the configured
 	// dangerous quorum here too; opaque wrappers must not get a weaker quorum.
-	if !classification.NeedsApproval {
+	// Opaque execution (a computed command word, or a program read from an
+	// unknown feed) is at least CAUTION for hooks; an explicit request keeps
+	// the unmatched-command escalation so it never gets a weaker quorum.
+	if !classification.NeedsApproval || (classification.Opaque && classification.Tier == RiskTierCaution &&
+		classification.MatchedPattern == "unresolved_execution") {
 		classification.Tier = RiskTierDangerous
 		classification.MinApprovals = rc.patternEngine.RequiredApprovals(RiskTierDangerous, -1)
 		classification.NeedsApproval = true

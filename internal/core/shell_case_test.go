@@ -40,8 +40,6 @@ func TestClassifyCaseStatements(t *testing.T) {
 		"quoted data":          `echo 'case "$x" in a*) echo a;; esac'`,
 		"multiline":            "case \"$x\" in\n# ) | ;; ' \" are comment text\na*)\n echo a\n ;;\n*) echo other;;\nesac",
 		"continued keyword":    "ca\\\nse \"$x\" in a) echo a;; esac",
-		"quoted heredoc":       "case \"$x\" in a) python3 - <<'EOF'\nprint(1)\nEOF\n;; esac",
-		"heredoc regression":   "python3 - <<'EOF'\nprint('case is data, not shell syntax')\nEOF",
 	}
 	for name, command := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -269,8 +267,6 @@ func TestClassifyControlFlowLiteralData(t *testing.T) {
 		`for item in 'rm -rf /'; do printf '%s' "$item"; done`,
 		`[[ 'rm -rf /' = "$value" ]]`,
 		`if [ -d /tmp ]; then printf '%s' "${value#/tmp/}"; fi`,
-		"if true; then python3 - <<'EOF'\nprint('hello')\nEOF\nfi",
-		"for item in a; do python3 - <<'EOF'\nprint('hello')\nEOF\ndone",
 	} {
 		t.Run(script, func(t *testing.T) {
 			got := engine.ClassifyCommand(script, "")

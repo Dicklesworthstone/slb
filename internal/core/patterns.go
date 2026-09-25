@@ -26,12 +26,15 @@ type Pattern struct {
 
 // MatchResult contains the result of pattern matching.
 type MatchResult struct {
-	Tier                RiskTier
-	MatchedPattern      string
-	MinApprovals        int
-	NeedsApproval       bool
-	IsSafe              bool
-	ParseError          bool
+	Tier           RiskTier
+	MatchedPattern string
+	MinApprovals   int
+	NeedsApproval  bool
+	IsSafe         bool
+	ParseError     bool
+	// Opaque marks executed code that could not be determined statically
+	// (see NormalizedCommand.Opaque); such commands are at least CAUTION.
+	Opaque              bool
 	MatchedSegments     []SegmentMatch
 	HasUnmatchedSegment bool
 }
@@ -90,7 +93,7 @@ func (e *PatternEngine) ClassifyCommand(cmd, cwd string) (result *MatchResult) {
 	normalized := NormalizeCommand(cmd)
 	result = &MatchResult{ParseError: normalized.ParseError}
 	if normalized.IsCompound && len(normalized.Segments) > 1 {
-		return e.applyParseUpgrade(e.classifyCompoundCommand(normalized, cwd), normalized.ParseError)
+		return e.finalizeClassification(e.classifyCompoundCommand(normalized, cwd), normalized)
 	}
 
 	var checkCmd string
@@ -106,19 +109,19 @@ func (e *PatternEngine) ClassifyCommand(cmd, cwd string) (result *MatchResult) {
 	}
 	if match := e.matchPatterns(checkCmd, e.safe); match != nil {
 		result.Tier, result.IsSafe, result.MatchedPattern = RiskTier(RiskSafe), true, match.Pattern
-		return e.applyParseUpgrade(result, normalized.ParseError)
+		return e.finalizeClassification(result, normalized)
 	}
 	if match := e.matchPatterns(checkCmd, e.critical); match != nil {
 		result.Tier, result.NeedsApproval, result.MatchedPattern = RiskTierCritical, true, match.Pattern
-		return e.applyParseUpgrade(result, normalized.ParseError)
+		return e.finalizeClassification(result, normalized)
 	}
 	if match := e.matchPatterns(checkCmd, e.dangerous); match != nil {
 		result.Tier, result.NeedsApproval, result.MatchedPattern = RiskTierDangerous, true, match.Pattern
-		return e.applyParseUpgrade(result, normalized.ParseError)
+		return e.finalizeClassification(result, normalized)
 	}
 	if match := e.matchPatterns(checkCmd, e.caution); match != nil {
 		result.Tier, result.NeedsApproval, result.MatchedPattern = RiskTierCaution, true, match.Pattern
-		return e.applyParseUpgrade(result, normalized.ParseError)
+		return e.finalizeClassification(result, normalized)
 	}
 	lowerRaw := strings.ToLower(cmd)
 	if strings.Contains(lowerRaw, "delete from") {
@@ -130,7 +133,7 @@ func (e *PatternEngine) ClassifyCommand(cmd, cwd string) (result *MatchResult) {
 			result.MatchedPattern = "fallback_sql_delete_no_where"
 		}
 	}
-	return e.applyParseUpgrade(result, normalized.ParseError)
+	return e.finalizeClassification(result, normalized)
 }
 
 // classifyCompoundCommand keeps the highest risk segment, never allowing one
@@ -208,6 +211,23 @@ func (e *PatternEngine) matchPatterns(cmd string, patterns []*Pattern) *Pattern 
 		}
 	}
 	return nil
+}
+
+// finalizeClassification applies the parse-error upgrade and then the opaque
+// floor: code whose content cannot be determined statically is never "no
+// pattern" or SAFE.
+func (e *PatternEngine) finalizeClassification(res *MatchResult, normalized *NormalizedCommand) *MatchResult {
+	res = e.applyParseUpgrade(res, normalized.ParseError)
+	res.Opaque = normalized.Opaque
+	if !normalized.Opaque || (res.Tier != "" && res.Tier != RiskTier(RiskSafe)) {
+		return res
+	}
+	res.Tier = RiskTierCaution
+	res.MinApprovals = tierApprovals(res.Tier)
+	res.NeedsApproval = true
+	res.IsSafe = false
+	res.MatchedPattern = "unresolved_execution"
+	return res
 }
 
 func (e *PatternEngine) applyParseUpgrade(res *MatchResult, parseErr bool) *MatchResult {
