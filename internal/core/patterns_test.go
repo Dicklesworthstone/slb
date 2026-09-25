@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestClassifyCommand(t *testing.T) {
@@ -977,6 +978,17 @@ func TestClassifyCommand_RedirectionsAndQuotedOperatorsDoNotHideArguments(t *tes
 		{`git push &>/dev/null --force origin main`, RiskTierCritical},
 		{`rm >/dev/null -rf /etc`, RiskTierCritical},
 		{`git reset 2>/dev/null --hard HEAD~3`, RiskTierDangerous},
+		// A here-string word is stdin, not an argument: left in place it
+		// was spliced into the argument list and could turn a destructive
+		// command into an allowlisted or unrecognized one.
+		{`kubectl delete <<<'pod x' namespace prod`, RiskTierCritical},
+		{`kubectl delete <<<pod namespace prod`, RiskTierCritical},
+		{`npm <<<'cache clean' uninstall foo`, RiskTierCaution},
+		{`rm <<<'-f a.log' -rf /etc`, RiskTierCritical},
+		{`git <<<x push --force origin main`, RiskTierCritical},
+		// `>|` is a redirection, not a pipe; `{fd}>` names its fd.
+		{`git push >|/tmp/log --force origin main`, RiskTierCritical},
+		{`git {fd}>/dev/null push -f origin main`, RiskTierCritical},
 	} {
 		for _, dir := range []string{"", cwd} {
 			result := engine.ClassifyCommand(tc.cmd, dir)
@@ -1007,13 +1019,33 @@ func TestStripRedirections(t *testing.T) {
 		"cmd a2>f b":                  "cmd a2  b",
 		"</dev/null cmd":              "  cmd",
 		"cmd &>>log arg":              "cmd   arg",
-		"psql <<< 'TRUNCATE users'":   "psql  'TRUNCATE users' ",
+		"psql <<< 'TRUNCATE users'":   "psql   'TRUNCATE users'",
+		"a <<<x b <<<'y z' c":         "a   b   c x 'y z'",
 		"psql <<-EOF":                 "psql  ",
 		`echo "a > b" '<c>' d\>e`:     `echo "a > b" '<c>' d\>e`,
 		"cmd >'my file' arg":          "cmd   arg",
+		"exec {fd}>/tmp/x a":          "exec   a",
+		"echo {1x}>g x{y}>h":          "echo {1x}  x{y} ",
+		"cmd a1>f '2'>g":              "cmd a1  '2' ",
+		// Unterminated quote in a target: unchanged, so the tokenizer
+		// still reports the parse error instead of it being dropped.
+		`git push >"x --force`: `git push >"x --force`,
 	} {
 		if got := stripRedirections(in); got != want {
 			t.Errorf("stripRedirections(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// stripRedirections re-copied everything written so far at each redirection
+// glued to a word, so a 1MB command of `1>b` words took minutes to classify.
+func TestStripRedirections_LinearTime(t *testing.T) {
+	for _, word := range []string{"1>b ", "a>b ", "{x}>b ", "<<<x "} {
+		cmd := "echo " + strings.Repeat(word, (1<<20-10)/len(word))
+		start := time.Now()
+		NewPatternEngine().ClassifyCommand(cmd, t.TempDir())
+		if elapsed := time.Since(start); elapsed > 10*time.Second {
+			t.Errorf("classifying %d bytes of %q took %v", len(cmd), word, elapsed)
 		}
 	}
 }

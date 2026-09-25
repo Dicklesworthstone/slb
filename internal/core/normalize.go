@@ -80,6 +80,7 @@ func splitPipesShellAware(seg string) []string {
 	inDoubleQuote := false
 	escaped := false
 	parenDepth := 0
+	redirectAt := -1 // index of the last unquoted, unescaped '>'
 	runes := []rune(seg)
 
 	for i := 0; i < len(runes); i++ {
@@ -115,6 +116,16 @@ func splitPipesShellAware(seg string) []string {
 			} else if r == ')' && parenDepth > 0 {
 				parenDepth--
 			}
+		}
+		if r == '>' && !inSingleQuote && !inDoubleQuote {
+			redirectAt = i
+		}
+		// `>|` is the clobber redirection, not a pipe: splitting there cut
+		// `git push >|log --force origin main` into `git push >` and a
+		// segment starting with the log file.
+		if r == '|' && redirectAt == i-1 && !inSingleQuote && !inDoubleQuote {
+			current.WriteRune(r)
+			continue
 		}
 		if r == '|' && !inSingleQuote && !inDoubleQuote && parenDepth == 0 {
 			// `||` is a compound separator, already split upstream; leave any
@@ -515,62 +526,64 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 }
 
 // stripRedirections removes unquoted I/O redirections (`>f`, `2>&1`, `&>>f`,
-// `<in`, `<<EOF`, `>|f`, `<>f`) from one simple command, wherever they appear
-// among its words, so the tokenizer sees every argument. The target word of a
-// redirection is dropped, except for a here-string (`<<< word`), whose word is
-// kept as an argument: it is data fed to the command and may be the dangerous
-// part (`psql <<< 'TRUNCATE users'`). Process and command substitutions have
-// already been replaced by splitExecutableSubstitutions.
+// `<in`, `<<EOF`, `>|f`, `<>f`, `{fd}>f`) from one simple command, wherever
+// they appear among its words, so the tokenizer sees every argument. The
+// target word of a redirection is dropped, except for a here-string
+// (`<<< word`), whose word is data fed to the command and may be the dangerous
+// part (`psql <<< 'TRUNCATE users'`). Here-string words are moved after the
+// command's own arguments rather than left in place: in place they could be
+// spliced into the argument list and change what the command looks like
+// (`kubectl delete <<<'pod x' namespace prod` would read as the allowlisted
+// `kubectl delete pod x ...`). Process and command substitutions have already
+// been replaced by splitExecutableSubstitutions.
+//
+// A redirection target with an unterminated quote leaves the command
+// unchanged, so the tokenizer still reports the parse error. The scan is
+// linear in the length of the command.
 func stripRedirections(part string) string {
 	runes := []rune(part)
-	var out strings.Builder
+	out := make([]rune, 0, len(runes))
+	var hereStrings [][]rune
 	inSingle, inDouble, escaped := false, false, false
-	wordStart := true // at the start of a shell word (fd numbers glue to it)
+	wordStart := 0 // index in out where the current shell word began
 	isSpace := func(r rune) bool { return r == ' ' || r == '\t' }
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
 		if escaped {
-			out.WriteRune(r)
-			escaped, wordStart = false, false
+			out = append(out, r)
+			escaped = false
 			continue
 		}
 		if r == '\\' && !inSingle {
-			out.WriteRune(r)
-			escaped, wordStart = true, false
+			out = append(out, r)
+			escaped = true
 			continue
 		}
 		if r == '\'' && !inDouble {
 			inSingle = !inSingle
-			out.WriteRune(r)
-			wordStart = false
+			out = append(out, r)
 			continue
 		}
 		if r == '"' && !inSingle {
 			inDouble = !inDouble
-			out.WriteRune(r)
-			wordStart = false
+			out = append(out, r)
 			continue
 		}
 		isRedirect := !inSingle && !inDouble &&
 			(r == '<' || r == '>' || (r == '&' && i+1 < len(runes) && runes[i+1] == '>'))
 		if !isRedirect {
-			out.WriteRune(r)
-			wordStart = isSpace(r)
+			out = append(out, r)
+			if isSpace(r) && !inSingle && !inDouble {
+				wordStart = len(out)
+			}
 			continue
 		}
 
-		// An fd number written immediately before the operator (`2>`) is part
-		// of the redirection, not an argument.
-		if !wordStart {
-			s := []rune(out.String())
-			j := len(s)
-			for j > 0 && s[j-1] >= '0' && s[j-1] <= '9' {
-				j--
-			}
-			if j < len(s) && (j == 0 || isSpace(s[j-1])) {
-				out.Reset()
-				out.WriteString(string(s[:j]))
-			}
+		// A word written immediately before the operator that is an fd
+		// number (`2>`) or a named fd (`{fd}>`) is part of the redirection,
+		// not an argument.
+		if word := out[wordStart:]; isRedirectionFD(word) {
+			out = out[:wordStart]
 		}
 		opStart := i
 		for i < len(runes) && strings.ContainsRune("<>&|", runes[i]) {
@@ -608,15 +621,49 @@ func stripRedirections(part string) string {
 				break
 			}
 		}
-		out.WriteRune(' ')
+		if wSingle || wDouble {
+			return part
+		}
+		out = append(out, ' ')
 		if op == "<<<" {
-			out.WriteString(string(runes[targetStart:i]))
-			out.WriteRune(' ')
+			hereStrings = append(hereStrings, runes[targetStart:i])
 		}
 		i-- // the loop increment resumes at the terminator
-		wordStart = true
+		wordStart = len(out)
 	}
-	return out.String()
+	for _, word := range hereStrings {
+		out = append(out, ' ')
+		out = append(out, word...)
+	}
+	return string(out)
+}
+
+// isRedirectionFD reports whether a word glued to a redirection operator is
+// its file descriptor: a number (`2>`) or a named fd (`{fd}>`).
+func isRedirectionFD(word []rune) bool {
+	if len(word) == 0 {
+		return false
+	}
+	digits := true
+	for _, r := range word {
+		if r < '0' || r > '9' {
+			digits = false
+			break
+		}
+	}
+	if digits {
+		return true
+	}
+	if len(word) < 3 || word[0] != '{' || word[len(word)-1] != '}' {
+		return false
+	}
+	for k, r := range word[1 : len(word)-1] {
+		if r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (k > 0 && r >= '0' && r <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // expandSubshellSegments replaces any segment that is entirely one subshell

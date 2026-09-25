@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -111,6 +112,35 @@ for line in sys.stdin.read().split("\n"):
 	}
 	if len(got) != len(commands) {
 		t.Errorf("python classified %d commands, want %d", len(got), len(commands))
+	}
+}
+
+// Python's `re` backtracks, so a rule that is linear under Go's RE2 can be
+// quadratic in the exported hook. Adjacent `\s*;?\s*` in the bare TRUNCATE
+// rule took ~30s on a command with 50KB of whitespace.
+func TestExportClaudeHook_NoQuadraticBacktracking(t *testing.T) {
+	python := findPython3(t)
+	hookPath := filepath.Join(t.TempDir(), "hook.py")
+	if err := os.WriteFile(hookPath, []byte(NewPatternEngine().ExportClaudeHook()), 0o600); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+	script := `import importlib.util, sys, time
+spec = importlib.util.spec_from_file_location("hook", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+for cmd in ["TRUNCATE a" + " " * 50000 + "!", "psql" + "\n" * 50000 + "TRUNCATE"]:
+    start = time.time()
+    m.classify(cmd)
+    print("%.2f" % (time.time() - start))
+`
+	out, err := exec.Command(python, "-c", script, hookPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("python3 failed: %v\n%s", err, out)
+	}
+	for _, line := range strings.Fields(string(out)) {
+		if secs, err := strconv.ParseFloat(line, 64); err != nil || secs > 3 {
+			t.Errorf("exported hook took %ss on a long pathological command (want < 3s)", line)
+		}
 	}
 }
 

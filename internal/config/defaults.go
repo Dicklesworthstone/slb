@@ -31,8 +31,11 @@ const (
 	sqlTruncateInSQLClient = `(?:^|[^\w.-])(?:psql|pgcli|mysql|mariadb|mycli|mysqlsh|sqlite3|litecli|duckdb|sqlcmd|sqlplus|` +
 		`clickhouse|clickhouse-client|cockroach|cqlsh|snowsql|usql|vsql|trino|presto|beeline|spark-sql|impala-shell)` +
 		`(?:\.exe)?(?:\s|<)[\s\S]*TRUNCATE(?:\s+[\w"` + "`" + `\[\\]|\s*` + sqlComment + `|["` + "`" + `\[])`
-	sqlTruncateBareStatement = `(?:^|[\r\n])\s*TRUNCATE\s+` + sqlTruncateList +
-		`\s*;?\s*(?:` + sqlComment + `[^\r\n]*)?(?:$|[\r\n])`
+	// Written without adjacent or line-spanning `\s*` runs so that Python's
+	// backtracking `re` (the exported hook) stays linear on long whitespace;
+	// `\s*;?\s*` took 30s on 50KB of spaces there.
+	sqlTruncateBareStatement = `(?:^|[\r\n])[^\S\r\n]*TRUNCATE\s+` + sqlTruncateList +
+		`\s*(?:;\s*)?(?:` + sqlComment + `[^\r\n]*)?(?:$|[\r\n])`
 	sqlTruncateTerminatedStatement = `\bTRUNCATE\s+` + sqlTruncateList + `\s*;`
 	sqlTruncateEchoedStatement     = `(?:^|[^\w.-])(?:echo|printf)\s[^|;&]*\bTRUNCATE\s+` + sqlTruncateList + sqlTruncateStatementEnd
 )
