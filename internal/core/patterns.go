@@ -107,20 +107,10 @@ func (e *PatternEngine) ClassifyCommand(cmd, cwd string) (result *MatchResult) {
 	if cwd != "" {
 		checkCmd = ResolvePathsInCommand(checkCmd, cwd)
 	}
-	if match := e.matchPatterns(checkCmd, e.safe); match != nil {
-		result.Tier, result.IsSafe, result.MatchedPattern = RiskTier(RiskSafe), true, match.Pattern
-		return e.finalizeClassification(result, normalized)
-	}
-	if match := e.matchPatterns(checkCmd, e.critical); match != nil {
-		result.Tier, result.NeedsApproval, result.MatchedPattern = RiskTierCritical, true, match.Pattern
-		return e.finalizeClassification(result, normalized)
-	}
-	if match := e.matchPatterns(checkCmd, e.dangerous); match != nil {
-		result.Tier, result.NeedsApproval, result.MatchedPattern = RiskTierDangerous, true, match.Pattern
-		return e.finalizeClassification(result, normalized)
-	}
-	if match := e.matchPatterns(checkCmd, e.caution); match != nil {
-		result.Tier, result.NeedsApproval, result.MatchedPattern = RiskTierCaution, true, match.Pattern
+	if tier, pattern := e.classifySegment(checkCmd); pattern != "" {
+		result.Tier, result.MatchedPattern = tier, pattern
+		result.IsSafe = tier == RiskTier(RiskSafe)
+		result.NeedsApproval = !result.IsSafe
 		return e.finalizeClassification(result, normalized)
 	}
 	lowerRaw := strings.ToLower(cmd)
@@ -145,40 +135,31 @@ func (e *PatternEngine) classifyCompoundCommand(normalized *NormalizedCommand, c
 		if cwd != "" {
 			segment = ResolvePathsInCommand(segment, cwd)
 		}
-		if xargsCmd := ExtractXargsCommand(segment); xargsCmd != "" {
-			segment = xargsCmd
-		}
 		segmentMatch := SegmentMatch{Segment: segment}
-		if match := e.matchPatterns(segment, e.safe); match != nil {
-			segmentMatch.Tier, segmentMatch.MatchedPattern = RiskTier(RiskSafe), match.Pattern
-			if highestTier == "" {
-				highestTier = RiskTier(RiskSafe)
+		segmentMatch.Tier, segmentMatch.MatchedPattern = e.classifySegment(segment)
+		if segmentMatch.MatchedPattern == "" {
+			lowerRaw := strings.ToLower(segment)
+			if strings.Contains(lowerRaw, "delete from") {
+				segmentMatch.Tier, segmentMatch.MatchedPattern = RiskTierDangerous, "fallback_sql_delete_with_where"
+				if !strings.Contains(lowerRaw, "where") {
+					segmentMatch.Tier, segmentMatch.MatchedPattern = RiskTierCritical, "fallback_sql_delete_no_where"
+				}
 			}
-		} else if match := e.matchPatterns(segment, e.critical); match != nil {
-			segmentMatch.Tier, segmentMatch.MatchedPattern = RiskTierCritical, match.Pattern
+		}
+		switch segmentMatch.Tier {
+		case RiskTierCritical:
 			highestTier = RiskTierCritical
-		} else if match := e.matchPatterns(segment, e.dangerous); match != nil {
-			segmentMatch.Tier, segmentMatch.MatchedPattern = RiskTierDangerous, match.Pattern
+		case RiskTierDangerous:
 			if highestTier != RiskTierCritical {
 				highestTier = RiskTierDangerous
 			}
-		} else if match := e.matchPatterns(segment, e.caution); match != nil {
-			segmentMatch.Tier, segmentMatch.MatchedPattern = RiskTierCaution, match.Pattern
+		case RiskTierCaution:
 			if highestTier == "" || highestTier == RiskTier(RiskSafe) {
 				highestTier = RiskTierCaution
 			}
-		} else {
-			lowerRaw := strings.ToLower(segment)
-			if strings.Contains(lowerRaw, "delete from") {
-				if !strings.Contains(lowerRaw, "where") {
-					segmentMatch.Tier, segmentMatch.MatchedPattern = RiskTierCritical, "fallback_sql_delete_no_where"
-					highestTier = RiskTierCritical
-				} else {
-					segmentMatch.Tier, segmentMatch.MatchedPattern = RiskTierDangerous, "fallback_sql_delete_with_where"
-					if highestTier != RiskTierCritical {
-						highestTier = RiskTierDangerous
-					}
-				}
+		case RiskTier(RiskSafe):
+			if highestTier == "" {
+				highestTier = RiskTier(RiskSafe)
 			}
 		}
 		if segmentMatch.MatchedPattern != "" {
@@ -202,6 +183,62 @@ func (e *PatternEngine) classifyCompoundCommand(normalized *NormalizedCommand, c
 		}
 	}
 	return result
+}
+
+// classifySegment returns the tier and pattern of the first rule matching
+// one normalized segment, checking safe, critical, dangerous and caution
+// rules in that order. An empty pattern means no rule matched.
+//
+// The normalizer replaces an xargs invocation by the command it runs plus a
+// stand-in for the arguments xargs appends; such a command is never SAFE,
+// since those arguments are unknown (`xargs kubectl delete pod` deletes
+// whatever pods it reads). A segment that still mentions xargs (behind a
+// program the normalizer does not unwrap, such as `stdbuf -oL xargs rm -rf
+// /`) is also classified as the text after "xargs", and the riskier result
+// wins. For that comparison an unmatched result ranks above SAFE, so neither
+// reading's allowlist match may clear the other.
+func (e *PatternEngine) classifySegment(segment string) (RiskTier, string) {
+	allowSafe := !strings.Contains(segment, xargsArgumentsPlaceholder)
+	tier, pattern := e.matchSegment(segment, allowSafe)
+	if xargsCmd := ExtractXargsCommand(segment); xargsCmd != "" {
+		if xTier, xPattern := e.matchSegment(xargsCmd, false); xargsRank(xTier, xPattern) > xargsRank(tier, pattern) {
+			tier, pattern = xTier, xPattern
+		}
+	}
+	return tier, pattern
+}
+
+func xargsRank(tier RiskTier, pattern string) int {
+	switch {
+	case pattern == "":
+		return 1
+	case tier == RiskTierCritical:
+		return 4
+	case tier == RiskTierDangerous:
+		return 3
+	case tier == RiskTierCaution:
+		return 2
+	default:
+		return 0
+	}
+}
+
+func (e *PatternEngine) matchSegment(segment string, allowSafe bool) (RiskTier, string) {
+	if allowSafe {
+		if match := e.matchPatterns(segment, e.safe); match != nil {
+			return RiskTier(RiskSafe), match.Pattern
+		}
+	}
+	if match := e.matchPatterns(segment, e.critical); match != nil {
+		return RiskTierCritical, match.Pattern
+	}
+	if match := e.matchPatterns(segment, e.dangerous); match != nil {
+		return RiskTierDangerous, match.Pattern
+	}
+	if match := e.matchPatterns(segment, e.caution); match != nil {
+		return RiskTierCaution, match.Pattern
+	}
+	return "", ""
 }
 
 func (e *PatternEngine) matchPatterns(cmd string, patterns []*Pattern) *Pattern {
@@ -495,9 +532,17 @@ func (e *PatternEngine) ExportClaudeHook() string {
 		sb.WriteString(fmt.Sprintf("    '%s': %d,\n", tier.name, e.requiredApprovalsLocked(RiskTier(tier.name), -1)))
 	}
 	sb.WriteString("}\n\n")
-	sb.WriteString(`def classify(command: str) -> Tuple[str, int]:
+	sb.WriteString(`# Python's re backtracks, so a rule that is linear in Go can take seconds on a
+# long command here. Longer commands are not scanned; they need the strictest
+# approval instead of being allowed unclassified.
+MAX_CLASSIFIED_LENGTH = 16384
+
+
+def classify(command: str) -> Tuple[str, int]:
     """Classify against the exported policy; return (tier, min_approvals)."""
     command = command.strip()
+    if len(command) > MAX_CLASSIFIED_LENGTH:
+        return ('critical', MIN_APPROVALS['critical'])
     for tier, patterns in (('safe', SAFE_PATTERNS), ('critical', CRITICAL_PATTERNS),
                            ('dangerous', DANGEROUS_PATTERNS), ('caution', CAUTION_PATTERNS)):
         for pattern in patterns:

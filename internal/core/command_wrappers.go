@@ -33,7 +33,19 @@ var executionWrappers = map[string]wrapperOptions{
 	"exec":    {"cl", "a", nil},
 	"strace":  {"fFvTtCxy", "eosu", nil},
 	"ltrace":  {"fCiST", "eos", nil},
+	// GNU and BSD xargs. The optional-argument forms -e/-i/-l only take a
+	// value glued to the flag; a glued value is not modeled and fails closed.
+	"xargs": {"0rtpxoeil", "adEILnPsJRS", map[string]bool{
+		"null": false, "no-run-if-empty": false, "verbose": false, "interactive": false,
+		"exit": false, "open-tty": false, "show-limits": false, "eof": false, "replace": false,
+		"max-lines": false, "arg-file": true, "delimiter": true, "max-args": true,
+		"max-procs": true, "max-chars": true, "process-slot-var": true,
+	}},
 }
+
+// xargsArgumentsPlaceholder stands for the arguments xargs appends to the
+// command it runs.
+const xargsArgumentsPlaceholder = "__slb_xargs_arguments__"
 
 func unwrapCommandTokens(tokens []string) ([]string, []string, bool) {
 	var wrappers []string

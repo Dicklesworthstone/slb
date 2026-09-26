@@ -1488,3 +1488,134 @@ func TestSubstringPatterns_AnchorToToken(t *testing.T) {
 		}
 	})
 }
+
+// expectTiers classifies each command with cwd and checks its tier.
+func expectTiers(t *testing.T, engine *PatternEngine, cwd string, cases map[string]RiskTier) {
+	t.Helper()
+	for command, want := range cases {
+		if got := engine.ClassifyCommand(command, cwd); got.Tier != want {
+			t.Errorf("%q (cwd %q): tier %q (pattern %q), want %q", command, cwd, got.Tier, got.MatchedPattern, want)
+		}
+	}
+}
+
+// A '+' refspec force-updates that ref, like --force.
+func TestClassifyPlusRefspecPushIsForcePush(t *testing.T) {
+	expectTiers(t, NewPatternEngine(), "", map[string]RiskTier{
+		"git push origin +main":                             RiskTierCritical,
+		"git push origin +refs/heads/main:refs/heads/main":  RiskTierCritical,
+		"git push origin +HEAD:main":                        RiskTierCritical,
+		"git push -u origin +main":                          RiskTierCritical,
+		"git push origin main +dev":                         RiskTierCritical,
+		"git push origin '+main'":                           RiskTierCritical,
+		"sudo git push origin +main":                        RiskTierCritical,
+		"git push --force origin main":                      RiskTierCritical,
+		"git push origin main":                              "",
+		"git push origin HEAD:main":                         "",
+		"git push origin v1.0+build":                        "",
+		"git push origin refs/heads/a+b:refs/heads/a+b":     "",
+		"git commit -m '+main' && git push origin main":     "",
+		"git push --force-with-lease origin main":           RiskTierDangerous,
+		"git push -o ci.skip origin main":                   "",
+		"git push origin :refs/heads/old":                   "",
+		"git push origin main --tags":                       "",
+		"git push --follow-tags origin main":                "",
+		"git push origin main:main":                         "",
+		"git -C repo status":                                "",
+		"git log --oneline +5":                              "",
+		"echo git push origin +main":                        "",
+		"git push origin main\ngit log +x":                  "",
+		"git push origin main # +comment":                   "",
+		"git pushx origin +main":                            "",
+		"git push\t+main":                                   RiskTierCritical,
+		"git push  origin  +main":                           RiskTierCritical,
+		"git  push origin +main":                            RiskTierCritical,
+		"git push origin +":                                 "",
+		"git push origin main -o merge_request.title=+1":    "",
+		"git push origin HEAD:refs/for/main%topic=+x":       "",
+		"git push origin +main 2>&1":                        RiskTierCritical,
+		"git push origin +main >/dev/null":                  RiskTierCritical,
+		"git push origin \"+main\"":                         RiskTierCritical,
+		"GIT_TRACE=1 git push origin +main":                 RiskTierCritical,
+		"git push origin +main; echo done":                  RiskTierCritical,
+		"(git push origin +main)":                           RiskTierCritical,
+		"git push origin +main | tee push.log":              RiskTierCritical,
+		"git push origin +main && git push origin +release": RiskTierCritical,
+	})
+}
+
+// With a working directory, ~ resolves to the daemon user's home: /home/<u>
+// on Linux and /Users/<u> on macOS. Both must classify the same.
+func TestClassifyHomeDeletionSameTierOnMacAndLinux(t *testing.T) {
+	engine := NewPatternEngine()
+	var tiers []map[string]RiskTier
+	for _, home := range []string{"/home/alice", "/Users/alice"} {
+		t.Setenv("HOME", home)
+		got := map[string]RiskTier{}
+		for _, command := range []string{"rm -rf ~", "rm -rf ~/", "rm -rf ~/projects/app", "rm -rf ./build", "rm -r ../app", "rm -f notes.txt"} {
+			got[command] = engine.ClassifyCommand(command, home+"/projects/app").Tier
+		}
+		if got["rm -rf ~"] != RiskTierCritical || got["rm -rf ~/"] != RiskTierCritical {
+			t.Errorf("HOME=%s: deleting the home directory is %q/%q, want critical", home, got["rm -rf ~"], got["rm -rf ~/"])
+		}
+		tiers = append(tiers, got)
+	}
+	for command, linux := range tiers[0] {
+		if mac := tiers[1][command]; mac != linux {
+			t.Errorf("%q: tier %q under /home but %q under /Users", command, linux, mac)
+		}
+	}
+	expectTiers(t, engine, "", map[string]RiskTier{
+		"rm -rf /Users/alice": RiskTierCritical,
+		"rm -rf /Users":       RiskTierCritical,
+		"rm -rf /home/alice":  RiskTierCritical,
+		"rm -rf /root":        RiskTierCritical,
+		"rm -rf /Usersdata":   RiskTierDangerous,
+	})
+}
+
+// xargs runs its command with arguments read from stdin; the command is
+// classified whether or not xargs sits in a pipeline, and never as SAFE.
+func TestClassifyXargsCommand(t *testing.T) {
+	expectTiers(t, NewPatternEngine(), "", map[string]RiskTier{
+		"xargs rm -rf":                                RiskTierDangerous,
+		"xargs rm -rf < list.txt":                     RiskTierDangerous,
+		"xargs -0 rm -rf < list.txt":                  RiskTierDangerous,
+		"xargs -n1 -P4 rm -rf":                        RiskTierDangerous,
+		"xargs -I{} rm -rf {}":                        RiskTierDangerous,
+		"xargs --null --max-args=1 rm -rf":            RiskTierDangerous,
+		"xargs -a list.txt rm -rf":                    RiskTierDangerous,
+		"sudo xargs rm -rf":                           RiskTierDangerous,
+		"xargs sudo rm -rf /etc":                      RiskTierCritical,
+		"xargs sh -c 'rm -rf /etc' _":                 RiskTierCritical,
+		"xargs git push --force origin":               RiskTierCritical,
+		"ls | xargs rm -rf":                           RiskTierDangerous,
+		"find . -name '*.log' | xargs rm -f a.log":    "",
+		"xargs rm -f a.log":                           "",
+		"xargs git stash":                             "",
+		"kubectl get pods | xargs kubectl delete pod": RiskTierDangerous,
+		"xargs kubectl delete pod":                    RiskTierDangerous,
+		"stdbuf -oL xargs rm -rf /etc":                RiskTierCritical,
+		"xargs grep -l foo":                           "",
+		"xargs --frobnicate rm -rf":                   RiskTierCaution, // unknown option: parse error
+		"ls | xargs":                                  "",
+	})
+}
+
+// A subshell followed by redirections runs the same commands.
+func TestClassifyRedirectedSubshell(t *testing.T) {
+	expectTiers(t, NewPatternEngine(), "", map[string]RiskTier{
+		"(rm -rf /etc) >/dev/null":            RiskTierCritical,
+		"(rm -rf /etc) 2>&1":                  RiskTierCritical,
+		"(rm -rf /etc) &>/dev/null":           RiskTierCritical,
+		"(cd /tmp && rm -rf ./x) 2>/dev/null": RiskTierDangerous,
+		"(git push --force) >/dev/null 2>&1":  RiskTierCritical,
+		"(ls) >/dev/null":                     "",
+		"(ls) 2>/dev/null >&2":                "",
+		"(cd /tmp && ls) > out.txt":           RiskTierCaution, // file write stays conservative
+		"(rm -rf ./x) > out.txt":              RiskTierCritical,
+		"(echo a >b)":                         "",
+		"(cat) <<< 'x'":                       RiskTierCaution,
+		"(rm -rf /etc)x":                      RiskTierCaution,
+	})
+}

@@ -44,7 +44,10 @@ const (
 // a second, weaker allowlist in configuration than the one used at runtime.
 var (
 	defaultCriticalPatterns = []string{
-		`^rm\s+(-[rf]+\s+)+["']?/+(?:\.\.?/+)*(boot|dev|etc|home|lib|lib64|media|mnt|opt|proc|root|run|sbin|srv|sys|usr|var)(?:[/\s"'*]|$)`,
+		// /Users is macOS's /home: with a working directory, `rm -rf ~`
+		// resolves to the daemon user's home, and must land in the same tier
+		// on both systems.
+		`^rm\s+(-[rf]+\s+)+["']?/+(?:\.\.?/+)*(boot|dev|etc|home|lib|lib64|media|mnt|opt|proc|root|run|sbin|srv|sys|Users|usr|var)(?:[/\s"'*]|$)`,
 		`^rm\s+(-[rf]+\s+)+/($|\s)`,
 		`^rm\s+(-[rf]+\s+)+/\*`,
 		`^rm\s+(-[rf]+\s+)+~`,
@@ -65,10 +68,17 @@ var (
 		`^kubectl\s+delete\s+(node|nodes|namespace|namespaces|pv|persistentvolume|pvc|persistentvolumeclaim)\b`,
 		`^helm\s+uninstall.*--all`,
 		`^docker\s+system\s+prune\s+-a`,
-		`^git\s+push\s+.*--force($|\s)`,
-		`^git\s+push\s+(?:.*\s)?-[a-z]*f[a-z]*($|\s)`,
+		// `push\s` rather than `push\s+` before `.*`: the same language on
+		// one line, but Python's backtracking `re` (the exported hook) would
+		// try every split of a whitespace run between the two, which is
+		// quadratic in its length.
+		`^git\s+push\s.*--force($|\s)`,
+		`^git\s+push\s(?:.*\s)?-[a-z]*f[a-z]*($|\s)`,
+		// A refspec starting with '+' force-updates that ref, exactly like
+		// --force does for all of them (`git push origin +main`).
+		`^git\s+push(?:\s.*)?[\s"']\+[^\s"']`,
 		`^aws\s+.*terminate-instances`,
-		`^gcloud\s+(?:.*\s)?delete(?:\s.*)?\s(?:--quiet|-q)($|\s)`,
+		`^gcloud\s(?:.*\s)?delete(?:\s.*)?\s(?:--quiet|-q)($|\s)`,
 		`\bdd\b.*of=/dev/`,
 		`^mkfs`,
 		`^fdisk`,
@@ -83,6 +93,11 @@ var (
 		`^git\s+clean\s+-fd`,
 		`^git\s+push.*--force-with-lease`,
 		`^kubectl\s+delete`,
+		// A downloaded script run by a shell cannot be inspected. The daemon
+		// normalizes `curl URL | sudo bash`, `bash <(curl URL)` and
+		// `sh -c "$(wget -O- URL)"` into this "fetch | shell" form; the
+		// offline hook sees the raw command.
+		`^(?:\S*/)?(?:curl|wget|fetch|xh|https?)(?:\s[^|]*)?\|\s*(?:sudo(?:\s+-\S+)*\s+)?(?:\S*/)?(?:ba|z|da|k|mk|a)?sh(?:\s|$)`,
 		`^helm\s+uninstall`,
 		`^docker\s+rm`,
 		`^docker\s+rmi`,

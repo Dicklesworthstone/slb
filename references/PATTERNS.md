@@ -23,12 +23,12 @@
 
 ### CRITICAL (2+ approvals)
 
-- `rm -rf /...`
+- `rm -rf /...` (system paths and homes: `/home`, `/Users`, `/root`, `~`)
 - `DROP DATABASE/SCHEMA`
 - `TRUNCATE [TABLE] [ONLY] ...` (SQL context; TABLE is optional)
 - `terraform destroy`
 - `kubectl delete node/namespace/pv/pvc`
-- `git push --force`
+- `git push --force`, `git push origin +main` (`+` refspec)
 - `aws terminate-instances`
 - `dd ... of=/dev/`
 
@@ -38,6 +38,7 @@
 - `git reset --hard`
 - `git clean -fd`
 - `kubectl delete`
+- `curl ... | bash`, `bash <(curl ...)` (downloaded script run by a shell)
 - `terraform destroy -target`
 - `DROP TABLE`
 - `chmod -R`

@@ -348,13 +348,22 @@ func (a *feedAnalysis) checkCall(call *syntax.CallExpr, feed *stdinFeed) {
 	case name == "eval":
 		// eval parses its expanded arguments as code: an unknown value is
 		// unknown code.
-		for _, token := range rest[1:] {
+		for i, token := range rest[1:] {
 			if strings.Contains(token, dynamicToken) {
 				a.opaque = true
+				for _, word := range args[1+i:] {
+					a.addRemoteScript(word, "sh")
+				}
 				return
 			}
 		}
 		a.addPayload(strings.Join(rest[1:], " "))
+	case name == "source" || name == ".":
+		// The sourced file is not visible here, but a downloaded one
+		// (`source <(curl URL)`) is a remote script run by the shell.
+		if len(args) > 1 && a.addRemoteScript(args[1], "sh") {
+			a.opaque = true
+		}
 	case stdinShells[name]:
 		a.checkShell(rest, args, feed)
 	default:
@@ -383,6 +392,7 @@ func (a *feedAnalysis) checkShell(tokens []string, words []*syntax.Word, feed *s
 			// when it is produced by running code.
 			if dynamicProgramWord(words[i]) {
 				a.opaque = true
+				a.addRemoteScript(words[i], tokens[0])
 			}
 			return
 		}
@@ -419,10 +429,16 @@ func (a *feedAnalysis) checkShell(tokens []string, words []*syntax.Word, feed *s
 			// The outer shell expands parameters before the inner shell parses
 			// the body, so an unknown value is unknown code, not data.
 			a.opaque = true
+			a.addRemoteScript(words[i+1], tokens[0])
 			return
 		}
 		if !strings.HasPrefix(arg, "--") && strings.ContainsRune(arg[1:], 's') {
 			stdinFlag = true
+		}
+	}
+	if feed.present() && feed.producer != nil {
+		if fetch := a.pipedFetch(feed.producer); fetch != nil {
+			a.segments = append(a.segments, remoteScriptSegment(fetch, tokens[0]))
 		}
 	}
 	a.checkStdinProgram(feed, true)
@@ -727,4 +743,118 @@ func printfEscapes(format string) (string, bool) {
 		}
 	}
 	return out.String(), true
+}
+
+// remoteFetchers write a downloaded document to stdout.
+var remoteFetchers = map[string]bool{
+	"curl": true, "wget": true, "fetch": true, "xh": true, "http": true, "https": true,
+}
+
+// A script downloaded and run by a shell (`curl URL | sh`, `bash <(curl URL)`,
+// `sh -c "$(wget -O- URL)"`, `source <(curl URL)`, `eval "$(curl URL)"`) is
+// opaque like any unknown program, but it is also code chosen by a remote
+// server. It is reported as a synthetic "fetch ARGS | shell" segment, which
+// the builtin DANGEROUS rule for remote scripts matches (that rule also
+// catches the plain form in the raw command seen by the offline hook).
+func remoteScriptSegment(fetch []string, shell string) string {
+	words := append([]string{filepath.Base(fetch[0])}, fetch[1:]...)
+	return strings.Join(append(words, "|", filepath.Base(shell)), " ")
+}
+
+// fetchCall returns the unwrapped argv of a call to a network fetcher.
+func (a *feedAnalysis) fetchCall(call *syntax.CallExpr) []string {
+	tokens := make([]string, len(call.Args))
+	for i, word := range call.Args {
+		value, _, ok := a.staticWord(word)
+		if !ok {
+			value = dynamicToken
+		}
+		tokens[i] = value
+	}
+	rest, _, _ := unwrapCommandTokens(tokens)
+	if len(rest) == 0 || !remoteFetchers[filepath.Base(rest[0])] {
+		return nil
+	}
+	for i, token := range rest {
+		if strings.Contains(token, dynamicToken) {
+			rest[i] = "__slb_dynamic__"
+		}
+		// Keep the synthetic segment's only '|' the one before the shell
+		// (`curl 'https://x/?a|b' | sh`).
+		rest[i] = strings.ReplaceAll(rest[i], "|", "%7C")
+	}
+	return rest
+}
+
+// pipedFetch returns the fetch whose output reaches the end of the pipeline
+// stmt, looking through stages that copy stdin to stdout (tee, cat without
+// file operands).
+func (a *feedAnalysis) pipedFetch(stmt *syntax.Stmt) []string {
+	for depth := 0; stmt != nil && depth <= maxCommandNesting; depth++ {
+		switch cmd := stmt.Cmd.(type) {
+		case *syntax.BinaryCmd:
+			if cmd.Op != syntax.Pipe && cmd.Op != syntax.PipeAll {
+				return nil
+			}
+			if fetch := a.pipedFetch(cmd.Y); fetch != nil || !passThrough(cmd.Y) {
+				return fetch
+			}
+			stmt = cmd.X
+		case *syntax.Subshell:
+			if len(cmd.Stmts) != 1 {
+				return nil
+			}
+			stmt = cmd.Stmts[0]
+		case *syntax.Block:
+			if len(cmd.Stmts) != 1 {
+				return nil
+			}
+			stmt = cmd.Stmts[0]
+		case *syntax.CallExpr:
+			return a.fetchCall(cmd)
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+// passThrough reports a stage that copies its stdin to stdout.
+func passThrough(stmt *syntax.Stmt) bool {
+	call, ok := stmt.Cmd.(*syntax.CallExpr)
+	if !ok || len(call.Args) == 0 || stdinRedirect(stmt.Redirs) != nil {
+		return false
+	}
+	switch call.Args[0].Lit() {
+	case "tee":
+		return true
+	case "cat":
+		for _, word := range call.Args[1:] {
+			if lit := word.Lit(); lit != "-" && !strings.HasPrefix(lit, "-") {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// addRemoteScript records a fetch whose output word substitutes (via $(...),
+// `...` or <(...)) into code run by shell. It reports whether it found one.
+func (a *feedAnalysis) addRemoteScript(word *syntax.Word, shell string) bool {
+	var fetch []string
+	walkCaseSyntax(word, func(node syntax.Node) bool {
+		if fetch != nil {
+			return false
+		}
+		if call, ok := node.(*syntax.CallExpr); ok {
+			fetch = a.fetchCall(call)
+		}
+		return fetch == nil
+	})
+	if fetch == nil {
+		return false
+	}
+	a.segments = append(a.segments, remoteScriptSegment(fetch, shell))
+	return true
 }

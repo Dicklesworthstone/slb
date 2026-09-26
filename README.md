@@ -207,12 +207,12 @@ tcp_require_auth = true
 
 | Pattern | Description |
 |---------|-------------|
-| `rm -rf /...` | Recursive delete on system paths |
+| `rm -rf /...` | Recursive delete on system paths and homes (`/home`, `/Users`, `/root`, `~`) |
 | `DROP DATABASE/SCHEMA` | SQL database destruction |
 | `TRUNCATE [TABLE] [ONLY] ...` | SQL data destruction (TABLE is optional) |
 | `terraform destroy` | Infrastructure destruction |
 | `kubectl delete node/namespace/pv/pvc` | Kubernetes critical resources |
-| `git push --force` | Force push (not with-lease) |
+| `git push --force`, `git push origin +main` | Force push (not with-lease), including `+` refspecs |
 | `aws terminate-instances` | Cloud resource destruction |
 | `dd ... of=/dev/` | Direct disk writes |
 
@@ -224,6 +224,7 @@ tcp_require_auth = true
 | `git reset --hard` | Discard all changes |
 | `git clean -fd` | Remove untracked files |
 | `kubectl delete` | Delete Kubernetes resources |
+| `curl ... \| bash`, `bash <(curl ...)` | Downloaded script run by a shell |
 | `terraform destroy -target` | Targeted destroy |
 | `DROP TABLE` | SQL table destruction |
 | `chmod -R`, `chown -R` | Recursive permission changes |

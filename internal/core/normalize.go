@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/mattn/go-shellwords"
@@ -505,7 +506,10 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 			if part == "" {
 				continue
 			}
-			if inner, ok := stripSubshellWrapper(part); ok {
+			if inner, ok, discardOnly := stripRedirectedSubshell(part); ok {
+				// Like the control-flow path: discarding output is understood,
+				// other file redirections stay conservative.
+				result.ParseError = result.ParseError || !discardOnly
 				result.HasSubshell = true
 				result.StrippedWrappers = append(result.StrippedWrappers, "(")
 				appendInner(normalizeCommandDepth(inner, depth+1))
@@ -535,6 +539,13 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 			result.ParseError = result.ParseError || !valid
 			if len(tokens) == 0 {
 				continue
+			}
+			if slices.Contains(wrappers, "xargs") {
+				// xargs appends the items it reads to the command, so the
+				// command runs with arguments nobody can see here. Keep a
+				// stand-in for them: `xargs rm -f a.log` must not match the
+				// allowlist entry for deleting only .log files.
+				tokens = append(tokens, xargsArgumentsPlaceholder)
 			}
 			if script, ok, valid := shellCommandBody(tokens); ok {
 				result.StrippedWrappers = append(result.StrippedWrappers, filepath.Base(tokens[0])+" -c")
@@ -783,6 +794,72 @@ func stripSubshellWrapper(seg string) (string, bool) {
 		return "", false
 	}
 	return inner, true
+}
+
+// stripRedirectedSubshell is stripSubshellWrapper for a subshell that may be
+// followed by redirections of its own output or input: `(rm -rf /etc)
+// >/dev/null` runs the same commands as `(rm -rf /etc)`. Without this the
+// segment reached the tokenizer, which cannot parse the parentheses, and a
+// critical command classified as a CAUTION parse error. Only redirections may
+// follow the closing parenthesis; a here-string's word is data for the
+// subshell and is not dropped, so that form stays unrecognized (and fails
+// closed) as before. discardOnly reports that every redirection only
+// discards output or duplicates a descriptor (`>/dev/null`, `2>&1`).
+func stripRedirectedSubshell(seg string) (inner string, ok, discardOnly bool) {
+	seg = strings.TrimSpace(seg)
+	if inner, ok := stripSubshellWrapper(seg); ok {
+		return inner, true, true
+	}
+	if !strings.HasPrefix(seg, "(") {
+		return "", false, false
+	}
+	end := subshellCloseIndex(seg)
+	if end < 0 || end == len(seg)-1 {
+		return "", false, false
+	}
+	rest := seg[end+1:]
+	if rest[0] != ' ' && rest[0] != '\t' && rest[0] != '<' && rest[0] != '>' &&
+		!(rest[0] == '&' && len(rest) > 1 && rest[1] == '>') {
+		return "", false, false // `(a)b` is not a subshell followed by redirections
+	}
+	if strings.Contains(rest, "<<<") || strings.TrimSpace(stripRedirections(rest)) != "" {
+		return "", false, false
+	}
+	inner, ok = stripSubshellWrapper(seg[:end+1])
+	return inner, ok, discardRedirections.MatchString(rest)
+}
+
+// discardRedirections matches a list of redirections that only discard
+// output or duplicate/close descriptors.
+var discardRedirections = regexp.MustCompile(`^(?:\s*(?:\d*>>?|&>>?|\d*>\|)\s*/dev/null|\s*\d*[<>]&(?:\d+|-))+\s*$`)
+
+// subshellCloseIndex returns the byte index of the parenthesis closing the
+// one that opens seg, or -1. Quotes and escapes are honored.
+func subshellCloseIndex(seg string) int {
+	depth := 0
+	inSingle, inDouble, escaped := false, false, false
+	for i := 0; i < len(seg); i++ {
+		c := seg[i]
+		switch {
+		case escaped:
+			escaped = false
+		case c == '\\' && !inSingle:
+			escaped = true
+		case c == '\'' && !inDouble:
+			inSingle = !inSingle
+		case c == '"' && !inSingle:
+			inDouble = !inDouble
+		case inSingle || inDouble:
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 // maskArithmeticExpansions replaces an arithmetic expansion with a literal so
