@@ -46,3 +46,5 @@ a.out
 
 # Beads ephemeral files
 .beads/last-touched
+# br doctor per-run artifacts
+.doctor/
