@@ -54,10 +54,11 @@ var variableAssigningBuiltins = map[string]bool{
 }
 
 // Builtins that run code the scan cannot see in the current shell: a trap
-// action is evaluated like eval (e.g. on every command with DEBUG), and
-// enable -f loads a builtin from a shared object. Their mere presence
-// disables resolution.
-var codeLoadingBuiltins = map[string]bool{"trap": true, "enable": true}
+// action is evaluated like eval (e.g. on every command with DEBUG), enable -f
+// loads a builtin from a shared object, and an alias body replaces a later
+// command word (`alias printf='printf -vXY'`). Their mere presence disables
+// resolution.
+var codeLoadingBuiltins = map[string]bool{"trap": true, "enable": true, "alias": true}
 
 // resolve returns the literal value of a plain parameter expansion, if the
 // expansion refers to a resolvable variable read after its assignment.
@@ -78,7 +79,7 @@ func plainParamExp(param *syntax.ParamExp) bool {
 }
 
 func collectLiteralVariables(file *syntax.File, raw string) literalVariables {
-	if file == nil || identifierCount(raw, "IFS") > 0 {
+	if file == nil || identifierCount(raw, "IFS") > 0 || identifierCount(raw, "BASH_ALIASES") > 0 {
 		return nil
 	}
 
@@ -150,10 +151,15 @@ func collectLiteralVariables(file *syntax.File, raw string) literalVariables {
 			// appears as an identifier in the raw text.
 			assigning, computed := false, false
 			var values []string
-			for _, arg := range node.Args {
+			// Words from this index on are printf data operands, which can
+			// never name a variable (GitHub #23); -1 when not proven.
+			dataStart := printfDataStart(node.Args)
+			for i, arg := range node.Args {
 				value, ok := staticWordValue(arg)
 				if !ok {
-					computed = true
+					if dataStart < 0 || i < dataStart {
+						computed = true
+					}
 					continue
 				}
 				assigning = assigning || variableAssigningBuiltins[value]
@@ -207,6 +213,62 @@ func collectLiteralVariables(file *syntax.File, raw string) literalVariables {
 		vars[name] = literalVariable{value: assigned[0].value, after: assigned[0].after}
 	}
 	return vars
+}
+
+// printfDataStart returns the index of the first data operand of a call to
+// the printf builtin whose option and format words are all static, or -1.
+//
+// Bash's printf accepts options (only -v NAME assigns) before its format
+// operand, and option parsing ends at the first word that does not start
+// with "-" (a lone "-" is a format) or after "--". Every later word is data
+// for the format: `printf '%s' -v S` prints "-v" and "S", and an expansion
+// there cannot become an option whatever its value. An expansion before the
+// format could (`x=-vS; printf "$x" v`), so such calls are not proven.
+//
+// The call must be printf itself, with no other word naming an assigning or
+// code-loading builtin, so a wrapper (`builtin printf`) or a data word that
+// a redefined printf might run stays fail-closed. Functions are walked like
+// any other code, and alias definitions disable resolution altogether.
+func printfDataStart(args []*syntax.Word) int {
+	if len(args) < 2 {
+		return -1
+	}
+	if name, ok := staticWordValue(args[0]); !ok || name != "printf" {
+		return -1
+	}
+	format := -1
+	for i := 1; i < len(args) && format < 0; i++ {
+		value, ok := staticWordValue(args[i])
+		switch {
+		case !ok:
+			return -1 // could expand to an option, or to nothing
+		case value == "--":
+			if i+1 < len(args) {
+				format = i + 1
+			} else {
+				return -1
+			}
+		case value == "-v":
+			i++ // the variable name, judged as an assigner word
+		case strings.HasPrefix(value, "-") && value != "-":
+			// -vNAME or an invalid option (printf then fails).
+		default:
+			format = i
+		}
+	}
+	if format < 0 {
+		return -1
+	}
+	if _, ok := staticWordValue(args[format]); !ok {
+		return -1
+	}
+	for i, arg := range args {
+		value, ok := staticWordValue(arg)
+		if i > 0 && ok && (variableAssigningBuiltins[value] || codeLoadingBuiltins[value]) {
+			return -1
+		}
+	}
+	return format + 1
 }
 
 // literalWordValue returns the value of a word made only of literal,

@@ -1,6 +1,11 @@
 package core
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"mvdan.cc/sh/v3/syntax"
+)
 
 // GitHub #20: valid control-flow scripts that were classified parse_error.
 func TestClassifyControlFlowLiteralVariablesAndHereStrings(t *testing.T) {
@@ -116,5 +121,88 @@ func TestClassifyControlFlowUnprovableStaysParseError(t *testing.T) {
 func TestIdentifierCount(t *testing.T) {
 	if got := identifierCount(`S=1; $S ${S} $SS S_ x/S/y`, "S"); got != 4 {
 		t.Fatalf("identifierCount = %d, want 4", got)
+	}
+}
+
+// GitHub #23: a printf whose options and format are literal cannot assign a
+// variable through its later words, whatever they expand to.
+func TestPrintfDataOperandsKeepResolution(t *testing.T) {
+	engine := NewPatternEngine()
+	for name, command := range map[string]string{
+		"literal data":        `S=/bin/ls; printf '%s\n' x; if true; then $S /; fi`,
+		"expanded data":       `S=/bin/ls; printf '%s\n' "$x"; if true; then $S /; fi`,
+		"loop variable data":  `S=/bin/ls; for w in a; do printf '%s\n' "$w"; done; if true; then $S /; fi`,
+		"reporter label loop": `B=/tmp/x; for ws in a b; do printf '%s: ' "$ws"; done; "$B/ee" --version`,
+		"after double dash":   `S=/bin/ls; printf -- '%s\n' "$x"; if true; then $S /; fi`,
+		"dash format":         `S=/bin/ls; printf - "$x"; if true; then $S /; fi`,
+		"-v of another name":  `S=/bin/ls; printf -v T '%s' "$x"; if true; then $S /; fi`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := engine.ClassifyCommand(command, "")
+			if got.ParseError || got.NeedsApproval {
+				t.Fatalf("valid script requested approval: %#v\ncommand: %s", got, command)
+			}
+		})
+	}
+	got := engine.ClassifyCommand(`X=rm; printf '%s\n' "$x"; if true; then $X -rf /srv/data; fi`, "")
+	if got.Tier != RiskTierDangerous && got.Tier != RiskTierCritical {
+		t.Fatalf("resolved command not exposed: %#v", got)
+	}
+}
+
+// Anything that could make printf (or what runs as printf) assign a variable
+// still disables resolution.
+func TestPrintfThatMightAssignStaysUnresolved(t *testing.T) {
+	engine := NewPatternEngine()
+	for name, command := range map[string]string{
+		"expanded format":         `XY=/bin/ls; printf "$fmt" x; if true; then $XY -rf /srv; fi`,
+		"expanded after --":       `XY=/bin/ls; printf -- "$fmt" x; if true; then $XY -rf /srv; fi`,
+		"expansion before -v":     `XY=/bin/ls; printf $e -vXY '%s' rm; if true; then $XY -rf /srv; fi`,
+		"expanded -v name":        `XY=/bin/ls; printf -v "$n" '%s' rm; if true; then $XY -rf /srv; fi`,
+		"expanded attached -v":    `XY=/bin/ls; printf -v"$n" '%s' rm; if true; then $XY -rf /srv; fi`,
+		"-v same name":            `XY=/bin/ls; printf -v XY '%s' "$x"; if true; then $XY -rf /srv; fi`,
+		"escaped -v name":         `XY=/bin/ls; printf -v X\Y '%s' "$x"; if true; then $XY -rf /srv; fi`,
+		"wrapped printf":          `XY=/bin/ls; builtin printf '%s' "$n"; if true; then $XY -rf /srv; fi`,
+		"assigner as data":        `XY=/bin/ls; printf '%s' read "$n"; if true; then $XY -rf /srv; fi`,
+		"redefined printf":        `printf() { read -r "$2"; }; XY=/bin/ls; printf '%s' "$n"; if true; then $XY -rf /srv; fi`,
+		"aliased printf":          "shopt -s expand_aliases\nalias printf='printf -vXY'\nXY=/bin/ls\nprintf '%s' \"$n\"\nif true; then $XY -rf /srv; fi",
+		"alias array":             "shopt -s expand_aliases\nBASH_ALIASES[printf]='printf -vXY'\nXY=/bin/ls\nprintf '%s' \"$n\"\nif true; then $XY -rf /srv; fi",
+		"arithmetic in data":      `XY=/bin/ls; printf '%s' $(( $n = 1 )); if true; then $XY -rf /srv; fi`,
+		"indirect assign in data": `XY=/bin/ls; printf '%s' "${!n:=rm}"; if true; then $XY -rf /srv; fi`,
+		"no format":               `XY=/bin/ls; printf -v Z; echo "$n"; if true; then $XY -rf /srv; fi; printf "$n"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := engine.ClassifyCommand(command, "")
+			if !got.NeedsApproval || (!got.ParseError && got.MatchedPattern != "unresolved_execution") {
+				t.Fatalf("unprovable script was cleared: %#v\ncommand: %s", got, command)
+			}
+		})
+	}
+}
+
+func TestPrintfDataStart(t *testing.T) {
+	for command, want := range map[string]int{
+		`printf '%s' "$x"`:         2,
+		`printf -- '%s' "$x"`:      3,
+		`printf -v Z '%s' "$x"`:    4,
+		`printf -vZ '%s' "$x"`:     3,
+		`printf - "$x"`:            2,
+		`printf "$f" x`:            -1,
+		`printf -- "$f" x`:         -1,
+		`printf --`:                -1,
+		`printf -v`:                -1,
+		`printf`:                   -1,
+		`builtin printf '%s' "$x"`: -1,
+		`printf '%s' eval "$x"`:    -1,
+		`echo '%s' "$x"`:           -1,
+	} {
+		file, err := syntax.NewParser().Parse(strings.NewReader(command), "")
+		if err != nil {
+			t.Fatalf("parse %q: %v", command, err)
+		}
+		call := file.Stmts[0].Cmd.(*syntax.CallExpr)
+		if got := printfDataStart(call.Args); got != want {
+			t.Errorf("printfDataStart(%s) = %d, want %d", command, got, want)
+		}
 	}
 }
