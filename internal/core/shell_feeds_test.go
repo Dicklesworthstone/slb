@@ -195,3 +195,54 @@ func TestExecutionFeedsRemoteScriptIsDangerous(t *testing.T) {
 		}
 	}
 }
+
+// An alias body is code that runs in place of a later command word, and
+// hash -p / BASH_CMDS rebind a command name to another program.
+func TestExecutionFeedsCommandRebinding(t *testing.T) {
+	engine := NewPatternEngine()
+	cwd := t.TempDir()
+	for _, command := range []string{
+		"shopt -s expand_aliases\nalias p='rm -rf /srv'\np",
+		"shopt -s expand_aliases\nalias ls='rm -rf /srv'\nls",
+		`alias -g X='; rm -rf /srv'`,
+		`builtin alias p='rm -rf /srv'`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			got := engine.ClassifyCommand(command, cwd)
+			if got.Tier != RiskTierCritical || !got.NeedsApproval {
+				t.Fatalf("alias body not classified: tier=%q pattern=%q opaque=%v", got.Tier, got.MatchedPattern, got.Opaque)
+			}
+		})
+	}
+	for _, command := range []string{
+		"shopt -s expand_aliases\nalias p=\"$X\"\np",
+		"shopt -s expand_aliases\nBASH_ALIASES[p]='rm -rf /srv'\np",
+		`hash -p /bin/rm ls; ls -rf /srv`,
+		`hash -dp /bin/rm ls; ls -rf /srv`,
+		`hash "$opt" /bin/rm ls; ls -rf /srv`,
+		`BASH_CMDS[ls]=/bin/rm; ls -rf /srv`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			got := engine.ClassifyCommand(command, cwd)
+			if !got.NeedsApproval || got.IsSafe || got.Tier == "" || got.Tier == RiskTier(RiskSafe) {
+				t.Fatalf("command rebinding was not at least CAUTION: %#v", got)
+			}
+		})
+	}
+	for _, command := range []string{
+		`alias ll='ls -la'`,
+		`alias`,
+		`alias -p`,
+		`alias ll`,
+		`unalias ll`,
+		`hash -r`,
+		`hash ls`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			got := engine.ClassifyCommand(command, cwd)
+			if got.Opaque || got.MatchedPattern == "unresolved_execution" || got.NeedsApproval {
+				t.Fatalf("benign command changed classification: %#v", got)
+			}
+		})
+	}
+}

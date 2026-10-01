@@ -90,6 +90,11 @@ func analyzeExecutionFeeds(raw string, depth int) (segments []string, opaque, pa
 		return nil, false, false
 	}
 	a := &feedAnalysis{raw: raw, depth: depth, literals: collectLiteralVariables(file, raw)}
+	// Writing these arrays defines an alias body or rebinds a command name to
+	// another program (`BASH_CMDS[ls]=/bin/rm; ls -rf /srv`).
+	if identifierCount(raw, "BASH_ALIASES") > 0 || identifierCount(raw, "BASH_CMDS") > 0 {
+		a.opaque = true
+	}
 	for _, stmt := range file.Stmts {
 		a.visitStmt(stmt, nil)
 	}
@@ -358,6 +363,23 @@ func (a *feedAnalysis) checkCall(call *syntax.CallExpr, feed *stdinFeed) {
 			}
 		}
 		a.addPayload(strings.Join(rest[1:], " "))
+	case name == "alias":
+		// An alias body is shell code that runs wherever its name is later
+		// used as a command word (bash with expand_aliases, zsh by default).
+		for _, token := range rest[1:] {
+			if strings.Contains(token, dynamicToken) {
+				a.opaque = true
+			} else if eq := strings.IndexByte(token, '='); eq > 0 {
+				a.addPayload(token[eq+1:])
+			}
+		}
+	case name == "hash":
+		// hash -p PATH NAME makes NAME run PATH (`hash -p /bin/rm ls`).
+		for _, token := range rest[1:] {
+			if strings.Contains(token, dynamicToken) || (strings.HasPrefix(token, "-") && strings.Contains(token, "p")) {
+				a.opaque = true
+			}
+		}
 	case name == "source" || name == ".":
 		// The sourced file is not visible here, but a downloaded one
 		// (`source <(curl URL)`) is a remote script run by the shell.
