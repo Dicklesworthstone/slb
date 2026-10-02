@@ -206,3 +206,32 @@ func TestPrintfDataStart(t *testing.T) {
 		}
 	}
 }
+
+// zsh evaluates the argument of a numeric printf conversion (and of a *
+// width) as arithmetic, which can assign a variable, so only text
+// conversions keep resolution with expanded data.
+func TestPrintfNumericConversionsStayUnresolved(t *testing.T) {
+	engine := NewPatternEngine()
+	for name, command := range map[string]string{
+		"%d data":    `XY=/bin/ls; printf '%d\n' "$n"; if true; then $XY -rf /srv; fi`,
+		"%x data":    `XY=/bin/ls; printf 'v=%04x' "$n"; if true; then $XY -rf /srv; fi`,
+		"* width":    `XY=/bin/ls; printf '%*s' "$n" x; if true; then $XY -rf /srv; fi`,
+		"%(...)T":    `XY=/bin/ls; printf '%(%F)T' "$n"; if true; then $XY -rf /srv; fi`,
+		"%s then %d": `XY=/bin/ls; printf '%s %d' a "$n"; if true; then $XY -rf /srv; fi`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := engine.ClassifyCommand(command, "")
+			if !got.NeedsApproval || (!got.ParseError && got.MatchedPattern != "unresolved_execution") {
+				t.Fatalf("unprovable script was cleared: %#v\ncommand: %s", got, command)
+			}
+		})
+	}
+	for format, want := range map[string]bool{
+		`%s\n`: true, `%b`: true, `%q`: true, `%c`: true, `100%%`: true, `%-10s|%5.2s`: true, `%1$s`: true, `plain`: true,
+		`%d`: false, `%i`: false, `%x`: false, `%f`: false, `%*s`: false, `%.*s`: false, `%(%F)T`: false, `%`: false, `%n`: false,
+	} {
+		if got := printfTextConversions(format); got != want {
+			t.Errorf("printfTextConversions(%q) = %v, want %v", format, got, want)
+		}
+	}
+}

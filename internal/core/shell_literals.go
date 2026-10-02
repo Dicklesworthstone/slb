@@ -259,7 +259,7 @@ func printfDataStart(args []*syntax.Word) int {
 	if format < 0 {
 		return -1
 	}
-	if _, ok := staticWordValue(args[format]); !ok {
+	if value, ok := staticWordValue(args[format]); !ok || !printfTextConversions(value) {
 		return -1
 	}
 	for i, arg := range args {
@@ -269,6 +269,28 @@ func printfDataStart(args []*syntax.Word) int {
 		}
 	}
 	return format + 1
+}
+
+// printfTextConversions reports a printf format whose conversions all take
+// their argument as text (%s, %b, %q, %c) or none (%%), with no * width or
+// precision. zsh evaluates the argument of a numeric conversion, and of a *
+// width, as an arithmetic expression, which can assign a variable
+// (`printf '%d' "$x"` with x='S=1' sets S).
+func printfTextConversions(format string) bool {
+	for i := 0; i < len(format); i++ {
+		if format[i] != '%' {
+			continue
+		}
+		j := i + 1
+		for j < len(format) && strings.IndexByte("-+ #0123456789.$'", format[j]) >= 0 {
+			j++
+		}
+		if j >= len(format) || strings.IndexByte("sbqc%", format[j]) < 0 {
+			return false
+		}
+		i = j
+	}
+	return true
 }
 
 // literalWordValue returns the value of a word made only of literal,

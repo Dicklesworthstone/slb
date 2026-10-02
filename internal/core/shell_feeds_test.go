@@ -246,3 +246,100 @@ func TestExecutionFeedsCommandRebinding(t *testing.T) {
 		})
 	}
 }
+
+// An alias body is a prefix: the words after the alias name complete the
+// command, so the use is classified with the body in place of the name.
+func TestExecutionFeedsAliasUseComposesBodyAndArguments(t *testing.T) {
+	engine := NewPatternEngine()
+	cwd := t.TempDir()
+	for _, command := range []string{
+		"shopt -s expand_aliases\nalias r=rm\nr -rf /srv",
+		"shopt -s expand_aliases\nalias r='rm -rf'\nr /srv",
+		"shopt -s expand_aliases\nalias -- r=rm\nr -rf /srv",
+		"shopt -s expand_aliases\ncommand alias r=rm\nr -rf /srv",
+		"shopt -s expand_aliases\nalias s='sudo ' r=rm\ns r -rf /srv",
+		"shopt -s expand_aliases\nalias r=ls\nalias r=rm\nr -rf /srv",
+		"shopt -s expand_aliases\nfor i in 1 2; do r -rf /srv; alias r=rm; done",
+	} {
+		t.Run(command, func(t *testing.T) {
+			got := engine.ClassifyCommand(command, cwd)
+			if got.Tier != RiskTierCritical {
+				t.Fatalf("alias use not classified with its body: tier=%q pattern=%q", got.Tier, got.MatchedPattern)
+			}
+		})
+	}
+	for _, command := range []string{
+		`alias ll='ls -la'; ll /tmp`,
+		"alias g='git status'\ng --short",
+	} {
+		t.Run(command, func(t *testing.T) {
+			got := engine.ClassifyCommand(command, cwd)
+			if got.NeedsApproval || got.Opaque {
+				t.Fatalf("benign alias use changed classification: %#v", got)
+			}
+		})
+	}
+}
+
+// BASH_ALIASES and BASH_CMDS can be written through a name operand whose
+// spelling is split by quoting, escapes or expansion; an array subscript in a
+// name operand is evaluated as arithmetic, which runs $(...) inside it.
+func TestExecutionFeedsHiddenRebindingAndSubscripts(t *testing.T) {
+	engine := NewPatternEngine()
+	cwd := t.TempDir()
+	for _, command := range []string{
+		`printf -v BASH_\CMDS[ls] /bin/rm; ls -rf /srv`,
+		`printf -vBASH_\CMDS[ls] /bin/rm; ls -rf /srv`,
+		`read BASH_\CMDS[ls] <<< /bin/rm; ls -rf /srv`,
+		`declare "BASH_C""MDS[ls]=/bin/rm"; ls -rf /srv`,
+		`builtin declare "BASH_C""MDS[ls]=/bin/rm"; ls -rf /srv`,
+		"shopt -s expand_aliases\nprintf -v BASH_ALI\\ASES[p] 'rm -rf /srv'\np",
+		`N=BASH_CM; printf -v "${N}DS[ls]" /bin/rm; ls -rf /srv`,
+		`read -r "$v" <<< /bin/rm; ls -rf /srv`,
+		`mapfile -t "$v" < f; ls -rf /srv`,
+		`builtin declare "$n=/bin/rm"; ls -rf /srv`,
+		`declare -n r="$x"; r[ls]=/bin/rm; ls -rf /srv`,
+		`printf "$o" "$n" /bin/rm; ls -rf /srv`,
+		`printf -v "a[$i]" x`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			got := engine.ClassifyCommand(command, cwd)
+			if !got.NeedsApproval || got.Tier == "" || got.Tier == RiskTier(RiskSafe) {
+				t.Fatalf("hidden rebinding was not at least CAUTION: %#v", got)
+			}
+		})
+	}
+	for _, command := range []string{
+		`printf -v 'a[$(rm -rf /srv)]' x`,
+		`read 'a[$(rm -rf /srv)]' <<< x`,
+		`declare 'a[$(rm -rf /srv)]=x'`,
+		"read 'a[`rm -rf /srv`]' <<< x",
+		`unset 'a[$(rm -rf /srv)]'`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			got := engine.ClassifyCommand(command, cwd)
+			if got.Tier != RiskTierCritical {
+				t.Fatalf("subscript command substitution not classified: tier=%q pattern=%q", got.Tier, got.MatchedPattern)
+			}
+		})
+	}
+	for _, command := range []string{
+		`printf "Hello %s\n" "$name"`,
+		`printf "$msg"`,
+		`read -r -p "$prompt" ans`,
+		`while IFS= read -r line; do echo "$line"; done < f`,
+		`export "PATH=$HOME/bin:$PATH"; ls`,
+		`local x="$1"; declare -a arr; arr[$i]=x`,
+		`mapfile -t lines < f; echo "${lines[@]}"`,
+		`printf -v ts '%(%s)T' -1; echo $ts`,
+		`getopts "ab:" opt; echo $opt`,
+		`read -r a b <<< "1 2"`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			got := engine.ClassifyCommand(command, cwd)
+			if got.NeedsApproval || got.Opaque {
+				t.Fatalf("benign command changed classification: %#v", got)
+			}
+		})
+	}
+}

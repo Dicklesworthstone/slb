@@ -73,6 +73,7 @@ type feedAnalysis struct {
 	raw      string
 	depth    int
 	literals literalVariables
+	aliases  map[string][]string // static alias bodies defined anywhere in the script
 	segments []string
 	opaque   bool
 	parseErr bool
@@ -95,6 +96,8 @@ func analyzeExecutionFeeds(raw string, depth int) (segments []string, opaque, pa
 	if identifierCount(raw, "BASH_ALIASES") > 0 || identifierCount(raw, "BASH_CMDS") > 0 {
 		a.opaque = true
 	}
+	a.checkRebinding(file)
+	a.collectAliases(file)
 	for _, stmt := range file.Stmts {
 		a.visitStmt(stmt, nil)
 	}
@@ -336,6 +339,10 @@ func (a *feedAnalysis) checkCall(call *syntax.CallExpr, feed *stdinFeed) {
 			a.parseErr = true
 		}
 		a.addPayload(strings.Join(words, " "))
+	}
+
+	for _, expanded := range a.expandAlias(call, tokens) {
+		a.addPayload(expanded)
 	}
 
 	rest, _, _ := unwrapCommandTokens(tokens)
