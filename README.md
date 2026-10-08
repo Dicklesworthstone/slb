@@ -56,17 +56,29 @@ scoop install dicklesworthstone/slb
 
 #### Alternative: Direct Download
 
-Download the latest release for your platform:
-- [Linux x86_64](https://github.com/Dicklesworthstone/slb/releases/latest/download/slb-linux-amd64)
-- [macOS Intel](https://github.com/Dicklesworthstone/slb/releases/latest/download/slb-darwin-amd64)
-- [macOS ARM](https://github.com/Dicklesworthstone/slb/releases/latest/download/slb-darwin-arm64)
-- [Windows](https://github.com/Dicklesworthstone/slb/releases/latest/download/slb-windows-amd64.exe)
+Choose the matching archive from the [latest release](https://github.com/Dicklesworthstone/slb/releases/latest):
+
+- Linux x86_64: `slb_<version>_linux_amd64.tar.gz`
+- Linux ARM64: `slb_<version>_linux_arm64.tar.gz`
+- macOS Intel: `slb_<version>_darwin_amd64.tar.gz`
+- macOS ARM64: `slb_<version>_darwin_arm64.tar.gz`
+- Windows x86_64: `slb_<version>_windows_amd64.zip`
+
+Download `checksums.txt` from that same release and verify the archive's SHA-256
+before extracting it. The archive contains `slb` on Linux/macOS or `slb.exe` on
+Windows. Windows ARM64 archives are not currently published.
 
 #### Alternative: Install Script
 
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/slb/main/scripts/install.sh?$(date +%s)" | bash
 ```
+
+The installer verifies the archive against `checksums.txt` from the selected
+release and reports the retained download workspace. Set `INSTALL_DIR` to choose
+the destination. For qualification with a known scratch location,
+`SLB_RETAIN_WORK_ROOT` may name an absolute path that does not exist yet and whose
+parent already exists; it is created privately and retained on success or failure.
 
 #### Build from Source
 
