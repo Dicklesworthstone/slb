@@ -46,6 +46,7 @@ archives:
         formats:
           - zip
     files:
+      - LICENSE
       - README*
       - PLAN_TO_MAKE_SLB.md
 
