@@ -20,9 +20,14 @@ const (
 	rmRecursive  = `^rm\s+(?:-[a-zA-Z]+\s+|--[\w=-]+\s+)*(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?:\s+|$)`
 	rmOperands   = `(?:\S+\s+)*["']?`
 	rmSystemPath = `/+(?:\.\.?/+)*(?:bin|boot|dev|etc|lib|lib64|media|mnt|opt|proc|run|sbin|srv|sys|usr|var)(?:[/\s"'*]|$)`
+	// A home-wide glob is still destructive even when it is spelled **,
+	// .*, ?*, or [!.]* rather than *. Protect its descendants as well (for
+	// example **/*); a literal project component such as build remains
+	// outside this rule. No glob is expanded or executed during matching.
+	rmHomeContents = `(?:/+(?:\.)?[*?\[][^\s"']*)?/*["']?(?:\s|$)`
 	// /home and /Users contain home roots; descendants of an individual
 	// home are ordinary project data. /root is itself a home root.
-	rmHomeRoot      = `/+(?:\.\.?/+)*(?:(?:home|Users)(?:/+[^/\s"']+)?|root)/*(?:\*)?["']?(?:\s|$)`
+	rmHomeRoot      = `/+(?:\.\.?/+)*(?:(?:home|Users)(?:/+[^/\s"']+)?|root)` + rmHomeContents
 	sqlIdent        = `[\w.$"` + "`" + `\[\]]+`
 	sqlTruncateList = `(?:ONLY\s+)?` + sqlIdent + `(?:\s*\*)?(?:\s*,\s*(?:ONLY\s+)?` + sqlIdent + `(?:\s*\*)?)*` +
 		`(?:\s+(?:RESTART|CONTINUE)\s+IDENTITY)?(?:\s+(?:CASCADE|RESTRICT))?`
@@ -59,7 +64,7 @@ var (
 		rmRecursive + rmOperands + rmSystemPath,
 		rmRecursive + rmOperands + rmHomeRoot,
 		rmRecursive + rmOperands + `/+(?:\*|["']?(?:\s|$))`,
-		rmRecursive + rmOperands + `~(?:[^/\s"']*)/*(?:\*)?["']?(?:\s|$)`,
+		rmRecursive + rmOperands + `~[^/\s"']*` + rmHomeContents,
 		`DROP\s+DATABASE`,
 		`DROP\s+SCHEMA`,
 		`TRUNCATE\s+TABLE`,
