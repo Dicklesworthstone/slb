@@ -183,8 +183,19 @@ func (rc *RequestCreator) createRequestOnce(ctx context.Context, opts CreateRequ
 	// Quota is checked atomically with persistence below, not with a separate
 	// precheck that concurrent clients could all pass. SAFE skips consume none.
 
-	// Step 4: Classify command
-	classification := rc.patternEngine.ClassifyCommand(opts.Command, opts.Cwd)
+	// Build the executable specification before classification or a SAFE
+	// shortcut. A direct request must not silently execute only the prefix
+	// that the tokenizer could parse, or fall back to different argv on error.
+	argv, err := parseRequestArgv(opts.Command, opts.Shell)
+	if err != nil {
+		return nil, fmt.Errorf("parsing requested command: %w", err)
+	}
+	cmdSpec := db.CommandSpec{
+		Raw: opts.Command, Argv: argv, Cwd: opts.Cwd, Shell: opts.Shell,
+	}
+
+	// Step 4: Classify the same invocation used by preflight and execution.
+	classification := rc.patternEngine.ClassifyCommandSpec(cmdSpec)
 
 	// Step 5: Skip only when the SAFE verdict covers the entire command.
 	// An unknown segment cannot borrow another segment's allowlist entry.
@@ -212,17 +223,6 @@ func (rc *RequestCreator) createRequestOnce(ctx context.Context, opts CreateRequ
 		if classification.MatchedPattern == "" || classification.HasUnmatchedSegment {
 			classification.MatchedPattern = "unmatched_default_escalation"
 		}
-	}
-
-	// Step 6: Parse command to argv
-	argv, _ := ParseCommandToArgv(opts.Command)
-
-	// Step 7: Build command spec (hash computed by DB admission)
-	cmdSpec := db.CommandSpec{
-		Raw:   opts.Command,
-		Argv:  argv,
-		Cwd:   opts.Cwd,
-		Shell: opts.Shell,
 	}
 
 	// Step 8: Apply redaction
@@ -323,12 +323,45 @@ func (rc *RequestCreator) checkDynamicQuorum(tier RiskTier, minApprovals int, pr
 	return minApprovals
 }
 
-// ParseCommandToArgv parses a command string into argv.
+// ParseCommandToArgv parses one complete direct invocation without expanding
+// environment variables or running substitutions. Shell syntax that stops the
+// tokenizer is an error, never permission to run a truncated prefix.
 func ParseCommandToArgv(cmd string) ([]string, error) {
+	if strings.IndexByte(cmd, 0) >= 0 {
+		return nil, errors.New("command contains a NUL byte")
+	}
 	parser := shellwords.NewParser()
 	parser.ParseEnv = false
 	parser.ParseBacktick = false
-	return parser.Parse(cmd)
+	argv, err := parser.Parse(cmd)
+	if err != nil {
+		return nil, err
+	}
+	if parser.Position >= 0 {
+		return nil, errors.New("shell operators require shell mode")
+	}
+	if len(argv) == 0 || argv[0] == "" {
+		return nil, ErrCommandRequired
+	}
+	return argv, nil
+}
+
+// Shell requests execute Raw, not Argv. Retain a parsed argv only when it
+// represents the complete script; leave it empty otherwise rather than
+// recording a misleading prefix as executable input. Malformed shell scripts
+// still go through the normalizer's conservative parse-error classification.
+func parseRequestArgv(raw string, shell bool) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, ErrCommandRequired
+	}
+	if strings.IndexByte(raw, 0) >= 0 {
+		return nil, errors.New("command contains a NUL byte")
+	}
+	argv, err := ParseCommandToArgv(raw)
+	if shell && err != nil {
+		return nil, nil
+	}
+	return argv, err
 }
 
 // Default redaction patterns for sensitive data.
