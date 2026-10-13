@@ -1067,6 +1067,15 @@ func resolveRMPathToken(tok, cwd, home string) string {
 	if tok == "" {
 		return "" // an empty argument is not the working directory
 	}
+	// Recognize only the exact HOME parameter and a following path boundary.
+	// Otherwise $HOME/* would be rebased below cwd and lose its home-wide
+	// protection. Do not evaluate arbitrary parameters or execute a shell.
+	for _, alias := range []string{"$HOME", "${HOME}"} {
+		if tok == alias || strings.HasPrefix(tok, alias+"/") {
+			tok = "~" + strings.TrimPrefix(tok, alias)
+			break
+		}
+	}
 	if strings.HasPrefix(tok, "~") {
 		anchor, tail, _ := strings.Cut(tok, "/")
 		if anchor != "~" || !filepath.IsAbs(home) {

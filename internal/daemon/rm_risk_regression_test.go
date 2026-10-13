@@ -40,6 +40,13 @@ func TestHookQueryRMOperandBoundariesAndRootGlobs(t *testing.T) {
 			{`rm -rf ~alice/**/*`, "critical", 2},
 			{`rm -rf ~/.*`, "critical", 2},
 			{`rm -rf ~/project/build`, "dangerous", 1},
+			{`rm -rf "$HOME"`, "critical", 2},
+			{`rm -R "${HOME}"/*`, "critical", 2},
+			{`rm -f build --recursive "$HOME"/**/*`, "critical", 2},
+			{`rm -rf "${HOME}/project/.."`, "critical", 2},
+			{`rm -rf "$HOME/build"`, "dangerous", 1},
+			{`rm -f "$HOME/notes.txt"`, "caution", 0},
+			{`rm -- -r "$HOME"`, "caution", 0},
 		} {
 			got := srv.classifyCommand(HookQueryParams{Command: tc.command, CWD: cwd})
 			if got.Tier != tc.tier || got.MinApprovals != tc.approvals || got.Action != "block" || got.MatchedPattern == "" {
