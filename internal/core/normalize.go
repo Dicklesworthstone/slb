@@ -555,7 +555,7 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 				result.ParseError = true
 			}
 			tokens[0] = canonicalExecutable(tokens[0])
-			result.Segments = append(result.Segments, strings.Join(tokens, " "))
+			result.Segments = append(result.Segments, joinNormalizedTokens(tokens))
 		}
 	}
 	// Analyze expansions independently so an allowlisted outer command cannot
@@ -955,8 +955,31 @@ func normalizeSegment(seg string) (string, []string, bool) {
 		return "", stripped, parseErr
 	}
 
-	normalized := strings.TrimSpace(strings.Join(tokens[i:], " "))
+	normalized := strings.TrimSpace(joinNormalizedTokens(tokens[i:]))
 	return normalized, stripped, parseErr
+}
+
+// joinNormalizedTokens keeps rm's argv boundaries until path resolution has
+// consumed its options. Joining a filename such as "local --" without quoting
+// would invent an option terminator and hide a real -r later in the command.
+// Other commands retain their existing regex-facing representation (including
+// SQL statements whose quotes deliberately disappear during normalization).
+func joinNormalizedTokens(tokens []string) string {
+	if len(tokens) == 0 || !strings.EqualFold(filepath.Base(tokens[0]), "rm") {
+		return strings.Join(tokens, " ")
+	}
+	quoted := make([]string, len(tokens))
+	for i, tok := range tokens {
+		quoted[i] = quoteRMToken(tok)
+	}
+	return strings.Join(quoted, " ")
+}
+
+func quoteRMToken(tok string) string {
+	if tok == "" || strings.ContainsAny(tok, " \t\r\n'\"\\`;&|<>()") {
+		return "'" + strings.ReplaceAll(tok, "'", `'\''`) + "'"
+	}
+	return tok
 }
 
 // ExtractXargsCommand extracts the command from an xargs invocation.
@@ -1001,7 +1024,7 @@ func ResolvePathsInCommand(cmd, cwd string) string {
 	}
 
 	home, _ := os.UserHomeDir()
-	if len(tokens) > 0 && filepath.Base(tokens[0]) == "rm" {
+	if len(tokens) > 0 && strings.EqualFold(filepath.Base(tokens[0]), "rm") {
 		// rm accepts options between operands. Canonicalize classification
 		// only (never execution), retaining every operand and honoring --.
 		options, operands := []string{}, []string{}
@@ -1012,24 +1035,10 @@ func ResolvePathsInCommand(cmd, cwd string) string {
 				continue
 			}
 			if !endOptions && strings.HasPrefix(tok, "-") && tok != "-" {
-				options = append(options, tok)
+				options = append(options, quoteRMToken(tok))
 				continue
 			}
-			tok = cleanPathToken(tok, cwd, home)
-			if cwd != "" && !filepath.IsAbs(tok) && !strings.HasPrefix(tok, "~") {
-				tok = filepath.Join(cwd, tok)
-			} else if strings.HasPrefix(tok, "-") {
-				// A literal filename after -- must not become an option.
-				tok = "./" + tok
-			}
-			// Protect the actual home root even when HOME uses a custom
-			// location outside /home or /Users. Descendants stay unchanged.
-			if home != "" && tok == filepath.Clean(home) {
-				tok = "~"
-			} else if home != "" && tok == filepath.Clean(home)+"/*" {
-				tok = "~/*"
-			}
-			operands = append(operands, tok)
+			operands = append(operands, quoteRMToken(resolveRMPathToken(tok, cwd, home)))
 		}
 		return strings.Join(append(append([]string{"rm"}, options...), operands...), " ")
 	}
@@ -1049,6 +1058,60 @@ func ResolvePathsInCommand(cmd, cwd string) string {
 	}
 
 	return strings.Join(tokens, " ")
+}
+
+// resolveRMPathToken resolves operands, not options or the executable. Named
+// homes must not be joined to cwd as literal project directories. No shell,
+// glob expansion, user lookup, or filesystem traversal is performed here.
+func resolveRMPathToken(tok, cwd, home string) string {
+	if tok == "" {
+		return "" // an empty argument is not the working directory
+	}
+	if strings.HasPrefix(tok, "~") {
+		anchor, tail, _ := strings.Cut(tok, "/")
+		if anchor != "~" || !filepath.IsAbs(home) {
+			// Clean within the symbolic home, but never lose the anchor.
+			// Traversal above an unknown user's home remains conservative.
+			tail = filepath.ToSlash(filepath.Clean(tail))
+			if tail == "." {
+				return anchor
+			}
+			if tail == ".." || strings.HasPrefix(tail, "../") {
+				return "~"
+			}
+			return anchor + "/" + tail
+		}
+		tok = filepath.Join(home, tail)
+	}
+	if filepath.IsAbs(tok) {
+		tok = filepath.Clean(tok)
+	} else if cwd != "" {
+		tok = filepath.Join(cwd, tok)
+	} else {
+		tok = filepath.Clean(tok)
+		if strings.HasPrefix(tok, "-") {
+			// A filename after -- must never become an option again.
+			tok = "./" + tok
+		}
+	}
+	if filepath.IsAbs(home) {
+		home = filepath.Clean(home)
+		if tok == home {
+			return "~"
+		}
+		prefix := home + string(filepath.Separator)
+		if strings.HasPrefix(tok, prefix) {
+			tail := strings.TrimPrefix(tok, prefix)
+			glob := strings.TrimPrefix(tail, ".")
+			if strings.HasPrefix(glob, "*") || strings.HasPrefix(glob, "?") || strings.HasPrefix(glob, "[") {
+				// Preserve every home-wide glob, not just the exact /* form.
+				// Literal project descendants stay unchanged, including
+				// system paths when a custom home lives under /var or /srv.
+				return "~/" + filepath.ToSlash(tail)
+			}
+		}
+	}
+	return tok
 }
 
 // cleanPathToken cleans a single token if it looks like a path.
