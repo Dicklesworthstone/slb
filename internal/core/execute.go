@@ -188,7 +188,7 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 	}
 
 	// Gate 4: Current pattern policy doesn't require higher tier
-	classification := e.patternEngine.ClassifyCommand(request.Command.Raw, request.Command.Cwd)
+	classification := e.patternEngine.ClassifyCommandSpec(request.Command)
 	if tierHigher(classification.Tier, request.RiskTier) {
 		return nil, fmt.Errorf("%w: approved as %s but now classified as %s",
 			ErrTierEscalated, request.RiskTier, classification.Tier)
@@ -377,7 +377,7 @@ func (e *Executor) CanExecute(requestID string) (bool, string) {
 		return false, "command hash mismatch (command may have been modified)"
 	}
 
-	classification := e.patternEngine.ClassifyCommand(request.Command.Raw, request.Command.Cwd)
+	classification := e.patternEngine.ClassifyCommandSpec(request.Command)
 	if tierHigher(classification.Tier, request.RiskTier) {
 		return false, fmt.Sprintf("policy escalation: command now classified as %s", classification.Tier)
 	}

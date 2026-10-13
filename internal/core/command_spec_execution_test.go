@@ -8,21 +8,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
 // The mismatched command is harmless even if the gate regresses: printf, not
 // a deletion or other destructive operation. A custom CRITICAL rule supplies
 // the policy requirement that the misleading SAFE display must not bypass.
-func commandSpecExecutionFixture(t *testing.T) (*db.DB, *db.Request, *db.Session) {
+func commandSpecExecutionFixture(t *testing.T, spec db.CommandSpec) (*db.DB, *db.Request, *db.Session) {
 	t.Helper()
 	database, original, session := policyExecutionFixture(t)
 	if _, err := database.InsertCustomPattern("critical", `^printf\s+command-spec-probe$`, "test invocation policy", "human"); err != nil {
 		t.Fatal(err)
 	}
+	spec.Cwd = original.ProjectPath
 	request := &db.Request{
 		ProjectPath: original.ProjectPath, Status: db.StatusApproved, RiskTier: db.RiskTierDangerous,
-		Command:            db.CommandSpec{Raw: "git stash", Argv: []string{"printf", "command-spec-probe"}, Cwd: original.ProjectPath},
+		Command:            spec,
 		RequestorSessionID: session.ID, RequestorAgent: session.AgentName, RequestorModel: session.Model,
 		MinApprovals: 1, ApprovalExpiresAt: original.ApprovalExpiresAt,
 		Justification: db.Justification{Reason: "test executable/display mismatch"},
@@ -46,7 +48,7 @@ func commandSpecExecutionFixture(t *testing.T) (*db.DB, *db.Request, *db.Session
 }
 
 func TestCommandSpecPolicyBlocksBeforePreflight(t *testing.T) {
-	database, request, session := commandSpecExecutionFixture(t)
+	database, request, session := commandSpecExecutionFixture(t, db.CommandSpec{Raw: "git stash", Argv: []string{"printf", "command-spec-probe"}})
 	executor := NewExecutor(database, NewPatternEngine())
 	if allowed, reason := executor.CanExecute(request.ID); allowed || reason == "" {
 		t.Fatalf("advisory check trusted display: allowed=%v reason=%q", allowed, reason)
@@ -72,7 +74,7 @@ func TestCommandSpecPolicyBlocksBothAtomicClaimPaths(t *testing.T) {
 			name = "authenticated-daemon"
 		}
 		t.Run(name, func(t *testing.T) {
-			database, request, session := commandSpecExecutionFixture(t)
+			database, request, session := commandSpecExecutionFixture(t, db.CommandSpec{Raw: "git stash", Argv: []string{"printf", "command-spec-probe"}})
 			var err error
 			if authenticated {
 				err = database.ClaimRequestExecutionAuthenticated(request, policyExecutionIdentity(session), session.SessionKey, ExecutionPolicyGuard(""))
@@ -84,5 +86,37 @@ func TestCommandSpecPolicyBlocksBothAtomicClaimPaths(t *testing.T) {
 			}
 			assertPolicyUnclaimed(t, database, request.ID)
 		})
+	}
+}
+
+// A non-executed display is not a reason to reject an otherwise valid signed
+// approval. Execute only this test binary with no tests selected; the display
+// is subject to a custom CRITICAL rule, not a destructive command.
+func TestCommandSpecExecutionIgnoresUnusedDisplay(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, request, session := commandSpecExecutionFixture(t, db.CommandSpec{
+		Raw: "printf command-spec-probe", Argv: []string{executable, "-test.run=^$"},
+	})
+	engine, err := LoadCommandPolicy(database, config.LoadOptions{ProjectDir: request.ProjectPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := NewExecutor(database, engine)
+	if allowed, reason := executor.CanExecute(request.ID); !allowed {
+		t.Fatalf("non-executed display blocked valid argv: %s", reason)
+	}
+	result, err := executor.ExecuteApprovedRequest(context.Background(), ExecuteOptions{
+		RequestID: request.ID, SessionID: session.ID, LogDir: filepath.Join(request.ProjectPath, "logs"),
+		SuppressOutput: true,
+	})
+	if err != nil || result == nil || result.ExitCode != 0 || result.Request.Status != db.StatusExecuted {
+		t.Fatalf("valid executable did not complete: result=%+v error=%v", result, err)
+	}
+	stored, err := database.GetRequest(request.ID)
+	if err != nil || stored.Status != db.StatusExecuted || stored.Execution == nil {
+		t.Fatalf("execution outcome not durable: request=%+v error=%v", stored, err)
 	}
 }
