@@ -344,15 +344,17 @@ func createRunLogFile(project, prefix string) (string, error) {
 	}
 
 	timestamp := time.Now().Format("20060102-150405")
-	logName := fmt.Sprintf("%s_%s.log", timestamp, prefix)
-	logPath := filepath.Join(baseDir, logName)
-
-	f, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	// SAFE runs have no request ID to distinguish concurrent executions.
+	// Exclusive randomized creation keeps one run from truncating another's
+	// audit trail or following a pre-existing log-file symlink.
+	f, err := os.CreateTemp(baseDir, fmt.Sprintf("%s-*_%s.log", timestamp, prefix))
 	if err != nil {
 		return "", fmt.Errorf("creating log file: %w", err)
 	}
-	_ = f.Close()
-	return logPath, nil
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("closing new run log: %w", err)
+	}
+	return f.Name(), nil
 }
 
 // ExecutionDecision represents the result of evaluating whether a request

@@ -576,9 +576,9 @@ func TestCreateRunLogFile_TimestampFormat(t *testing.T) {
 	// Extract filename
 	filename := filepath.Base(logPath)
 
-	// Should match pattern YYYYMMDD-HHMMSS_prefix.log
-	// Example: 20251216-150405_test.log
-	matched, _ := filepath.Match("????????-??????_test.log", filename)
+	// Retain the timestamp and category suffix, with an exclusive random ID.
+	// Example: 20251216-150405-123456789_test.log
+	matched, _ := filepath.Match("????????-??????-*_test.log", filename)
 	if !matched {
 		t.Errorf("filename %q doesn't match expected timestamp pattern", filename)
 	}
@@ -614,14 +614,14 @@ func TestCreateRunLogFile_MultipleCallsUniquePaths(t *testing.T) {
 			t.Fatalf("unexpected error on iteration %d: %v", i, err)
 		}
 
-		// In case files are created in the same second, they might have the same name
-		// This test verifies the function works, not uniqueness guarantee
+		if paths[logPath] {
+			t.Fatalf("execution reused audit path %q", logPath)
+		}
 		paths[logPath] = true
 	}
 
-	// At least one file should have been created
-	if len(paths) == 0 {
-		t.Error("no log files were created")
+	if len(paths) != 5 {
+		t.Errorf("created %d unique audit logs, want 5", len(paths))
 	}
 }
 
