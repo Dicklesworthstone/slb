@@ -20,6 +20,10 @@ const (
 	rmRecursive  = `^rm\s+(?:-[a-zA-Z]+\s+|--[\w=-]+\s+)*(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?:\s+|$)`
 	rmOperands   = `(?:\S+\s+)*["']?`
 	rmSystemPath = `/+(?:\.\.?/+)*(?:bin|boot|dev|etc|lib|lib64|media|mnt|opt|proc|run|sbin|srv|sys|usr|var)(?:[/\s"'*]|$)`
+	// A wildcard at the filesystem root can select protected directories
+	// without spelling any of their names. ? and bracket globs need the same
+	// protection as *, including equivalent /./ and /../ root spellings.
+	rmRootPath = `/+(?:\.\.?/+)*(?:(?:\.)?[*?\[]|["']?(?:\s|$))`
 	// A home-wide glob is still destructive even when it is spelled **,
 	// .*, ?*, or [!.]* rather than *. Protect its descendants as well (for
 	// example **/*); a literal project component such as build remains
@@ -63,7 +67,7 @@ var (
 		// on both systems.
 		rmRecursive + rmOperands + rmSystemPath,
 		rmRecursive + rmOperands + rmHomeRoot,
-		rmRecursive + rmOperands + `/+(?:\*|["']?(?:\s|$))`,
+		rmRecursive + rmOperands + rmRootPath,
 		rmRecursive + rmOperands + `~[^/\s"']*` + rmHomeContents,
 		`DROP\s+DATABASE`,
 		`DROP\s+SCHEMA`,

@@ -32,7 +32,10 @@ func TestDefaultRMHomeGlobProtection(t *testing.T) {
 		Tier    string `json:"tier"`
 	}
 	var examples []example
-	for _, home := range []string{"/home/ubuntu", "/Users/alice", "/root", "~", "~alice"} {
+	// Empty, dot and parent-of-root prefixes exercise filesystem-root wipes.
+	// /?* and /[!.]* must not evade the protection of /*. Each corresponding
+	// /build/<glob> remains project data, not a root-wide deletion.
+	for _, home := range []string{"", "/.", "/..", "/home/ubuntu", "/Users/alice", "/root", "~", "~alice"} {
 		for _, glob := range []string{"*", "**", "**/*", ".*", "?*", "[!.]*"} {
 			target := home + "/" + glob
 			for _, flags := range []string{"-r", "-R", "-rf", "-fr", "-f -r", "--recursive --force"} {
