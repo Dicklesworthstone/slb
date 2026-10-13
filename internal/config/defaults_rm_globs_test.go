@@ -38,7 +38,8 @@ func TestDefaultRMHomeGlobProtection(t *testing.T) {
 	for _, home := range []string{"", "/.", "/..", "/home/ubuntu", "/Users/alice", "/root", "~", "~alice", "$HOME", "${HOME}"} {
 		for _, glob := range []string{"*", "**", "**/*", ".*", "?*", "[!.]*"} {
 			target := home + "/" + glob
-			for _, flags := range []string{"-r", "-R", "-rf", "-fr", "-f -r", "--recursive --force"} {
+			for _, flags := range []string{"-r", "-R", "-rf", "-fr", "-f -r", "--recursive --force",
+				"--r", "--re", "--rec", "--recu", "--recur", "--recurs", "--recursi", "--recursiv"} {
 				examples = append(examples,
 					example{"rm " + flags + " " + target, "critical"},
 					example{"rm " + flags + " -- build " + target, "critical"},
@@ -51,6 +52,21 @@ func TestDefaultRMHomeGlobProtection(t *testing.T) {
 				example{"rm -rf " + home + "/build/" + glob, "dangerous"},
 			)
 		}
+	}
+	// Long-option abbreviations carry exactly the same recursive intent as
+	// --recursive. The option terminator still makes them literal filenames.
+	for _, flag := range []string{"--r", "--re", "--rec", "--recu", "--recur", "--recurs", "--recursi", "--recursiv", "--recursive"} {
+		examples = append(examples,
+			example{"rm " + flag + " /etc", "critical"},
+			example{"rm " + flag + " /home/ubuntu", "critical"},
+			example{"rm --force " + flag + " build /", "critical"},
+			example{"rm " + flag + " build", "dangerous"},
+			example{"rm -- " + flag + " /etc", "caution"},
+			example{"rm -f -- " + flag + " /home/ubuntu", "caution"},
+		)
+	}
+	for _, flag := range []string{"--restore", "--recycle", "--recursive-backup", "--recursive=true", "--no-preserve-root", "--force", "-ff"} {
+		examples = append(examples, example{"rm " + flag + " /etc", "caution"})
 	}
 	for _, command := range []string{`rm -rf "$HOME"`, `rm -rf "${HOME}"/*`, `rm -rf "$HOME"/**/*`} {
 		examples = append(examples, example{command, "critical"})

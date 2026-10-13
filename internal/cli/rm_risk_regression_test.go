@@ -51,6 +51,10 @@ func TestCheckRMOperandBoundariesAndRootGlobs(t *testing.T) {
 			{`rm -rf "$HOME/build"`, "dangerous", 1},
 			{`rm -f "$HOME/notes.txt"`, "caution", 0},
 			{`rm -- -r "$HOME"`, "caution", 0},
+			{`rm --r /etc`, "critical", 2},
+			{`rm -f --rec "$HOME"`, "critical", 2},
+			{`rm --rec build`, "dangerous", 1},
+			{`rm -- --rec /etc`, "caution", 0},
 		} {
 			resetPatternsFlags()
 			cmd := newTestPatternsCmd(h.DBPath)

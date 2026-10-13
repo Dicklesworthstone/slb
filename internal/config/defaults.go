@@ -17,7 +17,9 @@ const (
 	// Recursive intent is mandatory. Other options may precede it, including
 	// split short flags and GNU long options. Normalization moves rm options
 	// before operands, respecting --, so every operand is checked below.
-	rmRecursive  = `^rm\s+(?:-[a-zA-Z]+\s+|--[\w=-]+\s+)*(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?:\s+|$)`
+	// GNU rm accepts every nonempty prefix of --recursive (--r, --re, ...).
+	// Match only those complete options, not lookalikes such as --restore.
+	rmRecursive  = `^rm\s+(?:-[a-zA-Z]+\s+|--[\w=-]+\s+)*(?:-[a-zA-Z]*[rR][a-zA-Z]*|--(?:r|re|rec|recu|recur|recurs|recursi|recursiv|recursive))(?:\s+|$)`
 	rmOperands   = `(?:\S+\s+)*["']?`
 	rmSystemPath = `/+(?:\.\.?/+)*(?:bin|boot|dev|etc|lib|lib64|media|mnt|opt|proc|run|sbin|srv|sys|usr|var)(?:[/\s"'*]|$)`
 	// A wildcard at the filesystem root can select protected directories

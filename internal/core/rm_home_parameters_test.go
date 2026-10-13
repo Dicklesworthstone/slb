@@ -85,6 +85,10 @@ func TestRMHomeParameterClassification(t *testing.T) {
 			{`rm -- -r "$HOME"`, RiskTierCaution, 0},
 			{`rm -rf $HOME_BACKUP`, RiskTierDangerous, 1},
 			{`rm -rf ${HOME}suffix`, RiskTierDangerous, 1},
+			{`rm --r /etc`, RiskTierCritical, 2},
+			{`rm -f --rec "$HOME"`, RiskTierCritical, 2},
+			{`rm --rec build`, RiskTierDangerous, 1},
+			{`rm -- --rec /etc`, RiskTierCaution, 0},
 		} {
 			got := engine.ClassifyCommand(tc.command, cwd)
 			if got.Tier != tc.tier || got.MinApprovals != tc.approvals || !got.NeedsApproval || got.IsSafe || got.ParseError {
