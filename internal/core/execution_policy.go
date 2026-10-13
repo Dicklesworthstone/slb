@@ -106,7 +106,7 @@ func CheckExecutionPolicy(reader PolicyReader, request *db.Request, configPath s
 }
 
 func (e *PatternEngine) checkRequestPolicy(request *db.Request, available int) error {
-	classification := e.ClassifyCommand(request.Command.Raw, request.Command.Cwd)
+	classification := e.ClassifyCommandSpec(request.Command)
 	tier := classification.Tier
 	if !classification.NeedsApproval {
 		if classification.IsSafe && !classification.HasUnmatchedSegment {
