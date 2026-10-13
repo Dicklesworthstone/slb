@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/db"
@@ -99,9 +100,19 @@ func CheckExecutionPolicy(reader PolicyReader, request *db.Request, configPath s
 	if err := validateCommandCWD(request.Command.Cwd); err != nil {
 		return err
 	}
-	engine, err := LoadCommandPolicy(reader, config.LoadOptions{ProjectDir: request.ProjectPath, ConfigPath: configPath})
+	engine, cfg, err := loadCommandPolicy(reader, config.LoadOptions{ProjectDir: request.ProjectPath, ConfigPath: configPath})
 	if err != nil {
 		return err
+	}
+	// Blocking a requester revokes permission to execute their outstanding
+	// approvals too. Check the same freshly loaded policy as the classifier,
+	// before its SAFE shortcut or quorum calculation. The final atomic claim
+	// repeats this guard, so a previously successful advisory check is not a
+	// permit to ignore a later block. Stored signatures remain unchanged.
+	for _, blocked := range cfg.Agents.Blocked {
+		if strings.EqualFold(blocked, request.RequestorAgent) {
+			return fmt.Errorf("%w: requester %q cannot execute an outstanding approval", ErrAgentBlocked, request.RequestorAgent)
+		}
 	}
 	available, err := CountPolicyReviewers(reader, request.ProjectPath, request.RequestorSessionID, request.RequestorAgent)
 	if err != nil {

@@ -3,8 +3,10 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -160,5 +162,84 @@ func TestCommandSpecExecutionIgnoresUnusedDisplay(t *testing.T) {
 	stored, err := database.GetRequest(request.ID)
 	if err != nil || stored.Status != db.StatusExecuted || stored.Execution == nil {
 		t.Fatalf("execution outcome not durable: request=%+v error=%v", stored, err)
+	}
+}
+
+// A block applied after review must affect advisory checks, preflight and
+// both final claim routes, including commands that are currently allowlisted.
+// The probe is harmless printf; none of these tests invokes a deletion.
+func TestCommandSpecExecutionHonorsBlockedRequestor(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		for _, allowlisted := range []bool{false, true} {
+			t.Run(fmt.Sprintf("explicit=%t/allowlisted=%t", explicit, allowlisted), func(t *testing.T) {
+				database, request, session := commandSpecExecutionFixture(t, db.CommandSpec{
+					Raw: "printf blocked-request-probe", Argv: []string{"printf", "blocked-request-probe"},
+				})
+				policyText := ""
+				if allowlisted {
+					policyText = "[patterns.safe]\npatterns = ['^printf blocked-request-probe$']\n"
+				}
+				path := filepath.Join(request.ProjectPath, ".slb", "config.toml")
+				configPath := ""
+				if explicit {
+					path = filepath.Join(t.TempDir(), "execution-policy.toml")
+					configPath = path
+				}
+				writePolicy := func(text string) {
+					t.Helper()
+					if err := os.WriteFile(path, []byte(text), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				writePolicy(policyText)
+				engine, err := LoadCommandPolicy(database, config.LoadOptions{ProjectDir: request.ProjectPath, ConfigPath: configPath})
+				if err != nil {
+					t.Fatal(err)
+				}
+				executor := NewExecutor(database, engine)
+				if allowed, reason := executor.CanExecute(request.ID); !allowed {
+					t.Fatalf("valid baseline approval rejected: %s", reason)
+				}
+				writePolicy(policyText + fmt.Sprintf("[agents]\nblocked = [%q]\n", strings.ToUpper(session.AgentName)))
+				if err := CheckExecutionPolicy(database, request, configPath); !errors.Is(err, ErrAgentBlocked) {
+					t.Fatalf("fresh policy ignored requester block: %v", err)
+				}
+				if allowed, reason := executor.CanExecute(request.ID); allowed || reason == "" {
+					t.Fatalf("advisory check ignored revocation: %v %q", allowed, reason)
+				}
+				logDir := filepath.Join(request.ProjectPath, "must-not-create")
+				result, err := executor.ExecuteApprovedRequest(context.Background(), ExecuteOptions{
+					RequestID: request.ID, SessionID: session.ID, LogDir: logDir,
+					CaptureRollback: true, SuppressOutput: true,
+				})
+				if result != nil || !errors.Is(err, ErrAgentBlocked) {
+					t.Fatalf("blocked request reached execution: %+v %v", result, err)
+				}
+				if _, err := os.Stat(logDir); !os.IsNotExist(err) {
+					t.Fatalf("blocked request touched preflight files: %v", err)
+				}
+				for _, authenticated := range []bool{false, true} {
+					if authenticated {
+						err = database.ClaimRequestExecutionAuthenticated(request, policyExecutionIdentity(session), session.SessionKey, ExecutionPolicyGuard(configPath))
+					} else {
+						err = database.ClaimRequestExecution(request, policyExecutionIdentity(session), ExecutionPolicyGuard(configPath))
+					}
+					if !errors.Is(err, ErrAgentBlocked) {
+						t.Fatalf("authenticated=%t claim ignored block: %v", authenticated, err)
+					}
+					assertPolicyUnclaimed(t, database, request.ID)
+				}
+				if _, err := database.VerifyRequestApproval(request.ID); err != nil {
+					t.Fatalf("policy revocation damaged signed review evidence: %v", err)
+				}
+				// Lifting this block does not mint or renew approval. Existing
+				// signatures, expiry and quorum must still pass their own gates.
+				writePolicy(policyText + "[agents]\nblocked = ['unrelated-agent']\n")
+				if allowed, reason := executor.CanExecute(request.ID); !allowed {
+					t.Fatalf("unrelated block rejected valid requester: %s", reason)
+				}
+				assertPolicyUnclaimed(t, database, request.ID)
+			})
+		}
 	}
 }
