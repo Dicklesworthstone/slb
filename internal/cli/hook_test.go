@@ -766,16 +766,14 @@ func TestHookGenerateCommand_GeneratedScriptShapeIsCorrect(t *testing.T) {
 	}
 	script := string(body)
 
-	// (a) #4: raw-string preservation. The first dangerous builtin
-	// is `^rm\s+-[rf]{2}` — it MUST appear as `r'^rm\s+-[rf]{2}'`,
-	// NOT `r'^rm\\s+-[rf]{2}'` (which would treat the `\s` as
-	// literal `\s` characters in the Python re engine).
-	if strings.Contains(script, `r'^rm\\s+-[rf]{2}'`) {
+	// (a) #4: the recursive-rm builtin must preserve regex whitespace
+	// in Python raw strings rather than matching literal backslashes.
+	if strings.Contains(script, `r'^rm\\s+`) {
 		t.Errorf("regression #4: generated script double-escapes \\s inside raw-string literals; " +
 			"this kills every regex metacharacter in the embedded fallback classifier")
 	}
-	if !strings.Contains(script, `r'^rm\s+-[rf]{2}'`) {
-		t.Errorf("expected raw-string `r'^rm\\s+-[rf]{2}'` in generated script; not found")
+	if !strings.Contains(script, `r'^rm\s+(?:-[a-zA-Z]+\s+|--[\w=-]+\s+)*`) {
+		t.Errorf("expected recursive-rm raw-string in generated script; not found")
 	}
 
 	// (b) #4 follow-on: classify() must use search, not match. Anchored

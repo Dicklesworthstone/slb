@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -191,6 +192,42 @@ func TestPatternsTestCommand_RequiresCommand(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "accepts 1 arg") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestCheckDeletionRiskAndQuorum(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, location := range []string{"home/ubuntu", "data/tmp"} {
+		cwd := t.TempDir() + "/" + location
+		if err := os.MkdirAll(cwd, 0700); err != nil {
+			t.Fatal(err)
+		}
+		t.Chdir(cwd)
+		for _, tc := range []struct {
+			command, tier string
+			approvals     float64
+		}{
+			{"rm -f /home/ubuntu/notes.txt", "caution", 0},
+			{"rm -rf build", "dangerous", 1},
+			{"rm -rf ./build", "dangerous", 1},
+			{"rm -rf build /etc", "critical", 2},
+			{"rm --recursive /home/ubuntu", "critical", 2},
+		} {
+			resetPatternsFlags()
+			h := testutil.NewHarness(t)
+			cmd := newTestPatternsCmd(h.DBPath)
+			stdout, err := executeCommandCapture(t, cmd, "check", tc.command, "--json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+				t.Fatal(err)
+			}
+			if got["tier"] != tc.tier || got["min_approvals"] != tc.approvals || got["needs_approval"] != true {
+				t.Errorf("%s: %v, want %s/%v", tc.command, got, tc.tier, tc.approvals)
+			}
+		}
 	}
 }
 

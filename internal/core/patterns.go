@@ -104,7 +104,7 @@ func (e *PatternEngine) ClassifyCommand(cmd, cwd string) (result *MatchResult) {
 	} else {
 		checkCmd = cmd
 	}
-	if cwd != "" {
+	if cwd != "" || ExtractCommandName(checkCmd) == "rm" {
 		checkCmd = ResolvePathsInCommand(checkCmd, cwd)
 	}
 	if tier, pattern := e.classifySegment(checkCmd); pattern != "" {
@@ -132,7 +132,7 @@ func (e *PatternEngine) classifyCompoundCommand(normalized *NormalizedCommand, c
 	result := &MatchResult{MatchedSegments: []SegmentMatch{}}
 	highestTier := RiskTier("")
 	for _, segment := range normalized.Segments {
-		if cwd != "" {
+		if cwd != "" || ExtractCommandName(segment) == "rm" {
 			segment = ResolvePathsInCommand(segment, cwd)
 		}
 		segmentMatch := SegmentMatch{Segment: segment}

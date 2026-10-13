@@ -28,6 +28,8 @@ func TestRiskTierClassification_CommandMatrix(t *testing.T) {
 		// CRITICAL tier (2 approvals required)
 		{"rm -rf root", "rm -rf /", db.RiskTierCritical, 2, true},
 		{"rm -rf /etc", "rm -rf /etc", db.RiskTierCritical, 2, true},
+		{"rm -rf home root", "rm -rf /home/user", db.RiskTierCritical, 2, true},
+		{"rm -rf later protected operand", "rm -rf build /etc", db.RiskTierCritical, 2, true},
 		{"rm -rf /*", "rm -rf /*", db.RiskTierCritical, 2, true},
 		{"kubectl delete namespace prod", "kubectl delete namespace production", db.RiskTierCritical, 2, true},
 		{"terraform destroy bare", "terraform destroy", db.RiskTierCritical, 2, true},
@@ -38,7 +40,7 @@ func TestRiskTierClassification_CommandMatrix(t *testing.T) {
 
 		// DANGEROUS tier (1 approval required)
 		{"rm -rf local", "rm -rf ./build", db.RiskTierDangerous, 1, true},
-		{"rm -rf /home path", "rm -rf /home/user/project", db.RiskTierCritical, 2, true}, // /home triggers critical
+		{"rm -rf home project", "rm -rf /home/user/project", db.RiskTierDangerous, 1, true}, // GH #27: descendant, not home root
 		{"git reset --hard", "git reset --hard HEAD~1", db.RiskTierDangerous, 1, true},
 		{"git clean -fd", "git clean -fd", db.RiskTierDangerous, 1, true},
 		{"docker rm container", "docker rm mycontainer", db.RiskTierDangerous, 1, true},
@@ -46,6 +48,7 @@ func TestRiskTierClassification_CommandMatrix(t *testing.T) {
 		{"DROP TABLE", "DROP TABLE users", db.RiskTierDangerous, 1, true},
 
 		// CAUTION tier (0 approvals but tracked)
+		{"rm -f home file", "rm -f /home/user/notes.txt", db.RiskTierCaution, 0, true},
 		{"npm uninstall", "npm uninstall express", db.RiskTierCaution, 0, true},
 		{"git stash drop", "git stash drop", db.RiskTierCaution, 0, true},
 		{"pip uninstall", "pip uninstall requests", db.RiskTierCaution, 0, true},

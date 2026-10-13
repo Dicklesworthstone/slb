@@ -219,7 +219,7 @@ tcp_require_auth = true
 
 | Pattern | Description |
 |---------|-------------|
-| `rm -rf /...` | Recursive delete on system paths and homes (`/home`, `/Users`, `/root`, `~`) |
+| `rm -rf /...` | Recursive deletion of `/`, system paths, or home roots (`/home`, `/home/user`, `/Users/user`, `/root`, `~`) |
 | `DROP DATABASE/SCHEMA` | SQL database destruction |
 | `TRUNCATE [TABLE] [ONLY] ...` | SQL data destruction (TABLE is optional) |
 | `terraform destroy` | Infrastructure destruction |
@@ -240,6 +240,12 @@ tcp_require_auth = true
 | `terraform destroy -target` | Targeted destroy |
 | `DROP TABLE` | SQL table destruction |
 | `chmod -R`, `chown -R` | Recursive permission changes |
+
+For deletion, `-r`, `-R`, and `--recursive` express recursive intent; `-f`
+alone remains CAUTION. Project descendants such as `/home/user/project/build`
+are DANGEROUS, while home roots and system directories remain CRITICAL.
+`build` and `./build` resolve against the same working directory, and any
+protected operand makes a recursive deletion CRITICAL.
 
 ### CAUTION (auto-approved after 30s)
 

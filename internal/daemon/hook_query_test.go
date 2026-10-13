@@ -13,6 +13,28 @@ import (
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
+func TestHookQueryDeletionRiskAndQuorum(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	srv := &IPCServer{}
+	for _, cwd := range []string{"/home/ubuntu", "/data/tmp", t.TempDir()} {
+		for _, tc := range []struct {
+			command, tier string
+			approvals     int
+		}{
+			{"rm -f /home/ubuntu/notes.txt", "caution", 0},
+			{"rm -rf build", "dangerous", 1},
+			{"rm -rf ./build", "dangerous", 1},
+			{"rm -f -r build /etc", "critical", 2},
+			{"rm --recursive /home/ubuntu", "critical", 2},
+		} {
+			got := srv.classifyCommand(HookQueryParams{Command: tc.command, CWD: cwd})
+			if got.Tier != tc.tier || got.MinApprovals != tc.approvals || got.Action != "block" {
+				t.Errorf("%s in %s: %+v, want %s/%d/block", tc.command, cwd, got, tc.tier, tc.approvals)
+			}
+		}
+	}
+}
+
 func TestIPCServer_HookQuery_RequiresCommand(t *testing.T) {
 	t.Parallel()
 

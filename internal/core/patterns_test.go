@@ -659,11 +659,10 @@ func TestClassifyCommandWithCwd(t *testing.T) {
 
 	t.Run("cwd resolves relative paths - may escalate risk", func(t *testing.T) {
 		// Test with a cwd provided - the path should be resolved
-		// When resolved, /home/user/project/build becomes an absolute path which is CRITICAL
+		// Resolving a project descendant must not turn it into a home root.
 		result := engine.ClassifyCommand("rm -rf ./build", "/home/user/project")
-		// Either dangerous or critical is acceptable depending on path resolution
-		if result.Tier != RiskTierDangerous && result.Tier != RiskTierCritical {
-			t.Errorf("expected dangerous or critical tier, got %q", result.Tier)
+		if result.Tier != RiskTierDangerous {
+			t.Errorf("expected dangerous tier, got %q", result.Tier)
 		}
 		if !result.NeedsApproval {
 			t.Errorf("expected NeedsApproval to be true")
@@ -1207,19 +1206,19 @@ func TestExportClaudeHook_PreservesRegexMetacharacters(t *testing.T) {
 	engine := NewPatternEngine()
 	out := engine.ExportClaudeHook()
 
-	// The very first dangerous builtin is `^rm\s+-[rf]{2}` — its
+	// The dangerous recursive-rm builtin's
 	// `\s` MUST survive into the emitted Python source as a real
 	// regex whitespace match, not as the literal three-char
 	// sequence `\\s`.
-	if strings.Contains(out, `r'^rm\\s+-[rf]{2}'`) {
+	if strings.Contains(out, `r'^rm\\s+`) {
 		t.Fatalf("ExportClaudeHook double-escaped backslashes inside a raw-string literal; "+
 			"`r'^rm\\\\s+...'` would match the literal characters `\\\\s`, not whitespace.\n"+
 			"This is the issue #4 regression. Excerpt:\n%s",
 			extractFirstNLines(out, 60))
 	}
 	// Conversely, verify the correct shape DOES appear.
-	if !strings.Contains(out, `r'^rm\s+-[rf]{2}'`) {
-		t.Fatalf("expected exported pattern `r'^rm\\s+-[rf]{2}'` in claude-hook output; not found.\n"+
+	if !strings.Contains(out, `r'^rm\s+(?:-[a-zA-Z]+\s+|--[\w=-]+\s+)*`) {
+		t.Fatalf("expected exported recursive-rm pattern in claude-hook output; not found.\n"+
 			"Excerpt:\n%s", extractFirstNLines(out, 60))
 	}
 	// And the case-insensitivity flag must remain — the prior
@@ -1590,8 +1589,8 @@ func TestClassifyXargsCommand(t *testing.T) {
 		"xargs sh -c 'rm -rf /etc' _":                 RiskTierCritical,
 		"xargs git push --force origin":               RiskTierCritical,
 		"ls | xargs rm -rf":                           RiskTierDangerous,
-		"find . -name '*.log' | xargs rm -f a.log":    "",
-		"xargs rm -f a.log":                           "",
+		"find . -name '*.log' | xargs rm -f a.log":    RiskTierCaution,
+		"xargs rm -f a.log":                           RiskTierCaution,
 		"xargs git stash":                             "",
 		"kubectl get pods | xargs kubectl delete pod": RiskTierDangerous,
 		"xargs kubectl delete pod":                    RiskTierDangerous,
@@ -1600,6 +1599,92 @@ func TestClassifyXargsCommand(t *testing.T) {
 		"xargs --frobnicate rm -rf":                   RiskTierCaution, // unknown option: parse error
 		"ls | xargs":                                  "",
 	})
+}
+
+// GH #27: cleanup spelling and the host's project directory must not change
+// quorum, while any protected operand must retain the critical quorum.
+func TestDeletionRiskAndQuorum(t *testing.T) {
+	engine := NewPatternEngine()
+	for _, cwd := range []string{"", "/home/ubuntu", "/home/ubuntu/project", "/Users/alice/project", "/root/project", "/data/tmp"} {
+		for _, tc := range []struct {
+			command   string
+			tier      RiskTier
+			approvals int
+		}{
+			{"rm -f /home/ubuntu/notes.txt", RiskTierCaution, 0},
+			{"rm -f /etc/notes.txt", RiskTierCaution, 0},
+			{"rm --force notes.txt", RiskTierCaution, 0},
+			{"rm -rf build", RiskTierDangerous, 1},
+			{"rm -rf ./build", RiskTierDangerous, 1},
+			{"rm -fr ./x/../build/", RiskTierDangerous, 1},
+			{"rm -f -r build", RiskTierDangerous, 1},
+			{"rm --recursive --force build", RiskTierDangerous, 1},
+			{"rm build -R", RiskTierDangerous, 1},
+			{"rm -rf /home/ubuntu/build", RiskTierDangerous, 1},
+			{"rm -rf /Users/alice/build", RiskTierDangerous, 1},
+			{"rm -rf /root/build", RiskTierDangerous, 1},
+			{"rm -rf /", RiskTierCritical, 2},
+			{"rm -f -r /etc", RiskTierCritical, 2},
+			{"rm -R /usr/local", RiskTierCritical, 2},
+			{"rm --recursive /bin", RiskTierCritical, 2},
+			{"rm -rf /home", RiskTierCritical, 2},
+			{"rm -rf /home/ubuntu/", RiskTierCritical, 2},
+			{"rm -rf /Users/alice", RiskTierCritical, 2},
+			{"rm -rf /root", RiskTierCritical, 2},
+			{"rm -rf /home/ubuntu/*", RiskTierCritical, 2},
+			{"rm -rf /root/*", RiskTierCritical, 2},
+			{"rm -rf /home/ubuntu/project/*", RiskTierDangerous, 1},
+			{"rm -rf 'build' '/etc'", RiskTierCritical, 2},
+			{"rm -rf /*", RiskTierCritical, 2},
+			{"rm -rf build /etc", RiskTierCritical, 2},
+			{"rm -rf /etc build", RiskTierCritical, 2},
+			{"rm build /home/ubuntu -rf", RiskTierCritical, 2},
+			{"rm -rf -- build /etc", RiskTierCritical, 2},
+			{"rm -- -rf /etc", RiskTierCaution, 0},
+			{"rm -f -- -r /etc/notes.txt", RiskTierCaution, 0},
+			{"sudo rm -rf build /var/lib", RiskTierCritical, 2},
+			{"echo ok && rm -rf build /etc", RiskTierCritical, 2},
+		} {
+			t.Run(cwd+"/"+tc.command, func(t *testing.T) {
+				got := engine.ClassifyCommand(tc.command, cwd)
+				if got.Tier != tc.tier || got.MinApprovals != tc.approvals || !got.NeedsApproval {
+					t.Fatalf("tier=%s approvals=%d needs=%v; want %s/%d/true", got.Tier, got.MinApprovals, got.NeedsApproval, tc.tier, tc.approvals)
+				}
+			})
+		}
+	}
+	for _, tc := range []struct {
+		cwd, command string
+		tier         RiskTier
+	}{
+		{"/home/ubuntu", "rm -rf .", RiskTierCritical},
+		{"/home/ubuntu", "rm -rf ../ubuntu", RiskTierCritical},
+		{"/home/ubuntu/project", "rm -rf ..", RiskTierCritical},
+		{"/etc", "rm -rf build", RiskTierCritical},
+		{"/etc", "rm -rf ./build", RiskTierCritical},
+		{"/data/tmp", "rm -rf ../../etc", RiskTierCritical},
+	} {
+		if got := engine.ClassifyCommand(tc.command, tc.cwd); got.Tier != tc.tier {
+			t.Errorf("%s in %s: %s, want %s", tc.command, tc.cwd, got.Tier, tc.tier)
+		}
+	}
+}
+
+func TestDeletionCustomHomeRoot(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	engine := NewPatternEngine()
+	for _, cmd := range []string{"rm -rf ~", "rm -rf ~/", "rm -rf ~/*", "rm -rf " + home, "rm -rf .", "rm -rf build " + home} {
+		got := engine.ClassifyCommand(cmd, home)
+		if got.Tier != RiskTierCritical || got.MinApprovals != 2 {
+			t.Errorf("%s: %s/%d, want critical/2", cmd, got.Tier, got.MinApprovals)
+		}
+	}
+	for _, cmd := range []string{"rm -rf ~/build", "rm -rf ./build", "rm -rf build"} {
+		if got := engine.ClassifyCommand(cmd, home); got.Tier != RiskTierDangerous || got.MinApprovals != 1 {
+			t.Errorf("%s: %s/%d, want dangerous/1", cmd, got.Tier, got.MinApprovals)
+		}
+	}
 }
 
 // A subshell followed by redirections runs the same commands.

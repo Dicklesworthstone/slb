@@ -1001,6 +1001,38 @@ func ResolvePathsInCommand(cmd, cwd string) string {
 	}
 
 	home, _ := os.UserHomeDir()
+	if len(tokens) > 0 && filepath.Base(tokens[0]) == "rm" {
+		// rm accepts options between operands. Canonicalize classification
+		// only (never execution), retaining every operand and honoring --.
+		options, operands := []string{}, []string{}
+		endOptions := false
+		for _, tok := range tokens[1:] {
+			if !endOptions && tok == "--" {
+				endOptions = true
+				continue
+			}
+			if !endOptions && strings.HasPrefix(tok, "-") && tok != "-" {
+				options = append(options, tok)
+				continue
+			}
+			tok = cleanPathToken(tok, cwd, home)
+			if cwd != "" && !filepath.IsAbs(tok) && !strings.HasPrefix(tok, "~") {
+				tok = filepath.Join(cwd, tok)
+			} else if strings.HasPrefix(tok, "-") {
+				// A literal filename after -- must not become an option.
+				tok = "./" + tok
+			}
+			// Protect the actual home root even when HOME uses a custom
+			// location outside /home or /Users. Descendants stay unchanged.
+			if home != "" && tok == filepath.Clean(home) {
+				tok = "~"
+			} else if home != "" && tok == filepath.Clean(home)+"/*" {
+				tok = "~/*"
+			}
+			operands = append(operands, tok)
+		}
+		return strings.Join(append(append([]string{"rm"}, options...), operands...), " ")
+	}
 
 	for i, tok := range tokens {
 		// Handle flag=value case (e.g., --output=/tmp/foo)

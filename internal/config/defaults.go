@@ -14,6 +14,15 @@ package config
 // possibly multi-line command seen by the exported offline hook (quotes
 // kept), and must stay valid Python `re` syntax.
 const (
+	// Recursive intent is mandatory. Other options may precede it, including
+	// split short flags and GNU long options. Normalization moves rm options
+	// before operands, respecting --, so every operand is checked below.
+	rmRecursive  = `^rm\s+(?:-[a-zA-Z]+\s+|--[\w=-]+\s+)*(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?:\s+|$)`
+	rmOperands   = `(?:\S+\s+)*["']?`
+	rmSystemPath = `/+(?:\.\.?/+)*(?:bin|boot|dev|etc|lib|lib64|media|mnt|opt|proc|run|sbin|srv|sys|usr|var)(?:[/\s"'*]|$)`
+	// /home and /Users contain home roots; descendants of an individual
+	// home are ordinary project data. /root is itself a home root.
+	rmHomeRoot      = `/+(?:\.\.?/+)*(?:(?:home|Users)(?:/+[^/\s"']+)?|root)/*(?:\*)?["']?(?:\s|$)`
 	sqlIdent        = `[\w.$"` + "`" + `\[\]]+`
 	sqlTruncateList = `(?:ONLY\s+)?` + sqlIdent + `(?:\s*\*)?(?:\s*,\s*(?:ONLY\s+)?` + sqlIdent + `(?:\s*\*)?)*` +
 		`(?:\s+(?:RESTART|CONTINUE)\s+IDENTITY)?(?:\s+(?:CASCADE|RESTRICT))?`
@@ -47,10 +56,10 @@ var (
 		// /Users is macOS's /home: with a working directory, `rm -rf ~`
 		// resolves to the daemon user's home, and must land in the same tier
 		// on both systems.
-		`^rm\s+(-[rf]+\s+)+["']?/+(?:\.\.?/+)*(boot|dev|etc|home|lib|lib64|media|mnt|opt|proc|root|run|sbin|srv|sys|Users|usr|var)(?:[/\s"'*]|$)`,
-		`^rm\s+(-[rf]+\s+)+/($|\s)`,
-		`^rm\s+(-[rf]+\s+)+/\*`,
-		`^rm\s+(-[rf]+\s+)+~`,
+		rmRecursive + rmOperands + rmSystemPath,
+		rmRecursive + rmOperands + rmHomeRoot,
+		rmRecursive + rmOperands + `/+(?:\*|["']?(?:\s|$))`,
+		rmRecursive + rmOperands + `~(?:[^/\s"']*)/*(?:\*)?["']?(?:\s|$)`,
 		`DROP\s+DATABASE`,
 		`DROP\s+SCHEMA`,
 		`TRUNCATE\s+TABLE`,
@@ -87,8 +96,7 @@ var (
 		`^chown\s+(?:.*[\s"'])?/+(?:\.\.?/+)*(etc|usr|var|boot|bin|sbin)(?:[/\s"'*]|$)`,
 	}
 	defaultDangerousPatterns = []string{
-		`^rm\s+-[rf]{2}`, // -rf or -fr (order-independent)
-		`^rm\s+-r`,
+		rmRecursive,
 		`^git\s+reset\s+--hard`,
 		`^git\s+clean\s+-fd`,
 		`^git\s+push.*--force-with-lease`,
@@ -109,7 +117,7 @@ var (
 		`^chown\s+-R`,
 	}
 	defaultCautionPatterns = []string{
-		`^rm\s+[^-]`,
+		`^rm\s`,
 		`^rm$`,
 		`^git\s+stash\s+drop`,
 		`^git\s+branch\s+-[dD]`,
