@@ -35,7 +35,7 @@ func TestDefaultRMHomeGlobProtection(t *testing.T) {
 	// Empty, dot and parent-of-root prefixes exercise filesystem-root wipes.
 	// /?* and /[!.]* must not evade the protection of /*. Each corresponding
 	// /build/<glob> remains project data, not a root-wide deletion.
-	for _, home := range []string{"", "/.", "/..", "/home/ubuntu", "/Users/alice", "/root", "~", "~alice"} {
+	for _, home := range []string{"", "/.", "/..", "/home/ubuntu", "/Users/alice", "/root", "~", "~alice", "$HOME", "${HOME}"} {
 		for _, glob := range []string{"*", "**", "**/*", ".*", "?*", "[!.]*"} {
 			target := home + "/" + glob
 			for _, flags := range []string{"-r", "-R", "-rf", "-fr", "-f -r", "--recursive --force"} {
@@ -52,7 +52,11 @@ func TestDefaultRMHomeGlobProtection(t *testing.T) {
 			)
 		}
 	}
-	for _, command := range []string{"rm -rf build", "rm -rf ./build", "rm -rf /home/ubuntu/build", "rm -rf /root/.cache/build"} {
+	for _, command := range []string{`rm -rf "$HOME"`, `rm -rf "${HOME}"/*`, `rm -rf "$HOME"/**/*`} {
+		examples = append(examples, example{command, "critical"})
+	}
+	for _, command := range []string{"rm -rf build", "rm -rf ./build", "rm -rf /home/ubuntu/build", "rm -rf /root/.cache/build",
+		`rm -rf "$HOME/build"`, `rm -rf "${HOME}"/project/build`, `rm -rf $HOME_BACKUP`, `rm -rf ${HOME_BACKUP}`, `rm -rf ${HOME}suffix`} {
 		examples = append(examples, example{command, "dangerous"})
 	}
 	for _, command := range []string{"rm -f /home/ubuntu/notes.txt", "rm -ff /etc/notes.txt"} {

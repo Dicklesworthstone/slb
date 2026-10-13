@@ -69,6 +69,9 @@ var (
 		rmRecursive + rmOperands + rmHomeRoot,
 		rmRecursive + rmOperands + rmRootPath,
 		rmRecursive + rmOperands + `~[^/\s"']*` + rmHomeContents,
+		// The offline export sees shell parameters before Go's lexical
+		// home normalization. These exact aliases must retain protection.
+		rmRecursive + rmOperands + `\$(?:HOME|\{HOME\})["']?` + rmHomeContents,
 		`DROP\s+DATABASE`,
 		`DROP\s+SCHEMA`,
 		`TRUNCATE\s+TABLE`,
