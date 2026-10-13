@@ -57,3 +57,29 @@ func TestCommandSpecPendingPolicyUsesExecutableInput(t *testing.T) {
 		}
 	}
 }
+
+func TestCommandSpecPendingRejectsUnboundWorkingDirectory(t *testing.T) {
+	for _, cwd := range []string{"", ".", "relative"} {
+		for _, expired := range []bool{false, true} {
+			t.Run(fmt.Sprintf("cwd=%q/expired=%t", cwd, expired), func(t *testing.T) {
+				database, request := pendingFixture(t)
+				request.Command.Cwd = cwd
+				request.Command.Hash = db.ComputeCommandHash(request.Command)
+				pendingSQL(t, database, `UPDATE requests SET command_cwd = ?, command_hash = ? WHERE id = ?`,
+					cwd, request.Command.Hash, request.ID)
+				if expired {
+					pendingSQL(t, database, `UPDATE requests SET expires_at = ? WHERE id = ?`,
+						time.Now().UTC().Add(-time.Second).Format(time.RFC3339), request.ID)
+				}
+				result, err := AdvancePendingRequest(context.Background(), database, request.ID, PendingOptions{TimeoutAction: "auto_approve_warn"})
+				want := db.StatusPending
+				if expired {
+					want = db.StatusEscalated
+				}
+				if err != nil || result == nil || result.Request.Status != want || result.Request.ApprovalExpiresAt != nil {
+					t.Fatalf("timer approved unbound cwd: %+v %v", result, err)
+				}
+			})
+		}
+	}
+}

@@ -1,11 +1,44 @@
 package core
 
 import (
+	"errors"
+	"os"
 	"reflect"
 	"testing"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
+
+func TestCommandSpecAdmissionBindsWorkingDirectory(t *testing.T) {
+	database, _, session := policyExecutionFixture(t)
+	cfg := DefaultRequestCreatorConfig()
+	cfg.EnableDryRun, cfg.AgentMailEnabled = false, false
+	creator := NewRequestCreator(database, nil, NewPatternEngine(), cfg)
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := creator.CreateRequest(CreateRequestOptions{
+		SessionID: session.ID, Command: "printf cwd-probe",
+		Justification: Justification{Reason: "bind ambient cwd before review"},
+	})
+	if err != nil || result == nil || result.Request == nil {
+		t.Fatalf("admission: %+v %v", result, err)
+	}
+	stored, err := database.GetRequest(result.Request.ID)
+	if err != nil || stored.Command.Cwd != cwd || stored.Command.Hash != db.ComputeCommandHash(stored.Command) {
+		t.Fatalf("cwd not included in durable command specification: %+v %v", stored, err)
+	}
+	// Even a SAFE command may not bypass validation of explicit context.
+	for _, input := range []string{".", "relative", cwd + "\x00"} {
+		result, err := creator.CreateRequest(CreateRequestOptions{
+			SessionID: session.ID, Command: "git stash", Cwd: input,
+		})
+		if result != nil || !errors.Is(err, ErrUnboundCommandCWD) {
+			t.Fatalf("SAFE shortcut accepted ambiguous cwd %q: %+v %v", input, result, err)
+		}
+	}
+}
 
 func TestCommandSpecAdmissionRejectsPartialDirectInput(t *testing.T) {
 	for _, command := range []string{

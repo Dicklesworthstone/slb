@@ -89,6 +89,48 @@ func TestCommandSpecPolicyBlocksBothAtomicClaimPaths(t *testing.T) {
 	}
 }
 
+func TestCommandSpecExecutionRejectsUnboundWorkingDirectory(t *testing.T) {
+	for _, cwd := range []string{"", ".", "relative"} {
+		t.Run(cwd, func(t *testing.T) {
+			database, request, session := commandSpecExecutionFixture(t, db.CommandSpec{
+				Raw: "printf cwd-probe", Argv: []string{"printf", "cwd-probe"},
+			})
+			// Model an older, otherwise authentic approval, not hash tampering.
+			request.Command.Cwd = cwd
+			request.Command.Hash = db.ComputeCommandHash(request.Command)
+			if _, err := database.Exec(`UPDATE requests SET command_cwd = ?, command_hash = ? WHERE id = ?`,
+				cwd, request.Command.Hash, request.ID); err != nil {
+				t.Fatal(err)
+			}
+			executor := NewExecutor(database, NewPatternEngine())
+			if allowed, reason := executor.CanExecute(request.ID); allowed || reason == "" {
+				t.Fatalf("unbound cwd passed advisory check: %v %q", allowed, reason)
+			}
+			logDir := filepath.Join(request.ProjectPath, "must-not-create")
+			result, err := executor.ExecuteApprovedRequest(context.Background(), ExecuteOptions{
+				RequestID: request.ID, SessionID: session.ID, LogDir: logDir, SuppressOutput: true,
+			})
+			if result != nil || !errors.Is(err, ErrUnboundCommandCWD) {
+				t.Fatalf("unbound cwd reached preflight: %+v %v", result, err)
+			}
+			if _, err := os.Stat(logDir); !os.IsNotExist(err) {
+				t.Fatalf("rejected context created a log directory: %v", err)
+			}
+			for _, authenticated := range []bool{false, true} {
+				if authenticated {
+					err = database.ClaimRequestExecutionAuthenticated(request, policyExecutionIdentity(session), session.SessionKey, ExecutionPolicyGuard(""))
+				} else {
+					err = database.ClaimRequestExecution(request, policyExecutionIdentity(session), ExecutionPolicyGuard(""))
+				}
+				if !errors.Is(err, ErrUnboundCommandCWD) {
+					t.Fatalf("authenticated=%t accepted unbound cwd: %v", authenticated, err)
+				}
+				assertPolicyUnclaimed(t, database, request.ID)
+			}
+		})
+	}
+}
+
 // A non-executed display is not a reason to reject an otherwise valid signed
 // approval. Execute only this test binary with no tests selected; the display
 // is subject to a custom CRITICAL rule, not a destructive command.

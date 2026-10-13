@@ -60,7 +60,8 @@ func AdvancePendingRequest(ctx context.Context, database *db.DB, id string, opts
 			}
 		}
 
-		eligible := request.RiskTier == db.RiskTierCaution && request.MinApprovals == 0 && !request.RequireDifferentModel
+		eligible := request.RiskTier == db.RiskTierCaution && request.MinApprovals == 0 && !request.RequireDifferentModel &&
+			validateCommandCWD(request.Command.Cwd) == nil
 		classification := engine.ClassifyCommandSpec(request.Command)
 		eligible = eligible && !classification.ParseError && !classification.Opaque && !classification.HasUnmatchedSegment &&
 			(classification.Tier == RiskTierCaution || classification.IsSafe) &&

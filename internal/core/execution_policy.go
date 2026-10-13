@@ -94,6 +94,11 @@ func CheckExecutionPolicy(reader PolicyReader, request *db.Request, configPath s
 	if request == nil {
 		return errors.New("request is required for policy check")
 	}
+	// A legacy relative/empty cwd is not bound to the context reviewed at
+	// admission. Require a new request; never fill it from this executor.
+	if err := validateCommandCWD(request.Command.Cwd); err != nil {
+		return err
+	}
 	engine, err := LoadCommandPolicy(reader, config.LoadOptions{ProjectDir: request.ProjectPath, ConfigPath: configPath})
 	if err != nil {
 		return err

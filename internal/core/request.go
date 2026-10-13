@@ -20,7 +20,8 @@ type CreateRequestOptions struct {
 	SessionID string
 	// Command is the raw command string to execute.
 	Command string
-	// Cwd is the working directory for the command.
+	// Cwd is an absolute working directory. Empty captures the caller's
+	// current directory at admission, before classification and hash binding.
 	Cwd string
 	// Shell indicates if the command should be run through a shell.
 	Shell bool
@@ -190,8 +191,12 @@ func (rc *RequestCreator) createRequestOnce(ctx context.Context, opts CreateRequ
 	if err != nil {
 		return nil, fmt.Errorf("parsing requested command: %w", err)
 	}
+	cwd, err := bindCommandCWD(opts.Cwd)
+	if err != nil {
+		return nil, err
+	}
 	cmdSpec := db.CommandSpec{
-		Raw: opts.Command, Argv: argv, Cwd: opts.Cwd, Shell: opts.Shell,
+		Raw: opts.Command, Argv: argv, Cwd: cwd, Shell: opts.Shell,
 	}
 
 	// Step 4: Classify the same invocation used by preflight and execution.
