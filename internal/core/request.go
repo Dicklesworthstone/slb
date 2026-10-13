@@ -31,7 +31,8 @@ type CreateRequestOptions struct {
 	Attachments []db.Attachment
 	// RedactPatterns are custom patterns to redact from display.
 	RedactPatterns []string
-	// ProjectPath overrides the project path (defaults to session's project).
+	// ProjectPath defaults to the session's project. An explicit value must
+	// match that exact scope; it cannot transfer a session to another project.
 	ProjectPath string
 	// RequireDryRun refuses admission when a preview cannot complete successfully.
 	RequireDryRun bool
@@ -170,6 +171,18 @@ func (rc *RequestCreator) createRequestOnce(ctx context.Context, opts CreateRequ
 		return nil, ErrSessionInactive
 	}
 
+	// Validate scope before classification (including the SAFE shortcut),
+	// reviewer discovery, or external preflight tools. The database repeats
+	// this identity check at admission, but that is too late to prevent a
+	// rejected cross-project request from running its preview first.
+	projectPath := opts.ProjectPath
+	if projectPath == "" {
+		projectPath = session.ProjectPath
+	}
+	if projectPath == "" || projectPath != session.ProjectPath || session.AgentName == "" {
+		return nil, db.ErrRequestAdmissionIdentity
+	}
+
 	// Initialize notifier with project context if enabled.
 	notifier := rc.notifier
 	if rc.config != nil && rc.config.AgentMailEnabled {
@@ -234,12 +247,8 @@ func (rc *RequestCreator) createRequestOnce(ctx context.Context, opts CreateRequ
 	cmdSpec.DisplayRedacted = ApplyRedaction(opts.Command, opts.RedactPatterns)
 	cmdSpec.ContainsSensitive = cmdSpec.DisplayRedacted != opts.Command
 
-	// Resolve scope before counting: an empty override must not count agents
-	// in all projects. Distinct active agents exclude the requester identity.
-	projectPath := opts.ProjectPath
-	if projectPath == "" {
-		projectPath = session.ProjectPath
-	}
+	// Scope was validated before any classification or preflight. Distinct
+	// active agents in that project exclude the requester identity.
 	available, err := CountPolicyReviewers(rc.db, projectPath, session.ID, session.AgentName)
 	if err != nil {
 		return nil, fmt.Errorf("counting available reviewers: %w", err)

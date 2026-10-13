@@ -2,12 +2,135 @@ package core
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
+
+func TestCommandSpecAdmissionRejectsForeignProjectBeforeSafeShortcut(t *testing.T) {
+	for _, shell := range []bool{false, true} {
+		for _, command := range []string{"git stash", "git reset --hard HEAD~1"} {
+			t.Run(fmt.Sprintf("shell=%t/%s", shell, command), func(t *testing.T) {
+				database, original, session := policyExecutionFixture(t)
+				cfg := DefaultRequestCreatorConfig()
+				cfg.EnableDryRun, cfg.AgentMailEnabled = false, false
+				creator := NewRequestCreator(database, nil, NewPatternEngine(), cfg)
+				for _, project := range []string{t.TempDir(), original.ProjectPath + string(filepath.Separator) + "."} {
+					var before, after int
+					if err := database.QueryRow(`SELECT COUNT(*) FROM requests`).Scan(&before); err != nil {
+						t.Fatal(err)
+					}
+					result, err := creator.CreateRequest(CreateRequestOptions{
+						SessionID: session.ID, Command: command, Shell: shell,
+						Cwd: original.ProjectPath, ProjectPath: project,
+					})
+					if result != nil || !errors.Is(err, db.ErrRequestAdmissionIdentity) {
+						t.Fatalf("foreign scope acquired admission or a SAFE result: %+v %v", result, err)
+					}
+					if err := database.QueryRow(`SELECT COUNT(*) FROM requests`).Scan(&after); err != nil {
+						t.Fatal(err)
+					}
+					if after != before {
+						t.Fatalf("scope rejection inserted a request: %d -> %d", before, after)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestCommandSpecAdmissionRejectsForeignProjectBeforePreview(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX preview marker script")
+	}
+	for _, shell := range []bool{false, true} {
+		t.Run(fmt.Sprintf("shell=%t", shell), func(t *testing.T) {
+			database, original, session := policyExecutionFixture(t)
+			bin := t.TempDir()
+			marker := filepath.Join(bin, "preview-ran")
+			// Only the generated preview could reach this harmless fake Git.
+			// The requested reset is never executed by RequestCreator.
+			script := "#!/bin/sh\nprintf preview > '" + strings.ReplaceAll(marker, "'", `'\''`) + "'\n"
+			if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			cfg := DefaultRequestCreatorConfig()
+			cfg.EnableDryRun, cfg.AgentMailEnabled = true, false
+			creator := NewRequestCreator(database, nil, NewPatternEngine(), cfg)
+			result, err := creator.CreateRequest(CreateRequestOptions{
+				SessionID: session.ID, Command: "git reset --hard HEAD~1", Shell: shell,
+				Cwd: original.ProjectPath, ProjectPath: t.TempDir(), RequireDryRun: true,
+			})
+			if result != nil || !errors.Is(err, db.ErrRequestAdmissionIdentity) {
+				t.Fatalf("foreign scope was not rejected: %+v %v", result, err)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("rejected scope ran an external preview: %v", err)
+			}
+		})
+	}
+}
+
+func TestCommandSpecAdmissionRejectsUnscopedSession(t *testing.T) {
+	for _, query := range []string{
+		`UPDATE sessions SET project_path = '' WHERE id = ?`,
+		`UPDATE sessions SET agent_name = '' WHERE id = ?`,
+	} {
+		t.Run(query, func(t *testing.T) {
+			database, original, session := policyExecutionFixture(t)
+			if _, err := database.Exec(query, session.ID); err != nil {
+				t.Fatal(err)
+			}
+			cfg := DefaultRequestCreatorConfig()
+			cfg.EnableDryRun, cfg.AgentMailEnabled = false, false
+			creator := NewRequestCreator(database, nil, NewPatternEngine(), cfg)
+			result, err := creator.CreateRequest(CreateRequestOptions{
+				SessionID: session.ID, Command: "git stash", Cwd: original.ProjectPath,
+			})
+			if result != nil || !errors.Is(err, db.ErrRequestAdmissionIdentity) {
+				t.Fatalf("unscoped session acquired a SAFE result: %+v %v", result, err)
+			}
+		})
+	}
+}
+
+func TestCommandSpecAdmissionPreservesOwnProject(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		for _, command := range []string{"git stash", "git reset --hard HEAD~1"} {
+			t.Run(fmt.Sprintf("explicit=%t/%s", explicit, command), func(t *testing.T) {
+				database, original, session := policyExecutionFixture(t)
+				cfg := DefaultRequestCreatorConfig()
+				cfg.EnableDryRun, cfg.AgentMailEnabled = false, false
+				creator := NewRequestCreator(database, nil, NewPatternEngine(), cfg)
+				project := ""
+				if explicit {
+					project = original.ProjectPath
+				}
+				result, err := creator.CreateRequest(CreateRequestOptions{
+					SessionID: session.ID, Command: command, Cwd: original.ProjectPath, ProjectPath: project,
+				})
+				if err != nil || result == nil {
+					t.Fatalf("own project rejected: %+v %v", result, err)
+				}
+				if command == "git stash" {
+					if !result.Skipped || result.Request != nil {
+						t.Fatalf("SAFE behavior changed: %+v", result)
+					}
+				} else if result.Request == nil || result.Skipped || result.Request.ProjectPath != original.ProjectPath ||
+					result.Request.RiskTier != RiskTierDangerous || result.Request.MinApprovals != 1 {
+					t.Fatalf("own-project scope or quorum changed: %+v", result)
+				}
+			})
+		}
+	}
+}
 
 func TestCommandSpecAdmissionBindsWorkingDirectory(t *testing.T) {
 	database, _, session := policyExecutionFixture(t)
