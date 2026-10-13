@@ -40,6 +40,39 @@ func TestCommandSpecAdmissionBindsWorkingDirectory(t *testing.T) {
 	}
 }
 
+func TestCommandSpecAdmissionMissingCWDUsesHomeRootQuorum(t *testing.T) {
+	database, original, session := policyExecutionFixture(t)
+	t.Setenv("HOME", original.ProjectPath)
+	t.Setenv("USERPROFILE", original.ProjectPath)
+	t.Chdir(original.ProjectPath)
+	cfg := DefaultRequestCreatorConfig()
+	cfg.EnableDryRun, cfg.AgentMailEnabled = false, false
+	creator := NewRequestCreator(database, nil, NewPatternEngine(), cfg)
+	// These strings only enter classification/admission, never an executor.
+	for _, tc := range []struct {
+		command string
+		tier    RiskTier
+		quorum  int
+	}{
+		{"rm -rf .", RiskTierCritical, 2},
+		{"rm -rf build", RiskTierDangerous, 1},
+		{"rm -rf ./build", RiskTierDangerous, 1},
+		{"rm -f notes.txt", RiskTierCaution, 0},
+	} {
+		result, err := creator.CreateRequest(CreateRequestOptions{
+			SessionID: session.ID, Command: tc.command,
+			Justification: Justification{Reason: "test cwd-dependent approval requirements"},
+		})
+		if err != nil || result == nil || result.Request == nil {
+			t.Fatalf("%q: %+v %v", tc.command, result, err)
+		}
+		if result.Request.RiskTier != tc.tier || result.Request.MinApprovals != tc.quorum {
+			t.Fatalf("%q: tier=%s quorum=%d, want %s/%d", tc.command,
+				result.Request.RiskTier, result.Request.MinApprovals, tc.tier, tc.quorum)
+		}
+	}
+}
+
 func TestCommandSpecAdmissionRejectsPartialDirectInput(t *testing.T) {
 	for _, command := range []string{
 		"git stash; printf ignored", "git stash > ignored", "printf x | printf y",

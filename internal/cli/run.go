@@ -96,7 +96,7 @@ Examples:
 
 		cwd, err := os.Getwd()
 		if err != nil {
-			cwd = project
+			return fmt.Errorf("capturing command working directory: %w", err)
 		}
 
 		dbConn, err := db.OpenAndMigrate(GetDB())
@@ -117,11 +117,9 @@ Examples:
 			return writeError(cmd, out, "attachment_error", command, err)
 		}
 
-		// Merge the project's custom patterns into the default engine before
-		// classifying. CreateRequest (and runSafeCommand's re-check) classify
-		// against the default engine; without this, patterns added via
-		// `slb patterns add` are ignored and `run` classifies against builtins
-		// only, so a command the project marked dangerous could be auto-run.
+		// Merge project patterns before admission rather than classifying
+		// against builtins alone. The SAFE launch boundary independently
+		// reloads policy and session identity immediately before execution.
 		if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
 			return writeError(cmd, out, "custom_patterns_failed", command, err)
 		}
@@ -149,7 +147,7 @@ Examples:
 
 		// Step 2: If SAFE, execute immediately
 		if result.Skipped {
-			exitCode, err := runSafeCommand(cmd, out, command, cwd, project)
+			exitCode, err := runSafeCommandChecked(cmd, out, dbConn, command, cwd, project)
 			if err != nil {
 				return err
 			}
@@ -218,6 +216,18 @@ func approvalWaitDuration(seconds int) (time.Duration, error) {
 	return time.Duration(seconds) * time.Second, nil
 }
 
+// runSafeCommandChecked is the no-approval launch boundary. Recheck before
+// creating logs or entering the execution-only helper below; an admission-time
+// SAFE observation must not outlive the session or policy that produced it.
+func runSafeCommandChecked(cmd *cobra.Command, out *output.Writer, database *db.DB, command, cwd, project string) (int, error) {
+	spec := core.CommandSpec{Raw: command, Cwd: cwd, Shell: true}
+	if err := core.CheckSafeExecution(cmd.Context(), database, spec, project, flagSessionID, flagConfig); err != nil {
+		return -1, writeError(cmd, out, "safe_recheck_failed", command, err)
+	}
+	return runSafeCommand(cmd, out, command, cwd, project)
+}
+
+// runSafeCommand handles execution/output only, after runSafeCommandChecked.
 func runSafeCommand(cmd *cobra.Command, out *output.Writer, command, cwd, project string) (int, error) {
 	logPath, err := createRunLogFile(project, "safe")
 	if err != nil {
