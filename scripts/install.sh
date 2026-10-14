@@ -8,7 +8,7 @@ set -euo pipefail
 REPO="Dicklesworthstone/slb"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 BINARY="slb"
-DOWNLOADER_UA="OpenAI File Downloader, XaiImageApiFetch/1.0"
+DOWNLOADER_UA="slb-installer (+https://github.com/Dicklesworthstone/slb)"
 
 # Colors
 RED='\033[0;31m'
