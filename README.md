@@ -1090,55 +1090,67 @@ slb show <request-id> --with-reviews --with-execution --with-attachments
 
 ## Agent Mail Integration
 
-SLB integrates with MCP Agent Mail for cross-agent notifications.
+SLB can tell reviewers about requests through MCP Agent Mail. There are two
+routes, and there is no CLI command for sending a notification by hand: the
+notices follow request lifecycle changes.
 
-### Configuration
+### Request lifecycle notifications (daemon, recommended)
+
+Since v0.5.0 the project daemon can deliver committed request, review, status
+and execution changes from its request journal to Agent Mail (HTTP MCP) and/or a
+JSON webhook. Delivery survives daemon downtime and retries failed sends. It is
+opt-in and configured in the project's `.slb/config.toml`:
+
+```toml
+[notifications.requests]
+enabled = true
+agent_mail_url = "http://127.0.0.1:8765/mcp/"
+agent_mail_sender = "BlueLake"                     # an existing, registered identity
+agent_mail_recipients = ["GreenCastle", "RedStone"] # identities the sender may contact
+```
+
+- The Agent Mail project key is the daemon's absolute project path, and the
+  thread is `SLB-Requests`.
+- SLB does not register identities or change contact policies: the sender and
+  recipients must already exist in that project and be allowed to message each
+  other.
+- `integrations.agent_mail_enabled` does not turn this worker on; only
+  `[notifications.requests] enabled` does.
+- Restart the project daemon after changing these settings.
+- Notices carry request metadata (ID, risk tier, status, review counts, exit
+  code), never the command text or justification. Reviewers run
+  `slb review <request-id>` for the details.
+
+[docs/REQUEST_NOTIFICATIONS.md](docs/REQUEST_NOTIFICATIONS.md) covers webhooks,
+templates, retry and replay semantics. Alerts for commands that a hook blocked
+are a separate opt-in route, described in
+[docs/BLOCKED_NOTIFICATIONS.md](docs/BLOCKED_NOTIFICATIONS.md).
+
+### Legacy CLI notifications
+
+Without request-journal delivery, SLB sends a best-effort message when a request
+is created, approved, rejected or executed:
 
 ```toml
 [integrations]
-agent_mail_enabled = true
-agent_mail_thread = "SLB-Reviews"    # Default thread for notifications
+agent_mail_enabled = true            # default
+agent_mail_thread = "SLB-Reviews"    # default
 ```
 
-### Notification Events
+| Event | Importance |
+|-------|------------|
+| New CRITICAL request | urgent |
+| New DANGEROUS request | normal |
+| New CAUTION request | low |
+| Request approved | normal |
+| Request rejected | normal |
+| Request executed | low |
 
-| Event | Thread | Importance |
-|-------|--------|------------|
-| New CRITICAL request | SLB-Reviews | urgent |
-| New DANGEROUS request | SLB-Reviews | normal |
-| Request approved | SLB-Reviews | normal |
-| Request rejected | SLB-Reviews | normal |
-| Request executed | SLB-Reviews | low |
-| Request timeout/escalation | SLB-Reviews | urgent |
-
-### Message Format
-
-New request notification:
-```markdown
-## Command Approval Request
-
-**ID**: abc123
-**Risk**: CRITICAL
-**Command**: `rm -rf /etc`
-
-### Justification
-- Reason: Emergency cleanup
-- Expected: Remove config files
-- Goal: Reset system state
-- Safety: Backed up to S3
-
----
-To review: `slb review abc123`
-To approve: `slb approve abc123 --session-id <your-session>`
-```
-
-### Manual Notification
-
-Force send notification for a request:
-
-```bash
-slb notify <request-id> --via agent-mail
-```
+These messages are sent with the `mcp-agent-mail` CLI to `SLB-Broadcast` (sender
+`SLB-System` unless one is configured), with a two-second timeout. If that CLI is not installed they
+are skipped silently, and a failed send never blocks the request. Enabling
+`[notifications.requests]` turns this route off, so the journal worker is the
+single source of request notices.
 
 ## Output Formats
 
