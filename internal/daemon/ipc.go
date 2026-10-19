@@ -114,6 +114,10 @@ type IPCServer struct {
 
 	// Configure before Start; handlers never mutate the verifier.
 	verifier *Verifier
+
+	// hookPolicies caches compiled per-project hook policy (GH #24). Its zero
+	// value is ready to use.
+	hookPolicies hookPolicyCache
 }
 
 type subscriber struct {

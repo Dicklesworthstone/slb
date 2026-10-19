@@ -1,10 +1,12 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -25,30 +27,41 @@ type LoadOptions struct {
 // Load returns the effective configuration after applying precedence:
 // defaults < user (~/.slb/config.toml) < project (.slb/config.toml) < env (SLB_*) < flags.
 func Load(opts LoadOptions) (Config, error) {
+	sources, err := readSources(opts)
+	if err != nil {
+		return Config{}, err
+	}
+	return loadSources(sources, opts.FlagOverrides)
+}
+
+// LoadSources returns the configuration that Load returns for exactly the
+// inputs captured in sources. It reads nothing from disk or the environment.
+func LoadSources(sources Sources) (Config, error) {
+	if len(sources.env) != len(envBindings) {
+		return Config{}, errors.New("configuration sources were not read with ReadSources")
+	}
+	return loadSources(sources, nil)
+}
+
+func loadSources(sources Sources, flagOverrides map[string]any) (Config, error) {
 	v := viper.New()
 	setDefaults(v)
 
-	projectDir := opts.ProjectDir
-	if projectDir == "" {
-		if cwd, err := os.Getwd(); err == nil {
-			projectDir = cwd
+	// 1) User config, 2) project config
+	for _, file := range sources.files {
+		if !file.present {
+			continue
+		}
+		if err := mergeConfigData(v, file.path, file.data); err != nil {
+			return Config{}, err
 		}
 	}
-
-	// 1) User config
-	if err := mergeConfigFile(v, userConfigPath()); err != nil {
-		return Config{}, err
-	}
-	// 2) Project config
-	if err := mergeConfigFile(v, projectConfigPath(projectDir, opts.ConfigPath)); err != nil {
-		return Config{}, err
-	}
 	// 3) Environment variables
-	if err := applyEnvOverrides(v); err != nil {
+	if err := applyEnvValues(v, sources.env); err != nil {
 		return Config{}, err
 	}
 	// 4) CLI flags (highest)
-	applyFlagOverrides(v, opts.FlagOverrides)
+	applyFlagOverrides(v, flagOverrides)
 
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
@@ -127,30 +140,30 @@ func setTierDefaults(v *viper.Viper, prefix string, tier PatternTierConfig) {
 
 // mergeConfigFile merges the TOML config file if it exists.
 func mergeConfigFile(v *viper.Viper, path string) error {
-	if path == "" {
-		return nil
+	file, err := readSourceFile(path)
+	if err != nil || !file.present {
+		return err
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("stat config %s: %w", path, err)
-	}
-	if info.IsDir() {
-		return fmt.Errorf("config path %s is a directory", path)
-	}
+	return mergeConfigData(v, path, file.data)
+}
+
+// mergeConfigData merges a config file's content, typed by its extension as
+// viper's MergeInConfig would, without reading the file again.
+func mergeConfigData(v *viper.Viper, path string, data []byte) error {
 	v.SetConfigFile(path)
-	if err := v.MergeInConfig(); err != nil {
+	if kind := strings.TrimPrefix(filepath.Ext(path), "."); !slices.Contains(viper.SupportedExts, kind) {
+		return fmt.Errorf("merge config %s: %w", path, viper.UnsupportedConfigError(kind))
+	}
+	if err := v.MergeConfig(bytes.NewReader(data)); err != nil {
 		return fmt.Errorf("merge config %s: %w", path, err)
 	}
 	return nil
 }
 
-// applyEnvOverrides reads SLB_* env vars and applies them.
-func applyEnvOverrides(v *viper.Viper) error {
-	for _, binding := range envBindings {
-		val := os.Getenv(binding.Env)
+// applyEnvValues applies SLB_* values captured in envBindings order.
+func applyEnvValues(v *viper.Viper, values []string) error {
+	for i, binding := range envBindings {
+		val := values[i]
 		if val == "" {
 			continue
 		}
@@ -168,6 +181,101 @@ func applyFlagOverrides(v *viper.Viper, overrides map[string]any) {
 	for k, val := range overrides {
 		v.Set(k, val)
 	}
+}
+
+// Sources holds every external input that Load reads for one LoadOptions
+// without FlagOverrides: the user and project config files (content or
+// absence) and the SLB_* environment overrides. LoadSources of equal
+// Sources yields an equal configuration, so a caller may keep a result, and
+// anything compiled from it, for as long as freshly read Sources stay Equal.
+type Sources struct {
+	files [2]sourceFile
+	env   []string
+}
+
+type sourceFile struct {
+	path    string
+	present bool
+	data    []byte
+}
+
+// ReadSources reads the inputs Load would read for opts. Pass the result to
+// LoadSources to parse exactly those bytes, so that a cached configuration
+// can never come from content other than the snapshot it is compared by.
+func ReadSources(opts LoadOptions) (Sources, error) {
+	if len(opts.FlagOverrides) > 0 {
+		return Sources{}, errors.New("flag overrides are not configuration sources")
+	}
+	return readSources(opts)
+}
+
+func readSources(opts LoadOptions) (Sources, error) {
+	projectDir := opts.ProjectDir
+	if projectDir == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			projectDir = cwd
+		}
+	}
+	var sources Sources
+	for i, path := range [2]string{userConfigPath(), projectConfigPath(projectDir, opts.ConfigPath)} {
+		file, err := readSourceFile(path)
+		if err != nil {
+			return Sources{}, err
+		}
+		sources.files[i] = file
+	}
+	sources.env = make([]string, len(envBindings))
+	for i, binding := range envBindings {
+		sources.env[i] = os.Getenv(binding.Env)
+	}
+	return sources, nil
+}
+
+// readSourceFile reads one config file: a missing file (or no path) is
+// absent, and a directory is an error.
+func readSourceFile(path string) (sourceFile, error) {
+	file := sourceFile{path: path}
+	if path == "" {
+		return file, nil
+	}
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return file, nil
+	}
+	if err != nil {
+		return sourceFile{}, fmt.Errorf("stat config %s: %w", path, err)
+	}
+	if info.IsDir() {
+		return sourceFile{}, fmt.Errorf("config path %s is a directory", path)
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return file, nil
+	}
+	if err != nil {
+		return sourceFile{}, fmt.Errorf("read config %s: %w", path, err)
+	}
+	file.present, file.data = true, data
+	return file, nil
+}
+
+// Equal reports whether two reads found exactly the same inputs.
+func (s Sources) Equal(other Sources) bool {
+	if len(s.env) != len(other.env) {
+		return false
+	}
+	for i := range s.files {
+		a, b := s.files[i], other.files[i]
+		if a.path != b.path || a.present != b.present || !bytes.Equal(a.data, b.data) {
+			return false
+		}
+	}
+	for i := range s.env {
+		if s.env[i] != other.env[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ConfigPaths returns the user and project config file paths.

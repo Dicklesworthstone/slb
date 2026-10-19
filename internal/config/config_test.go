@@ -150,6 +150,119 @@ func TestMergeConfigFile(t *testing.T) {
 	}
 }
 
+func TestReadSourcesTracksEveryLoadInput(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("SLB_HOOK_CAUTION_ACTION", "")
+	project := t.TempDir()
+	opts := LoadOptions{ProjectDir: project}
+	read := func() Sources {
+		t.Helper()
+		sources, err := ReadSources(opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sources
+	}
+	write := func(path, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	base := read()
+	if !base.Equal(read()) {
+		t.Fatal("two reads of unchanged inputs differ")
+	}
+	projectConfig := filepath.Join(project, ".slb", "config.toml")
+	userConfig := filepath.Join(home, ".slb", "config.toml")
+	steps := []struct {
+		name   string
+		change func()
+	}{
+		{"empty project config appears", func() { write(projectConfig, "") }},
+		{"project config edited", func() { write(projectConfig, "[general]\nmin_approvals = 3\n") }},
+		{"same-length project edit", func() { write(projectConfig, "[general]\nmin_approvals = 4\n") }},
+		{"user config appears", func() { write(userConfig, "[general]\nmin_approvals = 2\n") }},
+		{"environment override set", func() { t.Setenv("SLB_HOOK_CAUTION_ACTION", "ask") }},
+	}
+	previous := base
+	for _, step := range steps {
+		step.change()
+		current := read()
+		if current.Equal(previous) {
+			t.Fatalf("%s: change not detected", step.name)
+		}
+		previous = current
+	}
+
+	if _, err := ReadSources(LoadOptions{ProjectDir: project, FlagOverrides: map[string]any{"general.min_approvals": 5}}); err == nil {
+		t.Fatal("flag overrides were accepted although Sources cannot represent them")
+	}
+	broken := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(broken, ".slb", "config.toml"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadSources(LoadOptions{ProjectDir: broken}); err == nil {
+		t.Fatal("a directory at the project config path was read as absent")
+	}
+}
+
+func TestLoadSourcesParsesTheSnapshotItWasGiven(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("SLB_MIN_APPROVALS", "")
+	project := t.TempDir()
+	projectConfig := filepath.Join(project, ".slb", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(projectConfig), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(projectConfig, []byte("[general]\nmin_approvals = 3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts := LoadOptions{ProjectDir: project}
+	sources, err := ReadSources(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct, err := Load(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := LoadSources(sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(direct, snapshot) {
+		t.Fatalf("LoadSources disagrees with Load:\n%+v\n%+v", snapshot, direct)
+	}
+
+	// Later edits and environment changes do not leak into the snapshot.
+	if err := os.WriteFile(projectConfig, []byte("[general]\nmin_approvals = 5\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SLB_MIN_APPROVALS", "4")
+	again, err := LoadSources(sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.General.MinApprovals != 3 {
+		t.Fatalf("snapshot reloaded live inputs: min_approvals = %d", again.General.MinApprovals)
+	}
+	if live, err := Load(opts); err != nil || live.General.MinApprovals != 4 {
+		t.Fatalf("live load = %d, %v; want the environment override 4", live.General.MinApprovals, err)
+	}
+	if _, err := LoadSources(Sources{}); err == nil {
+		t.Fatal("an empty Sources value was loaded as if it had been read")
+	}
+}
+
 func newTestViper() *viper.Viper {
 	// Keep this in a helper to avoid importing viper in every test.
 	// It also ensures defaults are seeded, mirroring Load().

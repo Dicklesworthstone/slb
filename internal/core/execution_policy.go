@@ -43,27 +43,48 @@ func loadCommandPolicy(reader PolicyReader, opts config.LoadOptions) (*PatternEn
 	}
 	var patterns []Pattern
 	if reader != nil {
-		rows, err := reader.Query(`SELECT tier, pattern, COALESCE(description, ''), COALESCE(source, '') FROM custom_patterns ORDER BY id`)
-		if err != nil {
-			return nil, cfg, fmt.Errorf("reading custom command policy: %w", err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var p Pattern
-			if err := rows.Scan(&p.Tier, &p.Pattern, &p.Description, &p.Source); err != nil {
-				return nil, cfg, fmt.Errorf("reading custom command policy row: %w", err)
-			}
-			patterns = append(patterns, p)
-		}
-		if err := rows.Err(); err != nil {
-			return nil, cfg, fmt.Errorf("reading custom command policy: %w", err)
+		if patterns, err = ReadCustomPatterns(reader); err != nil {
+			return nil, cfg, err
 		}
 	}
-	engine := &PatternEngine{}
-	if _, err := engine.ReplacePolicy(cfg, patterns, opts.ConfigPath); err != nil {
+	engine, err := CompileCommandPolicy(cfg, patterns, opts.ConfigPath)
+	if err != nil {
 		return nil, cfg, err
 	}
 	return engine, cfg, nil
+}
+
+// ReadCustomPatterns returns the persisted custom rules in stored order,
+// uncompiled. Only Tier, Pattern, Description and Source are set.
+func ReadCustomPatterns(reader PolicyReader) ([]Pattern, error) {
+	rows, err := reader.Query(`SELECT tier, pattern, COALESCE(description, ''), COALESCE(source, '') FROM custom_patterns ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("reading custom command policy: %w", err)
+	}
+	defer rows.Close()
+	var patterns []Pattern
+	for rows.Next() {
+		var p Pattern
+		if err := rows.Scan(&p.Tier, &p.Pattern, &p.Description, &p.Source); err != nil {
+			return nil, fmt.Errorf("reading custom command policy row: %w", err)
+		}
+		patterns = append(patterns, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading custom command policy: %w", err)
+	}
+	return patterns, nil
+}
+
+// CompileCommandPolicy compiles a loaded configuration together with the
+// custom rules from ReadCustomPatterns into a new engine. It never retains
+// or modifies custom.
+func CompileCommandPolicy(cfg config.Config, custom []Pattern, configPath string) (*PatternEngine, error) {
+	engine := &PatternEngine{}
+	if _, err := engine.ReplacePolicy(cfg, custom, configPath); err != nil {
+		return nil, err
+	}
+	return engine, nil
 }
 
 // CountPolicyReviewers counts independent, active identities only in the

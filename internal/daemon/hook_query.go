@@ -3,9 +3,11 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/audit"
@@ -92,61 +94,258 @@ func recordHookAudit(directory string, params HookQueryParams, result *HookQuery
 	})
 }
 
-// loadHookPolicy loads a fresh, project-local effective policy. A global
-// mutable engine would miss edits or leak another project's allowlist.
-func loadHookPolicy(cwd string) (*core.PatternEngine, *db.DB, string, error) {
+// hookPolicy is the effective, project-local policy for one hook query.
+type hookPolicy struct {
+	engine        *core.PatternEngine
+	cautionAction string
+	// statePath is the project's state database, or empty before `slb init`.
+	statePath string
+}
+
+// hookPolicyCache keeps each project's compiled policy between hook queries
+// (GH #24). Building it from scratch costs a config parse, a SQLite open and
+// a regexp compilation per built-in and configured pattern, and the garbage
+// from that work drove a GC cycle per query. Every query still revalidates every input the policy
+// was built from, so an edit is never missed and one project's rules never
+// leak into another's:
+//   - the user and project config files, compared byte for byte and parsed
+//     from the compared bytes, and the SLB_* overrides (config.Sources);
+//   - the custom_patterns table, re-read only when the state database or
+//     its WAL changed on disk, or when the last read raced a write.
+//
+// Entries are immutable once stored, so concurrent queries share an engine
+// without holding the cache lock while they classify.
+type hookPolicyCache struct {
+	mu      sync.Mutex
+	entries map[string]*cachedHookPolicy
+}
+
+// maxCachedHookPolicies bounds the cache for a daemon that answers hooks for
+// many projects; past it an arbitrary entry is dropped and rebuilt on demand.
+const maxCachedHookPolicies = 64
+
+// hookStateRacyWindow covers coarse filesystem clocks (down to FAT's two
+// seconds). A state file modified this close to the moment it was examined
+// may be written again within the same timestamp tick, so the next query
+// re-reads custom_patterns instead of trusting the unchanged stat (the rule
+// Git applies to racily clean index entries).
+const hookStateRacyWindow = 3 * time.Second
+
+type cachedHookPolicy struct {
+	sources  config.Sources
+	cfg      config.Config
+	hasState bool
+	state    stateStamp
+	custom   []core.Pattern
+	policy   hookPolicy
+}
+
+// stateStamp records the state database and its WAL as last examined.
+type stateStamp struct {
+	db, wal fileStamp
+	// racy means a timestamp fell inside hookStateRacyWindow of the moment
+	// the stamp was taken, so equality with a later stamp proves nothing.
+	racy bool
+}
+
+type fileStamp struct {
+	info  os.FileInfo // nil when the file does not exist
+	size  int64
+	mtime time.Time
+}
+
+func statFileStamp(path string) (fileStamp, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return fileStamp{}, nil
+	}
+	if err != nil {
+		return fileStamp{}, err
+	}
+	return fileStamp{info: info, size: info.Size(), mtime: info.ModTime()}, nil
+}
+
+func (f fileStamp) equal(other fileStamp) bool {
+	if f.info == nil || other.info == nil {
+		return f.info == nil && other.info == nil
+	}
+	return os.SameFile(f.info, other.info) && f.size == other.size && f.mtime.Equal(other.mtime)
+}
+
+func statState(path string) (stateStamp, error) {
+	// Take the reference time before the stats: any write after them gets a
+	// timestamp at or after this instant, minus the clock's coarseness.
+	examined := time.Now()
+	dbStamp, err := statFileStamp(path)
+	if err != nil {
+		return stateStamp{}, err
+	}
+	walStamp, err := statFileStamp(path + "-wal")
+	if err != nil {
+		return stateStamp{}, err
+	}
+	horizon := examined.Add(-hookStateRacyWindow)
+	racy := false
+	for _, f := range []fileStamp{dbStamp, walStamp} {
+		if f.info != nil && !f.mtime.Before(horizon) {
+			racy = true
+		}
+	}
+	return stateStamp{db: dbStamp, wal: walStamp, racy: racy}, nil
+}
+
+func (s stateStamp) unchangedSince(previous stateStamp) bool {
+	return !previous.racy && s.db.equal(previous.db) && s.wal.equal(previous.wal)
+}
+
+func customPatternsEqual(a, b []core.Pattern) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Tier != b[i].Tier || a[i].Pattern != b[i].Pattern ||
+			a[i].Description != b[i].Description || a[i].Source != b[i].Source {
+			return false
+		}
+	}
+	return true
+}
+
+func readHookCustomPatterns(path string) ([]core.Pattern, error) {
+	conn, err := db.OpenWithOptions(path, db.OpenOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return core.ReadCustomPatterns(conn)
+}
+
+// policyFor returns the effective policy for a hook query's cwd, reusing the
+// cached compilation when none of its inputs changed.
+func (c *hookPolicyCache) policyFor(cwd string) (hookPolicy, error) {
 	if cwd == "" {
-		return core.NewPatternEngine(), nil, "", nil
+		return hookPolicy{engine: core.NewPatternEngine(), cautionAction: "block"}, nil
 	}
 	if !filepath.IsAbs(cwd) {
-		return nil, nil, "", fmt.Errorf("hook cwd must be absolute")
+		return hookPolicy{}, fmt.Errorf("hook cwd must be absolute")
 	}
 	root := projectRootForSocket(cwd)
 	opts := config.LoadOptions{ProjectDir: root}
+	hasState := true
 	if _, err := os.Stat(filepath.Join(root, ".slb")); os.IsNotExist(err) {
-		engine, loadErr := core.LoadCommandPolicy(nil, opts)
-		return engine, nil, "", loadErr
+		hasState = false
 	} else if err != nil {
-		return nil, nil, "", err
+		return hookPolicy{}, err
 	}
-	path := filepath.Join(root, ".slb", "state.db")
-	conn, err := db.OpenWithOptions(path, db.OpenOptions{ReadOnly: true})
+	statePath := ""
+	if hasState {
+		statePath = filepath.Join(root, ".slb", "state.db")
+	}
+	// The configuration is parsed from these very bytes (LoadSources), so a
+	// cached policy always matches the snapshot it is compared by.
+	sources, err := config.ReadSources(opts)
 	if err != nil {
-		return nil, nil, "", err
+		c.forget(root)
+		return hookPolicy{}, err
 	}
-	engine, err := core.LoadCommandPolicy(conn, opts)
-	if err != nil {
-		conn.Close()
-		return nil, nil, "", err
+	var state stateStamp
+	if hasState {
+		if state, err = statState(statePath); err != nil {
+			c.forget(root)
+			return hookPolicy{}, err
+		}
 	}
-	return engine, conn, path, nil
+
+	cached := c.lookup(root)
+	var entry *cachedHookPolicy
+	switch {
+	case cached != nil && cached.hasState == hasState && cached.sources.Equal(sources) &&
+		(!hasState || state.unchangedSince(cached.state)):
+		return cached.policy, nil
+	case cached != nil && cached.hasState == hasState && cached.sources.Equal(sources):
+		// Only the state database moved. Most writes there are requests and
+		// reviews; recompile only if the custom rules themselves changed.
+		custom, err := readHookCustomPatterns(statePath)
+		if err != nil {
+			c.forget(root)
+			return hookPolicy{}, err
+		}
+		next := *cached
+		next.state, next.custom = state, custom
+		if !customPatternsEqual(custom, cached.custom) {
+			engine, err := core.CompileCommandPolicy(cached.cfg, custom, "")
+			if err != nil {
+				c.forget(root)
+				return hookPolicy{}, err
+			}
+			next.policy.engine = engine
+		}
+		entry = &next
+	default:
+		cfg, err := config.LoadSources(sources)
+		if err != nil {
+			c.forget(root)
+			return hookPolicy{}, fmt.Errorf("loading command policy: %w", err)
+		}
+		var custom []core.Pattern
+		if hasState {
+			if custom, err = readHookCustomPatterns(statePath); err != nil {
+				c.forget(root)
+				return hookPolicy{}, err
+			}
+		}
+		engine, err := core.CompileCommandPolicy(cfg, custom, "")
+		if err != nil {
+			c.forget(root)
+			return hookPolicy{}, err
+		}
+		entry = &cachedHookPolicy{
+			sources: sources, cfg: cfg, hasState: hasState, state: state, custom: custom,
+			policy: hookPolicy{engine: engine, cautionAction: cfg.Integrations.HookCautionAction, statePath: statePath},
+		}
+	}
+	c.store(root, entry)
+	return entry.policy, nil
+}
+
+func (c *hookPolicyCache) lookup(root string) *cachedHookPolicy {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.entries[root]
+}
+
+func (c *hookPolicyCache) store(root string, entry *cachedHookPolicy) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[string]*cachedHookPolicy)
+	}
+	if _, ok := c.entries[root]; !ok && len(c.entries) >= maxCachedHookPolicies {
+		for evict := range c.entries {
+			delete(c.entries, evict)
+			break
+		}
+	}
+	c.entries[root] = entry
+}
+
+// forget drops a project's entry after a failed load so that a broken policy
+// is rebuilt, and fails closed again, on every query until it is repaired.
+func (c *hookPolicyCache) forget(root string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, root)
 }
 
 func (s *IPCServer) classifyCommand(params HookQueryParams) *HookQueryResult {
-	engine, conn, dbPath, err := loadHookPolicy(params.CWD)
+	policy, err := s.hookPolicies.policyFor(params.CWD)
 	if err != nil {
 		return &HookQueryResult{
 			Action: "block", Tier: "unknown", MatchedPattern: "policy_load_error",
 			Message: "SLB: project policy could not be loaded; command blocked until policy is repaired.",
 		}
 	}
-	cautionAction := "block"
-	if params.CWD != "" {
-		cfg, cfgErr := config.Load(config.LoadOptions{ProjectDir: projectRootForSocket(params.CWD)})
-		if cfgErr != nil {
-			if conn != nil {
-				conn.Close()
-			}
-			return &HookQueryResult{
-				Action: "block", Tier: "unknown", MatchedPattern: "policy_load_error",
-				Message: "SLB: hook policy could not be loaded; command blocked until policy is repaired.",
-			}
-		}
-		cautionAction = cfg.Integrations.HookCautionAction
-	}
-	if conn != nil {
-		defer conn.Close()
-	}
+	engine, cautionAction := policy.engine, policy.cautionAction
 	classification := engine.ClassifyCommand(params.Command, params.CWD)
 	result := &HookQueryResult{
 		Tier: string(classification.Tier), MatchedPattern: classification.MatchedPattern,
@@ -172,9 +371,15 @@ func (s *IPCServer) classifyCommand(params HookQueryParams) *HookQueryResult {
 		return result
 	}
 
-	if conn == nil || params.SessionID == "" {
+	if policy.statePath == "" || params.SessionID == "" {
 		return result
 	}
+	// Only a command that needs approval reaches the database here.
+	conn, err := db.OpenWithOptions(policy.statePath, db.OpenOptions{ReadOnly: true})
+	if err != nil {
+		return result
+	}
+	defer conn.Close()
 	approved := findHookApproval(conn, engine, params, classification.MinApprovals)
 	if approved == nil {
 		return result
@@ -186,7 +391,7 @@ func (s *IPCServer) classifyCommand(params HookQueryParams) *HookQueryResult {
 		result.Action = "execute"
 		result.ExecutionHandoff = &HookExecutionHandoff{
 			RequestID: approved.ID, CommandHash: approved.Command.Hash,
-			SessionID: params.SessionID, DatabasePath: dbPath,
+			SessionID: params.SessionID, DatabasePath: policy.statePath,
 		}
 	}
 	// Old clients must never get a raw-shell permit from this lookup.
@@ -239,36 +444,21 @@ func (s *IPCServer) handleHookHealth(req RPCRequest) *RPCResponse {
 	now := time.Now().UTC()
 	engine := core.GetDefaultEngine()
 	cautionAction := config.DefaultConfig().Integrations.HookCautionAction
-	var policyConn *db.DB
 	if len(req.Params) != 0 {
 		var params HookHealthParams
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			return &RPCResponse{Error: &Error{Code: ErrCodeInvalidParams, Message: "invalid params: " + err.Error()}, ID: req.ID}
 		}
 		if params.CWD != "" {
-			fresh, conn, _, err := loadHookPolicy(params.CWD)
+			policy, err := s.hookPolicies.policyFor(params.CWD)
 			if err != nil {
 				return &RPCResponse{Result: HookHealthResult{
 					Status: "degraded", Uptime: int64(time.Since(s.startTime).Seconds()),
 					ServerTime: now.Format(time.RFC3339), PolicyError: err.Error(),
 				}, ID: req.ID}
 			}
-			engine, policyConn = fresh, conn
-			cfg, cfgErr := config.Load(config.LoadOptions{ProjectDir: projectRootForSocket(params.CWD)})
-			if cfgErr != nil {
-				if policyConn != nil {
-					policyConn.Close()
-				}
-				return &RPCResponse{Result: HookHealthResult{
-					Status: "degraded", Uptime: int64(time.Since(s.startTime).Seconds()),
-					ServerTime: now.Format(time.RFC3339), PolicyError: cfgErr.Error(),
-				}, ID: req.ID}
-			}
-			cautionAction = cfg.Integrations.HookCautionAction
+			engine, cautionAction = policy.engine, policy.cautionAction
 		}
-	}
-	if policyConn != nil {
-		defer policyConn.Close()
 	}
 	export := engine.Export()
 	result := HookHealthResult{
