@@ -42,6 +42,20 @@ func init() {
 var daemonCmd = &cobra.Command{
 	Use:   "daemon",
 	Short: "Manage the SLB daemon",
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		// Override the root command's -C handling: resolve a relative flag or
+		// SLB_PROJECT once, before changing directory, then keep the absolute
+		// project root for every lifecycle command.
+		project, err := daemonProjectPath()
+		if err != nil {
+			return err
+		}
+		if err := os.Chdir(project); err != nil {
+			return fmt.Errorf("chdir to project: %w", err)
+		}
+		flagProject = project
+		return nil
+	},
 }
 
 var daemonStartCmd = &cobra.Command{
@@ -52,12 +66,9 @@ var daemonStartCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		if err := os.Chdir(project); err != nil {
-			return fmt.Errorf("chdir to project: %w", err)
-		}
-
 		startedAt := time.Now().UTC().Format(time.RFC3339)
-		socketPath := daemon.DefaultSocketPath()
+		opts := daemon.ServerOptions{ProjectDir: project}
+		socketPath := daemon.SocketPathForCWD(project)
 
 		if flagDaemonStartForeground {
 			out := output.New(output.Format(GetOutput()))
@@ -67,14 +78,18 @@ var daemonStartCmd = &cobra.Command{
 				"started_at":  startedAt,
 				"foreground":  true,
 			})
-			return daemon.RunDaemon(context.Background(), daemon.DefaultServerOptions())
+			return daemon.RunDaemon(context.Background(), opts)
 		}
 
-		if err := daemon.StartDaemon(); err != nil {
+		if err := daemon.StartDaemonWithOptions(context.Background(), opts); err != nil {
 			return err
 		}
 
-		info := daemon.NewClient().GetStatusInfo()
+		info := daemon.NewClient(
+			daemon.WithSocketPath(socketPath),
+			daemon.WithPIDFile(daemon.PIDFileForCWD(project)),
+			daemon.WithLocalOnly(),
+		).GetStatusInfo()
 		out := output.New(output.Format(GetOutput()))
 		return out.Write(map[string]any{
 			"pid":         info.PID,
@@ -89,12 +104,16 @@ var daemonStopCmd = &cobra.Command{
 	Use:   "stop",
 	Short: "Stop the daemon",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		project, err := daemonProjectPath()
+		if err != nil {
+			return err
+		}
 		timeout := time.Duration(flagDaemonStopTimeoutSecs) * time.Second
 		if timeout <= 0 {
 			timeout = 10 * time.Second
 		}
 
-		if err := daemon.StopDaemon(timeout); err != nil {
+		if err := daemon.StopDaemonWithOptions(daemon.ServerOptions{ProjectDir: project}, timeout); err != nil {
 			return err
 		}
 
@@ -113,11 +132,11 @@ var daemonStatusCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		if err := os.Chdir(project); err != nil {
-			return fmt.Errorf("chdir to project: %w", err)
-		}
-
-		client := daemon.NewClient()
+		client := daemon.NewClient(
+			daemon.WithSocketPath(daemon.SocketPathForCWD(project)),
+			daemon.WithPIDFile(daemon.PIDFileForCWD(project)),
+			daemon.WithLocalOnly(),
+		)
 		info := client.GetStatusInfo()
 
 		// Best-effort uptime based on pid file mtime.
@@ -189,13 +208,35 @@ var daemonLogsCmd = &cobra.Command{
 }
 
 func daemonProjectPath() (string, error) {
-	if flagProject != "" {
-		return flagProject, nil
+	project := flagProject
+	if project == "" {
+		project = os.Getenv("SLB_PROJECT")
 	}
-	if env := os.Getenv("SLB_PROJECT"); env != "" {
-		return env, nil
+	if project == "" {
+		var err error
+		project, err = os.Getwd()
+		if err != nil {
+			return "", err
+		}
 	}
-	return os.Getwd()
+	abs, err := filepath.Abs(project)
+	if err != nil {
+		return "", fmt.Errorf("resolving daemon project: %w", err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("resolving daemon project: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("daemon project is not a directory: %s", abs)
+	}
+	// Match the physical working directory used after -C, including aliases
+	// that point into a project's descendants rather than its root.
+	abs, err = filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("resolving daemon project: %w", err)
+	}
+	return daemon.ProjectRootForCWD(abs), nil
 }
 
 func daemonProjectStats(projectPath string) (pendingCount int, activeSessions int) {

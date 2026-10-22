@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
@@ -389,6 +391,51 @@ func TestClient_GetStatusInfo_SLBHostTCP(t *testing.T) {
 	if info.PIDFile != "" {
 		t.Fatalf("expected PIDFile empty for TCP mode, got %q", info.PIDFile)
 	}
+
+	t.Run("local-only missing daemon", func(t *testing.T) {
+		dir := t.TempDir()
+		local := NewClient(
+			WithSocketPath(filepath.Join(dir, "missing.sock")),
+			WithPIDFile(filepath.Join(dir, "missing.pid")),
+			WithLocalOnly(),
+		)
+		if status := local.GetStatus(); status != DaemonNotRunning {
+			t.Fatalf("local status inherited remote daemon: %s", status)
+		}
+		info := local.GetStatusInfo()
+		if info.Status != DaemonNotRunning || info.SocketAlive || info.SocketPath != local.socketPath || info.PIDFile != local.pidFile {
+			t.Fatalf("local diagnostics inherited remote daemon: %+v", info)
+		}
+	})
+
+	t.Run("local-only running daemon", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("unix socket tests not supported on windows")
+		}
+		socketPath := filepath.Join(shortSocketDir(t), "local.sock")
+		localServer, err := NewIPCServer(socketPath, logger)
+		if err != nil {
+			t.Fatal(err)
+		}
+		localCtx, stop := context.WithCancel(context.Background())
+		t.Cleanup(func() {
+			stop()
+			_ = localServer.Stop()
+		})
+		go func() { _ = localServer.Start(localCtx) }()
+		pidFile := filepath.Join(t.TempDir(), "local.pid")
+		if err := writePIDFile(pidFile, os.Getpid()); err != nil {
+			t.Fatal(err)
+		}
+		local := NewClient(WithSocketPath(socketPath), WithPIDFile(pidFile), WithLocalOnly())
+		if status := local.GetStatus(); status != DaemonRunning {
+			t.Fatalf("local status=%s, want running", status)
+		}
+		info := local.GetStatusInfo()
+		if info.Status != DaemonRunning || !info.SocketAlive || info.PID != os.Getpid() || info.SocketPath != socketPath || info.PIDFile != pidFile {
+			t.Fatalf("local diagnostics did not identify the local daemon: %+v", info)
+		}
+	})
 }
 
 func TestClient_GetStatusInfo_SLBHostFallbackToUnix(t *testing.T) {
@@ -702,43 +749,34 @@ func TestWatcher_ErrorsChannelAndSendError(t *testing.T) {
 	w2.sendError(errors.New("dropped"))
 }
 
-func TestStartDaemonWithOptions_ForkPath_WritesPIDFile(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("process spawning not supported in this test on windows")
-	}
-
-	truePath, err := exec.LookPath("true")
-	if err != nil {
-		t.Skip("true not available")
-	}
-
+func TestStartDaemonWithOptions_ForkPath_RejectsChildThatExitsBeforeReady(t *testing.T) {
 	origArgs := append([]string(nil), os.Args...)
 	t.Cleanup(func() { os.Args = origArgs })
-	os.Args = []string{truePath}
+	// Re-executing this test binary with a CLI project flag exits without
+	// serving. The parent must not report startup or publish a PID record.
+	os.Args = []string{os.Args[0], "-test.run=^$"}
 
 	tmp := t.TempDir()
 	pidFile := filepath.Join(tmp, "daemon.pid")
 
 	t.Setenv(daemonModeEnv, "")
 
-	if err := StartDaemonWithOptions(context.Background(), ServerOptions{
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := StartDaemonWithOptions(ctx, ServerOptions{
 		SocketPath: filepath.Join(tmp, "daemon.sock"),
 		PIDFile:    pidFile,
 		Logger:     log.New(io.Discard),
-	}); err != nil {
-		t.Fatalf("StartDaemonWithOptions: %v", err)
+	}); err == nil {
+		t.Fatal("startup succeeded for a child that exited without serving")
 	}
 
-	b, err := os.ReadFile(pidFile)
-	if err != nil {
-		t.Fatalf("read pid file: %v", err)
-	}
-	if strings.TrimSpace(string(b)) == "" {
-		t.Fatalf("expected pid file to contain pid")
+	if _, err := os.Stat(pidFile); !os.IsNotExist(err) {
+		t.Fatalf("failed startup published a PID file: %v", err)
 	}
 }
 
-func TestStopDaemonWithOptions_StopsProcessAndRemovesPIDFile(t *testing.T) {
+func TestStopDaemonWithOptions_RefusesUnverifiedProcess(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unix signal tests not supported on windows")
 	}
@@ -758,24 +796,32 @@ func TestStopDaemonWithOptions_StopsProcessAndRemovesPIDFile(t *testing.T) {
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
+		select {
+		case <-waitCh:
+		case <-time.After(2 * time.Second):
+			t.Error("test child was not reaped")
+		}
 	})
 
 	tmp := t.TempDir()
 	pidFile := filepath.Join(tmp, "daemon.pid")
-	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(cmd.Process.Pid)+"\n"), 0644); err != nil {
+	pidContents := strconv.Itoa(cmd.Process.Pid) + "\n"
+	if err := os.WriteFile(pidFile, []byte(pidContents), 0600); err != nil {
 		t.Fatalf("write pid file: %v", err)
 	}
 
-	if err := StopDaemonWithOptions(ServerOptions{PIDFile: pidFile}, 2*time.Second); err != nil {
-		t.Fatalf("StopDaemonWithOptions: %v", err)
+	if err := StopDaemonWithOptions(ServerOptions{
+		SocketPath: filepath.Join(tmp, "missing.sock"),
+		PIDFile:    pidFile,
+	}, 100*time.Millisecond); err == nil {
+		t.Fatal("stop trusted a PID without a matching daemon socket")
 	}
-	select {
-	case <-waitCh:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("expected child process to be reaped")
+	if !processAlive(cmd.Process.Pid) {
+		t.Fatal("stop signalled the unrelated process")
 	}
-	if _, err := os.Stat(pidFile); !os.IsNotExist(err) {
-		t.Fatalf("expected pid file removed after stop")
+	contents, err := os.ReadFile(pidFile)
+	if err != nil || string(contents) != pidContents {
+		t.Fatalf("stop modified an unverified PID file: contents=%q err=%v", contents, err)
 	}
 }
 
@@ -1419,7 +1465,7 @@ func TestDefaultSocketPath_WalksUpToProjectRoot(t *testing.T) {
 // raw-CWD hashing so v0.3.x setups (no slb init) still get consistent
 // socket names within a single CWD.
 //
-// Tests projectRootForSocket directly (instead of going through
+// Tests ProjectRootForCWD directly (instead of going through
 // DefaultSocketPath + chdir) because t.TempDir's ancestor chain
 // reaches /tmp, which on a developer machine could plausibly
 // contain a `.slb/` from a prior test or experiment — that would
@@ -1445,7 +1491,7 @@ func TestProjectRootForSocket_FallbackWhenNoAncestorMatches(t *testing.T) {
 		}
 	}
 
-	got := projectRootForSocket(leaf)
+	got := ProjectRootForCWD(leaf)
 	wantAbs, err := filepath.Abs(leaf)
 	if err != nil {
 		t.Fatalf("filepath.Abs(%q): %v", leaf, err)
@@ -1455,8 +1501,8 @@ func TestProjectRootForSocket_FallbackWhenNoAncestorMatches(t *testing.T) {
 	}
 
 	// Determinism: invoking it twice must produce the same value.
-	if got2 := projectRootForSocket(leaf); got != got2 {
-		t.Errorf("projectRootForSocket should be deterministic: %q vs %q", got, got2)
+	if got2 := ProjectRootForCWD(leaf); got != got2 {
+		t.Errorf("ProjectRootForCWD should be deterministic: %q vs %q", got, got2)
 	}
 }
 
@@ -1497,5 +1543,237 @@ func TestSocketPathForCWDMatchesProjectRoot(t *testing.T) {
 	}
 	if SocketPathForCWD(other) == SocketPathForCWD(root) {
 		t.Fatal("different project roots resolved to the same socket")
+	}
+}
+
+func TestDaemonPathsUseSameProjectIdentity(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectA := filepath.Join(base, "A")
+	projectB := filepath.Join(base, "B")
+	nestedProject := filepath.Join(projectA, "nested")
+	for _, project := range []string{projectA, projectB, nestedProject} {
+		if err := os.MkdirAll(filepath.Join(project, ".slb"), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	subA := filepath.Join(projectA, "src", "pkg")
+	nestedSub := filepath.Join(nestedProject, "src")
+	for _, dir := range []string{subA, nestedSub} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(base)
+	for _, tc := range []struct {
+		name, cwd, project string
+	}{
+		{"root", projectA, projectA},
+		{"descendant", subA, projectA},
+		{"relative", filepath.Join("A", "src", "pkg"), projectA},
+		{"independent", projectB, projectB},
+		{"nested project", nestedSub, nestedProject},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hash := sha256.Sum256([]byte(tc.project))
+			stem := filepath.Join(os.TempDir(), "slb-"+hex.EncodeToString(hash[:])[:12])
+			if got := SocketPathForCWD(tc.cwd); got != stem+".sock" {
+				t.Errorf("socket=%q, want %q", got, stem+".sock")
+			}
+			if got := PIDFileForCWD(tc.cwd); got != stem+".pid" {
+				t.Errorf("PID file=%q, want %q", got, stem+".pid")
+			}
+		})
+	}
+	t.Chdir(subA)
+	if got, want := DefaultPIDFile(), PIDFileForCWD(projectA); got != want {
+		t.Errorf("default PID file=%q, want %q", got, want)
+	}
+	if got, want := DefaultSocketPath(), SocketPathForCWD(projectA); got != want {
+		t.Errorf("default socket=%q, want %q", got, want)
+	}
+}
+
+func TestDaemonRuntimePathsResolveProjectAliases(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := filepath.Join(base, "project")
+	subdir := filepath.Join(project, "src", "pkg")
+	nested := filepath.Join(project, "nested")
+	for _, dir := range []string{filepath.Join(project, ".slb"), subdir, filepath.Join(nested, ".slb")} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	aliasRoot := filepath.Join(base, "root-alias")
+	aliasSubdir := filepath.Join(base, "descendant-alias")
+	aliasNested := filepath.Join(base, "nested-alias")
+	for alias, target := range map[string]string{aliasRoot: project, aliasSubdir: subdir, aliasNested: nested} {
+		if err := os.Symlink(target, alias); err != nil {
+			if runtime.GOOS == "windows" {
+				t.Skipf("creating symlinks requires Windows developer mode or privilege: %v", err)
+			}
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct{ path, identity string }{
+		{project, project}, {subdir, project}, {aliasRoot, project},
+		{aliasSubdir, project}, {aliasNested, nested},
+		// Preserve the previous lexical fallback when the complete input path
+		// cannot be resolved, even if an earlier component is a valid alias.
+		{filepath.Join(aliasRoot, "missing"), aliasRoot},
+	} {
+		hash := sha256.Sum256([]byte(tc.identity))
+		stem := filepath.Join(os.TempDir(), "slb-"+hex.EncodeToString(hash[:])[:12])
+		if got := SocketPathForCWD(tc.path); got != stem+".sock" {
+			t.Errorf("socket for %q = %q, want %q", tc.path, got, stem+".sock")
+		}
+		if got := PIDFileForCWD(tc.path); got != stem+".pid" {
+			t.Errorf("PID file for %q = %q, want %q", tc.path, got, stem+".pid")
+		}
+	}
+	if got := ProjectRootForCWD(aliasRoot); got != aliasRoot {
+		t.Fatalf("runtime normalization changed approval path identity: got %q, want %q", got, aliasRoot)
+	}
+}
+
+func TestDefaultClientStatusDoesNotUseAnotherProjectsPID(t *testing.T) {
+	t.Setenv("SLB_HOST", "")
+	t.Setenv("TMPDIR", shortSocketDir(t))
+	projectA, projectB := t.TempDir(), t.TempDir()
+	for _, project := range []string{projectA, projectB} {
+		if err := os.Mkdir(filepath.Join(project, ".slb"), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(projectA)
+	pidFileA := DefaultPIDFile()
+	if err := os.WriteFile(pidFileA, []byte(strconv.Itoa(os.Getpid())+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := NewClient().GetStatus(); got != DaemonUnresponsive {
+		t.Fatalf("project A status=%s, want unresponsive for its live PID", got)
+	}
+	t.Chdir(projectB)
+	clientB := NewClient()
+	if got := clientB.GetStatus(); got != DaemonNotRunning {
+		t.Fatalf("project B inherited project A status: %s", got)
+	}
+	info := clientB.GetStatusInfo()
+	if info.Status != DaemonNotRunning || info.PID != 0 || info.PIDFile == pidFileA {
+		t.Fatalf("project B inherited project A PID information: %+v", info)
+	}
+	if pid, err := readPIDFile(pidFileA); err != nil || pid != os.Getpid() {
+		t.Fatalf("project A PID file changed: pid=%d err=%v", pid, err)
+	}
+}
+
+func TestGetStatusInfo_ResponsiveSocketWithStalePID(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket tests not supported on windows")
+	}
+	t.Setenv("SLB_HOST", "")
+	dir := shortSocketDir(t)
+	socketPath, pidFile := filepath.Join(dir, "s.sock"), filepath.Join(dir, "s.pid")
+	server, err := NewIPCServer(socketPath, log.New(io.Discard))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Start(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = server.Stop()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("server did not stop")
+		}
+	})
+	if err := os.WriteFile(pidFile, []byte("999999999\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	client := NewClient(WithSocketPath(socketPath), WithPIDFile(pidFile))
+	info := client.GetStatusInfo()
+	if info.Status != DaemonRunning || !info.SocketAlive || info.PID != 0 {
+		t.Fatalf("responsive socket lost to stale PID: %+v", info)
+	}
+	if !strings.Contains(info.Message, "stale PID") {
+		t.Fatalf("missing stale PID diagnostic: %q", info.Message)
+	}
+}
+
+func TestGetStatusInfo_UsesSocketIdentityForForeignLivePID(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket tests not supported on windows")
+	}
+	lifecycleEnvironment(t)
+	projectA, projectB := lifecycleProject(t), lifecycleProject(t)
+	a := startLifecycleChild(t, ServerOptions{ProjectDir: projectA}, false)
+	a.ready(t)
+	b := startLifecycleChild(t, ServerOptions{ProjectDir: projectB}, false)
+	b.ready(t)
+
+	// A client keeps the project selected when it was constructed, even if
+	// the caller subsequently changes directories into another project.
+	t.Chdir(projectA)
+	clientA := NewClient(WithLocalOnly())
+	t.Chdir(projectB)
+	if clientA.socketPath != a.opts.SocketPath || clientA.pidFile != a.opts.PIDFile {
+		t.Fatalf("default client did not retain project A paths: %+v", clientA)
+	}
+	originalPID := []byte(strconv.Itoa(a.cmd.Process.Pid) + "\n")
+	restorePID := true
+	t.Cleanup(func() {
+		if restorePID {
+			_ = os.WriteFile(a.opts.PIDFile, originalPID, 0600)
+		}
+	})
+	for _, tc := range []struct {
+		name, contents, diagnostic string
+	}{
+		{"foreign live PID", strconv.Itoa(b.cmd.Process.Pid) + "\n", "PID file mismatch"},
+		{"invalid PID", "invalid\n", "PID file missing or invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(a.opts.PIDFile, []byte(tc.contents), 0600); err != nil {
+				t.Fatal(err)
+			}
+			info := clientA.GetStatusInfo()
+			if info.Status != DaemonRunning || !info.SocketAlive || info.PID != a.cmd.Process.Pid {
+				t.Fatalf("project A status attributed to another process: %+v", info)
+			}
+			if !strings.Contains(info.Message, tc.diagnostic) {
+				t.Fatalf("missing %q diagnostic: %q", tc.diagnostic, info.Message)
+			}
+		})
+	}
+
+	// Explicit resource paths can also disagree. The selected Unix listener
+	// must identify itself instead of borrowing a live PID from the other file.
+	custom := NewClient(WithLocalOnly(), WithSocketPath(a.opts.SocketPath), WithPIDFile(b.opts.PIDFile))
+	info := custom.GetStatusInfo()
+	if info.Status != DaemonRunning || !info.SocketAlive || info.PID != a.cmd.Process.Pid || !strings.Contains(info.Message, "PID file mismatch") {
+		t.Fatalf("custom paths misidentified project A: %+v", info)
+	}
+	if pid, err := readPIDFile(b.opts.PIDFile); err != nil || pid != b.cmd.Process.Pid {
+		t.Fatalf("project B PID changed during status: pid=%d err=%v", pid, err)
+	}
+	if err := os.WriteFile(a.opts.PIDFile, originalPID, 0600); err != nil {
+		t.Fatal(err)
+	}
+	restorePID = false
+	a.assertRunning(t)
+	b.assertRunning(t)
+	for _, child := range []*lifecycleChild{a, b} {
+		if err := StopDaemonWithOptions(child.opts, 5*time.Second); err != nil {
+			t.Fatal(err)
+		}
+		child.wait(t, true)
 	}
 }

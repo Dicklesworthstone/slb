@@ -1,11 +1,18 @@
 package cli
 
 import (
+	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/daemon"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 	"github.com/spf13/cobra"
 )
@@ -21,16 +28,25 @@ func resetDaemonFlags() {
 	flagDaemonLogsLines = 200
 }
 
+func physicalDaemonTestPath(t *testing.T, path string) string {
+	t.Helper()
+	physical, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return physical
+}
+
 func TestDaemonProjectPath_FromFlag(t *testing.T) {
 	resetDaemonFlags()
-	flagProject = "/test/project/path"
+	flagProject = physicalDaemonTestPath(t, t.TempDir())
 
 	result, err := daemonProjectPath()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result != "/test/project/path" {
-		t.Errorf("expected '/test/project/path', got %q", result)
+	if result != flagProject {
+		t.Errorf("expected %q, got %q", flagProject, result)
 	}
 }
 
@@ -41,14 +57,15 @@ func TestDaemonProjectPath_FromEnv(t *testing.T) {
 	originalEnv := os.Getenv("SLB_PROJECT")
 	defer os.Setenv("SLB_PROJECT", originalEnv)
 
-	os.Setenv("SLB_PROJECT", "/env/project/path")
+	project := physicalDaemonTestPath(t, t.TempDir())
+	os.Setenv("SLB_PROJECT", project)
 
 	result, err := daemonProjectPath()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result != "/env/project/path" {
-		t.Errorf("expected '/env/project/path', got %q", result)
+	if result != project {
+		t.Errorf("expected %q, got %q", project, result)
 	}
 }
 
@@ -66,6 +83,7 @@ func TestDaemonProjectPath_FallbackToCwd(t *testing.T) {
 	}
 
 	cwd, _ := os.Getwd()
+	cwd = physicalDaemonTestPath(t, cwd)
 	if result != cwd {
 		t.Errorf("expected cwd %q, got %q", cwd, result)
 	}
@@ -433,14 +451,16 @@ func TestDaemonProjectPath_PrecedenceOrder(t *testing.T) {
 	defer os.Setenv("SLB_PROJECT", originalEnv)
 
 	// 1. Flag takes precedence over env
-	flagProject = "/flag/path"
-	os.Setenv("SLB_PROJECT", "/env/path")
+	flagPath := physicalDaemonTestPath(t, t.TempDir())
+	envPath := physicalDaemonTestPath(t, t.TempDir())
+	flagProject = flagPath
+	os.Setenv("SLB_PROJECT", envPath)
 
 	result, err := daemonProjectPath()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result != "/flag/path" {
+	if result != flagPath {
 		t.Errorf("flag should take precedence, got %q", result)
 	}
 
@@ -450,7 +470,7 @@ func TestDaemonProjectPath_PrecedenceOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result != "/env/path" {
+	if result != envPath {
 		t.Errorf("env should take precedence over cwd, got %q", result)
 	}
 
@@ -461,6 +481,7 @@ func TestDaemonProjectPath_PrecedenceOrder(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	cwd, _ := os.Getwd()
+	cwd = physicalDaemonTestPath(t, cwd)
 	if result != cwd {
 		t.Errorf("should fallback to cwd, got %q, want %q", result, cwd)
 	}
@@ -525,5 +546,266 @@ func TestDaemonLogPath_HomeUnset(t *testing.T) {
 		if !strings.Contains(result, "daemon.log") {
 			t.Errorf("expected valid path ending in daemon.log, got: %s", result)
 		}
+	}
+}
+
+func newTestDaemonLifecycleCommand(name string, runE func(*cobra.Command, []string) error) *cobra.Command {
+	root := newTestRootCmd()
+	root.PersistentPreRunE = rootCmd.PersistentPreRunE
+	daemonRoot := &cobra.Command{
+		Use:               "daemon",
+		PersistentPreRunE: daemonCmd.PersistentPreRunE,
+	}
+	daemonRoot.AddCommand(&cobra.Command{Use: name, RunE: runE})
+	root.AddCommand(daemonRoot)
+	return root
+}
+
+func TestDaemonLifecycleCommandsResolveProjectOnce(t *testing.T) {
+	base := physicalDaemonTestPath(t, t.TempDir())
+	projectA, projectB := filepath.Join(base, "A"), filepath.Join(base, "B")
+	subA := filepath.Join(projectA, "src", "pkg")
+	for _, dir := range []string{filepath.Join(projectA, ".slb"), filepath.Join(projectB, ".slb"), subA} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, command := range []string{"start", "stop", "status"} {
+		for _, tc := range []struct {
+			name, cwd, env, want string
+			args                 []string
+		}{
+			{"relative flag", base, "", projectA, []string{"-C", filepath.Join("A", "src", "pkg")}},
+			{"absolute flag", projectB, "", projectA, []string{"-C", subA}},
+			{"environment", base, filepath.Join("A", "src", "pkg"), projectA, nil},
+			{"working directory", subA, "", projectA, nil},
+			{"flag precedence", base, subA, projectB, []string{"-C", "B"}},
+		} {
+			t.Run(command+"/"+tc.name, func(t *testing.T) {
+				resetDaemonFlags()
+				t.Cleanup(resetDaemonFlags)
+				t.Chdir(tc.cwd)
+				t.Setenv("SLB_PROJECT", tc.env)
+				called := false
+				root := newTestDaemonLifecycleCommand(command, func(_ *cobra.Command, _ []string) error {
+					called = true
+					project, err := daemonProjectPath()
+					if err != nil {
+						return err
+					}
+					if project != tc.want {
+						t.Errorf("project=%q, want %q", project, tc.want)
+					}
+					cwd, err := os.Getwd()
+					if err != nil {
+						return err
+					}
+					if cwd != tc.want {
+						t.Errorf("cwd=%q, want %q", cwd, tc.want)
+					}
+					return nil
+				})
+				args := append([]string{"daemon", command}, tc.args...)
+				if _, _, err := executeCommand(root, args...); err != nil {
+					t.Fatalf("command failed: %v", err)
+				}
+				if !called {
+					t.Fatal("lifecycle handler did not run")
+				}
+			})
+		}
+	}
+}
+
+func TestDaemonStatusUsesSelectedProjectPathsAndDatabase(t *testing.T) {
+	resetDaemonFlags()
+	t.Cleanup(resetDaemonFlags)
+	t.Setenv("SLB_PROJECT", "")
+	t.Setenv("TMPDIR", t.TempDir())
+	a, b := testutil.NewHarness(t), testutil.NewHarness(t)
+	a.ProjectDir = physicalDaemonTestPath(t, a.ProjectDir)
+	b.ProjectDir = physicalDaemonTestPath(t, b.ProjectDir)
+	// A reachable remote daemon for B must not substitute for the selected
+	// local project A, whose daemon has never been started.
+	remote, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var remoteConnections atomic.Int32
+	remoteDone := make(chan struct{})
+	t.Cleanup(func() {
+		_ = remote.Close()
+		<-remoteDone
+	})
+	go func() {
+		defer close(remoteDone)
+		for {
+			conn, err := remote.Accept()
+			if err != nil {
+				return
+			}
+			remoteConnections.Add(1)
+			func() {
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+				decoder := json.NewDecoder(conn)
+				var auth map[string]string
+				if err := decoder.Decode(&auth); err != nil {
+					return
+				}
+				var request daemon.RPCRequest
+				if err := decoder.Decode(&request); err != nil || request.Method != "ping" {
+					return
+				}
+				_ = json.NewEncoder(conn).Encode(daemon.RPCResponse{
+					ID: request.ID, Result: map[string]any{"pong": true, "project_path": b.ProjectDir},
+				})
+			}()
+		}
+	}()
+	t.Setenv("SLB_HOST", remote.Addr().String())
+	t.Setenv("SLB_SESSION_KEY", "remote-project-b")
+	if info := daemon.NewClient().GetStatusInfo(); info.Status != daemon.DaemonRunning || info.SocketPath != remote.Addr().String() {
+		t.Fatalf("remote fixture is not reachable by ordinary TCP clients: %+v", info)
+	}
+	session := testutil.MakeSession(t, a.DB, testutil.WithProject(a.ProjectDir))
+	testutil.MakeRequest(t, a.DB, session)
+	subA := filepath.Join(a.ProjectDir, "src")
+	if err := os.Mkdir(subA, 0700); err != nil {
+		t.Fatal(err)
+	}
+	pidFileB := daemon.PIDFileForCWD(b.ProjectDir)
+	pidContents := strconv.Itoa(os.Getpid()) + "\n"
+	if err := os.WriteFile(pidFileB, []byte(pidContents), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, explicit := range []bool{false, true} {
+		name := "working directory"
+		if explicit {
+			name = "explicit relative project"
+		}
+		t.Run(name, func(t *testing.T) {
+			resetDaemonFlags()
+			args := []string{"daemon", "status", "--json"}
+			if explicit {
+				t.Chdir(b.ProjectDir)
+				relative, err := filepath.Rel(b.ProjectDir, subA)
+				if err != nil {
+					t.Fatal(err)
+				}
+				args = append(args, "-C", relative)
+			} else {
+				t.Chdir(subA)
+			}
+			root := newTestDaemonLifecycleCommand("status", daemonStatusCmd.RunE)
+			stdout, err := executeCommandCapture(t, root, args...)
+			if err != nil {
+				t.Fatalf("status: %v", err)
+			}
+			var result struct {
+				Status         string `json:"status"`
+				PID            int    `json:"pid"`
+				PIDFile        string `json:"pid_file"`
+				SocketPath     string `json:"socket_path"`
+				PendingCount   int    `json:"pending_count"`
+				ActiveSessions int    `json:"active_sessions"`
+			}
+			if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+				t.Fatalf("decode status %q: %v", stdout, err)
+			}
+			if result.Status != "not running" || result.PID != 0 {
+				t.Errorf("status inherited another project's PID: %+v", result)
+			}
+			if result.PIDFile != daemon.PIDFileForCWD(a.ProjectDir) || result.SocketPath != daemon.SocketPathForCWD(a.ProjectDir) {
+				t.Errorf("status reported the wrong project paths: %+v", result)
+			}
+			if result.PendingCount != 1 || result.ActiveSessions != 1 {
+				t.Errorf("status did not use the selected project database: %+v", result)
+			}
+		})
+	}
+	if contents, err := os.ReadFile(pidFileB); err != nil || string(contents) != pidContents {
+		t.Fatalf("status changed project B PID: contents=%q err=%v", contents, err)
+	}
+	if got := remoteConnections.Load(); got != 1 {
+		t.Fatalf("local lifecycle status contacted the remote daemon: connections=%d, want only the fixture probe", got)
+	}
+}
+
+func TestDaemonProjectPathRejectsInvalidDirectory(t *testing.T) {
+	resetDaemonFlags()
+	t.Cleanup(resetDaemonFlags)
+	project := t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".slb"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	flagProject = filepath.Join(project, "missing")
+	if _, err := daemonProjectPath(); err == nil {
+		t.Fatal("missing -C directory silently resolved to its parent project")
+	}
+	flagProject = filepath.Join(project, "file")
+	if err := os.WriteFile(flagProject, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := daemonProjectPath(); err == nil {
+		t.Fatal("regular file accepted as a project directory")
+	}
+}
+
+func TestDaemonStatusSymlinkProjectMatchesWorkingDirectory(t *testing.T) {
+	resetDaemonFlags()
+	t.Cleanup(resetDaemonFlags)
+	t.Setenv("SLB_PROJECT", "")
+	t.Setenv("SLB_HOST", "")
+	h := testutil.NewHarness(t)
+	h.ProjectDir = physicalDaemonTestPath(t, h.ProjectDir)
+	subdir := filepath.Join(h.ProjectDir, "src", "pkg")
+	if err := os.MkdirAll(subdir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	outside := physicalDaemonTestPath(t, t.TempDir())
+	alias := filepath.Join(outside, "project-descendant")
+	if err := os.Symlink(subdir, alias); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink creation requires Windows developer mode or privilege: %v", err)
+		}
+		t.Fatal(err)
+	}
+	session := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir))
+	testutil.MakeRequest(t, h.DB, session)
+	for _, tc := range []struct {
+		name, cwd, env string
+		args           []string
+	}{
+		{"physical working directory", subdir, "", nil},
+		{"explicit symlink", outside, "", []string{"-C", alias}},
+		{"environment symlink", outside, alias, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetDaemonFlags()
+			t.Chdir(tc.cwd)
+			t.Setenv("SLB_PROJECT", tc.env)
+			root := newTestDaemonLifecycleCommand("status", daemonStatusCmd.RunE)
+			args := append([]string{"daemon", "status", "--json"}, tc.args...)
+			stdout, err := executeCommandCapture(t, root, args...)
+			if err != nil {
+				t.Fatalf("status: %v", err)
+			}
+			var result struct {
+				PIDFile        string `json:"pid_file"`
+				SocketPath     string `json:"socket_path"`
+				PendingCount   int    `json:"pending_count"`
+				ActiveSessions int    `json:"active_sessions"`
+			}
+			if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+				t.Fatal(err)
+			}
+			if flagProject != h.ProjectDir || result.PIDFile != daemon.PIDFileForCWD(h.ProjectDir) || result.SocketPath != daemon.SocketPathForCWD(h.ProjectDir) {
+				t.Fatalf("project alias selected different lifecycle resources: project=%q status=%+v", flagProject, result)
+			}
+			if result.PendingCount != 1 || result.ActiveSessions != 1 {
+				t.Fatalf("project alias selected a different database: %+v", result)
+			}
+		})
 	}
 }

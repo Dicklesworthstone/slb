@@ -2,10 +2,20 @@
 package e2e
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/core"
+	"github.com/Dicklesworthstone/slb/internal/daemon"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 )
@@ -425,6 +435,223 @@ func TestSessionRecoveryAfterRestart(t *testing.T) {
 	t.Logf("  Approval succeeded, new status: %s", result.NewRequestStatus)
 
 	t.Log("=== PASS: TestSessionRecoveryAfterRestart ===")
+}
+
+// TestDaemonCLI_ProjectLifecycle uses the actual CLI binary, including its
+// background re-exec path. One build is shared by all lifecycle assertions.
+func TestDaemonCLI_ProjectLifecycle(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the CLI and launches background daemons")
+	}
+	moduleRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep runtime paths short enough for Unix sockets on macOS too.
+	base, err := os.MkdirTemp("", "slb-e2e-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	base, err = filepath.EvalSymlinks(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binaryName := "slb"
+	if runtime.GOOS == "windows" {
+		binaryName += ".exe"
+	}
+	binary := filepath.Join(base, binaryName)
+	buildCtx, cancelBuild := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelBuild()
+	build := exec.CommandContext(buildCtx, "go", "build", "-o", binary, "./cmd/slb")
+	build.Dir = moduleRoot
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("building CLI: %v\n%s", err, output)
+	}
+
+	runtimeDir, home := filepath.Join(base, "runtime"), filepath.Join(base, "home")
+	for _, dir := range []string{runtimeDir, home} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var environment []string
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		switch strings.ToUpper(name) {
+		case "HOME", "USERPROFILE", "XDG_CONFIG_HOME", "TMPDIR", "TMP", "TEMP", "PWD", "TOON_DEFAULT_FORMAT":
+			continue
+		}
+		if strings.HasPrefix(strings.ToUpper(name), "SLB_") {
+			continue
+		}
+		environment = append(environment, entry)
+	}
+	environment = append(environment,
+		"HOME="+home, "USERPROFILE="+home, "XDG_CONFIG_HOME="+filepath.Join(home, ".config"),
+		"TMPDIR="+runtimeDir, "TMP="+runtimeDir, "TEMP="+runtimeDir, "SLB_HOST=", "SLB_PROJECT=",
+	)
+	run := func(cwd, executable string, args ...string) ([]byte, []byte, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, executable, args...)
+		cmd.Dir, cmd.Env = cwd, environment
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		if ctx.Err() != nil {
+			err = fmt.Errorf("CLI command timed out: %w", ctx.Err())
+		}
+		return stdout.Bytes(), stderr.Bytes(), err
+	}
+	mustRun := func(t *testing.T, cwd, executable string, args ...string) []byte {
+		t.Helper()
+		stdout, stderr, err := run(cwd, executable, args...)
+		if err != nil {
+			t.Fatalf("%s %v from %s: %v\nstdout: %s\nstderr: %s", executable, args, cwd, err, stdout, stderr)
+		}
+		return stdout
+	}
+	type statusInfo struct {
+		Running     bool   `json:"running"`
+		Status      string `json:"status"`
+		PID         int    `json:"pid"`
+		PIDFile     string `json:"pid_file"`
+		SocketPath  string `json:"socket_path"`
+		SocketAlive bool   `json:"socket_alive"`
+	}
+	status := func(t *testing.T, cwd string, projectArgs ...string) statusInfo {
+		t.Helper()
+		args := append([]string{"daemon", "status", "-o", "json"}, projectArgs...)
+		data := mustRun(t, cwd, binary, args...)
+		var info statusInfo
+		if err := json.Unmarshal(data, &info); err != nil {
+			t.Fatalf("invalid daemon status JSON: %v\n%s", err, data)
+		}
+		return info
+	}
+	assertRunning := func(t *testing.T, info statusInfo, pid int) {
+		t.Helper()
+		if !info.Running || !info.SocketAlive || info.Status != "running" || info.PID != pid || pid <= 0 {
+			t.Fatalf("unexpected daemon status: %+v, want running PID %d", info, pid)
+		}
+	}
+	start := func(t *testing.T, cwd, executable string, projectArgs ...string) int {
+		t.Helper()
+		args := append([]string{"daemon", "start", "-o", "json"}, projectArgs...)
+		data := mustRun(t, cwd, executable, args...)
+		var result struct {
+			PID        int    `json:"pid"`
+			SocketPath string `json:"socket_path"`
+			Foreground bool   `json:"foreground"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil || result.PID <= 0 || result.SocketPath == "" || result.Foreground {
+			t.Fatalf("invalid background-start result: %s (decode error %v)", data, err)
+		}
+		return result.PID
+	}
+	for _, name := range []string{"A", "B", "unused", "broken"} {
+		project := filepath.Join(base, name)
+		if err := os.MkdirAll(project, 0700); err != nil {
+			t.Fatal(err)
+		}
+		mustRun(t, base, binary, "init", "-C", name, "-o", "json")
+		config := "[daemon]\nuse_file_watcher = false\n[notifications]\ndesktop_enabled = false\n"
+		if err := os.WriteFile(filepath.Join(project, ".slb", "config.toml"), []byte(config), 0600); err != nil {
+			t.Fatal(err)
+		}
+		// Cleanup uses explicit resource paths, so a CLI -C regression cannot
+		// prevent the test from stopping the background daemon it launched.
+		cleanupOptions := daemon.ServerOptions{
+			ProjectDir: project,
+			SocketPath: filepath.Join(runtimeDir, filepath.Base(daemon.SocketPathForCWD(project))),
+			PIDFile:    filepath.Join(runtimeDir, filepath.Base(daemon.PIDFileForCWD(project))),
+		}
+		t.Cleanup(func() { _ = daemon.StopDaemonWithOptions(cleanupOptions, 3*time.Second) })
+	}
+
+	t.Run("relative_executable_and_project", func(t *testing.T) {
+		// Both the executable and -C path are relative to the original CWD.
+		// The -- terminator prevents an appended project flag from being parsed.
+		relativeBinary := "." + string(filepath.Separator) + binaryName
+		pidA := start(t, base, relativeBinary, "-C", "A", "--")
+		pidB := start(t, base, relativeBinary, "-C", "B", "--")
+		if pidA == pidB {
+			t.Fatal("two independent projects reported the same daemon PID")
+		}
+		a, b := status(t, base, "-C", "A"), status(t, base, "-C", "B")
+		assertRunning(t, a, pidA)
+		assertRunning(t, b, pidB)
+		if a.PIDFile == b.PIDFile || a.SocketPath == b.SocketPath {
+			t.Fatalf("projects share lifecycle resources: A=%+v, B=%+v", a, b)
+		}
+		for _, info := range []statusInfo{a, b} {
+			if filepath.Dir(info.PIDFile) != runtimeDir || filepath.Dir(info.SocketPath) != runtimeDir ||
+				strings.TrimSuffix(info.PIDFile, ".pid") != strings.TrimSuffix(info.SocketPath, ".sock") {
+				t.Fatalf("PID and socket identity disagree: %+v", info)
+			}
+		}
+		if unused := status(t, base, "-C", "unused"); unused.Running || unused.SocketAlive || unused.PID != 0 || unused.Status != "not running" {
+			t.Fatalf("never-started project inherited another daemon's status: %+v", unused)
+		}
+		nested := filepath.Join(base, "A", "src", "deep")
+		if err := os.MkdirAll(nested, 0700); err != nil {
+			t.Fatal(err)
+		}
+		fromNested := status(t, nested)
+		assertRunning(t, fromNested, pidA)
+		if fromNested.PIDFile != a.PIDFile || fromNested.SocketPath != a.SocketPath {
+			t.Fatalf("nested CWD selected a different daemon: %+v", fromNested)
+		}
+		mustRun(t, nested, binary, "daemon", "stop", "-o", "json")
+		if stopped := status(t, base, "-C", "A"); stopped.Running || stopped.PID != 0 {
+			t.Fatalf("project A still running after nested-CWD stop: %+v", stopped)
+		}
+		assertRunning(t, status(t, base, "-C", "B"), pidB)
+		pidA = start(t, nested, binary)
+		assertRunning(t, status(t, base, "-C", "A"), pidA)
+		if _, err := os.Lstat(filepath.Join(nested, ".slb")); !os.IsNotExist(err) {
+			t.Fatalf("nested start created a second project database: %v", err)
+		}
+		mustRun(t, base, relativeBinary, "daemon", "stop", "-C", "B", "-o", "json")
+		assertRunning(t, status(t, nested), pidA)
+		mustRun(t, base, relativeBinary, "daemon", "stop", "-C", filepath.Join("A", "src", "deep"), "-o", "json")
+		for _, name := range []string{"A", "B"} {
+			info := status(t, base, "-C", name)
+			if info.Running || info.PID != 0 || info.SocketAlive {
+				t.Fatalf("project %s did not stop: %+v", name, info)
+			}
+			for _, path := range []string{info.PIDFile, info.SocketPath} {
+				if _, err := os.Lstat(path); !os.IsNotExist(err) {
+					t.Fatalf("stopped daemon left resource %s: %v", path, err)
+				}
+			}
+		}
+	})
+
+	t.Run("failed_startup_has_no_pid_residue", func(t *testing.T) {
+		configPath := filepath.Join(base, "broken", ".slb", "config.toml")
+		if err := os.WriteFile(configPath, []byte("[daemon\ninvalid TOML"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		stdout, stderr, err := run(base, binary, "daemon", "start", "-C", "broken", "-o", "json")
+		if err == nil {
+			t.Fatalf("failed startup reported success: %s", stdout)
+		}
+		if !strings.Contains(string(stderr), "daemon exited before readiness") {
+			t.Fatalf("startup did not report the child readiness failure: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		info := status(t, base, "-C", "broken")
+		if info.Running || info.PID != 0 || info.SocketAlive {
+			t.Fatalf("failed startup left a running daemon: %+v", info)
+		}
+		for _, path := range []string{info.PIDFile, info.SocketPath} {
+			if _, err := os.Lstat(path); !os.IsNotExist(err) {
+				t.Fatalf("failed startup left resource %s: %v", path, err)
+			}
+		}
+	})
 }
 
 // containsSession checks if a session ID is in the slice.

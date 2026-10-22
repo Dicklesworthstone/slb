@@ -582,7 +582,11 @@ Primary communication uses Unix domain sockets:
 /tmp/slb-<hash>.sock
 ```
 
-The socket path includes a hash derived from the project path, allowing multiple project daemons to coexist.
+The socket and PID file (`/tmp/slb-<hash>.pid`) use the same hash of the discovered project root, allowing independent project daemons to coexist. Both files use the system temporary directory, including `TMPDIR` when set. Use `-C /path/to/project` with `slb daemon start`, `stop`, or `status` to select a project. Selection falls back to `SLB_PROJECT`, then the working directory; all three resolve symlink aliases and discover the nearest ancestor containing `.slb`, so commands also work from nested directories. If no ancestor contains `.slb`, the selected directory is the project root.
+
+Lifecycle commands manage the local project daemon regardless of `SLB_HOST`. Companion `.pid.lock` and `.sock.lock` files remain after shutdown by design; leave them in place so daemon ownership remains coordinated across starts and stops.
+
+When upgrading from a version with the shared per-user PID file, stop any existing daemon through its original foreground session or process manager, then restart it with the new version. The socket naming format and client IPC remain compatible. The new `stop` command requires project-aware shutdown support and deliberately refuses to signal a process from the old shared PID file.
 
 ### JSON-RPC Protocol
 

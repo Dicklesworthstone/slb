@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -115,6 +116,11 @@ type IPCServer struct {
 	// Configure before Start; handlers never mutate the verifier.
 	verifier *Verifier
 
+	// Only RunDaemon's local Unix listener has lifecycle control. TCP clients
+	// and standalone IPC servers must never be able to stop a local daemon.
+	shutdown    context.CancelFunc
+	projectPath string
+
 	// hookPolicies caches compiled per-project hook policy (GH #24). Its zero
 	// value is ready to use.
 	hookPolicies hookPolicyCache
@@ -148,30 +154,13 @@ func NewIPCServer(socketPath string, logger *log.Logger) (*IPCServer, error) {
 	if socketPath == "" {
 		return nil, fmt.Errorf("socket path is required")
 	}
-	if fi, err := os.Lstat(socketPath); err == nil {
-		if fi.Mode().Type()&os.ModeSocket == 0 {
-			return nil, fmt.Errorf("path exists but is not a socket: %s", socketPath)
-		}
-		if err := os.Remove(socketPath); err != nil {
-			return nil, fmt.Errorf("removing stale socket: %w", err)
-		}
-	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("checking socket path: %w", err)
+	socketPath, err := filepath.Abs(socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolving unix socket path: %w", err)
 	}
-	ln, err := net.Listen("unix", socketPath)
+	ln, cleanup, err := listenOwnedUnix(socketPath)
 	if err != nil {
 		return nil, fmt.Errorf("creating unix socket: %w", err)
-	}
-	if err := os.Chmod(socketPath, 0600); err != nil {
-		_ = ln.Close()
-		_ = os.Remove(socketPath)
-		return nil, fmt.Errorf("setting socket permissions: %w", err)
-	}
-	cleanup := func() error {
-		if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		return nil
 	}
 	return newIPCServer(ln, socketPath, logger, cleanup, nil), nil
 }
@@ -315,6 +304,8 @@ func (s *IPCServer) handleRequest(conn net.Conn, data []byte) *RPCResponse {
 		return s.handlePing(req)
 	case "status":
 		return s.handleStatus(req)
+	case "shutdown":
+		return s.handleShutdown(req, conn)
 	case "notify":
 		return s.handleNotify(req)
 	case "subscribe":
@@ -332,6 +323,25 @@ func (s *IPCServer) handleRequest(conn net.Conn, data []byte) *RPCResponse {
 	}
 }
 
+func (s *IPCServer) handleShutdown(req RPCRequest, conn net.Conn) *RPCResponse {
+	if s.shutdown == nil {
+		return &RPCResponse{Error: &Error{Code: ErrCodeMethodNotFound, Message: "local daemon lifecycle control unavailable"}, ID: req.ID}
+	}
+	var params struct {
+		PID         int    `json:"pid"`
+		ProjectPath string `json:"project_path"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil || params.PID < 0 || params.ProjectPath != s.projectPath || (params.PID != 0 && params.PID != os.Getpid()) {
+		return &RPCResponse{Error: &Error{Code: ErrCodeInvalidParams, Message: "daemon identity does not match the selected project and PID"}, ID: req.ID}
+	}
+	// Acknowledge before cancellation closes this connection. The request is
+	// bound to this listener's generation, so PID reuse cannot signal a stranger.
+	if err := s.writeResponse(conn, &RPCResponse{Result: map[string]int{"pid": os.Getpid()}, ID: req.ID}); err == nil {
+		s.shutdown()
+	}
+	return nil
+}
+
 func (s *IPCServer) handlePing(req RPCRequest) *RPCResponse {
 	return &RPCResponse{Result: map[string]bool{"pong": true}, ID: req.ID}
 }
@@ -344,7 +354,12 @@ func (s *IPCServer) handleStatus(req RPCRequest) *RPCResponse {
 	if s.stateManaged {
 		sessions = s.sessionCount
 	}
+	pid := 0
+	if s.shutdown != nil {
+		pid = os.Getpid()
+	}
 	return &RPCResponse{Result: map[string]any{
+		"pid": pid, "project_path": s.projectPath,
 		"uptime_seconds": int64(time.Since(s.startTime).Seconds()),
 		"pending_count":  s.pendingCount.Load(), "active_sessions": sessions,
 		"active_connections": s.activeConns.Load(), "state_ready": s.stateReady,

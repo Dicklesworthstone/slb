@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -892,8 +893,12 @@ func TestHookGenerateCommand_SocketPathWalksUpToProjectRoot(t *testing.T) {
 	}
 	// The fallback is the start dir unless the host itself has a .slb
 	// directory somewhere above the temp dir; mirror the walk in Go.
-	wantLoose := loose
-	for dir := loose; ; dir = filepath.Dir(dir) {
+	physicalLoose, err := filepath.EvalSymlinks(loose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLoose := physicalLoose
+	for dir := physicalLoose; ; dir = filepath.Dir(dir) {
 		if info, err := os.Stat(filepath.Join(dir, ".slb")); err == nil && info.IsDir() {
 			wantLoose = dir
 			break
@@ -904,6 +909,60 @@ func TestHookGenerateCommand_SocketPathWalksUpToProjectRoot(t *testing.T) {
 	}
 	if len(lines) == 2 && lines[1] != wantLoose {
 		t.Errorf("_project_root_for_socket without .slb in the fixture = %q, want %q", lines[1], wantLoose)
+	}
+}
+
+func TestHookGenerateCommand_SymlinkSocketParity(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetHookFlags()
+	t.Cleanup(resetHookFlags)
+	scriptDir := t.TempDir()
+	cmd := newTestHookCmd(h.DBPath)
+	if _, err := executeCommandCapture(t, cmd, "hook", "generate", "--output-dir", scriptDir, "-j"); err != nil {
+		t.Fatal(err)
+	}
+	physical, err := filepath.EvalSymlinks(h.ProjectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subdir := filepath.Join(physical, "src", "pkg")
+	nested := filepath.Join(physical, "nested")
+	for _, dir := range []string{subdir, filepath.Join(nested, ".slb")} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	outside := t.TempDir()
+	rootAlias := filepath.Join(outside, "root-alias")
+	subdirAlias := filepath.Join(outside, "descendant-alias")
+	nestedAlias := filepath.Join(outside, "nested-alias")
+	for alias, target := range map[string]string{rootAlias: physical, subdirAlias: subdir, nestedAlias: nested} {
+		if err := os.Symlink(target, alias); err != nil {
+			if runtime.GOOS == "windows" {
+				t.Skipf("creating symlinks requires Windows developer mode or privilege: %v", err)
+			}
+			t.Fatal(err)
+		}
+	}
+	paths := []string{physical, subdir, rootAlias, subdirAlias, nestedAlias, filepath.Join(rootAlias, "missing"), outside}
+	stdout := runGeneratedHookPython(t, filepath.Join(scriptDir, "slb_guard.py"),
+		"import json\nprint(json.dumps([g['get_socket_path'](path) for path in sys.argv[2:]]))", paths...)
+	var sockets []string
+	if err := json.Unmarshal([]byte(stdout), &sockets); err != nil || len(sockets) != len(paths) {
+		t.Fatalf("invalid generated socket results: %q, %v", stdout, err)
+	}
+	for i, path := range paths {
+		if want := daemon.SocketPathForCWD(path); sockets[i] != want {
+			t.Errorf("Python/Go socket mismatch for %q: got %q, want %q", path, sockets[i], want)
+		}
+	}
+	for _, i := range []int{1, 2, 3} {
+		if sockets[i] != sockets[0] {
+			t.Errorf("same project alias has a distinct socket: %q vs %q", sockets[i], sockets[0])
+		}
+	}
+	if sockets[4] == sockets[0] {
+		t.Fatal("nested project incorrectly shares its parent socket")
 	}
 }
 

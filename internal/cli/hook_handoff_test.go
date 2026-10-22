@@ -81,3 +81,34 @@ response = {'action': 'execute', 'execution_handoff': {
 		})
 	}
 }
+
+func TestHookRuntimeSymlinkHandoffPreservesApprovalIdentity(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("POSIX Bash handoff fixture")
+	}
+	project := t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".slb"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "project-alias")
+	if err := os.Symlink(project, alias); err != nil {
+		t.Fatal(err)
+	}
+	setup := fmt.Sprintf(`
+shutil.which = lambda name: '/usr/local/bin/slb'
+os.environ['SLB_SESSION_ID'] = 'slb-session'
+query_slb_daemon = lambda *args: {'action': 'execute', 'execution_handoff': {
+    'request_id': 'req-alias', 'command_hash': 'a' * 64,
+    'session_id': 'slb-session', 'database_path': %q}}
+`, filepath.Join(alias, ".slb", "state.db"))
+	input, err := json.Marshal(map[string]any{
+		"cwd": alias, "tool_input": map[string]any{"command": "git reset --hard"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr := runHookRuntime(t, t.TempDir(), setup, string(input))
+	if hookPermission(t, stdout) != "allow" || stderr != "" || !strings.Contains(stdout, filepath.Join(alias, ".slb", "state.db")) {
+		t.Fatalf("socket normalization changed the approval-bound database identity: %s %s", stdout, stderr)
+	}
+}

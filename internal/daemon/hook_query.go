@@ -229,7 +229,7 @@ func (c *hookPolicyCache) policyFor(cwd string) (hookPolicy, error) {
 	if !filepath.IsAbs(cwd) {
 		return hookPolicy{}, fmt.Errorf("hook cwd must be absolute")
 	}
-	root := projectRootForSocket(cwd)
+	root := ProjectRootForCWD(cwd)
 	opts := config.LoadOptions{ProjectDir: root}
 	hasState := true
 	if _, err := os.Stat(filepath.Join(root, ".slb")); os.IsNotExist(err) {
@@ -407,12 +407,12 @@ func findHookApproval(conn *db.DB, engine *core.PatternEngine, params HookQueryP
 			AND s.ended_at IS NULL AND s.project_path = r.project_path
 			AND (r.approval_expires_at IS NULL OR julianday(r.approval_expires_at) > julianday('now'))
 		ORDER BY r.created_at DESC, r.id DESC LIMIT 1
-	`, params.Command, params.CWD, projectRootForSocket(params.CWD), params.SessionID).Scan(&id)
+	`, params.Command, params.CWD, ProjectRootForCWD(params.CWD), params.SessionID).Scan(&id)
 	if err != nil {
 		return nil
 	}
 	req, err := conn.GetRequest(id)
-	if err != nil || req.Status != db.StatusApproved || req.ProjectPath != projectRootForSocket(params.CWD) || req.Command.Raw != params.Command ||
+	if err != nil || req.Status != db.StatusApproved || req.ProjectPath != ProjectRootForCWD(params.CWD) || req.Command.Raw != params.Command ||
 		req.Command.Cwd != params.CWD || req.RequestorSessionID != params.SessionID {
 		return nil
 	}

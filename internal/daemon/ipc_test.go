@@ -43,7 +43,9 @@ func TestNewIPCServer(t *testing.T) {
 		if err != nil {
 			t.Fatalf("socket not created: %v", err)
 		}
-		if info.Mode().Perm() != 0600 {
+		// Windows enforces the private DACL checked by
+		// TestWindowsSocketUsesPrivateACL, rather than POSIX mode bits.
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 			t.Errorf("socket permissions = %o, want 0600", info.Mode().Perm())
 		}
 	})
@@ -53,6 +55,30 @@ func TestNewIPCServer(t *testing.T) {
 		_, err := NewIPCServer("", newTestLogger())
 		if err == nil {
 			t.Error("expected error for empty socket path")
+		}
+	})
+
+	t.Run("accepts relative socket paths", func(t *testing.T) {
+		t.Parallel()
+		cwd, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		socketPath, err := filepath.Abs(filepath.Join(shortSocketDir(t), "relative.sock"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		relative, err := filepath.Rel(cwd, socketPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv, err := NewIPCServer(relative, newTestLogger())
+		if err != nil {
+			t.Fatalf("NewIPCServer with relative path: %v", err)
+		}
+		defer srv.Stop()
+		if srv.socketPath != socketPath {
+			t.Fatalf("socket path = %s, want %s", srv.socketPath, socketPath)
 		}
 	})
 
@@ -83,37 +109,17 @@ func TestNewIPCServer(t *testing.T) {
 		t.Parallel()
 		socketPath := filepath.Join(shortSocketDir(t), "s.sock")
 
-		// Create a real unix socket to simulate a stale one.
-		// We create a listener but don't close it until after stat check.
-		ln, err := net.Listen("unix", socketPath)
+		// Leave an actual socket inode behind after its listener has exited.
+		ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
 		if err != nil {
 			t.Fatalf("creating stale socket: %v", err)
 		}
-
-		// Verify socket exists before closing.
-		if _, statErr := os.Stat(socketPath); statErr != nil {
-			ln.Close()
-			t.Fatalf("stale socket not created: %v", statErr)
+		ln.SetUnlinkOnClose(false)
+		if err := ln.Close(); err != nil {
+			t.Fatal(err)
 		}
-
-		// Now close the old listener to release the socket file for reuse.
-		// The socket file should remain on disk.
-		ln.Close()
-
-		// On some systems, closing the listener removes the socket.
-		// If so, we'll create a new one with just os.Mknod or skip.
-		fi, statErr := os.Stat(socketPath)
-		if os.IsNotExist(statErr) {
-			// Socket was removed on close - this is platform-specific behavior.
-			// Create a socket file using net.Listen again and leave it for cleanup.
-			ln2, err := net.Listen("unix", socketPath)
-			if err != nil {
-				t.Fatalf("recreating stale socket: %v", err)
-			}
-			// Don't close ln2 - it will be cleaned up with temp dir
-			_ = ln2 // intentionally kept open
-		} else if statErr == nil && fi.Mode().Type()&os.ModeSocket == 0 {
-			t.Fatalf("expected socket but got %v", fi.Mode())
+		if info, err := os.Lstat(socketPath); err != nil || info.Mode()&os.ModeSocket == 0 {
+			t.Fatalf("stale socket did not survive listener close: %v", err)
 		}
 
 		srv, err := NewIPCServer(socketPath, newTestLogger())

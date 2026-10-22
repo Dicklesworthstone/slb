@@ -10,9 +10,64 @@ import (
 	"syscall"
 )
 
-func ownedByCurrentUser(info os.FileInfo) bool {
+func ownedByCurrentUser(_ string, info os.FileInfo) bool {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	return ok && stat.Uid == uint32(os.Geteuid())
+}
+
+func lstatOwnedPath(path string) (os.FileInfo, error) { return os.Lstat(path) }
+
+func protectSocket(path string, original os.FileInfo) error {
+	current, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(original, current) || current.Mode()&os.ModeSocket == 0 {
+		return errors.New("socket path changed before setting permissions")
+	}
+	return os.Chmod(path, 0600)
+}
+
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = proc.Release() }()
+	err = proc.Signal(syscall.Signal(0))
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// openPIDFile never follows a symlink or blocks on a FIFO. Existing readable
+// PID files remain compatible, but a foreign or writable-by-others file cannot
+// be trusted to identify a daemon.
+func openPIDFile(path string, flags int) (*os.File, os.FileInfo, error) {
+	fd, err := syscall.Open(path, flags|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0600)
+	if err != nil {
+		return nil, nil, &os.PathError{Op: "open pid file", Path: path, Err: err}
+	}
+	file := os.NewFile(uintptr(fd), path)
+	info, err := file.Stat()
+	if err == nil {
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !info.Mode().IsRegular() || !ownedByCurrentUser(path, info) || info.Mode().Perm()&0022 != 0 || !ok || stat.Nlink != 1 {
+			err = errors.New("pid file must be an owned regular file with one link and no group/other write permission")
+		}
+	}
+	if err == nil {
+		current, statErr := os.Lstat(path)
+		if statErr != nil || !os.SameFile(info, current) {
+			err = errors.New("pid file path changed while opening it")
+		}
+	}
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	return file, info, nil
 }
 
 func acquireFileLease(path string) (*fileLease, error) {
@@ -40,7 +95,7 @@ func acquireFileLease(path string) (*fileLease, error) {
 		return nil, err
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !info.Mode().IsRegular() || !ownedByCurrentUser(info) || info.Mode().Perm()&0077 != 0 || !ok || stat.Nlink != 1 {
+	if !info.Mode().IsRegular() || !ownedByCurrentUser(path, info) || info.Mode().Perm()&0077 != 0 || !ok || stat.Nlink != 1 {
 		return nil, errors.New("daemon lease must be a private, owned regular file with one link")
 	}
 	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {

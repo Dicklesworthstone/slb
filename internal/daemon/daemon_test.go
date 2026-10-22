@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -365,6 +366,44 @@ func TestDefaultServerOptions(t *testing.T) {
 }
 
 // ============== normalizeServerOptions Tests ==============
+
+func TestResolveServerOptions_SymlinkProjectAndLogicalCWD(t *testing.T) {
+	project, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{filepath.Join(project, ".slb"), filepath.Join(project, "src", "nested")} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nested := filepath.Join(project, "src", "nested")
+	alias := filepath.Join(t.TempDir(), "selected")
+	if err := os.Symlink(nested, alias); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink creation requires Windows developer mode or privilege: %v", err)
+		}
+		t.Fatal(err)
+	}
+	t.Chdir(nested)
+	// On Unix, Getwd can return this logical alias instead of the physical
+	// directory. Default clients must still find the explicitly selected daemon.
+	t.Setenv("PWD", alias)
+	wantSocket, wantPID := SocketPathForCWD(project), PIDFileForCWD(project)
+	for _, selected := range []string{alias, ".", ""} {
+		opts, err := resolveServerOptions(ServerOptions{ProjectDir: selected})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if opts.ProjectDir != project || opts.SocketPath != wantSocket || opts.PIDFile != wantPID {
+			t.Fatalf("selection %q resolved to %+v, want physical project %s", selected, opts, project)
+		}
+	}
+	client := NewClient()
+	if client.socketPath != wantSocket || client.pidFile != wantPID || DefaultSocketPath() != wantSocket || DefaultPIDFile() != wantPID {
+		t.Fatal("default clients do not use the selected physical project identity")
+	}
+}
 
 func TestNormalizeServerOptions_EmptyPaths(t *testing.T) {
 	opts := normalizeServerOptions(ServerOptions{})

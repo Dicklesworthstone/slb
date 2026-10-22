@@ -9,13 +9,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
-	"os/user"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/charmbracelet/log"
@@ -52,6 +50,7 @@ type Client struct {
 	socketPath string
 	pidFile    string
 	logger     *log.Logger
+	localOnly  bool
 }
 
 // ClientOption configures a Client.
@@ -71,6 +70,15 @@ func WithPIDFile(path string) ClientOption {
 	}
 }
 
+// WithLocalOnly binds status checks to the selected local project's socket
+// and PID file. Lifecycle commands use this so SLB_HOST cannot substitute an
+// unrelated remote daemon; ordinary clients retain their TCP behavior.
+func WithLocalOnly() ClientOption {
+	return func(c *Client) {
+		c.localOnly = true
+	}
+}
+
 // WithLogger sets a custom logger.
 func WithLogger(l *log.Logger) ClientOption {
 	return func(c *Client) {
@@ -80,9 +88,10 @@ func WithLogger(l *log.Logger) ClientOption {
 
 // NewClient creates a new daemon client with optional configuration.
 func NewClient(opts ...ClientOption) *Client {
+	defaults := DefaultServerOptions()
 	c := &Client{
-		socketPath: DefaultSocketPath(),
-		pidFile:    DefaultPIDFile(),
+		socketPath: defaults.SocketPath,
+		pidFile:    defaults.PIDFile,
 		logger:     log.Default(),
 	}
 	for _, opt := range opts {
@@ -104,29 +113,43 @@ func NewClient(opts ...ClientOption) *Client {
 // Falls back to the raw CWD if no .slb/ ancestor exists, which
 // preserves the v0.3.x behavior for setups that don't use `slb init`.
 func DefaultSocketPath() string {
-	cwd, err := os.Getwd()
-	if err != nil {
-		cwd = "."
-	}
-	return SocketPathForCWD(cwd)
+	return DefaultServerOptions().SocketPath
 }
 
 // SocketPathForCWD returns the project-scoped Unix socket path that a hook
 // running from cwd will use. This is the explicit-CWD counterpart to
 // DefaultSocketPath and must stay in lockstep with generated hook discovery.
 func SocketPathForCWD(cwd string) string {
-	hashBase := projectRootForSocket(cwd)
-	hash := sha256.Sum256([]byte(hashBase))
-	shortHash := hex.EncodeToString(hash[:])[:12]
-	return filepath.Join(os.TempDir(), fmt.Sprintf("slb-%s.sock", shortHash))
+	return projectRuntimePath(cwd, ".sock")
 }
 
-// projectRootForSocket walks up from `start` looking for a `.slb/`
-// directory and returns the absolute path of the directory containing
-// it. Returns the input directory unchanged if no .slb/ ancestor is
+// PIDFileForCWD returns the PID file for the same project identity used by
+// SocketPathForCWD. The shared stem keeps lifecycle commands and IPC aligned.
+func PIDFileForCWD(cwd string) string {
+	return projectRuntimePath(cwd, ".pid")
+}
+
+func projectRuntimePath(cwd, extension string) string {
+	// Runtime resources use the physical project identity across -C, PWD,
+	// and hook aliases. Approval records retain their original path spelling
+	// through ProjectRootForCWD, so canonicalize only the runtime lookup.
+	if abs, err := filepath.Abs(cwd); err == nil {
+		if physical, err := filepath.EvalSymlinks(abs); err == nil {
+			cwd = physical
+		}
+	}
+	hashBase := ProjectRootForCWD(cwd)
+	hash := sha256.Sum256([]byte(hashBase))
+	shortHash := hex.EncodeToString(hash[:])[:12]
+	return filepath.Join(os.TempDir(), "slb-"+shortHash+extension)
+}
+
+// ProjectRootForCWD walks up from start looking for a .slb/ directory and
+// returns the absolute path of the directory containing it. Returns the
+// absolute input directory if no .slb/ ancestor is
 // found, so installations without an `slb init` still behave the
 // pre-existing way.
-func projectRootForSocket(start string) string {
+func ProjectRootForCWD(start string) string {
 	abs, err := filepath.Abs(start)
 	if err != nil {
 		return start
@@ -147,16 +170,10 @@ func projectRootForSocket(start string) string {
 	}
 }
 
-// DefaultPIDFile returns the default PID file path.
-// Format: /tmp/slb-daemon-{username}.pid
+// DefaultPIDFile returns the PID file for the current project.
+// Format: /tmp/slb-{project-hash}.pid, using the same identity as the socket.
 func DefaultPIDFile() string {
-	username := "unknown"
-	if u, err := user.Current(); err == nil {
-		username = u.Username
-	}
-	// Sanitize username for filename
-	username = strings.ReplaceAll(username, string(filepath.Separator), "_")
-	return filepath.Join(os.TempDir(), fmt.Sprintf("slb-daemon-%s.pid", username))
+	return DefaultServerOptions().PIDFile
 }
 
 // IsDaemonRunning checks if the daemon is running and responsive.
@@ -214,6 +231,28 @@ func (c *Client) GetStatusInfo() StatusInfo {
 	}
 
 	pid, err := c.readPID()
+	if socketCheck.transport == "unix" {
+		if daemonPID, ok := socketDaemonPID(ctx, c.socketPath); ok {
+			// The selected listener identifies its own process. A stale file
+			// may name another live daemon, so existence alone cannot bind
+			// that PID to this project's socket.
+			info.Status = DaemonRunning
+			info.SocketAlive = true
+			info.PID = daemonPID
+			switch {
+			case err != nil:
+				info.Message = fmt.Sprintf("Daemon running with PID %d (PID file missing or invalid)", daemonPID)
+			case pid != daemonPID:
+				info.Message = fmt.Sprintf("Daemon running with PID %d (PID file mismatch: recorded %d)", daemonPID, pid)
+			default:
+				info.Message = fmt.Sprintf("Daemon running with PID %d", daemonPID)
+			}
+			if socketCheck.host != "" {
+				info.Message = fmt.Sprintf("SLB_HOST unreachable at %s; using local unix socket; %s", socketCheck.host, info.Message)
+			}
+			return info
+		}
+	}
 	if err != nil {
 		if socketCheck.transport == "unix" {
 			info.Status = DaemonRunning
@@ -236,6 +275,15 @@ func (c *Client) GetStatusInfo() StatusInfo {
 	info.PID = pid
 
 	if !c.isProcessAlive(pid) {
+		if socketCheck.transport == "unix" {
+			// A responsive project socket is authoritative even if a previous
+			// daemon generation left a stale PID file behind.
+			info.Status = DaemonRunning
+			info.SocketAlive = true
+			info.PID = 0
+			info.Message = "Daemon running (stale PID file)"
+			return info
+		}
 		info.Status = DaemonNotRunning
 		info.Message = fmt.Sprintf("Process %d is not running (stale PID file)", pid)
 		return info
@@ -261,29 +309,45 @@ func (c *Client) GetStatusInfo() StatusInfo {
 	return info
 }
 
+// socketDaemonPID reads the identity published by current daemon listeners.
+// Older listeners and standalone IPC servers omit it; callers retain their
+// existing socket/PID fallback when no valid identity is available.
+func socketDaemonPID(ctx context.Context, socketPath string) (int, bool) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+	if err != nil {
+		return 0, false
+	}
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return 0, false
+		}
+	}
+	if err := json.NewEncoder(conn).Encode(RPCRequest{Method: "status", ID: 1}); err != nil {
+		return 0, false
+	}
+	var response struct {
+		Result struct {
+			PID         int    `json:"pid"`
+			ProjectPath string `json:"project_path"`
+		} `json:"result"`
+		Error *Error `json:"error"`
+		ID    int64  `json:"id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(conn, 4096)).Decode(&response); err != nil || response.Error != nil || response.ID != 1 || response.Result.PID <= 0 || !filepath.IsAbs(response.Result.ProjectPath) {
+		return 0, false
+	}
+	return response.Result.PID, true
+}
+
 // readPID reads the PID from the PID file.
 func (c *Client) readPID() (int, error) {
-	data, err := os.ReadFile(c.pidFile)
-	if err != nil {
-		return 0, err
-	}
-	pidStr := strings.TrimSpace(string(data))
-	pid, err := strconv.Atoi(pidStr)
-	if err != nil {
-		return 0, fmt.Errorf("invalid PID in file: %w", err)
-	}
-	return pid, nil
+	return readPIDFile(c.pidFile)
 }
 
 // isProcessAlive checks if a process is alive using kill -0.
 func (c *Client) isProcessAlive(pid int) bool {
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	// Send signal 0 to check if process exists
-	err = proc.Signal(syscall.Signal(0))
-	return err == nil
+	return processAlive(pid)
 }
 
 // canConnectSocket attempts to connect to the Unix socket.
@@ -304,8 +368,9 @@ type socketConnectivityResult struct {
 }
 
 func (c *Client) checkSocketConnectivity(ctx context.Context) socketConnectivityResult {
-	result := socketConnectivityResult{
-		host: strings.TrimSpace(os.Getenv("SLB_HOST")),
+	var result socketConnectivityResult
+	if !c.localOnly {
+		result.host = strings.TrimSpace(os.Getenv("SLB_HOST"))
 	}
 
 	if result.host != "" {

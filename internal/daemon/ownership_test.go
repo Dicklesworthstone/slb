@@ -4,15 +4,21 @@ package daemon
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
+	"time"
+
+	"github.com/charmbracelet/log"
 )
 
 func ownershipTestDir(t *testing.T) string {
@@ -227,5 +233,123 @@ func TestOwnedSocketCleanShutdownAndRestart(t *testing.T) {
 		if _, err := os.Lstat(path); !os.IsNotExist(err) {
 			t.Fatal("owned socket not cleaned up")
 		}
+	}
+}
+
+func TestPIDFileRejectsUnsafeFiles(t *testing.T) {
+	for _, kind := range []string{"symlink", "fifo", "writable", "hardlink", "directory"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := ownershipTestDir(t)
+			path := filepath.Join(dir, "daemon.pid")
+			target := filepath.Join(dir, "target")
+			if err := os.WriteFile(target, []byte("preserve\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			switch kind {
+			case "symlink":
+				err = os.Symlink(target, path)
+			case "fifo":
+				err = syscall.Mkfifo(path, 0600)
+			case "writable":
+				err = os.WriteFile(path, []byte("12345\n"), 0600)
+				if err == nil {
+					err = os.Chmod(path, 0666)
+				}
+			case "hardlink":
+				err = os.Link(target, path)
+			case "directory":
+				err = os.Mkdir(path, 0700)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			err = RunDaemon(ctx, ServerOptions{
+				ProjectDir: dir, PIDFile: path, SocketPath: filepath.Join(dir, "s"), Logger: log.New(io.Discard),
+			})
+			if err == nil || errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("unsafe PID file was accepted or blocked startup: %v", err)
+			}
+			after, err := os.Lstat(path)
+			if err != nil || !os.SameFile(before, after) {
+				t.Fatalf("startup replaced unsafe PID path: %v", err)
+			}
+			data, err := os.ReadFile(target)
+			if err != nil || string(data) != "preserve\n" {
+				t.Fatalf("startup modified PID link target: %q, %v", data, err)
+			}
+		})
+	}
+}
+
+func TestStopDaemonRejectsInvalidPIDWithoutRemovingRecord(t *testing.T) {
+	for _, contents := range []string{"0\n", "-1\n", "-23\n", "invalid\n", "", "1" + strings.Repeat(" ", 127) + "2"} {
+		t.Run(fmt.Sprintf("pid_%q", contents), func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "daemon.pid")
+			if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+				t.Fatal(err)
+			}
+			// Check parsing before exercising stop: a regression must fail the
+			// test without ever attempting to signal a process-group PID.
+			if _, err := readPIDFile(path); err == nil {
+				t.Fatal("invalid/nonpositive PID accepted")
+			}
+			if err := StopDaemonWithOptions(ServerOptions{PIDFile: path, SocketPath: filepath.Join(dir, "absent.sock")}, time.Second); err == nil {
+				t.Fatal("stop accepted invalid/nonpositive PID")
+			}
+			data, err := os.ReadFile(path)
+			if err != nil || string(data) != contents {
+				t.Fatalf("failed stop removed or rewrote PID record: %q, %v", data, err)
+			}
+		})
+	}
+}
+
+func TestStopDaemonCleansStalePID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.pid")
+	if err := os.WriteFile(path, []byte("99999999\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := StopDaemonWithOptions(ServerOptions{PIDFile: path, SocketPath: filepath.Join(dir, "absent.sock")}, time.Second); err != nil {
+		t.Fatalf("could not clean stale PID: %v", err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("stale PID survived stop: %v", err)
+	}
+}
+
+func TestStopDaemonIgnoresRemoteHost(t *testing.T) {
+	lifecycleEnvironment(t)
+	child := startLifecycleChild(t, ServerOptions{ProjectDir: lifecycleProject(t)}, false)
+	child.ready(t)
+	remote, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close()
+	t.Setenv("SLB_HOST", remote.Addr().String())
+	if err := StopDaemonWithOptions(child.opts, 5*time.Second); err != nil {
+		t.Fatalf("remote setting interfered with local project stop: %v", err)
+	}
+	child.wait(t, true)
+	if err := remote.SetDeadline(time.Now().Add(25 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := remote.Accept()
+	if conn != nil {
+		_ = conn.Close()
+		t.Fatal("local daemon stop contacted SLB_HOST")
+	}
+	var timeout net.Error
+	if !errors.As(err, &timeout) || !timeout.Timeout() {
+		t.Fatalf("checking remote listener: %v", err)
 	}
 }

@@ -18,8 +18,8 @@ from typing import Optional
 SLB_TIMEOUT = 0.05
 
 
-def _project_root_for_socket(start: str) -> str:
-    """Use the nearest .slb ancestor, matching the daemon socket discovery."""
+def _project_root_for_approval(start: str) -> str:
+    """Preserve the path spelling bound to existing approval records."""
     try:
         path = os.path.abspath(start)
     except (OSError, ValueError):
@@ -31,6 +31,19 @@ def _project_root_for_socket(start: str) -> str:
         if parent == path:
             return os.path.abspath(start)
         path = parent
+
+
+def _project_root_for_socket(start: str) -> str:
+    """Use physical project identity, matching daemon PID/socket discovery."""
+    try:
+        path = os.path.abspath(start)
+        # Go's EvalSymlinks leaves missing paths unchanged. Avoid Python's
+        # partial resolution of a missing path through an existing alias.
+        if os.path.exists(path):
+            path = os.path.realpath(path)
+    except (OSError, ValueError):
+        return _project_root_for_approval(start)
+    return _project_root_for_approval(path)
 
 
 def get_socket_path(cwd=None) -> str:
@@ -115,7 +128,7 @@ def _emit_execution_handoff(response, tool_input, session_id, cwd):
         raise ValueError("invalid command hash")
     if not session_id or handoff.get("session_id") != session_id or "\x00" in session_id:
         raise ValueError("session mismatch")
-    expected_db = os.path.join(_project_root_for_socket(cwd), ".slb", "state.db")
+    expected_db = os.path.join(_project_root_for_approval(cwd), ".slb", "state.db")
     if not isinstance(database_path, str) or database_path != expected_db:
         raise ValueError("project database mismatch")
     executable = shutil.which("slb")
