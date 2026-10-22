@@ -86,6 +86,7 @@ func resetSessionFlags() {
 	flagSessionAgent = ""
 	flagSessionProg = ""
 	flagSessionModel = ""
+	flagSessionKey = ""
 	flagResumeCreateIfMissing = true
 	flagResumeForce = false
 	flagSessionGCDryRun = false
@@ -347,6 +348,8 @@ func TestSessionResume_ReturnsExistingSession(t *testing.T) {
 	cmd := newTestSessionCmd(h.DBPath)
 	stdout, err := executeCommandCapture(t, cmd, "session", "resume",
 		"-a", "ExistingAgent",
+		"--session-id", existing.ID,
+		"--session-key", existing.SessionKey,
 		"-p", "original-program",
 		"-m", "original-model",
 		"-C", h.ProjectDir,

@@ -11,6 +11,9 @@ import (
 // ErrSessionProgramMismatch indicates an active session exists, but belongs to a different program.
 var ErrSessionProgramMismatch = errors.New("active session belongs to a different program")
 
+// ErrSessionAuthentication never includes credentials or the recovered session.
+var ErrSessionAuthentication = errors.New("session authentication failed: original session ID and key are required")
+
 // SessionSummary is a safe-to-serialize view of a session (excludes session_key).
 type SessionSummary struct {
 	ID           string
@@ -41,6 +44,8 @@ type SessionGCResult struct {
 
 // ResumeOptions configures session resume behavior.
 type ResumeOptions struct {
+	SessionID        string
+	SessionKey       string
 	AgentName        string
 	Program          string
 	Model            string
@@ -53,7 +58,8 @@ type ResumeOptions struct {
 //
 // Behavior:
 // - If an active session exists and Program is specified, it must match (unless ForceEndMismatch is true).
-// - On successful resume, updates the session heartbeat (last_active_at) and returns the session (with session_key).
+// - Existing sessions require proof of possession of their original ID and key before any mutation.
+// - On successful resume, updates the session heartbeat (last_active_at) and returns the authenticated session.
 // - If no active session exists:
 //   - CreateIfMissing=true → creates a new session and returns it
 //   - CreateIfMissing=false → returns db.ErrSessionNotFound
@@ -86,14 +92,25 @@ func ResumeSession(dbConn *db.DB, opts ResumeOptions) (*db.Session, error) {
 		return nil, err
 	}
 
+	// Authenticate before any mutation, including --force and model changes.
+	// Names and program/model labels are public metadata, not credentials.
+	if opts.SessionID != sess.ID || !db.ExecutionSessionKeyMatches(sess.SessionKey, opts.SessionKey) {
+		return nil, ErrSessionAuthentication
+	}
+
 	if opts.Program != "" && sess.Program != "" && sess.Program != opts.Program {
 		if !opts.ForceEndMismatch {
 			return nil, fmt.Errorf("%w: active=%q requested=%q", ErrSessionProgramMismatch, sess.Program, opts.Program)
 		}
 
 		// Force: end the old session and create a new one.
-		if err := dbConn.EndSession(sess.ID); err != nil {
+		result, err := dbConn.Exec(`UPDATE sessions SET ended_at = ? WHERE id = ? AND session_key = ? AND ended_at IS NULL`,
+			time.Now().UTC().Format(time.RFC3339), sess.ID, sess.SessionKey)
+		if err != nil {
 			return nil, err
+		}
+		if count, err := result.RowsAffected(); err != nil || count != 1 {
+			return nil, ErrSessionAuthentication
 		}
 		newSess := &db.Session{
 			AgentName:   opts.AgentName,
@@ -107,18 +124,22 @@ func ResumeSession(dbConn *db.DB, opts ResumeOptions) (*db.Session, error) {
 		return newSess, nil
 	}
 
-	// If model changed (and we didn't force-recreate), update the session model.
-	if opts.Model != "" && sess.Model != opts.Model {
-		if err := dbConn.UpdateSessionModel(sess.ID, opts.Model); err != nil {
-			return nil, fmt.Errorf("updating session model: %w", err)
-		}
+	if opts.Model != "" {
+		sess.Model = opts.Model
 	}
-
-	// Update heartbeat and return the refreshed session record.
-	if err := dbConn.UpdateSessionHeartbeat(sess.ID); err != nil {
+	// Fence mutations against credential rotation/session termination after
+	// the initial read. Never reread and return a replacement credential.
+	sess.LastActiveAt = time.Now().UTC().Truncate(time.Second)
+	result, err := dbConn.Exec(`UPDATE sessions SET model = ?, last_active_at = ?
+		WHERE id = ? AND session_key = ? AND ended_at IS NULL`,
+		sess.Model, sess.LastActiveAt.Format(time.RFC3339), sess.ID, sess.SessionKey)
+	if err != nil {
 		return nil, err
 	}
-	return dbConn.GetSession(sess.ID)
+	if count, err := result.RowsAffected(); err != nil || count != 1 {
+		return nil, ErrSessionAuthentication
+	}
+	return sess, nil
 }
 
 // GarbageCollectStaleSessions finds stale sessions for a project and ends them unless DryRun is set.

@@ -18,6 +18,7 @@ var (
 	flagSessionAgent string
 	flagSessionProg  string
 	flagSessionModel string
+	flagSessionKey   string
 
 	flagResumeCreateIfMissing bool
 	flagResumeForce           bool
@@ -34,6 +35,7 @@ func init() {
 
 	sessionResumeCmd.Flags().BoolVar(&flagResumeCreateIfMissing, "create-if-missing", true, "create a new session if none active")
 	sessionResumeCmd.Flags().BoolVar(&flagResumeForce, "force", false, "end mismatched active session and create a new one")
+	sessionResumeCmd.Flags().StringVar(&flagSessionKey, "session-key", "", "original session key (required to resume an existing session)")
 
 	sessionGcCmd.Flags().BoolVar(&flagSessionGCDryRun, "dry-run", false, "show what would be cleaned up without ending sessions")
 	sessionGcCmd.Flags().DurationVar(&flagSessionGCThreshold, "threshold", 30*time.Minute, "inactivity threshold (e.g., 30m, 2h)")
@@ -141,6 +143,8 @@ var sessionResumeCmd = &cobra.Command{
 		defer dbConn.Close()
 
 		sess, err := core.ResumeSession(dbConn, core.ResumeOptions{
+			SessionID:        flagSessionID,
+			SessionKey:       flagSessionKey,
 			AgentName:        flagSessionAgent,
 			Program:          flagSessionProg,
 			Model:            flagSessionModel,

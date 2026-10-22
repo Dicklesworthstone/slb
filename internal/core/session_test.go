@@ -68,6 +68,8 @@ func TestResumeSession_ProgramMismatch(t *testing.T) {
 	}
 
 	_, err = ResumeSession(dbConn, ResumeOptions{
+		SessionID:       existing.ID,
+		SessionKey:      existing.SessionKey,
 		AgentName:       "BlueSnow",
 		Program:         "codex-cli",
 		Model:           "gpt-5.2",
@@ -102,6 +104,8 @@ func TestResumeSession_UpdatesHeartbeat(t *testing.T) {
 	}
 
 	sess, err := ResumeSession(dbConn, ResumeOptions{
+		SessionID:       existing.ID,
+		SessionKey:      existing.SessionKey,
 		AgentName:       "BlueSnow",
 		Program:         "codex-cli",
 		Model:           "gpt-5.2",
@@ -273,6 +277,42 @@ func TestResumeSession_ValidationErrors(t *testing.T) {
 	})
 }
 
+func TestResumeSessionRejectsHijackingBeforeMutation(t *testing.T) {
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	victim := &db.Session{AgentName: "Victim", Program: "original", Model: "original", ProjectPath: "/project"}
+	if err := database.CreateSession(victim); err != nil {
+		t.Fatal(err)
+	}
+	for _, credentials := range []struct{ id, key string }{
+		{"", ""}, {victim.ID, ""}, {victim.ID, "bad"}, {"another-session", victim.SessionKey},
+	} {
+		for _, force := range []bool{false, true} {
+			got, err := ResumeSession(database, ResumeOptions{
+				AgentName: victim.AgentName, ProjectPath: victim.ProjectPath,
+				SessionID: credentials.id, SessionKey: credentials.key,
+				Program: "attacker", Model: "forged-model", ForceEndMismatch: force, CreateIfMissing: true,
+			})
+			if !errors.Is(err, ErrSessionAuthentication) || got != nil {
+				t.Fatalf("hijack returned session or wrong error: %v", err)
+			}
+			stored, err := database.GetSession(victim.ID)
+			if err != nil || stored.EndedAt != nil || stored.Model != victim.Model ||
+				stored.Program != victim.Program || !stored.LastActiveAt.Equal(victim.LastActiveAt.Truncate(time.Second)) {
+				t.Fatalf("failed authentication mutated victim: %v", err)
+			}
+		}
+	}
+	got, err := ResumeSession(database, ResumeOptions{AgentName: victim.AgentName, ProjectPath: victim.ProjectPath,
+		SessionID: victim.ID, SessionKey: victim.SessionKey})
+	if err != nil || got.ID != victim.ID || got.SessionKey != victim.SessionKey {
+		t.Fatalf("authenticated recovery failed: %v", err)
+	}
+}
+
 func TestResumeSession_ForceEndMismatch(t *testing.T) {
 	dbConn, err := db.Open(":memory:")
 	if err != nil {
@@ -293,6 +333,8 @@ func TestResumeSession_ForceEndMismatch(t *testing.T) {
 
 	// Resume with ForceEndMismatch=true should end old session and create new one.
 	sess, err := ResumeSession(dbConn, ResumeOptions{
+		SessionID:        existing.ID,
+		SessionKey:       existing.SessionKey,
 		AgentName:        "BlueSnow",
 		Program:          "codex-cli",
 		Model:            "gpt-5.2",

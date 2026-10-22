@@ -728,8 +728,9 @@ Payload includes request details, classification, and event type.
 ### Cryptographic Guarantees
 
 - **Command binding**: SHA-256 hash computed at request time, verified at execution
-- **Review signatures**: HMAC signatures using session keys prevent review forgery
-- **Session keys**: Generated per-session, never stored in plaintext
+- **Review signatures**: HMAC signatures prove possession of a session key, not independent reviewer identity.
+- **Session keys**: Generated per-session and stored in plaintext in SQLite for HMAC verification. Protect the database and its backups as credentials. File permissions do not separate processes sharing a UID.
+- **Session recovery**: Resuming an existing session requires its original `--session-id` and `--session-key`, including with `--force`. Names, programs, and models are not recovery credentials. If the key is lost, it cannot be recovered by name through the resume command.
 
 ### Fail-Closed Behavior
 
