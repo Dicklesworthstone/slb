@@ -3,12 +3,14 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 	"github.com/spf13/cobra"
@@ -368,6 +370,26 @@ func TestSessionResume_ReturnsExistingSession(t *testing.T) {
 	// Should return the existing session
 	if result["session_id"] != existing.ID {
 		t.Errorf("expected session_id=%s, got %v", existing.ID, result["session_id"])
+	}
+}
+
+func TestSessionResumeRejectsKeyRecovery(t *testing.T) {
+	h := testutil.NewHarness(t)
+	existing := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir),
+		testutil.WithAgent("Victim"), testutil.WithProgram("original"))
+	for _, key := range []string{"", "wrong-key"} {
+		resetSessionFlags()
+		cmd := newTestSessionCmd(h.DBPath)
+		stdout, err := executeCommandCapture(t, cmd, "session", "resume", "-a", existing.AgentName,
+			"-C", h.ProjectDir, "--session-id", existing.ID, "--session-key", key,
+			"--force", "--program", "attacker", "-j")
+		if !errors.Is(err, core.ErrSessionAuthentication) || stdout != "" {
+			t.Fatalf("unauthenticated resume returned output or wrong error: %v", err)
+		}
+		stored, err := h.DB.GetSession(existing.ID)
+		if err != nil || stored.EndedAt != nil || stored.Program != existing.Program {
+			t.Fatalf("unauthenticated force replaced victim: %v", err)
+		}
 	}
 }
 

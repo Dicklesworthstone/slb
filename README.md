@@ -8,6 +8,8 @@ A cross-platform CLI that implements a **two-person rule** for running potential
 
 When an agent wants to run something risky (e.g., `rm -rf`, `git push --force`, `kubectl delete`, `DROP TABLE`), `slb` requires peer review and explicit approval before execution.
 
+**Security restriction (issue #30):** The local backend cannot authenticate independent reviewer or model identities. Approval submissions and execution of requests requiring peer approvals or a different model now fail closed, including historical approvals. No external identity provider is implemented yet. Rejections and explicit zero-review CAUTION auto-approval remain available. The peer-approval examples below describe the intended workflow, which is currently blocked. See [the identity boundary and deployment requirements](references/SECURITY.md#reviewer-identity-security-boundary-issue-30).
+
 ## Why This Exists
 
 Coding agents can get tunnel vision, hallucinate, or misunderstand context. A second reviewer (ideally with a different model/tooling) catches mistakes before they become irreversible.

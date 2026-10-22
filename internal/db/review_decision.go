@@ -19,10 +19,14 @@ var (
 	ErrReviewInvalidDecision    = errors.New("invalid decision (must be approve or reject)")
 	ErrReviewTargetChanged      = errors.New("request changed since it was displayed; reload before reviewing")
 	ErrReviewDelegationMismatch = errors.New("cross-project reviewer identity mismatch")
+	// The local backend has no external reviewer authenticator. Session keys,
+	// agent names and model labels cannot establish independent principals.
+	ErrIndependentIdentityUnavailable = errors.New("independent reviewer identity unavailable: local sessions cannot authorize approvals; use an external identity and execution boundary")
 )
 
-// DelegatedReviewerIdentity is a reviewer authenticated in another project's
-// authoritative database. The target stores a deterministic, ended session row
+// DelegatedReviewerIdentity describes a credential-authenticated session in
+// another project's database, not an independently authenticated principal.
+// Approvals remain disabled; rejection provenance uses an ended session row
 // solely to satisfy review provenance/FK requirements; it never becomes an
 // active reviewer session or contributes to dynamic quorum.
 type DelegatedReviewerIdentity struct {
@@ -59,10 +63,10 @@ type ReviewOutcome struct {
 	StatusChanged bool
 }
 
-// ApplyReview authenticates, validates, inserts and resolves a review in one
-// transaction. An empty signature is signed using the authenticated session
-// key; a supplied signature is verified against the persisted key. No caller
-// supplied reviewer name or model is trusted.
+// ApplyReview refuses local approvals because no external identity verifier
+// exists. Rejections authenticate session-key possession and are committed in
+// one transaction. Names and models copied from sessions remain unverified
+// labels, even though callers cannot override them in an individual review.
 func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy) (*ReviewOutcome, error) {
 	if review == nil || review.RequestID == "" || review.ReviewerSessionID == "" {
 		return nil, fmt.Errorf("request_id and reviewer_session_id are required")
@@ -72,6 +76,13 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 	}
 	if review.Decision != DecisionApprove && review.Decision != DecisionReject {
 		return nil, ErrReviewInvalidDecision
+	}
+	if review.Decision == DecisionApprove {
+		// Fail closed for every approval entry point (CLI, TUI, RPC and
+		// cross-project delegation). Neither trusted_self_approve nor an
+		// authenticated HMAC session proves an independent reviewer. There is
+		// deliberately no environment/configuration switch to bypass this.
+		return nil, ErrIndependentIdentityUnavailable
 	}
 	if err := policy.validate(); err != nil {
 		return nil, err

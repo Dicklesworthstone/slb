@@ -1,5 +1,43 @@
 # SLB Security Design — Reference
 
+## Reviewer identity security boundary (issue #30)
+
+The local SQLite backend does **not** authenticate independent reviewers.
+All approval submissions now fail with `independent reviewer identity unavailable`.
+Execution also refuses any request requiring approvals or a different model,
+including previously approved requests. Rejections remain available. Explicit
+zero-review CAUTION auto-approval remains a separate policy choice.
+
+Agent names, program labels, model labels, extra session IDs, HMAC keys, and
+cross-project database records cannot establish separate principals. The
+`trusted_self_approve` list does not bypass this restriction. There is no
+environment variable, configuration option, or CLI flag to turn these labels
+into trusted identity. Peer-approval examples elsewhere in the documentation
+describe the intended workflow, which is currently blocked by this restriction.
+
+An external authenticated reviewer service is **not implemented** in this
+backend. Restoring independent approvals requires a separately protected
+authority that authenticates requester and reviewer principals, attests model
+identities, and binds every decision to the exact project, request, command,
+policy and expiry. Quorum must count distinct principals rather than names or
+sessions; self-review must compare those principals. Requester-controlled
+configuration must not be able to replace the authority's trust anchor.
+
+The protected authority must also own the execution boundary and effective
+policy. Processes sharing a UID can read/write the database, steal credentials,
+replace the binary or hooks, alter policy, or run commands directly. Local
+checks cannot constrain a malicious process that has those permissions. Use
+separate OS accounts with protected resources, or a separately privileged
+broker/remote executor, before treating agents as mutually untrusted. Merely
+putting each agent in another directory or assigning another name is insufficient.
+
+Existing-session recovery now requires the original session ID and key before
+heartbeat, model changes, or forced replacement. This preserves credential-based
+recovery where the credentials are protected; it provides no isolation from
+another process that can read those credentials. Lost credentials cannot be
+recovered through an agent-name lookup. Database copies and backups remain
+sensitive. Ending/recreating a session does not establish a new principal.
+
 ## Table of Contents
 - [Defense in Depth](#defense-in-depth)
 - [Execution Verification Gates](#execution-verification-gates)
@@ -39,7 +77,7 @@ Before any command executes, five gates must pass:
 
 - **Command binding**: SHA-256 hash verified at execution
 - **Review signatures**: HMAC using session keys
-- **Session keys**: Generated per-session, never stored in plaintext
+- **Session keys**: Generated per-session and stored in plaintext in SQLite for HMAC verification. File permissions do not isolate processes sharing a UID. HMAC possession is not proof of independent identity.
 
 ---
 

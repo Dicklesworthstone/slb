@@ -42,6 +42,108 @@ func applyFixtureReview(database *DB, request *Request, session *Session, decisi
 	return database.ApplyReview(&Review{RequestID: request.ID, ReviewerSessionID: session.ID, Decision: decision}, session.SessionKey, policy)
 }
 
+// Even possession of every local HMAC key must not establish independent
+// identity. Exercise the public DB boundary, not a mock identity checker.
+func TestIndependentIdentityFailsClosed(t *testing.T) {
+	for _, attack := range []struct {
+		name, agent, model                     string
+		trustedSelf, delegated, differentModel bool
+	}{
+		{name: "forged reviewer", agent: "OtherReviewer", model: "other-model"},
+		{name: "self approval", agent: "Requester", model: "request-model"},
+		{name: "trusted self approval", agent: "Requester", model: "request-model", trustedSelf: true},
+		{name: "fabricated different model", agent: "OtherReviewer", model: "other-model", differentModel: true},
+		{name: "cross project identity", agent: "OtherReviewer", model: "other-model", delegated: true},
+	} {
+		t.Run(attack.name, func(t *testing.T) {
+			database, err := Open(":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			requester := &Session{AgentName: "Requester", Model: "request-model", ProjectPath: "/project"}
+			if err := database.CreateSession(requester); err != nil {
+				t.Fatal(err)
+			}
+			reviewer := requester
+			if attack.agent != requester.AgentName {
+				reviewer = &Session{AgentName: attack.agent, Model: attack.model, ProjectPath: "/project"}
+				if err := database.CreateSession(reviewer); err != nil {
+					t.Fatal(err)
+				}
+			}
+			request := &Request{ProjectPath: "/project", RequestorSessionID: requester.ID,
+				RequestorAgent: requester.AgentName, RequestorModel: requester.Model,
+				Command:  CommandSpec{Raw: "echo review", Argv: []string{"echo", "review"}, Cwd: "/project"},
+				RiskTier: RiskTierDangerous, Status: StatusPending, MinApprovals: 1,
+				RequireDifferentModel: attack.differentModel, Justification: Justification{Reason: "identity regression"}}
+			if err := database.CreateRequest(request); err != nil {
+				t.Fatal(err)
+			}
+			policy := ReviewPolicy{}
+			if attack.trustedSelf {
+				policy.TrustedSelfApprove = []string{requester.AgentName}
+			}
+			if attack.delegated {
+				policy.DelegatedReviewer = &DelegatedReviewerIdentity{SourceProjectPath: "/other", SourceSessionID: reviewer.ID, AgentName: attack.agent, Model: attack.model}
+			}
+			review := &Review{RequestID: request.ID, ReviewerSessionID: reviewer.ID,
+				ReviewerAgent: attack.agent, ReviewerModel: attack.model, Decision: DecisionApprove}
+			if result, err := database.ApplyReview(review, reviewer.SessionKey, policy); result != nil || !errors.Is(err, ErrIndependentIdentityUnavailable) {
+				t.Fatalf("unverified identity authorized approval: %v", err)
+			}
+			stored, err := database.GetRequest(request.ID)
+			if err != nil || stored.Status != StatusPending {
+				t.Fatalf("denial mutated request: %v", err)
+			}
+			approvals, _, err := database.CountReviewsByDecision(request.ID)
+			if err != nil || approvals != 0 {
+				t.Fatalf("denial inserted vote: %d %v", approvals, err)
+			}
+
+			// Simulate a historical approval or an attacker who can read the
+			// SQLite keys and write a perfectly valid local HMAC and status.
+			review.SignatureTimestamp = time.Now().UTC().Truncate(time.Second)
+			review.Signature = ComputeReviewSignature(reviewer.SessionKey, request.ID, DecisionApprove, review.SignatureTimestamp)
+			if err := database.CreateReview(review); err != nil {
+				t.Fatal(err)
+			}
+			expiry := time.Now().UTC().Add(time.Hour)
+			if _, err := database.Exec(`UPDATE requests SET status = 'approved', approval_expires_at = ? WHERE id = ?`, expiry.Format(time.RFC3339), request.ID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.VerifyRequestApproval(request.ID); !errors.Is(err, ErrIndependentIdentityUnavailable) {
+				t.Fatalf("historical proof accepted: %v", err)
+			}
+			if approved, _, err := database.CheckRequestApprovalStatus(request.ID); approved || !errors.Is(err, ErrIndependentIdentityUnavailable) {
+				t.Fatalf("status helper accepted local identity: %v", err)
+			}
+			request.Status, request.ApprovalExpiresAt = StatusApproved, &expiry
+			now := time.Now().UTC()
+			execution := &Execution{ExecutedAt: &now, ExecutedBySessionID: requester.ID, ExecutedByAgent: requester.AgentName, ExecutedByModel: requester.Model, LogPath: "identity-test.log"}
+			if err := database.ClaimRequestExecutionAuthenticated(request, execution, requester.SessionKey); !errors.Is(err, ErrIndependentIdentityUnavailable) {
+				t.Fatalf("authenticated execution accepted local identity: %v", err)
+			}
+			if err := database.ClaimRequestExecution(request, execution); !errors.Is(err, ErrIndependentIdentityUnavailable) {
+				t.Fatalf("local execution accepted local identity: %v", err)
+			}
+			assertNoExecutionClaim(t, database, request.ID)
+		})
+	}
+}
+
+func TestIndependentIdentityStillAllowsRejection(t *testing.T) {
+	database, request, sessions := reviewDecisionFixture(t, 1)
+	outcome, err := applyFixtureReview(database, request, sessions[1], DecisionReject, ReviewPolicy{})
+	if err != nil || outcome.Request.Status != StatusRejected || outcome.Approvals != 0 {
+		t.Fatalf("rejection was blocked or approved request: %+v %v", outcome, err)
+	}
+	approved, rejected, err := database.CheckRequestApprovalStatus(request.ID)
+	if err != nil || approved || !rejected {
+		t.Fatalf("rejection status was lost: approved=%v rejected=%v err=%v", approved, rejected, err)
+	}
+}
+
 func TestApplyReviewPersistsApprovalDeadline(t *testing.T) {
 	for _, tier := range []RiskTier{RiskTierDangerous, RiskTierCritical} {
 		t.Run(string(tier), func(t *testing.T) {

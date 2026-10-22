@@ -36,12 +36,11 @@ func (db *DB) VerifyRequestApproval(id string) (*Request, error) {
 // survive its reviewer's session ending. Rotating the stored signing key, on
 // the other hand, invalidates signatures made with the old key.
 //
-// Request creation/decision policy owns self-review exceptions and conflict
-// resolution. In particular, first_wins may intentionally approve despite a
-// later rejection. Do not reinterpret those decisions here; require the stored
-// quorum of distinct, authentic approvals and any different-model constraint.
+// Independent-review policies are refused, including historical local HMAC
+// approvals: this backend has no external principal/model authenticator.
+// The remaining proof checks support explicit zero-review CAUTION policy only.
 // Session keys and the database are local trust material, not tamper-proof
-// storage or authentication of an agent's self-reported model identity.
+// storage or authentication of an agent's self-reported identity.
 func verifyApprovalTx(tx *sql.Tx, request *Request, now time.Time) error {
 	deny := func(reason string, args ...any) error {
 		return fmt.Errorf("%w: %s", ErrInvalidApprovalProof, fmt.Sprintf(reason, args...))
@@ -59,6 +58,12 @@ func verifyApprovalTx(tx *sql.Tx, request *Request, now time.Time) error {
 	}
 	if request.MinApprovals < 0 || (request.MinApprovals == 0 && request.RiskTier != RiskTierCaution) {
 		return deny("invalid approval quorum for %s", request.RiskTier)
+	}
+	if request.MinApprovals > 0 || request.RequireDifferentModel {
+		// Recheck at execution, including historical approvals created before
+		// this fix or by direct database writes. A status bit and local HMACs
+		// cannot attest independent reviewer identity.
+		return fmt.Errorf("%w: %w", ErrInvalidApprovalProof, ErrIndependentIdentityUnavailable)
 	}
 	if request.ApprovalExpiresAt == nil {
 		// Zero-review CAUTION requests are the explicit auto-approval path.
