@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -319,6 +320,305 @@ func TestOpenWithOptions_ReadOnly(t *testing.T) {
 	`, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
 	if err == nil {
 		t.Fatalf("expected write to fail in read-only mode")
+	}
+}
+
+func TestOpenProjectDB_LiteralPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		roots []string
+	}{
+		{"fragment_siblings", []string{"project#one", "project#two"}},
+		{"encoded_space", []string{"project space", "project%20space"}},
+		{"encoded_fragment", []string{"project#one", "project%23one"}},
+		{"unicode_and_percent", []string{"project-世界", "project-%E4%B8%96%E7%95%8C"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			var databases []*DB
+			for _, name := range tc.roots {
+				project := filepath.Join(base, name)
+				database, err := OpenProjectDB(project)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = database.Close() })
+				databases = append(databases, database)
+				assertOpenedDatabaseFile(t, database, filepath.Join(project, ".slb", "state.db"))
+				// The same primary key must be usable independently in each root.
+				if err := database.CreateSession(&Session{ID: "same-session-id", AgentName: name, ProjectPath: project}); err != nil {
+					t.Fatalf("project %q shares session state with another root: %v", name, err)
+				}
+			}
+			for i, database := range databases {
+				path := database.Path()
+				if err := database.Close(); err != nil {
+					t.Fatal(err)
+				}
+				reopened, err := OpenWithOptions(path, OpenOptions{ReadOnly: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = reopened.Close() })
+				session, err := reopened.GetSession("same-session-id")
+				if err != nil || session.AgentName != tc.roots[i] {
+					t.Fatalf("project state did not persist independently: session=%+v err=%v", session, err)
+				}
+			}
+			entries, err := os.ReadDir(base)
+			if err != nil || len(entries) != len(tc.roots) {
+				t.Fatalf("unexpected files outside project roots: entries=%v err=%v", entries, err)
+			}
+		})
+	}
+}
+
+func assertOpenedDatabaseFile(t *testing.T, database *DB, want string) {
+	t.Helper()
+	var sequence int
+	var name, actual string
+	if err := database.QueryRow("PRAGMA database_list").Scan(&sequence, &name, &actual); err != nil {
+		t.Fatal(err)
+	}
+	wantInfo, err := os.Stat(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actualInfo, err := os.Stat(actual)
+	if err != nil || name != "main" || !os.SameFile(wantInfo, actualInfo) {
+		t.Fatalf("SQLite opened %q instead of literal path %q: %v", actual, want, err)
+	}
+}
+
+func TestOpen_LiteralQueryDoesNotChangeGuards(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows filenames cannot contain a question mark")
+	}
+	path := filepath.Join(t.TempDir(), "state.db?_pragma=foreign_keys%3dOFF&_txlock=deferred&mode=memory&")
+	database, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	assertOpenedDatabaseFile(t, database, path)
+	for _, pragma := range []struct {
+		name string
+		want int
+	}{{"foreign_keys", 1}, {"busy_timeout", 5000}, {"synchronous", 1}} {
+		var got int
+		if err := database.QueryRow("PRAGMA " + pragma.name).Scan(&got); err != nil || got != pragma.want {
+			t.Fatalf("filename changed %s: got=%d want=%d err=%v", pragma.name, got, pragma.want, err)
+		}
+	}
+	var journal string
+	if err := database.QueryRow("PRAGMA journal_mode").Scan(&journal); err != nil || journal != "wal" {
+		t.Fatalf("filename changed journal mode: got=%q err=%v", journal, err)
+	}
+	if _, err := database.Exec("CREATE TABLE path_guard_parent (id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec("CREATE TABLE path_guard_child (parent_id INTEGER REFERENCES path_guard_parent(id))"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec("INSERT INTO path_guard_child VALUES (42)"); err == nil {
+		t.Fatal("filename disabled foreign key enforcement")
+	}
+	// Begin must reserve the writer before any application statement executes.
+	tx, err := database.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	other, err := database.conn.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if _, err := other.ExecContext(context.Background(), "PRAGMA busy_timeout=0"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.ExecContext(context.Background(), "INSERT INTO path_guard_parent VALUES (42)"); err == nil {
+		t.Fatal("filename disabled the immediate transaction writer reservation")
+	}
+}
+
+func TestOpenWithOptions_ReadOnlyLiteralPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db#readonly")
+	database, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec("CREATE TABLE readonly_probe (value TEXT)"); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	readonly, err := OpenWithOptions(path, OpenOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readonly.Close()
+	if _, err := readonly.Exec("INSERT INTO readonly_probe VALUES ('must not be written')"); err == nil {
+		t.Fatal("a fragment in the filename disabled read-only mode")
+	}
+	var count int
+	if err := readonly.QueryRow("SELECT COUNT(*) FROM readonly_probe").Scan(&count); err != nil || count != 0 {
+		t.Fatalf("read-only database changed: count=%d err=%v", count, err)
+	}
+	assertOpenedDatabaseFile(t, readonly, path)
+}
+
+func TestOpenWithOptions_MissingFileDoesNotCreate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts OpenOptions
+	}{
+		{"read_write", OpenOptions{}},
+		{"read_write_init", OpenOptions{InitSchema: true}},
+		{"read_only", OpenOptions{ReadOnly: true}},
+		{"read_only_create", OpenOptions{ReadOnly: true, CreateIfNotExists: true}},
+		{"read_only_create_init", OpenOptions{ReadOnly: true, CreateIfNotExists: true, InitSchema: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, relative := range []string{"missing.db", filepath.Join("missing-directory", "state.db")} {
+				base := t.TempDir()
+				path := filepath.Join(base, relative)
+				database, err := OpenWithOptions(path, tc.opts)
+				if database != nil {
+					database.Close()
+				}
+				if err == nil {
+					t.Errorf("opening missing database %q unexpectedly succeeded", relative)
+				}
+				entries, err := os.ReadDir(base)
+				if err != nil || len(entries) != 0 {
+					t.Errorf("opening missing database created files or directories: entries=%v err=%v", entries, err)
+				}
+			}
+		})
+	}
+}
+
+func TestOpen_CreatedFilesArePrivate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits do not describe Windows file access")
+	}
+	path := filepath.Join(t.TempDir(), "private#project", "state.db")
+	database, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	assertOpenedDatabaseFile(t, database, path)
+	for _, target := range []string{filepath.Dir(path), path} {
+		info, err := os.Stat(target)
+		if err != nil || info.Mode().Perm()&0077 != 0 {
+			t.Fatalf("created database resource is not private: path=%q info=%v err=%v", target, info, err)
+		}
+	}
+}
+
+func TestOpen_MemoryDoesNotCreateFile(t *testing.T) {
+	base := t.TempDir()
+	t.Chdir(base)
+	first, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if err := first.CreateSession(&Session{ID: "memory-session", AgentName: "memory-agent", ProjectPath: base}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.GetSession("memory-session"); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("independent in-memory databases share session state: %v", err)
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("in-memory database created filesystem artifacts: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestOpen_InvalidPathsHaveNoSideEffects(t *testing.T) {
+	for _, name := range []string{"empty", "nul"} {
+		t.Run(name, func(t *testing.T) {
+			base := t.TempDir()
+			t.Chdir(base)
+			path := ""
+			if name == "nul" {
+				path = filepath.Join(base, "truncated.db") + "\x00suffix"
+			}
+			database, err := Open(path)
+			if database != nil {
+				database.Close()
+			}
+			if err == nil {
+				t.Errorf("invalid path %q unexpectedly opened a database", path)
+			}
+			entries, err := os.ReadDir(base)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("invalid path created filesystem artifacts: entries=%v err=%v", entries, err)
+			}
+		})
+	}
+}
+
+func TestOpen_RelativePathSurvivesWorkingDirectoryChange(t *testing.T) {
+	base := t.TempDir()
+	firstDir, secondDir := filepath.Join(base, "first"), filepath.Join(base, "second")
+	for _, dir := range []string{firstDir, secondDir} {
+		if err := os.Mkdir(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(firstDir)
+	relative := filepath.Join("project", "state.db")
+	first, err := Open(relative)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if err := first.CreateSession(&Session{ID: "reconnected-session", AgentName: "first", ProjectPath: firstDir}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Open(filepath.Join(secondDir, relative))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if err := second.CreateSession(&Session{ID: "reconnected-session", AgentName: "second", ProjectPath: secondDir}); err != nil {
+		t.Fatal(err)
+	}
+	// Discard the idle physical connection, then make the pool reconnect from
+	// another cwd that contains a valid, different database at the same suffix.
+	first.conn.SetMaxIdleConns(0)
+	t.Chdir(secondDir)
+	session, err := first.GetSession("reconnected-session")
+	if err != nil || session.AgentName != "first" {
+		t.Fatalf("pooled connection followed the new cwd: session=%+v err=%v", session, err)
+	}
+	assertOpenedDatabaseFile(t, first, filepath.Join(firstDir, relative))
+}
+
+func TestOpenWithOptions_ReadOnlyMemoryRejected(t *testing.T) {
+	base := t.TempDir()
+	t.Chdir(base)
+	database, err := OpenWithOptions(":memory:", OpenOptions{ReadOnly: true, CreateIfNotExists: true})
+	if database != nil {
+		database.Close()
+	}
+	if err == nil {
+		t.Error("read-only mode unexpectedly opened a writable in-memory database")
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("read-only in-memory open created filesystem artifacts: entries=%v err=%v", entries, err)
 	}
 }
 

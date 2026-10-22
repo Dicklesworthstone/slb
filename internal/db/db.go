@@ -6,8 +6,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	_ "modernc.org/sqlite" // Pure Go SQLite driver
@@ -46,8 +48,27 @@ func Open(path string) (*DB, error) {
 
 // OpenWithOptions opens a database connection with the given options.
 func OpenWithOptions(path string, opts OpenOptions) (*DB, error) {
-	// Ensure parent directory exists if creating
-	if opts.CreateIfNotExists {
+	if path == "" || strings.ContainsRune(path, '\x00') {
+		return nil, fmt.Errorf("database path must be nonempty and contain no NUL bytes")
+	}
+	inMemory := path == ":memory:"
+	if inMemory && opts.ReadOnly {
+		return nil, fmt.Errorf("an in-memory database cannot be opened read-only")
+	}
+	if !inMemory {
+		// database/sql may open more connections after the caller changes CWD.
+		// Every connection must continue to use the originally selected file.
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("resolving database path: %w", err)
+		}
+		path = absolute
+	}
+
+	// Only explicit writable creation may change the filesystem. SQLite will
+	// subsequently use mode=rw so it cannot recreate a removed file with
+	// default permissions when the connection pool opens another connection.
+	if !inMemory && opts.CreateIfNotExists && !opts.ReadOnly {
 		dir := filepath.Dir(path)
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return nil, fmt.Errorf("creating database directory: %w", err)
@@ -56,8 +77,11 @@ func OpenWithOptions(path string, opts OpenOptions) (*DB, error) {
 		// Ensure the file exists with restrictive permissions before SQLite opens it
 		// (SQLite usually respects umask, but being explicit is safer)
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
-		if err == nil {
-			f.Close()
+		if err != nil {
+			return nil, fmt.Errorf("creating database file: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			return nil, fmt.Errorf("closing database file: %w", err)
 		}
 	}
 
@@ -74,11 +98,37 @@ func OpenWithOptions(path string, opts OpenOptions) (*DB, error) {
 	// contract needs. Read-only transactions opt out with
 	// sql.TxOptions{ReadOnly: true}, and read-only handles cannot take the
 	// lock at all, so they keep deferred transactions.
-	mode := "&_txlock=immediate"
-	if opts.ReadOnly {
-		mode = "&mode=ro"
+	query := url.Values{
+		"_pragma": {"journal_mode(WAL)", "busy_timeout(5000)", "synchronous(NORMAL)", "foreign_keys(ON)"},
+		"mode":    {"rw"},
 	}
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)%s", path, mode)
+	if opts.ReadOnly {
+		query.Set("mode", "ro")
+	} else {
+		query.Set("_txlock", "immediate")
+	}
+	var filename string
+	if inMemory {
+		filename = "file::memory:"
+		query.Set("mode", "memory")
+	} else {
+		// The API accepts a filename, never a caller-supplied SQLite URI.
+		// URL.Path escapes literal %, # and ? so neither SQLite nor the driver
+		// can reinterpret the filename as another file or connection options.
+		uriPath := filepath.ToSlash(path)
+		if filepath.Separator == '\\' {
+			if strings.HasPrefix(path, `\\?\`) {
+				// SQLite's Windows VFS recognizes the native long-path prefix;
+				// preserve its backslashes through URI percent encoding.
+				uriPath = "/" + path
+			} else if !strings.HasPrefix(uriPath, "/") {
+				uriPath = "/" + uriPath
+			}
+		}
+		uri := url.URL{Scheme: "file", Path: uriPath}
+		filename = uri.String()
+	}
+	dsn := filename + "?" + query.Encode()
 
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
