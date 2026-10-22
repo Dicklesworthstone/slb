@@ -396,16 +396,21 @@ func TestCreateRequest_WrappedDangerousPayload_NotSafe(t *testing.T) {
 	// Wrapped destructive payloads: the normalizer unwraps bash -c / env /
 	// nohup, and even if it could not, the fail-closed default must still
 	// queue these for approval. None may ever skip.
-	cases := []string{
-		`bash -c "rm -rf /srv/data"`,
-		`env FOO=bar bash -c "git push origin main --force"`,
-		`nohup sh -c 'DROP DATABASE prod' &`,
-		`/bin/bash -c "rm -rf ~"`,
+	cases := []struct {
+		command string
+		shell   bool
+	}{
+		{`bash -c "rm -rf /srv/data"`, false},
+		{`env FOO=bar bash -c "git push origin main --force"`, false},
+		{`nohup sh -c 'DROP DATABASE prod' &`, true},
+		{`/bin/bash -c "rm -rf ~"`, false},
 	}
-	for _, command := range cases {
+	for _, tc := range cases {
+		command := tc.command
 		result, err := creator.CreateRequest(CreateRequestOptions{
 			SessionID: session.ID,
 			Command:   command,
+			Shell:     tc.shell,
 			Cwd:       "/project",
 		})
 		if err != nil {
@@ -434,6 +439,7 @@ func TestCreateRequest_SafeSegmentWithUnmatchedSegment_NotSkipped(t *testing.T) 
 		result, err := creator.CreateRequest(CreateRequestOptions{
 			SessionID: session.ID,
 			Command:   command,
+			Shell:     true,
 			Cwd:       "/project",
 		})
 		if err != nil {

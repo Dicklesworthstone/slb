@@ -148,7 +148,7 @@ func TestRequestQueueRevalidatesAndDoesNotRetryStorageErrors(t *testing.T) {
 			finished := takeQueuedResult(t, done)
 			if name == "model-changed" {
 				if finished.err != nil || finished.result.Request.RequestorModel != "model-b" || !finished.result.Queued || notifier.calls.Load() != 2 {
-					t.Fatalf("stale session snapshot: %+v", finished)
+					t.Fatalf("stale session snapshot: result=%+v err=%v", finished.result, finished.err)
 				}
 			} else {
 				if finished.err == nil || finished.result != nil || notifier.calls.Load() != 1 {

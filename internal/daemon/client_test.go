@@ -533,6 +533,7 @@ func TestStartDaemonWithOptions_DaemonModeRunsAndStops(t *testing.T) {
 	}
 
 	tmp := shortSocketDir(t)
+	project := t.TempDir()
 	socketPath := filepath.Join(tmp, "d.sock")
 	pidFile := filepath.Join(tmp, "daemon.pid")
 
@@ -542,6 +543,7 @@ func TestStartDaemonWithOptions_DaemonModeRunsAndStops(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- StartDaemonWithOptions(ctx, ServerOptions{
+			ProjectDir: project,
 			SocketPath: socketPath,
 			PIDFile:    pidFile,
 			Logger:     log.New(io.Discard),
@@ -1635,10 +1637,44 @@ func TestDaemonRuntimePathsResolveProjectAliases(t *testing.T) {
 		if got := PIDFileForCWD(tc.path); got != stem+".pid" {
 			t.Errorf("PID file for %q = %q, want %q", tc.path, got, stem+".pid")
 		}
+		if _, err := os.Stat(tc.path); err == nil {
+			if got, err := PhysicalProjectRootForCWD(tc.path); err != nil || got != tc.identity {
+				t.Errorf("physical project for %q = %q, %v; want %q", tc.path, got, err, tc.identity)
+			}
+		}
 	}
 	if got := ProjectRootForCWD(aliasRoot); got != aliasRoot {
 		t.Fatalf("runtime normalization changed approval path identity: got %q, want %q", got, aliasRoot)
 	}
+}
+
+func TestPhysicalProjectRootRejectsUnavailablePaths(t *testing.T) {
+	base := t.TempDir()
+	file := filepath.Join(base, "ordinary-file")
+	if err := os.WriteFile(file, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	brokenState := filepath.Join(base, "broken-state")
+	if err := os.Mkdir(brokenState, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(brokenState, ".slb"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"", "relative", filepath.Join(base, "missing"), file, brokenState} {
+		if root, err := PhysicalProjectRootForCWD(path); err == nil {
+			t.Errorf("unavailable path %q selected policy root %q", path, root)
+		}
+	}
+	t.Run("dangling state directory", func(t *testing.T) {
+		project := t.TempDir()
+		if err := os.Symlink(filepath.Join(base, "missing"), filepath.Join(project, ".slb")); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		if root, err := PhysicalProjectRootForCWD(project); err == nil {
+			t.Fatalf("dangling project marker silently selected default policy at %q", root)
+		}
+	})
 }
 
 func TestDefaultClientStatusDoesNotUseAnotherProjectsPID(t *testing.T) {

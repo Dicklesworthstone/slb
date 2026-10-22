@@ -128,14 +128,12 @@ def _emit_execution_handoff(response, tool_input, session_id, cwd):
         raise ValueError("invalid command hash")
     if not session_id or handoff.get("session_id") != session_id or "\x00" in session_id:
         raise ValueError("session mismatch")
-    expected_db = os.path.join(_project_root_for_approval(cwd), ".slb", "state.db")
-    if not isinstance(database_path, str) or database_path != expected_db:
-        raise ValueError("project database mismatch")
+    database_path, log_directory = _execution_paths(cwd, database_path)
     executable = shutil.which("slb")
     if executable is None:
         raise ValueError("slb executable unavailable")
     argv = [os.path.abspath(executable), "execute", "--db", database_path,
-            "--log-dir", os.path.join(os.path.dirname(database_path), "logs"),
+            "--log-dir", log_directory,
             "--session-id", session_id, "--expected-command-hash", command_hash, "--json"]
     timeout = tool_input.get("timeout")
     if type(timeout) is int and timeout > 0:
@@ -149,6 +147,37 @@ def _emit_execution_handoff(response, tool_input, session_id, cwd):
         "updatedInput": updated,
         "additionalContext": "SLB is executing the reviewed request once and recording its outcome.",
     }}))
+
+
+def _execution_paths(cwd, database_path):
+    """Validate the physical project DB while preserving stored approval paths."""
+    if not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
+        raise ValueError("invalid project working directory")
+    root = physical_cwd = os.path.realpath(cwd)
+    while True:
+        marker = os.path.join(root, ".slb")
+        try:
+            os.lstat(marker)
+        except FileNotFoundError:
+            pass
+        else:
+            if not os.path.isdir(marker):
+                raise ValueError("invalid project state directory")
+            break
+        parent = os.path.dirname(root)
+        if parent == root:
+            root = physical_cwd
+            break
+        root = parent
+    state_directory = os.path.realpath(os.path.join(root, ".slb"))
+    expected_db = os.path.join(state_directory, "state.db")
+    if (not isinstance(database_path, str) or not os.path.isabs(database_path)
+            or not os.path.isfile(expected_db) or not os.path.isfile(database_path)):
+        raise ValueError("project database unavailable")
+    expected_db = os.path.realpath(expected_db)
+    if os.path.realpath(database_path) != expected_db:
+        raise ValueError("project database mismatch")
+    return expected_db, os.path.join(state_directory, "logs")
 
 
 def _record_audit(command, session_id, cwd, action, tier, min_approvals, source, matched_pattern="") -> bool:

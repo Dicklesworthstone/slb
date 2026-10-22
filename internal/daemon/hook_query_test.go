@@ -16,7 +16,11 @@ import (
 func TestHookQueryDeletionRiskAndQuorum(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	srv := &IPCServer{}
-	for _, cwd := range []string{"/home/ubuntu", "/data/tmp", t.TempDir()} {
+	base := t.TempDir()
+	for _, cwd := range []string{filepath.Join(base, "home", "ubuntu"), filepath.Join(base, "data", "tmp"), t.TempDir()} {
+		if err := os.MkdirAll(cwd, 0o700); err != nil {
+			t.Fatal(err)
+		}
 		for _, tc := range []struct {
 			command, tier string
 			approvals     int
@@ -115,7 +119,7 @@ func TestIPCServer_HookQuery_SafeCommand(t *testing.T) {
 	defer conn.Close()
 
 	// Send hook_query with safe command
-	params, _ := json.Marshal(HookQueryParams{Command: "ls -la", CWD: "/tmp"})
+	params, _ := json.Marshal(HookQueryParams{Command: "ls -la", CWD: t.TempDir()})
 	req := RPCRequest{Method: "hook_query", Params: params, ID: 2}
 	data, _ := json.Marshal(req)
 	data = append(data, '\n')
@@ -176,7 +180,7 @@ func TestIPCServer_HookQuery_DangerousCommand(t *testing.T) {
 	defer conn.Close()
 
 	// Send hook_query with dangerous command
-	params, _ := json.Marshal(HookQueryParams{Command: "rm -rf node_modules", CWD: "/tmp"})
+	params, _ := json.Marshal(HookQueryParams{Command: "rm -rf node_modules", CWD: t.TempDir()})
 	req := RPCRequest{Method: "hook_query", Params: params, ID: 3}
 	data, _ := json.Marshal(req)
 	data = append(data, '\n')
@@ -240,7 +244,7 @@ func TestIPCServer_HookQuery_CriticalCommand(t *testing.T) {
 	defer conn.Close()
 
 	// Send hook_query with critical command
-	params, _ := json.Marshal(HookQueryParams{Command: "git push --force", CWD: "/tmp"})
+	params, _ := json.Marshal(HookQueryParams{Command: "git push --force", CWD: t.TempDir()})
 	req := RPCRequest{Method: "hook_query", Params: params, ID: 4}
 	data, _ := json.Marshal(req)
 	data = append(data, '\n')

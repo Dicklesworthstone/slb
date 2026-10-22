@@ -397,7 +397,7 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 	} else if cwd, absErr := filepath.Abs(project); absErr != nil {
 		status["daemon_error"] = absErr.Error()
 	} else {
-		healthCtx, cancel := context.WithTimeout(cmd.Context(), hookQueryTimeout(hookGuardProjectRoot(cwd)))
+		healthCtx, cancel := context.WithTimeout(cmd.Context(), hookQueryTimeout(cwd))
 		client := daemon.NewIPCClient(daemon.SocketPathForCWD(cwd))
 		health, healthErr := client.HookHealth(healthCtx, cwd)
 		cancel()
@@ -495,7 +495,7 @@ func runHookHealth(cmd *cobra.Command, args []string) error {
 		"cwd":                         cwd,
 	}
 
-	healthCtx, cancel := context.WithTimeout(cmd.Context(), hookQueryTimeout(hookGuardProjectRoot(cwd)))
+	healthCtx, cancel := context.WithTimeout(cmd.Context(), hookQueryTimeout(cwd))
 	client := daemon.NewIPCClient(daemon.SocketPathForCWD(cwd))
 	health, healthErr := client.HookHealth(healthCtx, cwd)
 	cancel()
@@ -542,7 +542,7 @@ func runHookTest(cmd *cobra.Command, args []string) error {
 
 	var daemonErr error
 	if !flagHookLocalOnly && !flagHookSimulateFailure {
-		queryCtx, cancel := context.WithTimeout(cmd.Context(), hookQueryTimeout(hookGuardProjectRoot(cwd)))
+		queryCtx, cancel := context.WithTimeout(cmd.Context(), hookQueryTimeout(cwd))
 		client := daemon.NewIPCClient(daemon.SocketPathForCWD(cwd))
 		live, queryErr := client.HookQuery(queryCtx, daemon.HookQueryParams{
 			Command: command, SessionID: flagSessionID, CWD: cwd, ExecutionHandoff: true,

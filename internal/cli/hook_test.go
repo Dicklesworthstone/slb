@@ -15,6 +15,7 @@ import (
 
 	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/daemon"
+	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 	"github.com/spf13/cobra"
 )
@@ -1204,9 +1205,7 @@ func TestNativeHookGuardProtocolAndFallback(t *testing.T) {
 
 func TestNativeHookGuardExecutionHandoff(t *testing.T) {
 	project := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(project, ".slb"), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	hookHandoffDatabase(t, project)
 	hash := strings.Repeat("a", 64)
 	response := &daemon.HookQueryResult{
 		Action: "execute",
@@ -1249,6 +1248,173 @@ func TestNativeHookGuardExecutionHandoff(t *testing.T) {
 	response.ExecutionHandoff.DatabasePath = filepath.Join(t.TempDir(), "wrong.db")
 	if err := emitNativeExecutionHandoff(&cobra.Command{}, response, toolInput, "session-1", project); err == nil {
 		t.Fatal("cross-project execution handoff was accepted")
+	}
+}
+
+func TestNativeHookHandoffUsesPhysicalProjectDatabase(t *testing.T) {
+	project, other := t.TempDir(), t.TempDir()
+	databasePath := hookHandoffDatabase(t, project)
+	otherDatabase := hookHandoffDatabase(t, other)
+	nested := filepath.Join(project, "src")
+	if err := os.Mkdir(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rootAlias := filepath.Join(t.TempDir(), "root-alias")
+	descendantAlias := filepath.Join(other, "descendant-alias")
+	for alias, target := range map[string]string{rootAlias: project, descendantAlias: nested} {
+		if err := os.Symlink(target, alias); err != nil {
+			t.Skipf("directory symlinks unavailable: %v", err)
+		}
+	}
+	linkedProject, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(linkedProject, ".slb"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linkedDatabase := filepath.Join(linkedProject, ".slb", "state.db")
+	if err := os.Symlink(databasePath, linkedDatabase); err != nil {
+		t.Skipf("file symlinks unavailable: %v", err)
+	}
+	for _, tc := range []struct {
+		name, cwd, database, logDirectory string
+		valid                             bool
+	}{
+		{"root alias with alias DB", rootAlias, filepath.Join(rootAlias, ".slb", "state.db"), "", true},
+		{"root alias with physical DB", rootAlias, databasePath, "", true},
+		{"descendant alias with physical DB", descendantAlias, databasePath, "", true},
+		{"file-only DB symlink preserves project logs", linkedProject, linkedDatabase, filepath.Join(linkedProject, ".slb", "logs"), true},
+		{"descendant alias with lexical parent DB", descendantAlias, otherDatabase, "", false},
+		{"root alias with foreign DB", rootAlias, otherDatabase, "", false},
+		{"unavailable cwd", filepath.Join(rootAlias, "missing"), databasePath, "", false},
+		{"unavailable DB", rootAlias, filepath.Join(project, ".slb", "missing.db"), "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := &daemon.HookQueryResult{Action: "execute", ExecutionHandoff: &daemon.HookExecutionHandoff{
+				RequestID: "req-alias", CommandHash: strings.Repeat("a", 64), SessionID: "session-1", DatabasePath: tc.database,
+			}}
+			cmd := &cobra.Command{}
+			var stdout strings.Builder
+			cmd.SetOut(&stdout)
+			err := emitNativeExecutionHandoff(cmd, response, map[string]any{"command": "git reset --hard"}, "session-1", tc.cwd)
+			if tc.valid {
+				if err != nil {
+					t.Fatal(err)
+				}
+				var payload struct {
+					Output struct {
+						Input map[string]any `json:"updatedInput"`
+					} `json:"hookSpecificOutput"`
+				}
+				if err := json.Unmarshal([]byte(stdout.String()), &payload); err != nil {
+					t.Fatal(err)
+				}
+				command, _ := payload.Output.Input["command"].(string)
+				if !strings.Contains(command, databasePath) || !strings.Contains(command, strings.Repeat("a", 64)) {
+					t.Fatalf("valid alias handoff lost its database or command hash: %s", command)
+				}
+				logDirectory := tc.logDirectory
+				if logDirectory == "" {
+					logDirectory = filepath.Join(filepath.Dir(databasePath), "logs")
+				}
+				if !strings.Contains(command, "--log-dir "+hookShellQuote(logDirectory)) {
+					t.Fatalf("handoff moved logs outside the selected project's state: %s", command)
+				}
+			} else if err == nil || stdout.Len() != 0 {
+				t.Fatalf("invalid database handoff was accepted: %s, %v", stdout.String(), err)
+			}
+		})
+	}
+}
+
+func TestNativeHookFallbackRejectsUnavailableProjectPolicy(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
+	for _, tc := range []struct {
+		name, marker string
+	}{
+		{"missing database", ".slb"},
+		{"database directory", filepath.Join(".slb", "state.db")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			project := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(project, tc.marker), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if result, err := classifyNativeHookFallback("git stash", project); err == nil {
+				t.Fatalf("unavailable project state fell back to safe defaults: %+v", result)
+			}
+		})
+	}
+	if result, err := classifyNativeHookFallback("git stash", filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatalf("unavailable cwd fell back to safe defaults: %+v", result)
+	}
+}
+
+func TestNativeHookFallbackFollowsPhysicalProjectThroughAliases(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
+	project, other := t.TempDir(), t.TempDir()
+	for _, root := range []string{project, other} {
+		conn, err := db.OpenAndMigrate(filepath.Join(root, ".slb", "state.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if root == project {
+			if _, err := conn.InsertCustomPattern("critical", "^alias-db-wipe$", "project A rule", "human"); err != nil {
+				conn.Close()
+				t.Fatal(err)
+			}
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nested := filepath.Join(project, "src")
+	if err := os.Mkdir(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(project, ".slb", "config.toml")
+	if err := os.WriteFile(configPath, []byte("[patterns.critical]\npatterns = ['^alias-config-wipe$']\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, ".slb", "config.toml"),
+		[]byte("[patterns.safe]\npatterns = ['^alias-config-wipe$', '^alias-db-wipe$']\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rootAlias := filepath.Join(t.TempDir(), "root-alias")
+	externalAlias := filepath.Join(t.TempDir(), "descendant-alias")
+	otherAlias := filepath.Join(other, "descendant-alias")
+	for alias, target := range map[string]string{rootAlias: project, externalAlias: nested, otherAlias: nested} {
+		if err := os.Symlink(target, alias); err != nil {
+			t.Skipf("directory symlinks unavailable: %v", err)
+		}
+	}
+	for _, command := range []string{"alias-config-wipe", "alias-db-wipe"} {
+		control, err := classifyNativeHookFallback(command, other)
+		if err != nil || control.Action != "allow" {
+			t.Fatalf("project B control did not use its safe policy: %+v, %v", control, err)
+		}
+		for _, tc := range []struct{ name, cwd string }{
+			{"physical", nested}, {"root alias", rootAlias},
+			{"external descendant alias", externalAlias}, {"alias below project B", otherAlias},
+		} {
+			t.Run(command+"/"+tc.name, func(t *testing.T) {
+				result, err := classifyNativeHookFallback(command, tc.cwd)
+				if err != nil || result.Action != "block" || result.Tier != "critical" {
+					t.Fatalf("project A's offline policy was bypassed through %q: %+v, %v", tc.cwd, result, err)
+				}
+			})
+		}
+	}
+	if err := os.WriteFile(configPath, []byte("[patterns.critical\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, cwd := range []string{nested, externalAlias, otherAlias} {
+		if result, err := classifyNativeHookFallback("alias-config-wipe", cwd); err == nil {
+			t.Errorf("unavailable project A policy did not fail closed through %q: %+v", cwd, result)
+		}
 	}
 }
 
@@ -1532,5 +1698,31 @@ func TestHookQueryTimeoutConfig(t *testing.T) {
 	t.Setenv("SLB_HOOK_QUERY_TIMEOUT_MS", "5")
 	if got := hookQueryTimeout(project); got != 250*time.Millisecond {
 		t.Fatalf("out-of-range timeout must use the default, got %s", got)
+	}
+}
+
+func TestHookQueryTimeoutUsesPhysicalProject(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
+	project, other := t.TempDir(), t.TempDir()
+	for root, timeout := range map[string]string{project: "900", other: "1200"} {
+		if err := os.Mkdir(filepath.Join(root, ".slb"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, ".slb", "config.toml"),
+			[]byte("[integrations]\nhook_query_timeout_ms = "+timeout+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nested := filepath.Join(project, "src")
+	if err := os.Mkdir(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(other, "descendant-alias")
+	if err := os.Symlink(nested, alias); err != nil {
+		t.Skipf("directory symlinks unavailable: %v", err)
+	}
+	if got := hookQueryTimeout(alias); got != 900*time.Millisecond {
+		t.Fatalf("query timeout selected the lexical parent's policy: %s", got)
 	}
 }

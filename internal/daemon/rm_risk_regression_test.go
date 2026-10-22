@@ -15,12 +15,15 @@ func TestHookQueryRMOperandBoundariesAndRootGlobs(t *testing.T) {
 		t.Skip("POSIX shell paths")
 	}
 	home := filepath.Join(t.TempDir(), "agent home")
-	if err := os.MkdirAll(home, 0700); err != nil {
+	project := filepath.Join(home, "project")
+	if err := os.MkdirAll(project, 0700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("HOME", home)
 	srv := &IPCServer{}
-	for _, cwd := range []string{"", "/home/ubuntu", "/data/tmp", home, filepath.Join(home, "project")} {
+	// Physical policy discovery requires existing directories. Keep the
+	// classification cases independent of paths installed on the test host.
+	for _, cwd := range []string{"", t.TempDir(), t.TempDir(), home, project} {
 		for _, tc := range []struct {
 			command, tier string
 			approvals     int

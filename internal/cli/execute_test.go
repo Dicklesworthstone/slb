@@ -138,6 +138,7 @@ func TestExecuteCommand_CannotExecutePending(t *testing.T) {
 func TestExecuteCommand_ExecutesApprovedRequest(t *testing.T) {
 	h := testutil.NewHarness(t)
 	resetExecuteFlags()
+	t.Cleanup(resetExecuteFlags)
 
 	sess := testutil.MakeSession(t, h.DB,
 		testutil.WithProject(h.ProjectDir),
@@ -156,6 +157,7 @@ func TestExecuteCommand_ExecutesApprovedRequest(t *testing.T) {
 	cmd := newTestExecuteCmd(h.DBPath)
 	stdout, err := executeCommandCapture(t, cmd, "execute", req.ID,
 		"--session-id", sess.ID,
+		"--log-dir", h.MustPath(".slb", "logs"),
 		"-j",
 	)
 
@@ -276,6 +278,7 @@ func TestExecuteCommand_Help(t *testing.T) {
 func TestExecuteCommand_CustomTimeout(t *testing.T) {
 	h := testutil.NewHarness(t)
 	resetExecuteFlags()
+	t.Cleanup(resetExecuteFlags)
 
 	sess := testutil.MakeSession(t, h.DB,
 		testutil.WithProject(h.ProjectDir),
@@ -294,6 +297,7 @@ func TestExecuteCommand_CustomTimeout(t *testing.T) {
 	stdout, err := executeCommandCapture(t, cmd, "execute", req.ID,
 		"--session-id", sess.ID,
 		"--timeout", "10", // Short timeout (-t is now persistent --toon)
+		"--log-dir", h.MustPath(".slb", "logs"),
 		"-j",
 	)
 

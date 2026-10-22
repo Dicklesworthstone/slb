@@ -98,6 +98,7 @@ func recordHookAudit(directory string, params HookQueryParams, result *HookQuery
 type hookPolicy struct {
 	engine        *core.PatternEngine
 	cautionAction string
+	projectRoot   string
 	// statePath is the project's state database, or empty before `slb init`.
 	statePath string
 }
@@ -226,10 +227,10 @@ func (c *hookPolicyCache) policyFor(cwd string) (hookPolicy, error) {
 	if cwd == "" {
 		return hookPolicy{engine: core.NewPatternEngine(), cautionAction: "block"}, nil
 	}
-	if !filepath.IsAbs(cwd) {
-		return hookPolicy{}, fmt.Errorf("hook cwd must be absolute")
+	root, err := PhysicalProjectRootForCWD(cwd)
+	if err != nil {
+		return hookPolicy{}, err
 	}
-	root := ProjectRootForCWD(cwd)
 	opts := config.LoadOptions{ProjectDir: root}
 	hasState := true
 	if _, err := os.Stat(filepath.Join(root, ".slb")); os.IsNotExist(err) {
@@ -301,7 +302,7 @@ func (c *hookPolicyCache) policyFor(cwd string) (hookPolicy, error) {
 		}
 		entry = &cachedHookPolicy{
 			sources: sources, cfg: cfg, hasState: hasState, state: state, custom: custom,
-			policy: hookPolicy{engine: engine, cautionAction: cfg.Integrations.HookCautionAction, statePath: statePath},
+			policy: hookPolicy{engine: engine, cautionAction: cfg.Integrations.HookCautionAction, projectRoot: root, statePath: statePath},
 		}
 	}
 	c.store(root, entry)
@@ -380,7 +381,7 @@ func (s *IPCServer) classifyCommand(params HookQueryParams) *HookQueryResult {
 		return result
 	}
 	defer conn.Close()
-	approved := findHookApproval(conn, engine, params, classification.MinApprovals)
+	approved := findHookApproval(conn, engine, params, policy.projectRoot)
 	if approved == nil {
 		return result
 	}
@@ -398,7 +399,7 @@ func (s *IPCServer) classifyCommand(params HookQueryParams) *HookQueryResult {
 	return result
 }
 
-func findHookApproval(conn *db.DB, engine *core.PatternEngine, params HookQueryParams, minApprovals int) *db.Request {
+func findHookApproval(conn *db.DB, engine *core.PatternEngine, params HookQueryParams, projectRoot string) *db.Request {
 	var id string
 	err := conn.QueryRow(`
 		SELECT r.id FROM requests r JOIN sessions s ON s.id = r.requestor_session_id
@@ -414,6 +415,13 @@ func findHookApproval(conn *db.DB, engine *core.PatternEngine, params HookQueryP
 	req, err := conn.GetRequest(id)
 	if err != nil || req.Status != db.StatusApproved || req.ProjectPath != ProjectRootForCWD(params.CWD) || req.Command.Raw != params.Command ||
 		req.Command.Cwd != params.CWD || req.RequestorSessionID != params.SessionID {
+		return nil
+	}
+	// Keep the exact stored path, cwd and hash binding above, including root
+	// aliases. A lexical ancestor across a descendant alias must nevertheless
+	// belong to the physical project whose policy and database we selected.
+	approvedRoot, err := PhysicalProjectRootForCWD(req.ProjectPath)
+	if err != nil || approvedRoot != projectRoot {
 		return nil
 	}
 	// CanExecute checks the current project-local dynamic quorum; comparing

@@ -125,6 +125,8 @@ func TestWriteError_JSON(t *testing.T) {
 func TestRunApprovedRequest_Success(t *testing.T) {
 	h := testutil.NewHarness(t)
 	// h.Close() is NOT needed as Harness uses t.Cleanup
+	// The approved-run helper writes default logs relative to the caller's cwd.
+	t.Chdir(h.ProjectDir)
 
 	// Setup session
 	sess := testutil.MakeSession(t, h.DB,
@@ -223,6 +225,8 @@ func TestRunApprovedRequest_ValidationFailure(t *testing.T) {
 
 func TestRunApprovedRequest_ExecutionFailure(t *testing.T) {
 	h := testutil.NewHarness(t)
+	// Keep the default .slb/logs directory inside the isolated project fixture.
+	t.Chdir(h.ProjectDir)
 
 	sess := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir))
 	flagSessionID = sess.ID

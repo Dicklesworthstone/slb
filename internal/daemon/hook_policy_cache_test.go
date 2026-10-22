@@ -15,7 +15,10 @@ func hookPolicyProject(tb testing.TB) string {
 	tb.Helper()
 	tb.Setenv("HOME", tb.TempDir())
 	tb.Setenv("USERPROFILE", tb.TempDir())
-	project := tb.TempDir()
+	project, err := filepath.EvalSymlinks(tb.TempDir())
+	if err != nil {
+		tb.Fatal(err)
+	}
 	database, err := db.OpenAndMigrate(filepath.Join(project, ".slb", "state.db"))
 	if err != nil {
 		tb.Fatal(err)
@@ -194,6 +197,67 @@ func TestHookPolicyCacheIsBounded(t *testing.T) {
 	}
 	if got := len(cache.entries); got > maxCachedHookPolicies {
 		t.Fatalf("cache holds %d entries, bound is %d", got, maxCachedHookPolicies)
+	}
+}
+
+func TestHookPolicyFollowsPhysicalProjectThroughAliases(t *testing.T) {
+	project := hookPolicyProject(t)
+	other := hookPolicyProject(t)
+	physical, err := filepath.EvalSymlinks(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(physical, "src")
+	if err := os.Mkdir(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(project, ".slb", "config.toml")
+	if err := os.WriteFile(configPath, []byte("[patterns.critical]\npatterns = ['^alias-config-wipe$']\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openProjectDB(t, project).InsertCustomPattern("critical", "^alias-db-wipe$", "project A rule", "human"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, ".slb", "config.toml"),
+		[]byte("[patterns.safe]\npatterns = ['^alias-config-wipe$', '^alias-db-wipe$']\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rootAlias := filepath.Join(t.TempDir(), "root-alias")
+	externalAlias := filepath.Join(t.TempDir(), "descendant-alias")
+	otherAlias := filepath.Join(other, "descendant-alias")
+	for alias, target := range map[string]string{rootAlias: project, externalAlias: nested, otherAlias: nested} {
+		if err := os.Symlink(target, alias); err != nil {
+			t.Skipf("directory symlinks unavailable: %v", err)
+		}
+	}
+	srv := &IPCServer{}
+	for _, command := range []string{"alias-config-wipe", "alias-db-wipe"} {
+		if result := srv.classifyCommand(HookQueryParams{Command: command, CWD: other}); result.Action != "allow" {
+			t.Fatalf("project B control did not use its safe policy: %+v", result)
+		}
+		for _, tc := range []struct{ name, cwd string }{
+			{"physical", nested}, {"root alias", rootAlias},
+			{"external descendant alias", externalAlias}, {"alias below project B", otherAlias},
+		} {
+			t.Run(command+"/"+tc.name, func(t *testing.T) {
+				if SocketPathForCWD(tc.cwd) != SocketPathForCWD(physical) {
+					t.Fatal("fixture did not route to project A's daemon")
+				}
+				result := srv.classifyCommand(HookQueryParams{Command: command, CWD: tc.cwd})
+				if result.Action != "block" || result.Tier != "critical" {
+					t.Fatalf("project A's policy was bypassed through %q: %+v", tc.cwd, result)
+				}
+			})
+		}
+	}
+	if err := os.WriteFile(configPath, []byte("[patterns.critical\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, cwd := range []string{nested, externalAlias, otherAlias} {
+		result := srv.classifyCommand(HookQueryParams{Command: "alias-config-wipe", CWD: cwd})
+		if result.Action != "block" || result.MatchedPattern != "policy_load_error" {
+			t.Errorf("unavailable project A policy did not fail closed through %q: %+v", cwd, result)
+		}
 	}
 }
 

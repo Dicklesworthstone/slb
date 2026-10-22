@@ -170,6 +170,45 @@ func ProjectRootForCWD(start string) string {
 	}
 }
 
+// PhysicalProjectRootForCWD selects policy and state for an existing absolute
+// working directory. Resolve aliases before ancestor discovery so an alias into
+// another project's descendant cannot select its lexical parent's policy.
+// Approval records keep their literal paths through ProjectRootForCWD instead.
+func PhysicalProjectRootForCWD(cwd string) (string, error) {
+	if !filepath.IsAbs(cwd) {
+		return "", fmt.Errorf("project working directory must be absolute")
+	}
+	physical, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		return "", fmt.Errorf("resolving project working directory: %w", err)
+	}
+	info, err := os.Stat(physical)
+	if err != nil {
+		return "", fmt.Errorf("reading project working directory: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("project working directory is not a directory")
+	}
+	for dir := physical; ; dir = filepath.Dir(dir) {
+		marker := filepath.Join(dir, ".slb")
+		if _, err := os.Lstat(marker); err == nil {
+			info, err := os.Stat(marker)
+			if err != nil {
+				return "", fmt.Errorf("reading project state directory: %w", err)
+			}
+			if !info.IsDir() {
+				return "", fmt.Errorf("project state path %q is not a directory", marker)
+			}
+			return dir, nil
+		} else if !os.IsNotExist(err) {
+			return "", fmt.Errorf("finding project state directory: %w", err)
+		}
+		if filepath.Dir(dir) == dir {
+			return physical, nil
+		}
+	}
+}
+
 // DefaultPIDFile returns the PID file for the current project.
 // Format: /tmp/slb-{project-hash}.pid, using the same identity as the socket.
 func DefaultPIDFile() string {

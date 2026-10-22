@@ -7,28 +7,37 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
 func hookApprovalFixture(t *testing.T) (*db.DB, *db.Request, HookQueryParams) {
 	t.Helper()
-	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	cwd := filepath.Join(root, "src", "nested")
 	if err := os.MkdirAll(cwd, 0700); err != nil {
 		t.Fatal(err)
 	}
-	conn, err := db.Open(filepath.Join(root, ".slb", "state.db"))
+	return hookApprovalFixtureForPaths(t, root, root, cwd)
+}
+
+func hookApprovalFixtureForPaths(t *testing.T, databaseRoot, projectPath, cwd string) (*db.DB, *db.Request, HookQueryParams) {
+	t.Helper()
+	conn, err := db.Open(filepath.Join(databaseRoot, ".slb", "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	session := &db.Session{AgentName: "HookAgent", Model: "test", Program: "test", ProjectPath: root}
+	session := &db.Session{AgentName: "HookAgent", Model: "test", Program: "test", ProjectPath: projectPath}
 	if err := conn.CreateSession(session); err != nil {
 		t.Fatal(err)
 	}
 	expires := time.Now().UTC().Add(time.Hour)
 	req := &db.Request{
-		ProjectPath: root, RequestorSessionID: session.ID, RequestorAgent: session.AgentName,
+		ProjectPath: projectPath, RequestorSessionID: session.ID, RequestorAgent: session.AgentName,
 		RequestorModel: session.Model, Status: db.StatusApproved, RiskTier: db.RiskTierDangerous,
 		Command:      db.CommandSpec{Raw: "git reset --hard", Argv: []string{"git", "reset", "--hard"}, Cwd: cwd},
 		MinApprovals: 1, ApprovalExpiresAt: &expires, Justification: db.Justification{Reason: "Test hook handoff"},
@@ -38,7 +47,7 @@ func hookApprovalFixture(t *testing.T) (*db.DB, *db.Request, HookQueryParams) {
 	}
 	// The status bit is not an approval: handoff eligibility re-verifies
 	// signed reviewer evidence (f4fb378), so record one authentic approval.
-	reviewer := &db.Session{AgentName: "HookReviewer", Model: "reviewer-model", Program: "test", ProjectPath: root}
+	reviewer := &db.Session{AgentName: "HookReviewer", Model: "reviewer-model", Program: "test", ProjectPath: projectPath}
 	if err := conn.CreateSession(reviewer); err != nil {
 		t.Fatal(err)
 	}
@@ -162,5 +171,63 @@ func TestHookPolicyReloadsWithoutLeakingAcrossProjects(t *testing.T) {
 	// and a hard denial, not an interactive fallback.
 	if result := srv.classifyCommand(params); result.Action != "block" || result.MatchedPattern != "policy_load_error" || result.ExecutionHandoff != nil {
 		t.Fatalf("invalid policy failed open: %+v", result)
+	}
+}
+
+func TestHookApprovalRootAliasPreservesLiteralBinding(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "src", "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "project-alias")
+	if err := os.Symlink(root, alias); err != nil {
+		t.Skipf("directory symlinks unavailable: %v", err)
+	}
+	conn, req, params := hookApprovalFixtureForPaths(t, root, alias, filepath.Join(alias, "src", "nested"))
+	srv := &IPCServer{}
+	result := srv.classifyCommand(params)
+	if result.Action != "execute" || result.ExecutionHandoff == nil {
+		t.Fatalf("existing alias-bound approval was lost: %+v", result)
+	}
+	handoff := result.ExecutionHandoff
+	if handoff.DatabasePath != filepath.Join(root, ".slb", "state.db") || handoff.CommandHash != req.Command.Hash ||
+		handoff.RequestID != req.ID || handoff.SessionID != params.SessionID {
+		t.Fatalf("handoff changed the approval binding or selected a lexical database: %+v", handoff)
+	}
+	stored, err := conn.GetRequest(req.ID)
+	if err != nil || stored.ProjectPath != alias || stored.Command.Cwd != params.CWD || stored.Command.Hash != req.Command.Hash ||
+		stored.Status != db.StatusApproved {
+		t.Fatalf("physical policy selection changed the stored approval: %+v, %v", stored, err)
+	}
+	params.CWD = filepath.Join(root, "src", "nested")
+	if result := srv.classifyCommand(params); result.Action != "block" || result.ExecutionHandoff != nil {
+		t.Fatalf("physical equivalence relaxed the exact command cwd binding: %+v", result)
+	}
+}
+
+func TestHookApprovalRejectsLexicalProjectAcrossDescendantAlias(t *testing.T) {
+	project := hookPolicyProject(t)
+	other := hookPolicyProject(t)
+	nested := filepath.Join(project, "src")
+	if err := os.Mkdir(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(other, "project-alias")
+	if err := os.Symlink(nested, alias); err != nil {
+		t.Skipf("directory symlinks unavailable: %v", err)
+	}
+	conn, req, params := hookApprovalFixtureForPaths(t, project, other, alias)
+	if ProjectRootForCWD(alias) != other {
+		t.Fatal("fixture does not exercise a different lexical project")
+	}
+	if ok, reason := core.NewExecutor(conn, core.NewPatternEngine()).CanExecute(req.ID); !ok {
+		t.Fatalf("fixture approval must otherwise be executable: %s", reason)
+	}
+	result := (&IPCServer{}).classifyCommand(params)
+	if result.Action != "block" || result.ExecutionHandoff != nil || result.RequestID != "" {
+		t.Fatalf("project B approval was handed off using project A's state: %+v", result)
 	}
 }

@@ -36,6 +36,7 @@ func TestDaemonModeEnabled(t *testing.T) {
 
 func TestRunDaemon_WritesPIDAndSocketAndCleansUp(t *testing.T) {
 	tmp := shortSocketDir(t)
+	project := t.TempDir()
 	pidFile := filepath.Join(tmp, "slb.pid")
 	socketPath := filepath.Join(tmp, "s.sock")
 
@@ -45,6 +46,7 @@ func TestRunDaemon_WritesPIDAndSocketAndCleansUp(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- RunDaemon(ctx, ServerOptions{
+			ProjectDir: project,
 			SocketPath: socketPath,
 			PIDFile:    pidFile,
 			Logger:     logger,

@@ -72,7 +72,7 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 	if parent == nil {
 		parent = context.Background()
 	}
-	queryTimeout := hookQueryTimeout(hookGuardProjectRoot(cwd))
+	queryTimeout := hookQueryTimeout(cwd)
 	queryCtx, cancel := context.WithTimeout(parent, queryTimeout)
 	client := daemon.NewIPCClient(daemon.SocketPathForCWD(cwd))
 	live, liveErr := client.HookQuery(queryCtx, daemon.HookQueryParams{
@@ -116,13 +116,15 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 		fallback.Tier, fallback.MinApprovals, fallback.MatchedPattern, source, false)
 }
 
-// hookQueryTimeout is the configured daemon-query deadline for a project.
+// hookQueryTimeout is the configured daemon-query deadline for cwd's physical project.
 // Config errors fall back to the default: the offline path loads the same
 // config and fails closed on it.
-func hookQueryTimeout(projectRoot string) time.Duration {
+func hookQueryTimeout(cwd string) time.Duration {
 	ms := config.DefaultHookQueryTimeoutMS
-	if cfg, err := config.Load(config.LoadOptions{ProjectDir: projectRoot}); err == nil {
-		ms = cfg.Integrations.HookQueryTimeoutMS
+	if root, err := daemon.PhysicalProjectRootForCWD(cwd); err == nil {
+		if cfg, err := config.Load(config.LoadOptions{ProjectDir: root}); err == nil {
+			ms = cfg.Integrations.HookQueryTimeoutMS
+		}
 	}
 	if ms < config.MinHookQueryTimeoutMS || ms > config.MaxHookQueryTimeoutMS {
 		ms = config.DefaultHookQueryTimeoutMS
@@ -170,7 +172,10 @@ func hookGuardCWD(input map[string]any) (string, error) {
 }
 
 func classifyNativeHookFallback(command, cwd string) (*daemon.HookQueryResult, error) {
-	root := hookGuardProjectRoot(cwd)
+	root, err := daemon.PhysicalProjectRootForCWD(cwd)
+	if err != nil {
+		return nil, err
+	}
 	opts := config.LoadOptions{ProjectDir: root}
 	cfg, err := config.Load(opts)
 	if err != nil {
@@ -180,7 +185,10 @@ func classifyNativeHookFallback(command, cwd string) (*daemon.HookQueryResult, e
 	var reader core.PolicyReader
 	var connection *db.DB
 	stateDB := filepath.Join(root, ".slb", "state.db")
-	if info, statErr := os.Stat(stateDB); statErr == nil && !info.IsDir() {
+	if info, statErr := os.Stat(stateDB); statErr == nil {
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("project state database is not a regular file")
+		}
 		connection, err = db.OpenWithOptions(stateDB, db.OpenOptions{
 			CreateIfNotExists: false, InitSchema: false, ReadOnly: true,
 		})
@@ -191,6 +199,12 @@ func classifyNativeHookFallback(command, cwd string) (*daemon.HookQueryResult, e
 		reader = connection
 	} else if statErr != nil && !os.IsNotExist(statErr) {
 		return nil, statErr
+	} else if _, markerErr := os.Stat(filepath.Join(root, ".slb")); markerErr == nil {
+		// An initialized project's missing database is unavailable policy, not
+		// permission to discard its custom rules and use defaults.
+		return nil, statErr
+	} else if !os.IsNotExist(markerErr) {
+		return nil, markerErr
 	}
 	engine, err := core.LoadCommandPolicy(reader, opts)
 	if err != nil {
@@ -223,20 +237,6 @@ func classifyNativeHookFallback(command, cwd string) (*daemon.HookQueryResult, e
 		result.Message = "SLB OFFLINE: command is not covered by policy; confirmation required while the daemon is unavailable."
 	}
 	return result, nil
-}
-
-func hookGuardProjectRoot(cwd string) string {
-	path := filepath.Clean(cwd)
-	for {
-		if info, err := os.Stat(filepath.Join(path, ".slb")); err == nil && info.IsDir() {
-			return path
-		}
-		parent := filepath.Dir(path)
-		if parent == path {
-			return filepath.Clean(cwd)
-		}
-		path = parent
-	}
 }
 
 func decideAndAuditNativeHook(cmd *cobra.Command, command, sessionID, cwd, action, message, tier string,
@@ -295,9 +295,9 @@ func emitNativeExecutionHandoff(cmd *cobra.Command, response *daemon.HookQueryRe
 		handoff.SessionID != sessionID {
 		return fmt.Errorf("invalid execution handoff")
 	}
-	expectedDB := filepath.Join(hookGuardProjectRoot(cwd), ".slb", "state.db")
-	if handoff.DatabasePath != expectedDB {
-		return fmt.Errorf("execution handoff project mismatch")
+	databasePath, logDirectory, err := hookExecutionPaths(cwd, handoff.DatabasePath)
+	if err != nil {
+		return err
 	}
 	executable, err := os.Executable()
 	if err != nil {
@@ -308,8 +308,8 @@ func emitNativeExecutionHandoff(cmd *cobra.Command, response *daemon.HookQueryRe
 		return err
 	}
 	args := []string{
-		executable, "execute", "--db", handoff.DatabasePath,
-		"--log-dir", filepath.Join(filepath.Dir(handoff.DatabasePath), "logs"),
+		executable, "execute", "--db", databasePath,
+		"--log-dir", logDirectory,
 		"--session-id", sessionID, "--expected-command-hash", handoff.CommandHash, "--json",
 	}
 	if rawTimeout, ok := toolInput["timeout"]; ok {
@@ -339,6 +339,39 @@ func emitNativeExecutionHandoff(cmd *cobra.Command, response *daemon.HookQueryRe
 			"additionalContext": "SLB is executing the reviewed request once and recording its outcome.",
 		},
 	})
+}
+
+func hookExecutionPaths(cwd, databasePath string) (string, string, error) {
+	root, err := daemon.PhysicalProjectRootForCWD(cwd)
+	if err != nil {
+		return "", "", err
+	}
+	if !filepath.IsAbs(databasePath) {
+		return "", "", fmt.Errorf("execution handoff database path must be absolute")
+	}
+	stateDirectory, err := filepath.EvalSymlinks(filepath.Join(root, ".slb"))
+	if err != nil {
+		return "", "", fmt.Errorf("resolving project state directory: %w", err)
+	}
+	expected, err := filepath.EvalSymlinks(filepath.Join(stateDirectory, "state.db"))
+	if err != nil {
+		return "", "", fmt.Errorf("resolving project database: %w", err)
+	}
+	actual, err := filepath.EvalSymlinks(databasePath)
+	if err != nil || actual != expected {
+		return "", "", fmt.Errorf("execution handoff project mismatch")
+	}
+	info, err := os.Stat(expected)
+	if err != nil {
+		return "", "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", "", fmt.Errorf("execution handoff database is not a regular file")
+	}
+	// Use the validated physical path for execution rather than following the
+	// supplied alias again. Logs remain in the project's state directory even
+	// when only state.db is a symlink. The request retains its literal identity.
+	return expected, filepath.Join(stateDirectory, "logs"), nil
 }
 
 func hookJSONPositiveInt(value any) (int, bool) {
