@@ -44,14 +44,17 @@ another process that can read those credentials. Lost credentials cannot be
 recovered through an agent-name lookup. Ending/recreating a session does not
 establish a new principal.
 
-Session keys are stored only as digests (schema version 5), so the database,
-its copies and its backups no longer contain a key that slb accepts. The
-upgrade converts plaintext keys in place, re-signs the votes whose signatures
-still verify, zeroes the freed space (`secure_delete`) and truncates the
-write-ahead log. Copies made before the upgrade, and filesystem blocks the old
-file used, still hold the old keys: end those sessions and start new ones if
-such a copy may have leaked. An older slb binary that writes the database later
-stores a plaintext key again; a current binary converts it on its next open.
+Session keys are stored only as digests (schema versions 5 and 6), so the
+database, its copies and its backups no longer contain a key that slb accepts.
+The upgrade converts plaintext keys in place, re-signs the votes whose
+signatures still verify, zeroes the freed space (`secure_delete`), rebuilds the
+file with `VACUUM` (rewriting rows does not reach old bytes on pages SQLite
+leaves alone, such as a table's root page once it holds more than one page of
+rows) and truncates the write-ahead log. Copies made before the upgrade, and
+filesystem blocks the old file used, still hold the old keys: end those
+sessions and start new ones if such a copy may have leaked. An older slb binary
+that writes the database later stores a plaintext key again; a current binary
+converts it on its next open and rebuilds the file if it can.
 None of this changes the same-UID limits above. A process running as the same
 user can read another agent's key wherever that agent keeps it (environment,
 files, terminal scrollback), and can write the database or run commands

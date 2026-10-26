@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,13 +42,10 @@ func databaseFilesContain(t *testing.T, path, needle string) bool {
 	return false
 }
 
-// Issue #30: upgrading a database converts plaintext keys to digests in
-// place. Agents keep their keys, votes that verified keep verifying, and the
-// plaintext is gone from the database files.
-func TestSessionKeyDigestMigration(t *testing.T) {
-	SimulateIndependentIdentityForTest(t) // to re-verify the historical approval
-	project := t.TempDir()
-	path := filepath.Join(project, "state.db")
+// openSchemaV4Database creates a database at schema version 4, the last one
+// that stored session keys in plaintext, without migrating it further.
+func openSchemaV4Database(t *testing.T, path string) *DB {
+	t.Helper()
 	legacy, err := OpenWithOptions(path, OpenOptions{CreateIfNotExists: true})
 	if err != nil {
 		t.Fatal(err)
@@ -62,6 +60,17 @@ func TestSessionKeyDigestMigration(t *testing.T) {
 		journalExec(t, legacy, migration.Up)
 		journalExec(t, legacy, `INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)`, migration.Version, time.Now().UTC().Format(time.RFC3339))
 	}
+	return legacy
+}
+
+// Issue #30: upgrading a database converts plaintext keys to digests in
+// place. Agents keep their keys, votes that verified keep verifying, and the
+// plaintext is gone from the database files.
+func TestSessionKeyDigestMigration(t *testing.T) {
+	SimulateIndependentIdentityForTest(t) // to re-verify the historical approval
+	project := t.TempDir()
+	path := filepath.Join(project, "state.db")
+	legacy := openSchemaV4Database(t, path)
 	keys := map[string]string{
 		"requester": strings.Repeat("1a", 32),
 		"reviewer":  strings.Repeat("2b", 32),
@@ -198,6 +207,48 @@ func TestSessionKeysFromOlderBinariesAreConverted(t *testing.T) {
 	var stored string
 	if err := database.QueryRow(`SELECT session_key FROM sessions WHERE id = 'old-binary'`).Scan(&stored); err != nil || stored != "" {
 		t.Fatalf("plaintext key kept after conversion: %q %v", stored, err)
+	}
+}
+
+// With more sessions than fit on one page, the sessions table's root page
+// becomes an interior page that still holds the bytes of the rows it had as
+// a leaf. Converting the rows never rewrites it, so only rebuilding the file
+// removes those keys.
+func TestSessionKeyDigestMigrationClearsMultiPageTables(t *testing.T) {
+	project := t.TempDir()
+	path := filepath.Join(project, "state.db")
+	legacy := openSchemaV4Database(t, path)
+	now := time.Now().UTC().Truncate(time.Second).Format(time.RFC3339)
+	var keys []string
+	for i := 0; i < 60; i++ {
+		sum := sha256.Sum256([]byte{byte(i)})
+		key := hex.EncodeToString(sum[:])
+		keys = append(keys, key)
+		journalExec(t, legacy, `INSERT INTO sessions(id, agent_name, program, model, project_path, session_key, started_at, last_active_at)
+			VALUES (?, ?, 'test', 'model', ?, ?, ?, ?)`, fmt.Sprintf("session-%02d", i), fmt.Sprintf("agent-%02d", i), project, key, now, now)
+	}
+	if !databaseFilesContain(t, path, keys[0]) {
+		t.Fatal("fixture did not write a plaintext key; the file scans below would prove nothing")
+	}
+	var pages int
+	if err := legacy.QueryRow(`SELECT COUNT(*) FROM dbstat WHERE name = 'sessions'`).Scan(&pages); err != nil {
+		t.Fatal(err)
+	}
+	if pages < 3 {
+		t.Fatalf("sessions table spans %d page(s); the fixture needs an interior root page", pages)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	for i, key := range keys {
+		if databaseFilesContain(t, path, key) {
+			t.Errorf("plaintext key of session-%02d is still in the database files after the upgrade", i)
+		}
 	}
 }
 

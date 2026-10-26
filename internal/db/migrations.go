@@ -199,6 +199,15 @@ ALTER TABLE execution_outcomes ADD COLUMN human_notes TEXT;
 		Version: 5,
 		Name:    "session_key_digests",
 	},
+	{
+		// Rebuild the file once keys are digests. Rewriting a row leaves its
+		// old bytes wherever SQLite does not rewrite the page: an interior
+		// page that was a leaf when the key was written, or space freed by
+		// earlier updates. VACUUM keeps only live rows. It cannot run in a
+		// transaction, so ApplyMigrations special-cases this version.
+		Version: 6,
+		Name:    "vacuum_after_session_key_digests",
+	},
 }
 
 // ApplyMigrations applies any pending migrations in order.
@@ -215,8 +224,9 @@ func (db *DB) ApplyMigrations(ctx context.Context) error {
 		return err
 	}
 
-	// Set when plaintext session keys were converted; older page images that
-	// held them are then dropped from the write-ahead log.
+	// Set when plaintext session keys were converted or the file rebuilt;
+	// older page images that held keys are then dropped from the
+	// write-ahead log.
 	purgeWAL := false
 
 	// Connections can migrate concurrently. Never sort a shared global slice.
@@ -225,6 +235,19 @@ func (db *DB) ApplyMigrations(ctx context.Context) error {
 
 	for _, m := range ordered {
 		if m.Version <= current {
+			continue
+		}
+
+		// Two CLIs migrating at once may both run VACUUM; that is harmless,
+		// and recording the version is idempotent.
+		if m.Version == 6 {
+			if _, err := db.conn.ExecContext(ctx, `VACUUM`); err != nil {
+				return fmt.Errorf("migration %d (%s) failed: %w", m.Version, m.Name, err)
+			}
+			if _, err := db.conn.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(?, ?)`, m.Version, time.Now().UTC().Format(time.RFC3339)); err != nil {
+				return fmt.Errorf("record migration %d: %w", m.Version, err)
+			}
+			purgeWAL = true
 			continue
 		}
 
@@ -304,6 +327,10 @@ func (db *DB) ApplyMigrations(ctx context.Context) error {
 	// is best effort: until a later open converts a row, it has no digest
 	// and authenticates nothing, so a failure here cannot grant access.
 	converted, _ := hashLateSessionKeys(ctx, db.conn)
+	if converted > 0 {
+		// Same reason as migration 6; best effort here too.
+		_, _ = db.conn.ExecContext(ctx, `VACUUM`)
+	}
 	if purgeWAL || converted > 0 {
 		// Best effort: a concurrent reader can keep the log from being
 		// truncated now, in which case later checkpoints reuse it.
