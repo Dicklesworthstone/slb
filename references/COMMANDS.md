@@ -18,7 +18,7 @@
 ```bash
 slb session start --agent <name> --program <prog> --model <model>
 slb session end --session-id <id>
-slb session resume --agent <name> --create-if-missing  # Resume after crash
+slb session resume --agent <name> --session-id <id> --session-key <key>  # Resume after crash
 slb session list                               # Show active sessions
 slb session heartbeat --session-id <id>        # Keep session alive
 slb session gc --threshold 2h                  # Clean stale sessions

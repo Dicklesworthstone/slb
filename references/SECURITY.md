@@ -41,8 +41,21 @@ Existing-session recovery now requires the original session ID and key before
 heartbeat, model changes, or forced replacement. This preserves credential-based
 recovery where the credentials are protected; it provides no isolation from
 another process that can read those credentials. Lost credentials cannot be
-recovered through an agent-name lookup. Database copies and backups remain
-sensitive. Ending/recreating a session does not establish a new principal.
+recovered through an agent-name lookup. Ending/recreating a session does not
+establish a new principal.
+
+Session keys are stored only as digests (schema version 5), so the database,
+its copies and its backups no longer contain a key that slb accepts. The
+upgrade converts plaintext keys in place, re-signs the votes whose signatures
+still verify, zeroes the freed space (`secure_delete`) and truncates the
+write-ahead log. Copies made before the upgrade, and filesystem blocks the old
+file used, still hold the old keys: end those sessions and start new ones if
+such a copy may have leaked. An older slb binary that writes the database later
+stores a plaintext key again; a current binary converts it on its next open.
+None of this changes the same-UID limits above. A process running as the same
+user can read another agent's key wherever that agent keeps it (environment,
+files, terminal scrollback), and can write the database or run commands
+directly, so hashing is not isolation between agents.
 
 ## Table of Contents
 - [Defense in Depth](#defense-in-depth)
@@ -82,8 +95,8 @@ Before any command executes, five gates must pass:
 ## Cryptographic Guarantees
 
 - **Command binding**: SHA-256 hash verified at execution
-- **Review signatures**: HMAC using session keys
-- **Session keys**: Generated per-session and stored in plaintext in SQLite for HMAC verification. File permissions do not isolate processes sharing a UID. HMAC possession is not proof of independent identity.
+- **Review signatures**: HMAC-SHA256 keyed with the session key's digest, so execution can re-verify stored votes. Anything that can read the database can compute them; they detect edits that bypass slb, not who reviewed.
+- **Session keys**: Generated per session and shown once. SQLite stores only SHA-256 over a domain label and the key (`session_key_digest`); the old `session_key` column is left empty. Supplied keys are compared with the digest in constant time. File permissions do not isolate processes sharing a UID, and key possession is not proof of independent identity.
 
 ---
 

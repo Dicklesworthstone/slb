@@ -162,8 +162,18 @@ slb daemon start
 
 ### "Active session already exists"
 
+Resume it with the session ID and key that `slb session start` printed:
+
 ```bash
-slb session resume --agent "YourAgent" --create-if-missing
+slb session resume --agent "YourAgent" --session-id <id> --session-key <key>
+```
+
+slb stores only a digest of the key and cannot print it again. If the key is
+lost, end that session and start a new one:
+
+```bash
+slb session end --session-id <id>
+slb session start --agent "YourAgent" --program <prog> --model <model>
 ```
 
 ### Approval expired

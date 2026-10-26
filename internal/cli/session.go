@@ -81,7 +81,7 @@ var sessionStartCmd = &cobra.Command{
 
 		if err := dbConn.CreateSession(session); err != nil {
 			if errors.Is(err, db.ErrActiveSessionExists) {
-				return fmt.Errorf("active session already exists for agent %q in project %q (try: slb session resume -a %s)", flagSessionAgent, project, flagSessionAgent)
+				return fmt.Errorf("active session already exists for agent %q in project %q (resume it with: slb session resume -a %s --session-id <id> --session-key <key>)", flagSessionAgent, project, flagSessionAgent)
 			}
 			return err
 		}

@@ -132,7 +132,7 @@ slb approve <request-id> --session-id <reviewer-id> --comment "Looks safe"
 ```bash
 slb session start --agent <name> --program <prog> --model <model>
 slb session end --session-id <id>
-slb session resume --agent <name>              # Resume after crash
+slb session resume --agent <name> --session-id <id> --session-key <key>  # Resume after crash
 slb session list                               # Show active sessions
 slb session heartbeat --session-id <id>        # Keep session alive
 ```
@@ -348,10 +348,18 @@ slb daemon start
 
 ### "Active session already exists"
 
-Resume your existing session instead of starting a new one:
+Resume it with the session ID and key that `slb session start` printed:
 
 ```bash
-slb session resume --agent "YourAgent" --create-if-missing
+slb session resume --agent "YourAgent" --session-id <id> --session-key <key>
+```
+
+slb stores only a digest of the key and cannot print it again. If the key is
+lost, end that session and start a new one:
+
+```bash
+slb session end --session-id <id>
+slb session start --agent "YourAgent" --program <prog> --model <model>
 ```
 
 ### Approval expired
@@ -730,9 +738,9 @@ Payload includes request details, classification, and event type.
 ### Cryptographic Guarantees
 
 - **Command binding**: SHA-256 hash computed at request time, verified at execution
-- **Review signatures**: HMAC signatures prove possession of a session key, not independent reviewer identity.
-- **Session keys**: Generated per-session and stored in plaintext in SQLite for HMAC verification. Protect the database and its backups as credentials. File permissions do not separate processes sharing a UID.
-- **Session recovery**: Resuming an existing session requires its original `--session-id` and `--session-key`, including with `--force`. Names, programs, and models are not recovery credentials. If the key is lost, it cannot be recovered by name through the resume command.
+- **Review signatures**: HMAC-SHA256 keyed with the digest of the reviewer's session key. A valid signature shows the vote was written by a holder of that key or by something that can read the database, not that the reviewer is an independent principal.
+- **Session keys**: Generated per session and shown once, by `slb session start` (or by `slb session resume` when it creates a session). SQLite stores only a SHA-256 digest of each key, and supplied keys are compared with it in constant time, so a copy or backup of `state.db` does not contain a key slb will accept. Upgrading to schema version 5 converts existing keys in place; agents keep using the keys they hold. Hashing protects copies of the database. It does not separate agents that run as the same OS user: such a process can read another agent's key from its environment, files or terminal, write the database, or run commands directly. See [the identity boundary](references/SECURITY.md#reviewer-identity-security-boundary-issue-30).
+- **Session recovery**: Resuming an existing session requires its original `--session-id` and `--session-key`, including with `--force`. Names, programs, and models are not recovery credentials. slb cannot return a lost key, because it does not have it; start a new session instead.
 
 ### Fail-Closed Behavior
 
@@ -870,14 +878,14 @@ Sessions track agent identity and activity for audit and coordination.
 ### Session Lifecycle
 
 ```bash
-# Start session (creates session_key for signing)
+# Start session (prints session_key once; slb keeps only its digest)
 slb session start --agent "GreenLake" --program "claude-code" --model "opus"
 
-# Resume after crash (preserves session_key)
-slb session resume --agent "GreenLake" --create-if-missing
+# Resume after a crash: present the original session ID and key
+slb session resume --agent "GreenLake" --session-id <id> --session-key <key>
 
-# Force resume (ends mismatched session)
-slb session resume --agent "GreenLake" --force
+# Force resume (ends a session started by another program; still needs the key)
+slb session resume --agent "GreenLake" --program "codex-cli" --session-id <id> --session-key <key> --force
 
 # Heartbeat (update last_active for GC)
 slb session heartbeat --session-id <id>
