@@ -300,11 +300,10 @@ func (db *DB) ApplyMigrations(ctx context.Context) error {
 	}
 
 	// An older slb binary can still insert a plaintext key after version 5.
-	// Convert such rows whenever a current binary opens the database.
-	converted, err := hashLateSessionKeys(ctx, db.conn)
-	if err != nil {
-		return err
-	}
+	// Convert such rows whenever a current binary opens the database. This
+	// is best effort: until a later open converts a row, it has no digest
+	// and authenticates nothing, so a failure here cannot grant access.
+	converted, _ := hashLateSessionKeys(ctx, db.conn)
 	if purgeWAL || converted > 0 {
 		// Best effort: a concurrent reader can keep the log from being
 		// truncated now, in which case later checkpoints reuse it.
@@ -314,7 +313,7 @@ func (db *DB) ApplyMigrations(ctx context.Context) error {
 }
 
 // hashLateSessionKeys converts plaintext keys written after migration 5 by an
-// older binary. The common case is a single indexed-free probe with no write.
+// older binary. Usually it costs one read and writes nothing.
 func hashLateSessionKeys(ctx context.Context, conn *sql.DB) (int, error) {
 	current, err := currentVersion(conn)
 	if err != nil || current < 5 {

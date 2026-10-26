@@ -38,7 +38,7 @@ var (
 	ErrMalformedSessionKey = errors.New("session key must be 64 hexadecimal characters")
 	// ErrSessionKeysNotMigrated indicates a database whose session keys have
 	// not been converted to digests yet. Read-only handles cannot convert it.
-	ErrSessionKeysNotMigrated = errors.New("session keys in this database are not yet stored as digests; run any slb command that opens it for writing (such as `slb session list`) and retry")
+	ErrSessionKeysNotMigrated = errors.New("session keys in this database are not stored as digests yet; open it once with this slb version (for example `slb session list -C <project>`) and retry")
 )
 
 // SessionKeyDigest returns the stored form of a session key: the hex SHA-256
@@ -55,7 +55,7 @@ func SessionKeyDigest(key string) (digest string, ok bool) {
 
 // SessionKeyMatches reports whether supplied is the key whose digest is
 // stored. The comparison is constant time, and malformed keys or digests
-// (including the empty digest of an unconverted or delegated-only row) never
+// (including the missing digest of a row not yet converted) never
 // match.
 func SessionKeyMatches(storedDigest, supplied string) bool {
 	stored, err := hex.DecodeString(storedDigest)
