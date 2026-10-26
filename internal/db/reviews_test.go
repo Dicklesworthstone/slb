@@ -336,6 +336,7 @@ func TestHasDifferentModelApproval(t *testing.T) {
 }
 
 func TestCheckRequestApprovalStatus(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	db := setupTestDB(t)
 	defer db.Close()
 
@@ -501,6 +502,7 @@ func TestScanReviewList_BadRows(t *testing.T) {
 }
 
 func TestCreateReviewWithValidation_ApproveRejectAndValidationErrors(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	db := setupTestDB(t)
 	defer db.Close()
 
@@ -625,6 +627,7 @@ func TestCreateReviewWithValidation_ApproveRejectAndValidationErrors(t *testing.
 }
 
 func TestCreateReviewWithValidation_RequireDifferentModel(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	db := setupTestDB(t)
 	defer db.Close()
 

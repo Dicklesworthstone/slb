@@ -55,6 +55,7 @@ func writeNotaryPolicy(t *testing.T, project, policy string) {
 }
 
 func TestNotaryRechecksConfiguredQuorumAndModel(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	for _, policy := range []string{
 		"[patterns.dangerous]\nmin_approvals = 2\n",
 		"[general]\nrequire_different_model = true\n",
@@ -103,6 +104,7 @@ func TestHookUsesConfiguredPatternsAndReloads(t *testing.T) {
 }
 
 func TestHookAcceptsValidDynamicQuorumHandoff(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	database, request, session := notaryPolicyFixture(t)
 	writeNotaryPolicy(t, request.ProjectPath, "[patterns.dangerous]\npatterns = ['^echo policy-test$']\nmin_approvals = 3\ndynamic_quorum = true\ndynamic_quorum_floor = 1\n")
 	server := &IPCServer{}

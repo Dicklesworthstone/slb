@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -111,7 +112,36 @@ func TestApproveCommand_RequiresSessionKey(t *testing.T) {
 	}
 }
 
+// Without an external identity authority (issue #30), a valid reviewer
+// session and key still cannot approve through the CLI.
+func TestApproveCommand_FailsClosedWithoutIdentityAuthority(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetApproveFlags()
+	requestor := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir),
+		testutil.WithAgent("Requestor"), testutil.WithModel("model-a"))
+	reviewer := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir),
+		testutil.WithAgent("Reviewer"), testutil.WithModel("model-b"))
+	req := testutil.MakeRequest(t, h.DB, requestor,
+		testutil.WithCommand("rm -rf ./build", h.ProjectDir, true),
+		testutil.WithRisk(db.RiskTierDangerous))
+
+	cmd := newTestApproveCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, cmd, "approve", req.ID,
+		"--session-id", reviewer.ID, "-k", reviewer.SessionKey, "-C", h.ProjectDir, "-j")
+	if !errors.Is(err, db.ErrIndependentIdentityUnavailable) || stdout != "" {
+		t.Fatalf("approve = %q, %v; want %v", stdout, err, db.ErrIndependentIdentityUnavailable)
+	}
+	stored, err := h.DB.GetRequest(req.ID)
+	if err != nil || stored.Status != db.StatusPending {
+		t.Fatalf("refused approval changed the request: %+v %v", stored, err)
+	}
+	if approvals, _, err := h.DB.CountReviewsByDecision(req.ID); err != nil || approvals != 0 {
+		t.Fatalf("refused approval recorded a vote: %d %v", approvals, err)
+	}
+}
+
 func TestApproveCommand_ApprovesRequest(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	h := testutil.NewHarness(t)
 	resetApproveFlags()
 
@@ -173,6 +203,7 @@ func TestApproveCommand_ApprovesRequest(t *testing.T) {
 }
 
 func TestApproveCommand_WithComments(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	h := testutil.NewHarness(t)
 	resetApproveFlags()
 
@@ -217,6 +248,7 @@ func TestApproveCommand_WithComments(t *testing.T) {
 }
 
 func TestApproveCommand_SelfReviewPrevented(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	h := testutil.NewHarness(t)
 	resetApproveFlags()
 
@@ -246,6 +278,7 @@ func TestApproveCommand_SelfReviewPrevented(t *testing.T) {
 }
 
 func TestApproveCommand_InvalidSessionKey(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	h := testutil.NewHarness(t)
 	resetApproveFlags()
 
@@ -420,6 +453,7 @@ func TestBuildAgentMailNotifier_DefaultsToNoopWithNoConfig(t *testing.T) {
 // TestApproveCommand_CrossProject tests approving a request from another project
 // using the --target-project flag.
 func TestApproveCommand_CrossProject(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	targetH := testutil.NewHarness(t)
 	currentH := testutil.NewHarness(t)
 	resetApproveFlags()

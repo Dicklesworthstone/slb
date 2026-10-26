@@ -38,7 +38,9 @@ func (db *DB) VerifyRequestApproval(id string) (*Request, error) {
 //
 // Independent-review policies are refused, including historical local HMAC
 // approvals: this backend has no external principal/model authenticator.
-// The remaining proof checks support explicit zero-review CAUTION policy only.
+// The remaining proof checks support explicit zero-review CAUTION policy only,
+// plus the retained peer-review checks that tests exercise behind
+// SimulateIndependentIdentityForTest.
 // Session keys and the database are local trust material, not tamper-proof
 // storage or authentication of an agent's self-reported identity.
 func verifyApprovalTx(tx *sql.Tx, request *Request, now time.Time) error {
@@ -59,7 +61,7 @@ func verifyApprovalTx(tx *sql.Tx, request *Request, now time.Time) error {
 	if request.MinApprovals < 0 || (request.MinApprovals == 0 && request.RiskTier != RiskTierCaution) {
 		return deny("invalid approval quorum for %s", request.RiskTier)
 	}
-	if request.MinApprovals > 0 || request.RequireDifferentModel {
+	if (request.MinApprovals > 0 || request.RequireDifferentModel) && !independentIdentityAttested() {
 		// Recheck at execution, including historical approvals created before
 		// this fix or by direct database writes. A status bit and local HMACs
 		// cannot attest independent reviewer identity.

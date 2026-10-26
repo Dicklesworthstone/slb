@@ -61,6 +61,7 @@ func gitHookApprovalFixture(t *testing.T, operation ...string) (*db.DB, GitHookI
 }
 
 func TestGitHookAuthorizationConsumesExactlyOnce(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	database, intent, request, session := gitHookApprovalFixture(t)
 	executor := NewExecutor(database, NewPatternEngine())
 	checked := 0
@@ -122,6 +123,7 @@ func TestGitHookAuthorizationRejectsInvalidBindingAndProof(t *testing.T) {
 }
 
 func TestGitHookAuthorizationConcurrentClaim(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	database, intent, request, session := gitHookApprovalFixture(t)
 	var wg sync.WaitGroup
 	results := make(chan error, 6)
@@ -183,6 +185,7 @@ func TestCreateGitHookRequestCannotBorrowAllowlist(t *testing.T) {
 }
 
 func TestGitRebaseAuthorizationGates(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	for _, kind := range []string{"success-and-replay", "stale-ref-state", "wrong-operation", "critical-quorum", "safe-allowlist", "expired"} {
 		t.Run(kind, func(t *testing.T) {
 			database, intent, request, session := gitHookApprovalFixture(t, "pre-rebase")

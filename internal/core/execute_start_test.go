@@ -13,6 +13,7 @@ import (
 )
 
 func TestExecutionStartObservesCommittedClaim(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX fixture")
 	}
@@ -53,6 +54,7 @@ func TestExecutionStartObservesCommittedClaim(t *testing.T) {
 }
 
 func TestExecutionStartupFailureCannotReissueApproval(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX fixture")
 	}

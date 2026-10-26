@@ -76,6 +76,7 @@ func interactiveRun(m Model, cmd tea.Cmd) Model {
 }
 
 func TestInteractiveReviewKeyboardCommitsDecision(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	for _, decision := range []db.Decision{db.DecisionApprove, db.DecisionReject} {
 		t.Run(string(decision), func(t *testing.T) {
 			database, target, reviewer, opts := interactiveReviewFixture(t, 1)
@@ -119,6 +120,7 @@ func TestInteractiveReviewKeyboardCommitsDecision(t *testing.T) {
 }
 
 func TestInteractiveReviewPartialQuorum(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	database, target, reviewer, opts := interactiveReviewFixture(t, 2)
 	first := submitInteractiveReview(opts, target.ID, target.Command.Hash, db.DecisionApprove, "first vote")
 	if first.Err != nil || !first.Recorded || first.Request.Status != db.StatusPending || first.Approvals != 1 || first.Request.ApprovalExpiresAt != nil {
@@ -137,6 +139,7 @@ func TestInteractiveReviewPartialQuorum(t *testing.T) {
 }
 
 func TestInteractiveReviewFailuresDoNotCommit(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	for _, name := range []string{"no-key", "bad-key", "ended", "self", "stale-command", "wrong-project", "expired", "already-resolved", "insert-failure", "resolution-failure", "different-model", "duplicate-agent"} {
 		t.Run(name, func(t *testing.T) {
 			database, target, reviewer, opts := interactiveReviewFixture(t, 2)
@@ -217,6 +220,7 @@ func TestInteractiveReviewFailuresDoNotCommit(t *testing.T) {
 }
 
 func TestInteractiveReviewFormOwnsNavigationAndRetainsFailedInput(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	_, target, reviewer, opts := interactiveReviewFixture(t, 1)
 	opts.SessionKey = "wrong"
 	m := interactiveReviewModel(opts, target, reviewer)
@@ -241,6 +245,7 @@ func TestInteractiveReviewFormOwnsNavigationAndRetainsFailedInput(t *testing.T) 
 }
 
 func TestInteractiveReviewWorkerCapturesIdentityAndIgnoresOtherView(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	_, target, reviewer, opts := interactiveReviewFixture(t, 1)
 	m := interactiveReviewModel(opts, target, reviewer)
 	cmd := m.approveRequest(target.ID, "captured")
@@ -274,6 +279,7 @@ func TestInteractiveReviewPolicyDurations(t *testing.T) {
 }
 
 func TestInteractiveReviewEscalatedStillRequiresQuorum(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	database, target, _, opts := interactiveReviewFixture(t, 2)
 	if _, err := database.Exec(`UPDATE requests SET status=?,expires_at=? WHERE id=?`, string(db.StatusEscalated), time.Now().Add(-time.Minute).UTC().Format(time.RFC3339), target.ID); err != nil {
 		t.Fatal(err)
@@ -285,6 +291,7 @@ func TestInteractiveReviewEscalatedStillRequiresQuorum(t *testing.T) {
 }
 
 func TestInteractiveReviewTargetBinding(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	database, target, reviewer, _ := interactiveReviewFixture(t, 1)
 	for _, policy := range []db.ReviewPolicy{{ExpectedCommandHash: "stale"}, {ExpectedProjectPath: "wrong"}} {
 		review := &db.Review{RequestID: target.ID, ReviewerSessionID: reviewer.ID, Decision: db.DecisionApprove}

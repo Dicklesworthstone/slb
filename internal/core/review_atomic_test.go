@@ -51,6 +51,7 @@ func atomicReviewFixture(t *testing.T, quorum int) (*db.DB, *db.Request, []*db.S
 }
 
 func TestReviewServiceNotifiesCommittedApprovalAndTTL(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	database, request, sessions := atomicReviewFixture(t, 2)
 	cfg := DefaultReviewConfig()
 	cfg.ApprovalTTL = 2 * time.Minute
@@ -97,6 +98,7 @@ func TestReviewServiceWriteFailureDoesNotNotifyOrApprove(t *testing.T) {
 }
 
 func TestReviewServiceExpiryAndSessionErrors(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	for _, expired := range []bool{false, true} {
 		t.Run(fmt.Sprintf("expired=%v", expired), func(t *testing.T) {
 			database, request, sessions := atomicReviewFixture(t, 1)
@@ -119,6 +121,7 @@ func TestReviewServiceExpiryAndSessionErrors(t *testing.T) {
 }
 
 func TestReviewServiceFirstDecisionCannotBypassQuorum(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	database, request, sessions := atomicReviewFixture(t, 2)
 	cfg := DefaultReviewConfig()
 	cfg.ConflictResolution = ConflictFirstWins

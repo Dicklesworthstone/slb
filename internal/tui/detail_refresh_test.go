@@ -44,6 +44,7 @@ func TestDetailRefreshObservesPeerReviewAndEndedSession(t *testing.T) {
 }
 
 func TestDetailRefreshIgnoresReadsBeforeLocalCommitAndOldViews(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	_, target, reviewer, opts := interactiveReviewFixture(t, 1)
 	m := interactiveReviewModel(opts, target, reviewer)
 	m.detailRefreshToken++

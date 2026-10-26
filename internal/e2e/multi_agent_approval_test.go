@@ -21,6 +21,7 @@ import (
 // 5. Second reviewer approval (request becomes approved, 2/2)
 // 6. Verify audit trail (reviews recorded)
 func TestMultiAgentApproval_FullWorkflow(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	h := testutil.NewHarness(t)
 
 	t.Log("=== TestMultiAgentApproval_FullWorkflow ===")
@@ -202,6 +203,7 @@ func TestMultiAgentApproval_FullWorkflow(t *testing.T) {
 // TestMultiAgentApproval_SameModelRejected tests that same-model approval
 // is rejected when require_different_model is true.
 func TestMultiAgentApproval_SameModelRejected(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	h := testutil.NewHarness(t)
 
 	t.Log("=== TestMultiAgentApproval_SameModelRejected ===")
@@ -329,6 +331,7 @@ func TestMultiAgentApproval_RejectionBlocksApproval(t *testing.T) {
 // TestMultiAgentApproval_DuplicateReviewPrevented tests that the same
 // reviewer cannot approve the same request twice.
 func TestMultiAgentApproval_DuplicateReviewPrevented(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	h := testutil.NewHarness(t)
 
 	t.Log("=== TestMultiAgentApproval_DuplicateReviewPrevented ===")

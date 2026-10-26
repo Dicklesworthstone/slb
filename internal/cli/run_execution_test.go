@@ -123,6 +123,7 @@ func TestWriteError_JSON(t *testing.T) {
 }
 
 func TestRunApprovedRequest_Success(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	h := testutil.NewHarness(t)
 	// h.Close() is NOT needed as Harness uses t.Cleanup
 	// The approved-run helper writes default logs relative to the caller's cwd.
@@ -224,6 +225,7 @@ func TestRunApprovedRequest_ValidationFailure(t *testing.T) {
 }
 
 func TestRunApprovedRequest_ExecutionFailure(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	h := testutil.NewHarness(t)
 	// Keep the default .slb/logs directory inside the isolated project fixture.
 	t.Chdir(h.ProjectDir)

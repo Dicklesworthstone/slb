@@ -11,6 +11,7 @@ import (
 )
 
 func TestConfiguredReviewUsesRequestProjectAndDeadline(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("USERPROFILE", t.TempDir())
 	oldConfig := flagConfig

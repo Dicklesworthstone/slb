@@ -316,6 +316,7 @@ func TestSubmitReview_DifferentModelRequired_SameModelRejected(t *testing.T) {
 }
 
 func TestSubmitReview_DifferentModelRequired_DifferentModelAccepted(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	dbConn, _, req := setupReviewTest(t)
 	defer dbConn.Close()
 
@@ -353,6 +354,7 @@ func TestSubmitReview_DifferentModelRequired_DifferentModelAccepted(t *testing.T
 }
 
 func TestSubmitReview_SessionKeyMismatch_Rejected(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	dbConn, _, req := setupReviewTest(t)
 	defer dbConn.Close()
 
@@ -986,6 +988,7 @@ func TestSubmitReview_ValidationErrors(t *testing.T) {
 }
 
 func TestSubmitReview_SessionErrors(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	t.Run("session not found", func(t *testing.T) {
 		dbConn, _, req := setupReviewTest(t)
 		defer dbConn.Close()
@@ -1069,6 +1072,7 @@ func TestSubmitReview_RequestErrors(t *testing.T) {
 }
 
 func TestSubmitReview_SelfReview(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	t.Run("self review rejected for untrusted agent", func(t *testing.T) {
 		dbConn, sess, req := setupReviewTest(t)
 		defer dbConn.Close()
@@ -1143,6 +1147,7 @@ func TestSubmitReview_SelfReview(t *testing.T) {
 }
 
 func TestSubmitReview_AlreadyReviewed(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	dbConn, _, req := setupReviewTest(t)
 	defer dbConn.Close()
 
@@ -1239,6 +1244,7 @@ func TestSubmitReview_Rejection(t *testing.T) {
 }
 
 func TestSubmitReview_NotifierCalled(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	t.Run("notifier called on approval", func(t *testing.T) {
 		dbConn, _, req := setupReviewTest(t)
 		defer dbConn.Close()
@@ -1521,6 +1527,7 @@ func TestGetReviewStatus_Errors(t *testing.T) {
 }
 
 func TestSubmitCrossProjectReviewAuthorization(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	source, err := db.Open(":memory:")
 	if err != nil {
 		t.Fatal(err)

@@ -298,7 +298,7 @@ func (db *DB) CheckRequestApprovalStatus(requestID string) (approved bool, rejec
 	if rejectionCount > 0 {
 		return false, true, nil
 	}
-	if req.MinApprovals > 0 || req.RequireDifferentModel {
+	if (req.MinApprovals > 0 || req.RequireDifferentModel) && !independentIdentityAttested() {
 		return false, false, ErrIndependentIdentityUnavailable
 	}
 

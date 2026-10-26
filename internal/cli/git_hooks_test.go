@@ -99,6 +99,7 @@ func approveNativeCLIRequest(t *testing.T, database *db.DB, id string, reviewer 
 }
 
 func TestNativeGitHookCLIRequestReviewRetry(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	_, database, _, reviewer := nativeCLIFixture(t)
 	ctx := context.Background()
 	assessment, revalidate, err := assessNativeGit(ctx, "commit", "", "", nil)
@@ -214,6 +215,7 @@ func TestNativeGitSafeOperationNeedsNoSLBDatabase(t *testing.T) {
 }
 
 func TestNativeGitRebaseCLIRequestReviewRetry(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	for _, stale := range []bool{false, true} {
 		t.Run(map[bool]string{false: "valid", true: "stale-refs"}[stale], func(t *testing.T) {
 			repo, database, _, reviewer := nativeCLIFixture(t)

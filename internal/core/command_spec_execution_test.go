@@ -50,6 +50,7 @@ func commandSpecExecutionFixture(t *testing.T, spec db.CommandSpec) (*db.DB, *db
 }
 
 func TestCommandSpecPolicyBlocksBeforePreflight(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	database, request, session := commandSpecExecutionFixture(t, db.CommandSpec{Raw: "git stash", Argv: []string{"printf", "command-spec-probe"}})
 	executor := NewExecutor(database, NewPatternEngine())
 	if allowed, reason := executor.CanExecute(request.ID); allowed || reason == "" {
@@ -70,6 +71,7 @@ func TestCommandSpecPolicyBlocksBeforePreflight(t *testing.T) {
 }
 
 func TestCommandSpecPolicyBlocksBothAtomicClaimPaths(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	for _, authenticated := range []bool{false, true} {
 		name := "client"
 		if authenticated {
@@ -92,6 +94,7 @@ func TestCommandSpecPolicyBlocksBothAtomicClaimPaths(t *testing.T) {
 }
 
 func TestCommandSpecExecutionRejectsUnboundWorkingDirectory(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	for _, cwd := range []string{"", ".", "relative"} {
 		t.Run(cwd, func(t *testing.T) {
 			database, request, session := commandSpecExecutionFixture(t, db.CommandSpec{
@@ -137,6 +140,7 @@ func TestCommandSpecExecutionRejectsUnboundWorkingDirectory(t *testing.T) {
 // approval. Execute only this test binary with no tests selected; the display
 // is subject to a custom CRITICAL rule, not a destructive command.
 func TestCommandSpecExecutionIgnoresUnusedDisplay(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -169,6 +173,7 @@ func TestCommandSpecExecutionIgnoresUnusedDisplay(t *testing.T) {
 // both final claim routes, including commands that are currently allowlisted.
 // The probe is harmless printf; none of these tests invokes a deletion.
 func TestCommandSpecExecutionHonorsBlockedRequestor(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	for _, explicit := range []bool{false, true} {
 		for _, allowlisted := range []bool{false, true} {
 			t.Run(fmt.Sprintf("explicit=%t/allowlisted=%t", explicit, allowlisted), func(t *testing.T) {

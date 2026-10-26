@@ -28,6 +28,7 @@ func executorApprovalFixture(t *testing.T) (*db.DB, *db.Request, []*db.Session) 
 }
 
 func TestExecutorRejectsInvalidProofBeforePreflight(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	for _, tc := range []struct {
 		name, query string
 		want        error
@@ -71,6 +72,7 @@ func TestExecutorRejectsInvalidProofBeforePreflight(t *testing.T) {
 }
 
 func TestExecutorProofCheckDoesNotConsumeApproval(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	database, request, _ := executorApprovalFixture(t)
 	executor := NewExecutor(database, nil)
 	for i := 0; i < 2; i++ {
@@ -88,6 +90,7 @@ func TestExecutorProofCheckDoesNotConsumeApproval(t *testing.T) {
 }
 
 func TestExecutorProofCheckRejectsReplacedSnapshot(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	database, request, _ := executorApprovalFixture(t)
 	if _, err := database.Exec(`UPDATE requests SET project_path = ? WHERE id = ?`, filepath.Join(request.ProjectPath, "other"), request.ID); err != nil {
 		t.Fatal(err)

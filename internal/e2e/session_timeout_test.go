@@ -337,6 +337,7 @@ func TestConcurrentSessionsSameAgent(t *testing.T) {
 // TestSessionRecoveryAfterRestart tests that session and request state persists.
 // Note: This test simulates restart by closing and reopening the database.
 func TestSessionRecoveryAfterRestart(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	h := testutil.NewHarness(t)
 
 	t.Log("=== TestSessionRecoveryAfterRestart ===")

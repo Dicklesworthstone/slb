@@ -7,6 +7,7 @@ import (
 )
 
 func TestReviewSnapshotConsistentWithConcurrentDecision(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	database, author := admissionFixture(t)
 	reviewer := &Session{AgentName: "snapshot-reviewer", Model: "review-model", ProjectPath: author.ProjectPath}
 	if err := database.CreateSession(reviewer); err != nil {

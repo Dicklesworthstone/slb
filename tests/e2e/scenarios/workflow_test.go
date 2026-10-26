@@ -130,6 +130,7 @@ func TestDuplicateReviewPrevention(t *testing.T) {
 
 // TestMultipleApproversRequired tests requests requiring multiple approvals.
 func TestMultipleApproversRequired(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	env := harness.NewE2EEnvironment(t)
 
 	env.Step("Creating sessions")

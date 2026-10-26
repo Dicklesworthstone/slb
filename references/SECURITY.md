@@ -15,6 +15,12 @@ environment variable, configuration option, or CLI flag to turn these labels
 into trusted identity. Peer-approval examples elsewhere in the documentation
 describe the intended workflow, which is currently blocked by this restriction.
 
+The quorum, self-review, different-model, signature and expiry checks are kept
+for a future authority. Their tests run them through
+`db.SimulateIndependentIdentityForTest`, which works only inside binaries built
+by `go test` (`testing.Testing()`, fixed at link time). A test builds the real
+CLI and confirms that it still refuses fresh and database-forged approvals.
+
 An external authenticated reviewer service is **not implemented** in this
 backend. Restoring independent approvals requires a separately protected
 authority that authenticates requester and reviewer principals, attests model

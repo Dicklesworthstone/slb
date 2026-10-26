@@ -77,7 +77,7 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 	if review.Decision != DecisionApprove && review.Decision != DecisionReject {
 		return nil, ErrReviewInvalidDecision
 	}
-	if review.Decision == DecisionApprove {
+	if review.Decision == DecisionApprove && !independentIdentityAttested() {
 		// Fail closed for every approval entry point (CLI, TUI, RPC and
 		// cross-project delegation). Neither trusted_self_approve nor an
 		// authenticated HMAC session proves an independent reviewer. There is

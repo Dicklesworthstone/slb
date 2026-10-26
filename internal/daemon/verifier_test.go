@@ -108,6 +108,7 @@ func requireNotaryClaim(t *testing.T, v *Verifier, p VerifyExecuteParams) *Verif
 }
 
 func TestVerifier_AdvisoryAndAtomicClaim(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	database, v, p := notaryFixture(t)
 	for i := 0; i < 2; i++ {
 		result, err := v.VerifyExecutionAllowed(p)
@@ -235,6 +236,7 @@ func TestVerifier_MissingClaimFields(t *testing.T) {
 }
 
 func TestVerifier_ConcurrentClaims(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	var p VerifyExecuteParams
 	// Independent DB handles exercise SQLite locking, not a Go mutex.
 	path := filepath.Join(t.TempDir(), "race.db")
@@ -286,6 +288,7 @@ func completionFor(p VerifyExecuteParams, result *VerificationResult) CompleteEx
 }
 
 func TestVerifier_CompletionOutcomes(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	for _, status := range []db.RequestStatus{db.StatusExecuted, db.StatusExecutionFailed, db.StatusTimedOut} {
 		t.Run(string(status), func(t *testing.T) {
 			database, v, p := notaryFixture(t)
@@ -318,6 +321,7 @@ func TestVerifier_CompletionOutcomes(t *testing.T) {
 }
 
 func TestVerifier_CompletionOwnershipAndValidation(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	for _, mode := range []string{"wrong key", "wrong receipt", "local log", "other session", "rotated key", "invalid status", "missing exit", "nonzero success", "negative duration"} {
 		t.Run(mode, func(t *testing.T) {
 			database, v, p := notaryFixture(t)
@@ -358,6 +362,7 @@ func TestVerifier_CompletionOwnershipAndValidation(t *testing.T) {
 }
 
 func TestVerifier_EndedSessionCanComplete(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	database, v, p := notaryFixture(t)
 	claim := requireNotaryClaim(t, v, p)
 	notarySQL(t, database, "UPDATE sessions SET ended_at = ? WHERE id = ?", time.Now().UTC().Format(time.RFC3339), p.SessionID)
@@ -367,6 +372,7 @@ func TestVerifier_EndedSessionCanComplete(t *testing.T) {
 }
 
 func TestVerifier_DatabaseFailuresNeverAuthorize(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	for _, boundary := range []string{"claim", "completion"} {
 		t.Run(boundary, func(t *testing.T) {
 			database, v, p := notaryFixture(t)

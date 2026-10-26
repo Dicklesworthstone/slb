@@ -145,6 +145,7 @@ func TestIndependentIdentityStillAllowsRejection(t *testing.T) {
 }
 
 func TestApplyReviewPersistsApprovalDeadline(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	for _, tier := range []RiskTier{RiskTierDangerous, RiskTierCritical} {
 		t.Run(string(tier), func(t *testing.T) {
 			database, request, sessions := reviewDecisionFixture(t, 2)
@@ -183,6 +184,7 @@ func TestApplyReviewPersistsApprovalDeadline(t *testing.T) {
 }
 
 func TestApplyReviewRejectsChangedEligibility(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	for _, tc := range []struct {
 		name, query string
 		want        error
@@ -236,6 +238,7 @@ func TestApplyReviewOutcomeFailureRollsBackVote(t *testing.T) {
 }
 
 func TestApplyReviewWaitsForWriterThenRevalidatesSession(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	database, request, sessions := reviewDecisionFixture(t, 1)
 	other, err := Open(filepath.Join(request.ProjectPath, "state.db"))
 	if err != nil {
@@ -272,6 +275,7 @@ func TestApplyReviewWaitsForWriterThenRevalidatesSession(t *testing.T) {
 }
 
 func TestApplyReviewConcurrentQuorumAcrossConnections(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	database, request, sessions := reviewDecisionFixture(t, 16)
 	other, err := Open(filepath.Join(request.ProjectPath, "state.db"))
 	if err != nil {
@@ -319,6 +323,7 @@ func TestApplyReviewConcurrentQuorumAcrossConnections(t *testing.T) {
 }
 
 func TestApplyReviewRestartDoesNotCreateAnotherVoter(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	database, request, sessions := reviewDecisionFixture(t, 2)
 	if _, err := applyFixtureReview(database, request, sessions[1], DecisionApprove, ReviewPolicy{}); err != nil {
 		t.Fatal(err)
@@ -346,6 +351,7 @@ func TestApplyReviewRestartDoesNotCreateAnotherVoter(t *testing.T) {
 }
 
 func TestApplyReviewConflictPoliciesAndQuorum(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	for _, mode := range []string{"any_rejection_blocks", "first_wins", "human_breaks_tie"} {
 		t.Run(mode, func(t *testing.T) {
 			database, request, sessions := reviewDecisionFixture(t, 2)
@@ -381,6 +387,7 @@ func TestApplyReviewConflictPoliciesAndQuorum(t *testing.T) {
 }
 
 func TestApplyReviewAuthenticatesSuppliedSignature(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	for _, mode := range []string{"forged", "stale", "future", "valid"} {
 		t.Run(mode, func(t *testing.T) {
 			database, request, sessions := reviewDecisionFixture(t, 1)
@@ -408,6 +415,7 @@ func TestApplyReviewAuthenticatesSuppliedSignature(t *testing.T) {
 }
 
 func TestSignedReviewEntryPointAuthenticatesPersistedSession(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	database, request, sessions := reviewDecisionFixture(t, 1)
 	review := &Review{RequestID: request.ID, ReviewerSessionID: sessions[1].ID,
 		Decision: DecisionApprove, SignatureTimestamp: time.Now().UTC()}

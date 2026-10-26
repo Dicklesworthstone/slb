@@ -81,6 +81,7 @@ func assertPolicyUnclaimed(t *testing.T, database *db.DB, id string) {
 }
 
 func TestExecutionPolicyRejectsChangesBeforePreflight(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	for _, tc := range []struct {
 		name, text string
 		want       error
@@ -113,6 +114,7 @@ func TestExecutionPolicyRejectsChangesBeforePreflight(t *testing.T) {
 }
 
 func TestExecutionPolicyClaimRechecksAfterAdvisory(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	for _, authenticated := range []bool{false, true} {
 		for _, change := range []string{"custom-rule", "config-quorum"} {
 			t.Run(fmt.Sprintf("authenticated=%t/%s", authenticated, change), func(t *testing.T) {
@@ -145,6 +147,7 @@ func TestExecutionPolicyClaimRechecksAfterAdvisory(t *testing.T) {
 }
 
 func TestExecutionPolicyClaimSerializesPolicyWriters(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	database, request, session := policyExecutionFixture(t)
 	other, err := db.OpenAndMigrate(database.Path())
 	if err != nil {
@@ -188,6 +191,7 @@ func TestExecutionPolicyClaimSerializesPolicyWriters(t *testing.T) {
 }
 
 func TestExecutionPolicyFailedGuardRollsBackClaim(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	database, request, session := policyExecutionFixture(t)
 	sentinel := errors.New("policy read failed")
 	err := database.ClaimRequestExecution(request, policyExecutionIdentity(session), func(*sql.Tx, *db.Request) error { return sentinel })
@@ -281,6 +285,7 @@ func TestExecutionPolicyKeepsSignedProofAndProjectGates(t *testing.T) {
 }
 
 func TestExecutionPolicyValidRequestExecutesOnce(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX shell")
 	}

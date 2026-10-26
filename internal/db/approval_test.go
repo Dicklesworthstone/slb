@@ -40,6 +40,7 @@ func assertNoExecutionClaim(t *testing.T, database *DB, requestID string) {
 }
 
 func TestExecutionRejectsMissingOrInvalidApprovalEvidence(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	for _, tc := range []struct{ name, query string }{
 		{"deleted review", `DELETE FROM reviews WHERE reviewer_session_id = 'review-session-1'`},
 		{"forged signature", `UPDATE reviews SET signature = 'forged' WHERE reviewer_session_id = 'review-session-1'`},
@@ -79,6 +80,7 @@ func TestExecutionRejectsMissingOrInvalidApprovalEvidence(t *testing.T) {
 }
 
 func TestExecutionCannotTrustApprovedStatusWithoutVotes(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	database, request, sessions := reviewDecisionFixture(t, 2)
 	expiry := time.Now().Add(time.Hour)
 	if _, err := database.Exec(`UPDATE requests SET status = 'approved', approval_expires_at = ?`, expiry.UTC().Format(time.RFC3339)); err != nil {
@@ -95,6 +97,7 @@ func TestExecutionCannotTrustApprovedStatusWithoutVotes(t *testing.T) {
 }
 
 func TestExecutionCountsDistinctReviewerAgents(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	database, request, sessions, execution := approvedEvidenceFixture(t)
 	// Simulate duplicate historical votes from one agent across two sessions.
 	if _, err := database.Exec(`UPDATE sessions SET ended_at = ? WHERE id = ?`, time.Now().UTC().Format(time.RFC3339), sessions[1].ID); err != nil {
@@ -113,6 +116,7 @@ func TestExecutionCountsDistinctReviewerAgents(t *testing.T) {
 }
 
 func TestExecutionRechecksDifferentModelEvidence(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	database, request, sessions := reviewDecisionFixture(t, 1)
 	outcome, err := applyFixtureReview(database, request, sessions[1], DecisionApprove, ReviewPolicy{})
 	if err != nil {
@@ -128,6 +132,7 @@ func TestExecutionRechecksDifferentModelEvidence(t *testing.T) {
 }
 
 func TestExecutionPreservesValidHistoricalApprovals(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	database, request, sessions, execution := approvedEvidenceFixture(t)
 	signedAt := time.Now().UTC().Add(-15 * time.Minute).Truncate(time.Second)
 	signature := ComputeReviewSignature(sessions[1].SessionKey, request.ID, DecisionApprove, signedAt)
@@ -146,6 +151,7 @@ func TestExecutionPreservesValidHistoricalApprovals(t *testing.T) {
 }
 
 func TestExecutionHonorsFirstWinsResolutionWithoutWeakeningQuorum(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	database, request, sessions := reviewDecisionFixture(t, 2)
 	policy := ReviewPolicy{ConflictResolution: "first_wins"}
 	for i, decision := range []Decision{DecisionApprove, DecisionReject, DecisionApprove} {
@@ -175,6 +181,7 @@ func TestExecutionRetainsZeroReviewCautionAutoApproval(t *testing.T) {
 }
 
 func TestExecutionEvidenceCheckAndClaimHaveOneWinner(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	database, request, _, execution := approvedEvidenceFixture(t)
 	other, err := Open(filepath.Join(request.ProjectPath, "state.db"))
 	if err != nil {
@@ -219,6 +226,7 @@ func TestExecutionEvidenceCheckAndClaimHaveOneWinner(t *testing.T) {
 }
 
 func TestExecutionRechecksEvidenceAfterConcurrentWriter(t *testing.T) {
+	SimulateIndependentIdentityForTest(t)
 	database, request, _, execution := approvedEvidenceFixture(t)
 	other, err := Open(filepath.Join(request.ProjectPath, "state.db"))
 	if err != nil {

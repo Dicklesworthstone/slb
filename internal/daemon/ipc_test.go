@@ -993,7 +993,8 @@ func TestIPCServer_handleVerifyExecute_RequestNotFound(t *testing.T) {
 }
 
 func TestIPCServer_handleVerifyExecute_AllowedMarksExecuting(t *testing.T) {
-	t.Parallel()
+	// Not parallel: the simulated identity authority is process-wide.
+	db.SimulateIndependentIdentityForTest(t)
 
 	database := setupTestDB(t)
 	requestor := createTestSession(t, database, "sess-requestor")

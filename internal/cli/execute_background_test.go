@@ -23,6 +23,11 @@ func TestExecuteBackgroundWorkerProcess(t *testing.T) {
 	if os.Getenv("SLB_TEST_EXECUTE_BACKGROUND_WORKER") != "1" {
 		return
 	}
+	// Inherit the parent test's simulated identity authority, if it has one.
+	// Its peer-approved fixtures are refused without it (issue #30).
+	if os.Getenv(db.SimulatedIdentityEnvForTest) == "1" {
+		db.SimulateIndependentIdentityForTest(t)
+	}
 	command := newBackgroundWorkerCmd()
 	command.SetArgs([]string{})
 	if err := command.ExecuteContext(context.Background()); err != nil {
@@ -104,6 +109,7 @@ func waitBackgroundOutcome(t *testing.T, conn *db.DB, id string) *db.Request {
 }
 
 func TestExecuteBackgroundPreservesEnvironmentCWDAndLogs(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	conn, job := backgroundExecutionFixture(t, `printf '%s\n' "$SLB_BG_TEST_VALUE"; pwd; if read ignored; then exit 17; fi; sleep 0.2`)
 	t.Setenv("SLB_BG_TEST_VALUE", "background-output-is-not-launch-json")
 	receipt, err := launchTestBackground(t, job)
@@ -127,6 +133,7 @@ func TestExecuteBackgroundPreservesEnvironmentCWDAndLogs(t *testing.T) {
 }
 
 func TestExecuteBackgroundFailureAndTimeoutAreDurable(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	for _, tc := range []struct {
 		name, script string
 		timeout      int64
@@ -151,6 +158,7 @@ func TestExecuteBackgroundFailureAndTimeoutAreDurable(t *testing.T) {
 }
 
 func TestExecuteBackgroundRevalidatesBeforeStarting(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	for _, fault := range []string{"signature", "expired", "hash", "session", "project", "policy", "missing-shell"} {
 		t.Run(fault, func(t *testing.T) {
 			conn, job := backgroundExecutionFixture(t, "echo background-should-not-run")
@@ -198,6 +206,7 @@ func TestExecuteBackgroundRevalidatesBeforeStarting(t *testing.T) {
 }
 
 func TestExecuteBackgroundConcurrentSingleWinner(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	conn, job := backgroundExecutionFixture(t, "sleep 0.2; printf once")
 	var wg sync.WaitGroup
 	results := make(chan *background.Receipt, 4)

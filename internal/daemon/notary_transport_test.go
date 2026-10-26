@@ -36,6 +36,7 @@ func TestNotaryRPC_RequiresCommandBindingAndCredentials(t *testing.T) {
 }
 
 func TestNotaryRPC_ClaimAndCompleteOverUnix(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix sockets")
 	}

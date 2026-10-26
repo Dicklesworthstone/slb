@@ -61,6 +61,7 @@ func hookApprovalFixtureForPaths(t *testing.T, databaseRoot, projectPath, cwd st
 }
 
 func TestHookApprovalHandoffRequiresAtomicExecutor(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	conn, req, params := hookApprovalFixture(t)
 	srv := &IPCServer{}
 	for range 2 {
@@ -175,6 +176,7 @@ func TestHookPolicyReloadsWithoutLeakingAcrossProjects(t *testing.T) {
 }
 
 func TestHookApprovalRootAliasPreservesLiteralBinding(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -209,6 +211,7 @@ func TestHookApprovalRootAliasPreservesLiteralBinding(t *testing.T) {
 }
 
 func TestHookApprovalRejectsLexicalProjectAcrossDescendantAlias(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	project := hookPolicyProject(t)
 	other := hookPolicyProject(t)
 	nested := filepath.Join(project, "src")

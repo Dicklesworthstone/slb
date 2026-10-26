@@ -136,6 +136,7 @@ func TestExecuteCommand_CannotExecutePending(t *testing.T) {
 }
 
 func TestExecuteCommand_ExecutesApprovedRequest(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	h := testutil.NewHarness(t)
 	resetExecuteFlags()
 	t.Cleanup(resetExecuteFlags)
@@ -276,6 +277,7 @@ func TestExecuteCommand_Help(t *testing.T) {
 }
 
 func TestExecuteCommand_CustomTimeout(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
 	h := testutil.NewHarness(t)
 	resetExecuteFlags()
 	t.Cleanup(resetExecuteFlags)
