@@ -390,8 +390,13 @@ func TestSessionRecoveryAfterRestart(t *testing.T) {
 	if recoveredSession.AgentName != "recovery-agent" {
 		t.Errorf("Session agent name mismatch: got %s, want recovery-agent", recoveredSession.AgentName)
 	}
-	if recoveredSession.SessionKey != sessionKey {
-		t.Error("Session key changed after restart")
+	// The key is not stored, only its digest: it still authenticates after
+	// the restart, but nothing read back from the database contains it.
+	if recoveredSession.SessionKey != "" {
+		t.Error("GetSession returned a session key")
+	}
+	if _, err := newDB.AuthenticateSession(sessionID, sessionKey); err != nil {
+		t.Errorf("Session key no longer authenticates after restart: %v", err)
 	}
 	if recoveredSession.EndedAt != nil {
 		t.Error("Session should still be active after restart")

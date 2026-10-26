@@ -194,7 +194,7 @@ func TestApplyReviewRejectsChangedEligibility(t *testing.T) {
 		{"cancelled", `UPDATE requests SET status = 'cancelled'`, ErrReviewNotPending},
 		{"executing", `UPDATE requests SET status = 'executing'`, ErrReviewNotPending},
 		{"ended reviewer", `UPDATE sessions SET ended_at = '2000-01-01T00:00:00Z' WHERE id = 'review-session-1'`, ErrReviewSessionInactive},
-		{"rotated key", `UPDATE sessions SET session_key = 'different' WHERE id = 'review-session-1'`, ErrReviewSessionKeyMismatch},
+		{"rotated key", `UPDATE sessions SET session_key_digest = 'different' WHERE id = 'review-session-1'`, ErrReviewSessionKeyMismatch},
 		{"changed command", `UPDATE requests SET command_raw = 'echo changed'`, ErrInvalidSignature},
 		{"changed model rule", `UPDATE requests SET require_different_model = 1, requestor_model = 'model-1'`, ErrReviewDifferentModel},
 	} {

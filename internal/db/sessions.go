@@ -19,8 +19,13 @@ var ErrActiveSessionExists = errors.New("active session already exists for this 
 // ErrSessionNotFound is returned when a session is not found.
 var ErrSessionNotFound = errors.New("session not found")
 
+// sessionColumns are the session fields every read returns. The key's digest
+// is read only by the queries that authenticate a supplied key.
+const sessionColumns = "id, agent_name, program, model, project_path, started_at, last_active_at, ended_at"
+
 // CreateSession creates a new session in the database.
-// Generates a UUID and HMAC session key.
+// Generates a UUID and a random session key. Only the key's digest is stored;
+// s.SessionKey is the one copy of the key, for the caller to hand to the agent.
 // Returns ErrActiveSessionExists if an active session already exists for the agent+project.
 func (db *DB) CreateSession(s *Session) error {
 	if s.AgentName == "" {
@@ -37,11 +42,15 @@ func (db *DB) CreateSession(s *Session) error {
 
 	// Generate session key (32 bytes = 256 bits for HMAC-SHA256)
 	if s.SessionKey == "" {
-		key := make([]byte, 32)
+		key := make([]byte, sessionKeyBytes)
 		if _, err := rand.Read(key); err != nil {
 			return fmt.Errorf("generating session key: %w", err)
 		}
 		s.SessionKey = hex.EncodeToString(key)
+	}
+	digest, ok := SessionKeyDigest(s.SessionKey)
+	if !ok {
+		return ErrMalformedSessionKey
 	}
 
 	// Set timestamps
@@ -50,11 +59,12 @@ func (db *DB) CreateSession(s *Session) error {
 	s.LastActiveAt = now
 	s.EndedAt = nil
 
-	// Insert into database
+	// Insert into database. session_key stays empty: older binaries read it
+	// as the key, and an empty key never authenticates there.
 	_, err := db.Exec(`
-		INSERT INTO sessions (id, agent_name, program, model, project_path, session_key, started_at, last_active_at, ended_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
-	`, s.ID, s.AgentName, s.Program, s.Model, s.ProjectPath, s.SessionKey, s.StartedAt.Format(time.RFC3339), s.LastActiveAt.Format(time.RFC3339))
+		INSERT INTO sessions (id, agent_name, program, model, project_path, session_key, session_key_digest, started_at, last_active_at, ended_at)
+		VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, NULL)
+	`, s.ID, s.AgentName, s.Program, s.Model, s.ProjectPath, digest, s.StartedAt.Format(time.RFC3339), s.LastActiveAt.Format(time.RFC3339))
 
 	if err != nil {
 		// Check for unique constraint violation (active session already exists)
@@ -90,7 +100,7 @@ func (db *DB) UpdateSessionModel(id, newModel string) error {
 // GetSession retrieves a session by ID.
 func (db *DB) GetSession(id string) (*Session, error) {
 	row := db.QueryRow(`
-		SELECT id, agent_name, program, model, project_path, session_key, started_at, last_active_at, ended_at
+		SELECT `+sessionColumns+`
 		FROM sessions WHERE id = ?
 	`, id)
 
@@ -101,7 +111,7 @@ func (db *DB) GetSession(id string) (*Session, error) {
 // Returns ErrSessionNotFound if no active session exists.
 func (db *DB) GetActiveSession(agentName, projectPath string) (*Session, error) {
 	row := db.QueryRow(`
-		SELECT id, agent_name, program, model, project_path, session_key, started_at, last_active_at, ended_at
+		SELECT `+sessionColumns+`
 		FROM sessions
 		WHERE agent_name = ? AND project_path = ? AND ended_at IS NULL
 	`, agentName, projectPath)
@@ -112,7 +122,7 @@ func (db *DB) GetActiveSession(agentName, projectPath string) (*Session, error) 
 // ListActiveSessions returns all active sessions for a project.
 func (db *DB) ListActiveSessions(projectPath string) ([]*Session, error) {
 	rows, err := db.Query(`
-		SELECT id, agent_name, program, model, project_path, session_key, started_at, last_active_at, ended_at
+		SELECT `+sessionColumns+`
 		FROM sessions
 		WHERE project_path = ? AND ended_at IS NULL
 		ORDER BY last_active_at DESC
@@ -128,7 +138,7 @@ func (db *DB) ListActiveSessions(projectPath string) ([]*Session, error) {
 // ListAllActiveSessions returns all active sessions across all projects.
 func (db *DB) ListAllActiveSessions() ([]*Session, error) {
 	rows, err := db.Query(`
-		SELECT id, agent_name, program, model, project_path, session_key, started_at, last_active_at, ended_at
+		SELECT ` + sessionColumns + `
 		FROM sessions
 		WHERE ended_at IS NULL
 		ORDER BY last_active_at DESC
@@ -238,7 +248,7 @@ func (db *DB) ResetSessionRateLimits(id string, now time.Time) (time.Time, error
 func (db *DB) FindStaleSessions(threshold time.Duration) ([]*Session, error) {
 	cutoff := time.Now().UTC().Add(-threshold).Format(time.RFC3339)
 	rows, err := db.Query(`
-		SELECT id, agent_name, program, model, project_path, session_key, started_at, last_active_at, ended_at
+		SELECT `+sessionColumns+`
 		FROM sessions
 		WHERE ended_at IS NULL AND last_active_at < ?
 		ORDER BY last_active_at ASC
@@ -255,7 +265,7 @@ func (db *DB) FindStaleSessions(threshold time.Duration) ([]*Session, error) {
 // that have a different model than the specified one.
 func (db *DB) ListActiveSessionsWithDifferentModel(projectPath, excludeModel string) ([]*Session, error) {
 	rows, err := db.Query(`
-		SELECT id, agent_name, program, model, project_path, session_key, started_at, last_active_at, ended_at
+		SELECT `+sessionColumns+`
 		FROM sessions
 		WHERE project_path = ? AND ended_at IS NULL AND model != ?
 		ORDER BY last_active_at DESC
@@ -329,34 +339,40 @@ func scanSession(row *sql.Row) (*Session, error) {
 	var startedAt, lastActiveAt string
 	var endedAt sql.NullString
 
-	err := row.Scan(&s.ID, &s.AgentName, &s.Program, &s.Model, &s.ProjectPath, &s.SessionKey, &startedAt, &lastActiveAt, &endedAt)
+	err := row.Scan(&s.ID, &s.AgentName, &s.Program, &s.Model, &s.ProjectPath, &startedAt, &lastActiveAt, &endedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrSessionNotFound
 		}
 		return nil, fmt.Errorf("scanning session: %w", err)
 	}
+	if err := parseSessionTimes(s, startedAt, lastActiveAt, endedAt); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
 
-	// Parse timestamps
+// parseSessionTimes parses the stored timestamps of a scanned session.
+func parseSessionTimes(s *Session, startedAt, lastActiveAt string, endedAt sql.NullString) error {
+	var err error
 	s.StartedAt, err = time.Parse(time.RFC3339, startedAt)
 	if err != nil {
-		return nil, fmt.Errorf("parsing started_at: %w", err)
+		return fmt.Errorf("parsing started_at: %w", err)
 	}
 
 	s.LastActiveAt, err = time.Parse(time.RFC3339, lastActiveAt)
 	if err != nil {
-		return nil, fmt.Errorf("parsing last_active_at: %w", err)
+		return fmt.Errorf("parsing last_active_at: %w", err)
 	}
 
 	if endedAt.Valid {
 		t, err := time.Parse(time.RFC3339, endedAt.String)
 		if err != nil {
-			return nil, fmt.Errorf("parsing ended_at: %w", err)
+			return fmt.Errorf("parsing ended_at: %w", err)
 		}
 		s.EndedAt = &t
 	}
-
-	return s, nil
+	return nil
 }
 
 // scanSessions scans multiple session rows.
@@ -367,30 +383,13 @@ func scanSessions(rows *sql.Rows) ([]*Session, error) {
 		var startedAt, lastActiveAt string
 		var endedAt sql.NullString
 
-		err := rows.Scan(&s.ID, &s.AgentName, &s.Program, &s.Model, &s.ProjectPath, &s.SessionKey, &startedAt, &lastActiveAt, &endedAt)
+		err := rows.Scan(&s.ID, &s.AgentName, &s.Program, &s.Model, &s.ProjectPath, &startedAt, &lastActiveAt, &endedAt)
 		if err != nil {
 			return nil, fmt.Errorf("scanning session row: %w", err)
 		}
-
-		// Parse timestamps
-		s.StartedAt, err = time.Parse(time.RFC3339, startedAt)
-		if err != nil {
-			return nil, fmt.Errorf("parsing started_at: %w", err)
+		if err := parseSessionTimes(s, startedAt, lastActiveAt, endedAt); err != nil {
+			return nil, err
 		}
-
-		s.LastActiveAt, err = time.Parse(time.RFC3339, lastActiveAt)
-		if err != nil {
-			return nil, fmt.Errorf("parsing last_active_at: %w", err)
-		}
-
-		if endedAt.Valid {
-			t, err := time.Parse(time.RFC3339, endedAt.String)
-			if err != nil {
-				return nil, fmt.Errorf("parsing ended_at: %w", err)
-			}
-			s.EndedAt = &t
-		}
-
 		sessions = append(sessions, s)
 	}
 

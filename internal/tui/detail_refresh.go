@@ -90,10 +90,10 @@ func readInteractiveSnapshot(opts Options, id string) (*db.RequestReviewSnapshot
 func authenticatedSnapshotSession(opts Options, snapshot *db.RequestReviewSnapshot) *db.Session {
 	session := snapshot.Session
 	if session == nil || opts.SessionID == "" || opts.SessionKey == "" || session.ID != opts.SessionID ||
-		!session.IsActive() || !db.ExecutionSessionKeyMatches(session.SessionKey, opts.SessionKey) {
+		!session.IsActive() || !snapshot.SessionKeyMatches(opts.SessionKey) {
 		return nil
 	}
-	// Do not retain the stored signing key in a display model.
+	// Sessions read from the database carry no key; keep it that way.
 	copy := *session
 	copy.SessionKey = ""
 	return &copy

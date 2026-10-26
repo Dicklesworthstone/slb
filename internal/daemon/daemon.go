@@ -321,11 +321,7 @@ func RunDaemon(ctx context.Context, opts ServerOptions) error {
 				if err := ctx.Err(); err != nil {
 					return false, err
 				}
-				var count int
-				if err := database.QueryRow(`SELECT COUNT(*) FROM sessions WHERE session_key = ? AND ended_at IS NULL AND project_path = ?`, sessionKey, projectPath).Scan(&count); err != nil {
-					return false, err
-				}
-				return count > 0, nil
+				return database.ActiveSessionKeyMatches(projectPath, sessionKey)
 			},
 		}, logger)
 		if err != nil {

@@ -20,7 +20,7 @@ func TestAuthenticatedClaimRechecksKeyAfterWriterWait(t *testing.T) {
 	defer other.Close()
 	started, outcome := make(chan struct{}), make(chan error, 1)
 	err = database.Transaction(func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`UPDATE sessions SET session_key=? WHERE id=?`, strings.Repeat("19", 32), session.ID); err != nil {
+		if _, err := tx.Exec(`UPDATE sessions SET session_key_digest=? WHERE id=?`, strings.Repeat("19", 32), session.ID); err != nil {
 			return err
 		}
 		go func() {
@@ -79,18 +79,28 @@ func authenticatedClaimFixture(t *testing.T) (*DB, *Request, *Execution, *Sessio
 	}, session
 }
 
-func TestExecutionSessionKeyMatches(t *testing.T) {
+func TestSessionKeyMatches(t *testing.T) {
 	key := strings.Repeat("ab", 32)
+	digest, ok := SessionKeyDigest(key)
+	if !ok || digest == key || strings.Contains(digest, key) {
+		t.Fatalf("digest of a valid key = %q, %v", digest, ok)
+	}
+	short := strings.Repeat("ab", 16)
+	if _, ok := SessionKeyDigest(short); ok {
+		t.Fatal("short key produced a digest")
+	}
 	for _, test := range []struct {
 		stored, supplied string
 		want             bool
 	}{
-		{key, key, true}, {key, strings.ToUpper(key), true}, {key, "", false},
-		{key, strings.Repeat("cd", 32), false}, {"broken", "broken", false},
-		{"", "", false}, {strings.Repeat("ab", 16), strings.Repeat("ab", 16), false},
+		{digest, key, true}, {digest, strings.ToUpper(key), true}, {strings.ToUpper(digest), key, true},
+		{digest, "", false}, {digest, strings.Repeat("cd", 32), false}, {digest, short, false},
+		// The stored digest is not itself a credential, nor is the key a digest.
+		{digest, digest, false}, {key, key, false},
+		{"broken", "broken", false}, {"", "", false}, {"", key, false},
 	} {
-		if got := ExecutionSessionKeyMatches(test.stored, test.supplied); got != test.want {
-			t.Errorf("key comparison = %v, want %v", got, test.want)
+		if got := SessionKeyMatches(test.stored, test.supplied); got != test.want {
+			t.Errorf("SessionKeyMatches(%q, %q) = %v, want %v", test.stored, test.supplied, got, test.want)
 		}
 	}
 }
@@ -107,7 +117,7 @@ func TestAuthenticatedClaimRejectsIdentityChanges(t *testing.T) {
 			case "empty key":
 				key = ""
 			case "rotated key":
-				query = "UPDATE sessions SET session_key='" + strings.Repeat("01", 32) + "'"
+				query = "UPDATE sessions SET session_key_digest='" + strings.Repeat("01", 32) + "'"
 			case "ended":
 				query = "UPDATE sessions SET ended_at='2020-01-01T00:00:00Z'"
 			case "other project":

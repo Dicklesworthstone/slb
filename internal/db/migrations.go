@@ -193,6 +193,12 @@ ALTER TABLE execution_outcomes ADD COLUMN human_notes TEXT;
 		Name:    "durable_request_events",
 		Up:      requestEventsSchema,
 	},
+	{
+		// Store session keys only as digests (issue #30). The conversion
+		// needs Go code, so ApplyMigrations special-cases this version.
+		Version: 5,
+		Name:    "session_key_digests",
+	},
 }
 
 // ApplyMigrations applies any pending migrations in order.
@@ -208,6 +214,10 @@ func (db *DB) ApplyMigrations(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	// Set when plaintext session keys were converted; older page images that
+	// held them are then dropped from the write-ahead log.
+	purgeWAL := false
 
 	// Connections can migrate concurrently. Never sort a shared global slice.
 	ordered := append([]Migration(nil), migrations...)
@@ -260,6 +270,17 @@ func (db *DB) ApplyMigrations(ctx context.Context) error {
 					return fmt.Errorf("migration %d (%s) failed: %w", m.Version, m.Name, err)
 				}
 			}
+		case 5:
+			if err := addColumnIfMissing(ctx, tx, "sessions", "session_key_digest", "TEXT"); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("migration %d (%s) failed: %w", m.Version, m.Name, err)
+			}
+			if converted, err := hashStoredSessionKeys(ctx, tx); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("migration %d (%s) failed: %w", m.Version, m.Name, err)
+			} else if converted > 0 {
+				purgeWAL = true
+			}
 		default:
 			if _, err := tx.ExecContext(ctx, m.Up); err != nil {
 				_ = tx.Rollback()
@@ -278,7 +299,48 @@ func (db *DB) ApplyMigrations(ctx context.Context) error {
 		}
 	}
 
+	// An older slb binary can still insert a plaintext key after version 5.
+	// Convert such rows whenever a current binary opens the database.
+	converted, err := hashLateSessionKeys(ctx, db.conn)
+	if err != nil {
+		return err
+	}
+	if purgeWAL || converted > 0 {
+		// Best effort: a concurrent reader can keep the log from being
+		// truncated now, in which case later checkpoints reuse it.
+		_, _ = db.conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
+	}
 	return nil
+}
+
+// hashLateSessionKeys converts plaintext keys written after migration 5 by an
+// older binary. The common case is a single indexed-free probe with no write.
+func hashLateSessionKeys(ctx context.Context, conn *sql.DB) (int, error) {
+	current, err := currentVersion(conn)
+	if err != nil || current < 5 {
+		return 0, err
+	}
+	var pending bool
+	if err := conn.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sessions WHERE session_key != '')`).Scan(&pending); err != nil {
+		return 0, fmt.Errorf("checking for plaintext session keys: %w", err)
+	}
+	if !pending {
+		return 0, nil
+	}
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin session key conversion: %w", err)
+	}
+	converted, err := hashStoredSessionKeys(ctx, tx)
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, fmt.Errorf("converting plaintext session keys: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		return 0, fmt.Errorf("commit session key conversion: %w", err)
+	}
+	return converted, nil
 }
 
 func ensureMigrationsTable(conn *sql.DB) error {

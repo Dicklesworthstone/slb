@@ -2,7 +2,9 @@
 package db
 
 import (
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -122,8 +124,16 @@ func TestGetSession(t *testing.T) {
 	if retrieved.AgentName != original.AgentName {
 		t.Errorf("AgentName mismatch: got %s, want %s", retrieved.AgentName, original.AgentName)
 	}
-	if retrieved.SessionKey != original.SessionKey {
-		t.Errorf("SessionKey mismatch")
+	// Issue #30: reads never return the key. Only its digest is stored.
+	if retrieved.SessionKey != "" {
+		t.Errorf("GetSession returned the session key")
+	}
+	authenticated, err := db.AuthenticateSession(original.ID, original.SessionKey)
+	if err != nil || authenticated.ID != original.ID || authenticated.SessionKey != original.SessionKey {
+		t.Errorf("AuthenticateSession(original key) = %+v, %v", authenticated, err)
+	}
+	if _, err := db.AuthenticateSession(original.ID, strings.Repeat("00", 32)); !errors.Is(err, ErrSessionKeyMismatch) {
+		t.Errorf("AuthenticateSession(wrong key) error = %v, want %v", err, ErrSessionKeyMismatch)
 	}
 }
 

@@ -25,12 +25,18 @@ func setupTestDB(t *testing.T) *db.DB {
 	return database
 }
 
+// testSessionKey is the deterministic key createTestSession issues. The
+// database keeps only its digest, so fixtures recompute it rather than read it.
+func testSessionKey(id string) string {
+	key := sha256.Sum256([]byte("notary-test-key-" + id))
+	return hex.EncodeToString(key[:])
+}
+
 func createTestSession(t *testing.T, database *db.DB, id string) *db.Session {
 	t.Helper()
-	key := sha256.Sum256([]byte("notary-test-key-" + id))
 	session := &db.Session{
 		ID: id, AgentName: "Agent-" + id, Program: "test-cli", Model: "test-model",
-		ProjectPath: "/test/project", SessionKey: hex.EncodeToString(key[:]),
+		ProjectPath: "/test/project", SessionKey: testSessionKey(id),
 	}
 	if err := database.CreateSession(session); err != nil {
 		t.Fatal(err)
@@ -70,7 +76,7 @@ func createTestReview(t *testing.T, database *db.DB, requestID, sessionID string
 	review := &db.Review{
 		RequestID: requestID, ReviewerSessionID: sessionID,
 		ReviewerAgent: session.AgentName, ReviewerModel: session.Model, Decision: decision,
-		SignatureTimestamp: now, Signature: db.ComputeReviewSignature(session.SessionKey, requestID, decision, now),
+		SignatureTimestamp: now, Signature: db.ComputeReviewSignature(testSessionKey(sessionID), requestID, decision, now),
 	}
 	if err := database.CreateReview(review); err != nil {
 		t.Fatal(err)
@@ -184,7 +190,7 @@ func TestVerifier_RefusesInvalidClaims(t *testing.T) {
 			notarySQL(t, d, "UPDATE requests SET require_different_model = 1 WHERE id = ?", p.RequestID)
 		}},
 		{"revoked signer key", func(t *testing.T, d *db.DB, _ *VerifyExecuteParams) {
-			notarySQL(t, d, "UPDATE sessions SET session_key = ? WHERE id = 'reviewer'", strings.Repeat("f", 64))
+			notarySQL(t, d, "UPDATE sessions SET session_key_digest = ? WHERE id = 'reviewer'", strings.Repeat("f", 64))
 		}},
 		{"new restrictive pattern", func(t *testing.T, d *db.DB, _ *VerifyExecuteParams) {
 			if _, err := d.InsertCustomPattern("critical", `^rm\s+-rf`, "new restriction", "human"); err != nil {
@@ -338,7 +344,7 @@ func TestVerifier_CompletionOwnershipAndValidation(t *testing.T) {
 				other := createTestSession(t, database, "other")
 				report.SessionID, report.SessionKey = other.ID, other.SessionKey
 			case "rotated key":
-				notarySQL(t, database, "UPDATE sessions SET session_key = ? WHERE id = ?", strings.Repeat("f", 64), p.SessionID)
+				notarySQL(t, database, "UPDATE sessions SET session_key_digest = ? WHERE id = ?", strings.Repeat("f", 64), p.SessionID)
 			case "invalid status":
 				report.Status = db.StatusApproved
 			case "missing exit":

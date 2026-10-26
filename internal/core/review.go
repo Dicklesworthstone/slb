@@ -2,7 +2,6 @@
 package core
 
 import (
-	"crypto/hmac"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -137,7 +136,13 @@ func (rs *ReviewService) SubmitCrossProjectReview(sourceDB *db.DB, sourceProject
 	if sourceDB == nil || !rs.config.CrossProjectReviews {
 		return nil, ErrCrossProjectReviewDenied
 	}
-	session, err := sourceDB.GetSession(opts.SessionID)
+	if opts.SessionKey == "" {
+		return nil, ErrSessionKeyMismatch
+	}
+	session, err := sourceDB.AuthenticateSession(opts.SessionID, opts.SessionKey)
+	if errors.Is(err, db.ErrSessionKeyMismatch) {
+		return nil, ErrSessionKeyMismatch
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -151,9 +156,6 @@ func (rs *ReviewService) SubmitCrossProjectReview(sourceDB *db.DB, sourceProject
 	sessionAbs, err := filepath.Abs(session.ProjectPath)
 	if err != nil || filepath.Clean(sourceAbs) != filepath.Clean(sessionAbs) {
 		return nil, ErrCrossProjectReviewDenied
-	}
-	if opts.SessionKey == "" || !hmac.Equal([]byte(opts.SessionKey), []byte(session.SessionKey)) {
-		return nil, ErrSessionKeyMismatch
 	}
 	allowed := false
 	for _, agent := range rs.config.ReviewPool {

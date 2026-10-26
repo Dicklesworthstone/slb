@@ -1,6 +1,7 @@
 package db
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -80,7 +81,7 @@ func verifyApprovalTx(tx *sql.Tx, request *Request, now time.Time) error {
 	rows, err := tx.Query(`
 		SELECT r.reviewer_session_id, r.reviewer_agent, r.reviewer_model,
 			r.decision, r.signature, r.signature_timestamp,
-			s.session_key, s.agent_name, s.model
+			s.session_key_digest, s.agent_name, s.model
 		FROM reviews r LEFT JOIN sessions s ON s.id = r.reviewer_session_id
 		WHERE r.request_id = ? ORDER BY r.rowid
 	`, request.ID)
@@ -92,15 +93,14 @@ func verifyApprovalTx(tx *sql.Tx, request *Request, now time.Time) error {
 	approvals, differentModel := 0, false
 	for rows.Next() {
 		var sessionID, agent, model, decision, signature, timestamp string
-		var key, sessionAgent, sessionModel sql.NullString
-		if err := rows.Scan(&sessionID, &agent, &model, &decision, &signature, &timestamp, &key, &sessionAgent, &sessionModel); err != nil {
+		var digest, sessionAgent, sessionModel sql.NullString
+		if err := rows.Scan(&sessionID, &agent, &model, &decision, &signature, &timestamp, &digest, &sessionAgent, &sessionModel); err != nil {
 			return fmt.Errorf("reading approval evidence: %w", err)
 		}
-		if !key.Valid || !sessionAgent.Valid || agent == "" || sessionAgent.String != agent || sessionModel.String != model {
+		if !sessionAgent.Valid || agent == "" || sessionAgent.String != agent || sessionModel.String != model {
 			return deny("reviewer identity is missing or changed for session %s", sessionID)
 		}
-		decodedKey, err := hex.DecodeString(key.String)
-		if err != nil || len(decodedKey) != 32 {
+		if decoded, err := hex.DecodeString(digest.String); err != nil || len(decoded) != sha256.Size {
 			return deny("invalid signing key for reviewer session %s", sessionID)
 		}
 		if decision != string(DecisionApprove) && decision != string(DecisionReject) {
@@ -108,7 +108,7 @@ func verifyApprovalTx(tx *sql.Tx, request *Request, now time.Time) error {
 		}
 		signedAt, err := time.Parse(time.RFC3339, timestamp)
 		if err != nil || signedAt.IsZero() || signedAt.After(now.Add(time.Minute)) ||
-			!VerifyReviewSignature(key.String, request.ID, Decision(decision), signedAt, signature) {
+			!verifyReviewWithDigest(digest.String, request.ID, Decision(decision), signedAt, signature) {
 			return deny("invalid signature for reviewer session %s", sessionID)
 		}
 		if seenAgents[agent] {

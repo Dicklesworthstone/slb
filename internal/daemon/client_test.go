@@ -827,6 +827,9 @@ func TestStopDaemonWithOptions_RefusesUnverifiedProcess(t *testing.T) {
 	}
 }
 
+// tcpTestKey is a well-formed session key for the TCP authentication test.
+var tcpTestKey = strings.Repeat("ab", 32)
+
 func TestRunDaemon_StartsTCPListenerFromConfigAndValidatesAuth(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unix socket tests not supported on windows")
@@ -840,7 +843,12 @@ func TestRunDaemon_StartsTCPListenerFromConfigAndValidatesAuth(t *testing.T) {
 	addr := ln.Addr().String()
 	_ = ln.Close()
 
-	project := shortSocketDir(t)
+	// The daemon scopes authentication to its physical project path, and
+	// /tmp is a symlink on macOS.
+	project, err := filepath.EvalSymlinks(shortSocketDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
 	slbDir := filepath.Join(project, ".slb")
 	if err := os.MkdirAll(slbDir, 0755); err != nil {
 		t.Fatalf("mkdir .slb: %v", err)
@@ -873,7 +881,7 @@ func TestRunDaemon_StartsTCPListenerFromConfigAndValidatesAuth(t *testing.T) {
 		Program:     "test",
 		Model:       "test",
 		ProjectPath: project,
-		SessionKey:  "good",
+		SessionKey:  tcpTestKey,
 	}
 	if err := dbConn.CreateSession(session); err != nil {
 		t.Fatalf("CreateSession: %v", err)
@@ -903,15 +911,29 @@ func TestRunDaemon_StartsTCPListenerFromConfigAndValidatesAuth(t *testing.T) {
 	}()
 
 	// Wait for TCP ping to succeed.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	ping := func(key string) error {
 		pctx, pcancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-		err := pingDaemonTCP(pctx, addr, "good")
-		pcancel()
-		if err == nil {
-			break
-		}
+		defer pcancel()
+		return pingDaemonTCP(pctx, addr, key)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	pingErr := ping(tcpTestKey)
+	for pingErr != nil && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
+		pingErr = ping(tcpTestKey)
+	}
+	if pingErr != nil {
+		t.Fatalf("TCP ping with the session key failed: %v", pingErr)
+	}
+	// Neither a wrong key nor the digest stored in the database authenticates.
+	var digest string
+	if err := dbConn.QueryRow(`SELECT session_key_digest FROM sessions WHERE id = ?`, session.ID).Scan(&digest); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{strings.Repeat("cd", 32), digest} {
+		if err := ping(key); err == nil {
+			t.Fatalf("TCP ping authenticated with %q", key)
+		}
 	}
 
 	cancel()

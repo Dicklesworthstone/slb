@@ -1,9 +1,7 @@
 package db
 
 import (
-	"crypto/hmac"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -107,30 +105,19 @@ func (db *DB) claimRequestExecution(expected *Request, execution *Execution, ses
 }
 
 func authenticateExecutionTx(tx *sql.Tx, project, sessionID, supplied string, requireActive bool) error {
-	var key, sessionProject string
-	var ended sql.NullString
-	err := tx.QueryRow(`SELECT session_key, project_path, ended_at FROM sessions WHERE id = ?`, sessionID).Scan(&key, &sessionProject, &ended)
+	var sessionProject string
+	var digest, ended sql.NullString
+	err := tx.QueryRow(`SELECT session_key_digest, project_path, ended_at FROM sessions WHERE id = ?`, sessionID).Scan(&digest, &sessionProject, &ended)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrExecutionAuthentication
 	}
 	if err != nil {
-		return fmt.Errorf("reading executor identity: %w", err)
+		return fmt.Errorf("reading executor identity: %w", sessionDigestReadError(err))
 	}
-	if sessionProject != project || (requireActive && ended.Valid) || !ExecutionSessionKeyMatches(key, supplied) {
+	if sessionProject != project || (requireActive && ended.Valid) || !SessionKeyMatches(digest.String, supplied) {
 		return ErrExecutionAuthentication
 	}
 	return nil
-}
-
-// ExecutionSessionKeyMatches rejects malformed keys and compares decoded keys
-// in constant time. The authenticated claim repeats this check transactionally.
-func ExecutionSessionKeyMatches(stored, supplied string) bool {
-	a, err := hex.DecodeString(stored)
-	if err != nil || len(a) != 32 {
-		return false
-	}
-	b, err := hex.DecodeString(supplied)
-	return err == nil && len(b) == 32 && hmac.Equal(a, b)
 }
 
 // CompleteRequestExecution persists the terminal state and child outcome in one

@@ -128,14 +128,14 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 			return fmt.Errorf("invalid negative approval quorum")
 		}
 
-		var agent, model, storedKey string
+		var agent, model, storedDigest string
 		var ended sql.NullString
 		delegated := policy.DelegatedReviewer
 		if delegated != nil {
 			if accepted.ReviewerSessionID != delegated.SourceSessionID {
 				return ErrReviewDelegationMismatch
 			}
-			accepted.ReviewerSessionID, agent, model, storedKey, err =
+			accepted.ReviewerSessionID, agent, model, storedDigest, err =
 				db.ensureDelegatedReviewerTx(tx, request.ProjectPath, sessionKey, delegated, now)
 			if err != nil {
 				return err
@@ -145,20 +145,22 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 			// must never appear as active target-project capacity.
 			ended.Valid = true
 		} else {
-			err = tx.QueryRow(`SELECT agent_name, COALESCE(model, ''), session_key, ended_at FROM sessions WHERE id = ?`,
-				accepted.ReviewerSessionID).Scan(&agent, &model, &storedKey, &ended)
+			var digest sql.NullString
+			err = tx.QueryRow(`SELECT agent_name, COALESCE(model, ''), session_key_digest, ended_at FROM sessions WHERE id = ?`,
+				accepted.ReviewerSessionID).Scan(&agent, &model, &digest, &ended)
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrSessionNotFound
 			}
 			if err != nil {
-				return fmt.Errorf("reading review session: %w", err)
+				return fmt.Errorf("reading review session: %w", sessionDigestReadError(err))
 			}
 			if ended.Valid {
 				return ErrReviewSessionInactive
 			}
-			if !hmac.Equal([]byte(sessionKey), []byte(storedKey)) {
+			if !SessionKeyMatches(digest.String, sessionKey) {
 				return ErrReviewSessionKeyMismatch
 			}
+			storedDigest = digest.String
 		}
 		// Restarting a session does not create an independent second agent.
 		self := accepted.ReviewerSessionID == request.RequestorSessionID || agent == request.RequestorAgent
@@ -196,11 +198,11 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 		accepted.ReviewerAgent, accepted.ReviewerModel = agent, model
 		if accepted.Signature == "" {
 			accepted.SignatureTimestamp = now.Truncate(time.Second)
-			accepted.Signature = ComputeReviewSignature(storedKey, request.ID, accepted.Decision, accepted.SignatureTimestamp)
+			accepted.Signature = signReviewWithDigest(storedDigest, request.ID, accepted.Decision, accepted.SignatureTimestamp)
 		} else {
 			if accepted.SignatureTimestamp.IsZero() || accepted.SignatureTimestamp.Before(now.Add(-5*time.Minute)) ||
 				accepted.SignatureTimestamp.After(now.Add(time.Minute)) ||
-				!VerifyReviewSignature(storedKey, request.ID, accepted.Decision, accepted.SignatureTimestamp, accepted.Signature) {
+				!verifyReviewWithDigest(storedDigest, request.ID, accepted.Decision, accepted.SignatureTimestamp, accepted.Signature) {
 				return ErrInvalidSignature
 			}
 		}
@@ -235,7 +237,7 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 
 func (db *DB) ensureDelegatedReviewerTx(tx *sql.Tx, targetProject, sessionKey string,
 	identity *DelegatedReviewerIdentity, now time.Time,
-) (id, agent, model, storedKey string, err error) {
+) (id, agent, model, storedDigest string, err error) {
 	if identity == nil || identity.SourceProjectPath == "" || identity.SourceSessionID == "" ||
 		identity.AgentName == "" || targetProject == "" || identity.SourceProjectPath == targetProject {
 		return "", "", "", "", ErrReviewDelegationMismatch
@@ -243,30 +245,34 @@ func (db *DB) ensureDelegatedReviewerTx(tx *sql.Tx, targetProject, sessionKey st
 	sum := sha256.Sum256([]byte(identity.SourceProjectPath + "\x00" + identity.SourceSessionID))
 	id = "xpr-" + hex.EncodeToString(sum[:16])
 	delegationKey := deriveDelegatedReviewKey(sessionKey, targetProject, identity.SourceProjectPath, identity.SourceSessionID)
+	delegationDigest, ok := SessionKeyDigest(delegationKey)
+	if !ok {
+		return "", "", "", "", ErrReviewDelegationMismatch
+	}
 	timestamp := now.UTC().Format(time.RFC3339Nano)
 	_, err = tx.Exec(`
 		INSERT OR IGNORE INTO sessions (
-			id, agent_name, program, model, project_path, session_key,
+			id, agent_name, program, model, project_path, session_key, session_key_digest,
 			started_at, last_active_at, ended_at
-		) VALUES (?, ?, 'cross-project-review', ?, ?, ?, ?, ?, ?)
-	`, id, identity.AgentName, identity.Model, targetProject, delegationKey, timestamp, timestamp, timestamp)
+		) VALUES (?, ?, 'cross-project-review', ?, ?, '', ?, ?, ?, ?)
+	`, id, identity.AgentName, identity.Model, targetProject, delegationDigest, timestamp, timestamp, timestamp)
 	if err != nil {
 		return "", "", "", "", fmt.Errorf("recording delegated reviewer identity: %w", err)
 	}
 	var project string
-	var ended sql.NullString
+	var ended, digest sql.NullString
 	err = tx.QueryRow(`
-		SELECT agent_name, COALESCE(model, ''), session_key, project_path, ended_at
+		SELECT agent_name, COALESCE(model, ''), session_key_digest, project_path, ended_at
 		FROM sessions WHERE id = ?
-	`, id).Scan(&agent, &model, &storedKey, &project, &ended)
+	`, id).Scan(&agent, &model, &digest, &project, &ended)
 	if err != nil {
 		return "", "", "", "", fmt.Errorf("reading delegated reviewer identity: %w", err)
 	}
 	if !ended.Valid || project != targetProject || agent != identity.AgentName || model != identity.Model ||
-		!hmac.Equal([]byte(delegationKey), []byte(storedKey)) {
+		!SessionKeyMatches(digest.String, delegationKey) {
 		return "", "", "", "", ErrReviewDelegationMismatch
 	}
-	return id, agent, model, storedKey, nil
+	return id, agent, model, digest.String, nil
 }
 
 func deriveDelegatedReviewKey(sourceSessionKey, targetProject, sourceProject, sourceSessionID string) string {

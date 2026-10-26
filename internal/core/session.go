@@ -94,9 +94,20 @@ func ResumeSession(dbConn *db.DB, opts ResumeOptions) (*db.Session, error) {
 
 	// Authenticate before any mutation, including --force and model changes.
 	// Names and program/model labels are public metadata, not credentials.
-	if opts.SessionID != sess.ID || !db.ExecutionSessionKeyMatches(sess.SessionKey, opts.SessionKey) {
+	// The database holds only the key's digest, so nothing read here can be
+	// handed back as a credential; the caller must already have the key.
+	if opts.SessionID != sess.ID {
 		return nil, ErrSessionAuthentication
 	}
+	authenticated, err := dbConn.AuthenticateSession(sess.ID, opts.SessionKey)
+	if err != nil {
+		if errors.Is(err, db.ErrSessionKeyMismatch) || errors.Is(err, db.ErrSessionNotFound) {
+			return nil, ErrSessionAuthentication
+		}
+		return nil, err
+	}
+	sess = authenticated
+	digest, _ := db.SessionKeyDigest(opts.SessionKey)
 
 	if opts.Program != "" && sess.Program != "" && sess.Program != opts.Program {
 		if !opts.ForceEndMismatch {
@@ -104,8 +115,8 @@ func ResumeSession(dbConn *db.DB, opts ResumeOptions) (*db.Session, error) {
 		}
 
 		// Force: end the old session and create a new one.
-		result, err := dbConn.Exec(`UPDATE sessions SET ended_at = ? WHERE id = ? AND session_key = ? AND ended_at IS NULL`,
-			time.Now().UTC().Format(time.RFC3339), sess.ID, sess.SessionKey)
+		result, err := dbConn.Exec(`UPDATE sessions SET ended_at = ? WHERE id = ? AND session_key_digest = ? AND ended_at IS NULL`,
+			time.Now().UTC().Format(time.RFC3339), sess.ID, digest)
 		if err != nil {
 			return nil, err
 		}
@@ -131,8 +142,8 @@ func ResumeSession(dbConn *db.DB, opts ResumeOptions) (*db.Session, error) {
 	// the initial read. Never reread and return a replacement credential.
 	sess.LastActiveAt = time.Now().UTC().Truncate(time.Second)
 	result, err := dbConn.Exec(`UPDATE sessions SET model = ?, last_active_at = ?
-		WHERE id = ? AND session_key = ? AND ended_at IS NULL`,
-		sess.Model, sess.LastActiveAt.Format(time.RFC3339), sess.ID, sess.SessionKey)
+		WHERE id = ? AND session_key_digest = ? AND ended_at IS NULL`,
+		sess.Model, sess.LastActiveAt.Format(time.RFC3339), sess.ID, digest)
 	if err != nil {
 		return nil, err
 	}

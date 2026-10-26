@@ -1,10 +1,7 @@
 package db
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -253,20 +250,21 @@ func scanReviewList(rows *sql.Rows) ([]*Review, error) {
 	return list, nil
 }
 
-// ComputeReviewSignature computes an HMAC signature for a review.
-// Signature = HMAC-SHA256(sessionKey, requestID + decision + timestamp)
+// ComputeReviewSignature computes the signature a session key makes over a
+// review: HMAC-SHA256(SessionKeyDigest(sessionKey), requestID + decision +
+// timestamp). It returns "" for a malformed key; "" never verifies.
 func ComputeReviewSignature(sessionKey, requestID string, decision Decision, timestamp time.Time) string {
-	data := requestID + string(decision) + timestamp.Format(time.RFC3339)
-	key, _ := hex.DecodeString(sessionKey)
-	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte(data))
-	return hex.EncodeToString(mac.Sum(nil))
+	digest, ok := SessionKeyDigest(sessionKey)
+	if !ok {
+		return ""
+	}
+	return signReviewWithDigest(digest, requestID, decision, timestamp)
 }
 
-// VerifyReviewSignature verifies an HMAC signature for a review.
+// VerifyReviewSignature verifies a review signature against a session key.
 func VerifyReviewSignature(sessionKey, requestID string, decision Decision, timestamp time.Time, signature string) bool {
-	expected := ComputeReviewSignature(sessionKey, requestID, decision, timestamp)
-	return hmac.Equal([]byte(expected), []byte(signature))
+	digest, ok := SessionKeyDigest(sessionKey)
+	return ok && verifyReviewWithDigest(digest, requestID, decision, timestamp, signature)
 }
 
 // HasDifferentModelApproval checks if there's an approval from a different model.

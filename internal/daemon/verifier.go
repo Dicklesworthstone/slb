@@ -64,9 +64,8 @@ func (v *Verifier) VerifyExecutionAllowed(p VerifyExecuteParams) (*VerificationR
 	if err != nil {
 		return nil, fmt.Errorf("getting request: %w", err)
 	}
-	session, err := v.db.GetSession(p.SessionID)
-	if err != nil || !session.IsActive() || session.ProjectPath != request.ProjectPath ||
-		!db.ExecutionSessionKeyMatches(session.SessionKey, p.SessionKey) {
+	session, err := v.db.AuthenticateSession(p.SessionID, p.SessionKey)
+	if err != nil || !session.IsActive() || session.ProjectPath != request.ProjectPath {
 		return &VerificationResult{Reason: db.ErrExecutionAuthentication.Error()}, nil
 	}
 

@@ -9,11 +9,20 @@ import (
 
 // RequestReviewSnapshot is one consistent view of a request, all its reviews,
 // and the selected reviewer. It is display evidence, not execution authority.
-// SessionKey is already excluded from Session's JSON representation.
+// The session's key digest is kept unexported so that a display model cannot
+// serialize it; use SessionKeyMatches to authenticate the selected reviewer.
 type RequestReviewSnapshot struct {
 	Request *Request
 	Reviews []*Review
 	Session *Session
+
+	sessionKeyDigest string
+}
+
+// SessionKeyMatches reports whether supplied is the selected reviewer's key,
+// as of the snapshot.
+func (s *RequestReviewSnapshot) SessionKeyMatches(supplied string) bool {
+	return s != nil && s.Session != nil && SessionKeyMatches(s.sessionKeyDigest, supplied)
 }
 
 // ReadRequestReviewSnapshot prevents a refresh from displaying a committed
@@ -48,8 +57,8 @@ func (db *DB) ReadRequestReviewSnapshot(ctx context.Context, project, id, sessio
 	}
 	result := &RequestReviewSnapshot{Request: target, Reviews: reviews}
 	if sessionID != "" {
-		result.Session, err = scanSession(tx.QueryRowContext(ctx, `SELECT id, agent_name, program, model, project_path,
-			session_key, started_at, last_active_at, ended_at FROM sessions WHERE id = ?`, sessionID))
+		result.Session, result.sessionKeyDigest, err = scanSessionWithDigest(tx.QueryRowContext(ctx,
+			`SELECT `+sessionColumns+`, session_key_digest FROM sessions WHERE id = ?`, sessionID))
 		if err != nil && !errors.Is(err, ErrSessionNotFound) {
 			return nil, fmt.Errorf("reading reviewer snapshot: %w", err)
 		}

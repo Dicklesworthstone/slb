@@ -18,7 +18,10 @@ type Session struct {
 	Model string `json:"model"`
 	// ProjectPath is the absolute path to the project.
 	ProjectPath string `json:"project_path"`
-	// SessionKey is the HMAC key for signing (not serialized in JSON).
+	// SessionKey is the session's bearer credential. It is never stored
+	// (only its digest is) and never serialized: CreateSession sets it for
+	// the caller to hand out once, and AuthenticateSession echoes the key
+	// that was just verified. Sessions read from the database leave it empty.
 	SessionKey string `json:"-"`
 	// StartedAt is when the session was started.
 	StartedAt time.Time `json:"started_at"`
@@ -204,7 +207,7 @@ type Review struct {
 
 	// Decision is approve or reject.
 	Decision Decision `json:"decision"`
-	// Signature is HMAC(session_key, request_id + decision + timestamp).
+	// Signature is HMAC(SessionKeyDigest(key), request_id + decision + timestamp).
 	Signature string `json:"signature"`
 	// SignatureTimestamp is included in the signature to prevent replay.
 	SignatureTimestamp time.Time `json:"signature_timestamp"`
