@@ -196,9 +196,9 @@ func TestPatternsTestCommand_RequiresCommand(t *testing.T) {
 }
 
 func TestCheckDeletionRiskAndQuorum(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HOME", testutil.NonSystemTempDir(t))
 	for _, location := range []string{"home/ubuntu", "data/tmp"} {
-		cwd := t.TempDir() + "/" + location
+		cwd := testutil.NonSystemTempDir(t) + "/" + location
 		if err := os.MkdirAll(cwd, 0700); err != nil {
 			t.Fatal(err)
 		}

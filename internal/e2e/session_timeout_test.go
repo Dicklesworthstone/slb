@@ -447,8 +447,18 @@ func TestDaemonCLI_ProjectLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Keep runtime paths short enough for Unix sockets on macOS too.
-	base, err := os.MkdirTemp("", "slb-e2e-")
+	// Keep runtime paths short enough for Unix sockets on macOS too, where
+	// sun_path holds 103 bytes and the per-user TMPDIR resolves to a long
+	// /private/var/folders/... path once symlinks are evaluated below.
+	tempRoot := os.TempDir()
+	if resolved, err := filepath.EvalSymlinks(tempRoot); err == nil {
+		tempRoot = resolved
+	}
+	longest := filepath.Join(tempRoot, "slb-e2e-4294967295", "runtime", "slb-0123456789ab.sock")
+	if runtime.GOOS != "windows" && len(longest) > 103 {
+		tempRoot = "/tmp"
+	}
+	base, err := os.MkdirTemp(tempRoot, "slb-e2e-")
 	if err != nil {
 		t.Fatal(err)
 	}

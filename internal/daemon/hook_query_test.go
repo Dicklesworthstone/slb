@@ -11,13 +11,14 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
+	"github.com/Dicklesworthstone/slb/internal/testutil"
 )
 
 func TestHookQueryDeletionRiskAndQuorum(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HOME", testutil.NonSystemTempDir(t))
 	srv := &IPCServer{}
-	base := t.TempDir()
-	for _, cwd := range []string{filepath.Join(base, "home", "ubuntu"), filepath.Join(base, "data", "tmp"), t.TempDir()} {
+	base := testutil.NonSystemTempDir(t)
+	for _, cwd := range []string{filepath.Join(base, "home", "ubuntu"), filepath.Join(base, "data", "tmp"), testutil.NonSystemTempDir(t)} {
 		if err := os.MkdirAll(cwd, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -180,7 +181,7 @@ func TestIPCServer_HookQuery_DangerousCommand(t *testing.T) {
 	defer conn.Close()
 
 	// Send hook_query with dangerous command
-	params, _ := json.Marshal(HookQueryParams{Command: "rm -rf node_modules", CWD: t.TempDir()})
+	params, _ := json.Marshal(HookQueryParams{Command: "rm -rf node_modules", CWD: testutil.NonSystemTempDir(t)})
 	req := RPCRequest{Method: "hook_query", Params: params, ID: 3}
 	data, _ := json.Marshal(req)
 	data = append(data, '\n')

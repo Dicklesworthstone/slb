@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/Dicklesworthstone/slb/internal/testutil"
 	"github.com/mattn/go-shellwords"
 )
 
@@ -67,7 +68,7 @@ func TestRMHomeParameterClassification(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX shell parameters")
 	}
-	t.Setenv("HOME", filepath.Join(t.TempDir(), "agent home"))
+	t.Setenv("HOME", filepath.Join(testutil.NonSystemTempDir(t), "agent home"))
 	engine := NewPatternEngine()
 	for _, cwd := range []string{"", "/home/ubuntu", "/data/tmp"} {
 		for _, tc := range []struct {

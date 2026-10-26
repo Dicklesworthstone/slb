@@ -72,6 +72,10 @@ func TestDaemonProjectPath_FromEnv(t *testing.T) {
 func TestDaemonProjectPath_FallbackToCwd(t *testing.T) {
 	resetDaemonFlags()
 	flagProject = ""
+	// Project discovery walks up to the nearest .slb. Start below no .slb,
+	// not in a checkout that may sit under one (such as a home directory
+	// where slb is in use).
+	t.Chdir(t.TempDir())
 
 	originalEnv := os.Getenv("SLB_PROJECT")
 	defer os.Setenv("SLB_PROJECT", originalEnv)
@@ -446,6 +450,7 @@ func TestTailFileLines_NoTrailingNewline(t *testing.T) {
 // TestDaemonProjectPath_PrecedenceOrder verifies the correct fallback order.
 func TestDaemonProjectPath_PrecedenceOrder(t *testing.T) {
 	resetDaemonFlags()
+	t.Chdir(t.TempDir()) // see TestDaemonProjectPath_FallbackToCwd
 
 	originalEnv := os.Getenv("SLB_PROJECT")
 	defer os.Setenv("SLB_PROJECT", originalEnv)

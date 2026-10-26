@@ -16,11 +16,11 @@ func TestCheckRMOperandBoundariesAndRootGlobs(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX shell paths")
 	}
-	home := filepath.Join(t.TempDir(), "agent home")
+	home := filepath.Join(testutil.NonSystemTempDir(t), "agent home")
 	t.Setenv("HOME", home)
 	h := testutil.NewHarness(t)
 	t.Cleanup(resetPatternsFlags)
-	for _, cwd := range []string{home, filepath.Join(home, "project"), t.TempDir()} {
+	for _, cwd := range []string{home, filepath.Join(home, "project"), testutil.NonSystemTempDir(t)} {
 		if err := os.MkdirAll(cwd, 0700); err != nil {
 			t.Fatal(err)
 		}

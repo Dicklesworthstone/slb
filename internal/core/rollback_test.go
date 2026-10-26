@@ -1301,7 +1301,8 @@ func TestEstimateFileBytes(t *testing.T) {
 	})
 
 	t.Run("nonexistent path", func(t *testing.T) {
-		_, err := estimateFileBytes([]string{"/nonexistent/path"}, 0)
+		// A fixed path such as /nonexistent/path can exist on a test host.
+		_, err := estimateFileBytes([]string{filepath.Join(t.TempDir(), "missing")}, 0)
 		if err == nil {
 			t.Error("expected error for nonexistent path")
 		}
@@ -1441,7 +1442,7 @@ func TestWriteTarGz(t *testing.T) {
 	t.Run("fails for nonexistent source", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		outPath := filepath.Join(tmpDir, "fail.tar.gz")
-		roots := []FilesystemRoot{{ID: "p0", Path: "/nonexistent/path"}}
+		roots := []FilesystemRoot{{ID: "p0", Path: filepath.Join(tmpDir, "missing")}}
 		err := writeTarGz(outPath, roots)
 		if err == nil {
 			t.Error("expected error for nonexistent source")

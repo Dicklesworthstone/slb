@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/Dicklesworthstone/slb/internal/testutil"
 )
 
 // Use the daemon's policy-loading and classification path. The strings below
@@ -14,7 +16,7 @@ func TestHookQueryRMOperandBoundariesAndRootGlobs(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX shell paths")
 	}
-	home := filepath.Join(t.TempDir(), "agent home")
+	home := filepath.Join(testutil.NonSystemTempDir(t), "agent home")
 	project := filepath.Join(home, "project")
 	if err := os.MkdirAll(project, 0700); err != nil {
 		t.Fatal(err)
@@ -23,7 +25,7 @@ func TestHookQueryRMOperandBoundariesAndRootGlobs(t *testing.T) {
 	srv := &IPCServer{}
 	// Physical policy discovery requires existing directories. Keep the
 	// classification cases independent of paths installed on the test host.
-	for _, cwd := range []string{"", t.TempDir(), t.TempDir(), home, project} {
+	for _, cwd := range []string{"", testutil.NonSystemTempDir(t), testutil.NonSystemTempDir(t), home, project} {
 		for _, tc := range []struct {
 			command, tier string
 			approvals     int

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/slb/internal/testutil"
 )
 
 func TestClassifyCommand(t *testing.T) {
@@ -1671,7 +1673,7 @@ func TestDeletionRiskAndQuorum(t *testing.T) {
 }
 
 func TestDeletionCustomHomeRoot(t *testing.T) {
-	home := t.TempDir()
+	home := testutil.NonSystemTempDir(t)
 	t.Setenv("HOME", home)
 	engine := NewPatternEngine()
 	for _, cmd := range []string{"rm -rf ~", "rm -rf ~/", "rm -rf ~/*", "rm -rf " + home, "rm -rf .", "rm -rf build " + home} {

@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/Dicklesworthstone/slb/internal/testutil"
 	"github.com/mattn/go-shellwords"
 )
 
@@ -110,7 +111,7 @@ func TestRMClassificationPreservesOperandsAndHomes(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX shell paths")
 	}
-	home := filepath.Join(t.TempDir(), "custom home")
+	home := filepath.Join(testutil.NonSystemTempDir(t), "custom home")
 	t.Setenv("HOME", home)
 	// os.UserHomeDir uses USERPROFILE on Windows.
 	t.Setenv("USERPROFILE", home)

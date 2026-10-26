@@ -13,13 +13,14 @@ import (
 
 	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/db"
+	"github.com/Dicklesworthstone/slb/internal/testutil"
 )
 
 func policyExecutionFixture(t *testing.T) (*db.DB, *db.Request, *db.Session) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("USERPROFILE", t.TempDir())
-	project := t.TempDir()
+	t.Setenv("HOME", testutil.NonSystemTempDir(t))
+	t.Setenv("USERPROFILE", testutil.NonSystemTempDir(t))
+	project := testutil.NonSystemTempDir(t)
 	database, err := db.OpenAndMigrate(filepath.Join(project, ".slb", "state.db"))
 	if err != nil {
 		t.Fatal(err)
