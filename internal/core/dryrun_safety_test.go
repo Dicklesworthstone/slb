@@ -2,6 +2,7 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -486,6 +487,62 @@ func TestRunDryRunUsesExecutionArgv(t *testing.T) {
 		if got, err := os.ReadFile(filepath.Join(directory, name)); err != nil || string(got) != "untouched" {
 			t.Fatalf("preview modified %q: %q, %v", name, got, err)
 		}
+	}
+}
+
+func TestDryRunMatchesLegacyDirectExecutionOperands(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("argv-recording fixtures use POSIX shell scripts")
+	}
+	bin := t.TempDir()
+	// Neither executable performs its named operation: both only report argv.
+	for _, name := range []string{"rm", "ls"} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	for _, tc := range []struct {
+		name         string
+		raw          string
+		direct       []string
+		shellOperand string
+	}{
+		{"quoted spaces", "rm -- 'two words'", []string{"'two", "words'"}, "two words"},
+		{"escaped spaces", "rm -- escaped\\ space", []string{"escaped\\", "space"}, "escaped space"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			spec := &db.CommandSpec{Raw: tc.raw, Cwd: dir}
+			executed, err := RunCommand(context.Background(), spec, filepath.Join(dir, "execution.log"), nil)
+			if err != nil || executed == nil {
+				t.Fatalf("recording actual direct execution: %+v, %v", executed, err)
+			}
+			actual := strings.Split(strings.TrimRight(executed.Output, "\n"), "\n")
+			wantActual := append([]string{"--"}, tc.direct...)
+			if !reflect.DeepEqual(actual, wantActual) {
+				t.Fatalf("unexpected actual execution argv: got=%q want=%q", actual, wantActual)
+			}
+			preview, err := RunDryRun(spec)
+			if err != nil || preview == nil {
+				t.Fatalf("recording direct preview: %+v, %v", preview, err)
+			}
+			gotPreview := strings.Split(strings.TrimRight(preview.Output, "\n"), "\n")
+			wantPreview := append([]string{"-la", "--"}, actual[1:]...)
+			if !reflect.DeepEqual(gotPreview, wantPreview) {
+				t.Fatalf("preview changed execution operands: got=%q want=%q", gotPreview, wantPreview)
+			}
+			shellSpec := *spec
+			shellSpec.Shell = true
+			shellPreview, err := RunDryRun(&shellSpec)
+			if err != nil || shellPreview == nil {
+				t.Fatalf("recording shell preview: %+v, %v", shellPreview, err)
+			}
+			gotShell := strings.Split(strings.TrimRight(shellPreview.Output, "\n"), "\n")
+			if want := []string{"-la", "--", tc.shellOperand}; !reflect.DeepEqual(gotShell, want) {
+				t.Fatalf("shell preview lost quoting: got=%q want=%q", gotShell, want)
+			}
+		})
 	}
 }
 

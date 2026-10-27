@@ -60,6 +60,9 @@ func RunDryRunContext(parent context.Context, spec *db.CommandSpec) (*db.DryRunR
 		// Argv is authoritative for non-shell execution. Do not reinterpret a
 		// display string and preview different arguments from those approved.
 		requested, ok = append([]string(nil), spec.Argv...), true
+	} else if !spec.Shell {
+		// Match RunCommand's legacy raw-only direct execution exactly.
+		requested, ok = strings.Fields(spec.Raw), true
 	}
 	if !ok {
 		return nil, nil
@@ -498,23 +501,24 @@ func runGitResetPreview(ctx context.Context, plan gitResetPreviewPlan, cwd strin
 	steps := plan.steps(head, target, root)
 	result.Command = describeGitResetPreview(steps)
 	output := &outputCapture{limit: maxCapturedOutputBytes}
-	fmt.Fprintf(output, "Git reset %s: HEAD %s -> target %s. Read-only observations; the repository can change after this preview.\n", plan.mode, head, target)
+	// This bounded in-memory writer always accepts writes without an error.
+	_, _ = fmt.Fprintf(output, "Git reset %s: HEAD %s -> target %s. Read-only observations; the repository can change after this preview.\n", plan.mode, head, target)
 	switch plan.mode {
 	case "--soft":
-		fmt.Fprintln(output, "Only refs move; the index and working tree are preserved.")
+		_, _ = fmt.Fprintln(output, "Only refs move; the index and working tree are preserved.")
 	case "--mixed":
-		fmt.Fprintln(output, "The index is reset; working-tree files are preserved.")
+		_, _ = fmt.Fprintln(output, "The index is reset; working-tree files are preserved.")
 	case "--hard":
-		fmt.Fprintln(output, "Tracked contents are discarded/replaced. Untracked or ignored paths obstructing the target may be deleted; inventories below do not simulate collisions.")
+		_, _ = fmt.Fprintln(output, "Tracked contents are discarded/replaced. Untracked or ignored paths obstructing the target may be deleted; inventories below do not simulate collisions.")
 	case "--merge":
-		fmt.Fprintln(output, "Unstaged changes are preserved where Git permits; conflicting index/target changes can abort reset. Candidate diffs do not simulate Git's merge checks.")
+		_, _ = fmt.Fprintln(output, "Unstaged changes are preserved where Git permits; conflicting index/target changes can abort reset. Candidate diffs do not simulate Git's merge checks.")
 	case "--keep":
-		fmt.Fprintln(output, "Local changes are preserved where Git permits; paths changed between HEAD and target can cause reset to abort. Candidate diffs do not simulate Git's keep checks.")
+		_, _ = fmt.Fprintln(output, "Local changes are preserved where Git permits; paths changed between HEAD and target can cause reset to abort. Candidate diffs do not simulate Git's keep checks.")
 	}
 	for _, step := range steps {
-		fmt.Fprintf(output, "\n--- %s ---\n", step.label)
+		_, _ = fmt.Fprintf(output, "\n--- %s ---\n", step.label)
 		text, err := runDryRunProcess(ctx, step.args, cwd)
-		fmt.Fprintln(output, text)
+		_, _ = fmt.Fprintln(output, text)
 		if err != nil {
 			result.Output = output.String()
 			return result, err
