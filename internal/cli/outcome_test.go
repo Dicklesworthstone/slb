@@ -227,6 +227,77 @@ func TestOutcomeListCommand_ListsOutcomes(t *testing.T) {
 	}
 }
 
+func TestOutcomeCommandPreservesRecordedPolicyAndAssurance(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
+	h := testutil.NewHarness(t)
+	resetOutcomeFlags()
+	t.Cleanup(resetOutcomeFlags)
+	requester := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("OutcomeAuthor"))
+	h.WriteFile(".slb/config.toml", []byte("[general]\napproval_policy = 'independent'\n"), 0600)
+	type provenance struct {
+		Policy        db.ApprovalPolicy
+		Assurance     db.ReviewAssurance
+		RequestPolicy db.ApprovalPolicy
+	}
+	expected := make(map[string]provenance)
+	for _, recorded := range []provenance{
+		{db.ApprovalPolicyIndependent, db.AssuranceLegacyUnknown, db.ApprovalPolicyIndependent},
+		{db.ApprovalPolicySameHost, db.AssuranceSameHost, db.ApprovalPolicySameHost},
+		{db.ApprovalPolicyIndependent, db.AssuranceLegacyUnknown, db.ApprovalPolicySameHost},
+	} {
+		// Seed historical metadata; this output test runs no command and does
+		// not treat a legacy record as authenticated execution evidence.
+		request := testutil.MakeRequest(t, h.DB, requester, func(request *db.Request) {
+			request.Status = db.StatusExecuted
+			request.ApprovalPolicy = recorded.RequestPolicy
+		})
+		if _, err := h.DB.Exec(`UPDATE requests SET execution_executed_at = '2026-01-01T00:00:00Z',
+			execution_approval_policy = ?, execution_assurance = ? WHERE id = ?`, recorded.Policy, recorded.Assurance, request.ID); err != nil {
+			t.Fatal(err)
+		}
+		expected[request.ID] = recorded
+		resetOutcomeFlags()
+		stdout, err := executeCommandCapture(t, newTestOutcomeCmd(h.DBPath), "outcome", "record", request.ID, "-j")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result map[string]any
+		if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+			t.Fatal(err)
+		}
+		if result["approval_policy"] != string(recorded.Policy) || result["approval_policy_label"] != recorded.Policy.Label() || result["assurance"] != string(recorded.Assurance) {
+			t.Fatalf("outcome record lost stored provenance: %+v", result)
+		}
+	}
+	h.WriteFile(".slb/config.toml", []byte("[general]\napproval_policy = 'same_host'\n"), 0600)
+	resetOutcomeFlags()
+	stdout, err := executeCommandCapture(t, newTestOutcomeCmd(h.DBPath), "outcome", "list", "-j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Outcomes []struct {
+			RequestID string             `json:"request_id"`
+			Policy    db.ApprovalPolicy  `json:"approval_policy"`
+			Label     string             `json:"approval_policy_label"`
+			Assurance db.ReviewAssurance `json:"assurance"`
+		} `json:"outcomes"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Outcomes) != len(expected) {
+		t.Fatalf("outcome history missing: %+v", result)
+	}
+	for _, outcome := range result.Outcomes {
+		recorded, ok := expected[outcome.RequestID]
+		if !ok || outcome.Policy != recorded.Policy || outcome.Label != recorded.Policy.Label() || outcome.Assurance != recorded.Assurance {
+			t.Fatalf("current policy relabeled historical evidence: %+v", outcome)
+		}
+	}
+}
+
 func TestOutcomeStatsCommand_ShowsStats(t *testing.T) {
 	h := testutil.NewHarness(t)
 	resetOutcomeFlags()

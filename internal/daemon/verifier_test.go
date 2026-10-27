@@ -174,6 +174,30 @@ func TestVerifierSameHostClaimLabelsAndCurrentPolicy(t *testing.T) {
 				!strings.Contains(response.ReviewNotice, "not independently authenticated authorization") {
 				t.Fatalf("notary promoted or concealed local evidence: %+v", response)
 			}
+			// A later opt-out revokes new execution claims, but completion must
+			// keep the policy captured by this already committed claim.
+			if err := os.WriteFile(configPath, []byte("[general]\napproval_policy = 'independent'\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			zero := 0
+			completion, err := json.Marshal(CompleteExecuteParams{RequestID: request.ID,
+				SessionID: author.ID, SessionKey: author.SessionKey, ExecutionReceipt: claim.ExecutionReceipt,
+				Status: db.StatusExecuted, ExitCode: &zero})
+			if err != nil {
+				t.Fatal(err)
+			}
+			completed := (&IPCServer{verifier: v}).handleCompleteExecute(RPCRequest{Params: completion, ID: 31})
+			if completed.Error != nil {
+				t.Fatalf("completion after opt-out failed: %+v", completed.Error)
+			}
+			receipt, ok := completed.Result.(map[string]any)
+			if !ok || receipt["approval_policy"] != db.ApprovalPolicySameHost || receipt["assurance"] != db.AssuranceSameHost || receipt["review_notice"] != db.ApprovalPolicySameHost.Label() {
+				t.Fatalf("completion receipt reinterpreted historical execution: %+v", completed.Result)
+			}
+			stored, err := database.GetRequest(request.ID)
+			if err != nil || stored.Status != db.StatusExecuted || stored.Execution == nil || stored.Execution.Assurance != db.AssuranceSameHost || stored.Execution.ApprovalPolicy != db.ApprovalPolicySameHost {
+				t.Fatalf("completed execution lost captured evidence category: %+v %v", stored, err)
+			}
 		})
 	}
 }

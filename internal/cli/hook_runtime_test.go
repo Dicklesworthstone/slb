@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Dicklesworthstone/slb/internal/audit"
+	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
 // These tests exercise the exact embedded Python runtime, independent of the
@@ -23,7 +24,7 @@ func runHookRuntime(t *testing.T, home, setup, input string) (string, string) {
 	// The generator embeds these constants ahead of the runtime (f37f6ee added
 	// HOOK_CAUTION_ACTION; "block" is the generated default). Tests override
 	// them in setup when a case depends on a different value.
-	preamble := "__name__ = 'slb_runtime_test'\nAUDIT_REDACTION_PATTERNS = [r'(?i)token=[^ ]+']\nHOOK_CAUTION_ACTION = 'block'\n"
+	preamble := "__name__ = 'slb_runtime_test'\nAUDIT_REDACTION_PATTERNS = [r'(?i)token=[^ ]+']\nHOOK_CAUTION_ACTION = 'block'\nHOOK_APPROVAL_POLICY = 'independent'\n"
 	script := preamble + hookRuntime + "\n" + setup + "\nmain()\n"
 	command := exec.Command(python, "-c", script)
 	command.Dir = t.TempDir()
@@ -68,6 +69,36 @@ func TestHookRuntimeOfflineAuditIsReadableByGo(t *testing.T) {
 		strings.Contains(event.CommandRedacted, "supersecret") || !strings.Contains(event.CommandRedacted, "[REDACTED]") ||
 		event.CommandHash != audit.CommandHash("git push --force token=supersecret", event.CWD) {
 		t.Fatalf("audit redaction or cross-language schema/hash mismatch: %+v", event)
+	}
+}
+
+func TestHookRuntimeApprovalPolicyAuditAndOutput(t *testing.T) {
+	for _, tc := range []struct {
+		name, setup string
+		policy      db.ApprovalPolicy
+	}{
+		{"offline independent", "query_slb_daemon = lambda *args: None\nclassify = lambda command: ('dangerous', 1)", db.ApprovalPolicyIndependent},
+		{"offline same host", "HOOK_APPROVAL_POLICY = 'same_host'\nquery_slb_daemon = lambda *args: None\nclassify = lambda command: ('dangerous', 1)", db.ApprovalPolicySameHost},
+		{"live same host", "query_slb_daemon = lambda *args: {'action':'block', 'tier':'dangerous', 'approval_policy':'same_host'}", db.ApprovalPolicySameHost},
+		{"live overrides snapshot", "HOOK_APPROVAL_POLICY = 'same_host'\nquery_slb_daemon = lambda *args: {'action':'block', 'tier':'dangerous', 'approval_policy':'independent'}", db.ApprovalPolicyIndependent},
+		{"live unknown does not inherit snapshot", "HOOK_APPROVAL_POLICY = 'same_host'\nquery_slb_daemon = lambda *args: {'action':'block', 'tier':'dangerous'}", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			notice := ""
+			if tc.policy != "" {
+				notice = tc.policy.Label()
+			}
+			stdout, stderr := runHookRuntime(t, home, tc.setup, `{"tool_input":{"command":"disposable-hook-fixture"}}`)
+			if hookPermission(t, stdout) != "deny" || stderr != "" || !strings.Contains(stdout, notice) ||
+				(tc.policy == "" && strings.Contains(stdout, "same-host peer review")) {
+				t.Fatalf("policy notice or fail-closed decision missing: %s %s", stdout, stderr)
+			}
+			events, err := audit.Query(filepath.Join(home, ".slb", "audit", "blocked"), audit.Filter{})
+			if err != nil || len(events) != 1 || events[0].ApprovalPolicy != string(tc.policy) || events[0].ReviewNotice != notice {
+				t.Fatalf("hook policy provenance missing: %+v, %v", events, err)
+			}
+		})
 	}
 }
 

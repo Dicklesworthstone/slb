@@ -68,9 +68,15 @@ func TestBuiltCLIRefusesLocalApprovals(t *testing.T) {
 		// Signed votes and an APPROVED status written straight to SQLite, as
 		// a historical approval or a process with database access would.
 		testutil.ApproveRequest(t, h.DB, request)
-		output, err := run("execute", request.ID, "--session-id", requester.ID, "-C", h.ProjectDir)
-		if err == nil || !strings.Contains(output, refusal) {
-			t.Fatalf("built CLI executed a locally approved request = %v\n%s", err, output)
+		for _, background := range []bool{false, true} {
+			args := []string{"execute", request.ID, "--session-id", requester.ID, "-C", h.ProjectDir}
+			if background {
+				args = append(args, "--background")
+			}
+			output, err := run(args...)
+			if err == nil || !strings.Contains(output, refusal) {
+				t.Fatalf("built CLI executed a locally approved request (background=%v) = %v\n%s", background, err, output)
+			}
 		}
 		if _, err := os.Stat(marker); !os.IsNotExist(err) {
 			t.Fatalf("command ran despite refusal: %v", err)
@@ -111,14 +117,18 @@ func identityCLIEnvironment(home string) []string {
 	var env []string
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
-		if strings.HasPrefix(key, "SLB_") || strings.HasPrefix(key, "TOON_") ||
-			key == "HOME" || key == "USERPROFILE" || key == "XDG_CONFIG_HOME" {
+		if strings.HasPrefix(key, "SLB_") || strings.HasPrefix(key, "TOON_") {
+			continue
+		}
+		switch key {
+		case "HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "TMPDIR", "TMP", "TEMP", "SHELL":
 			continue
 		}
 		env = append(env, entry)
 	}
 	return append(env, "HOME="+home, "USERPROFILE="+home,
-		"XDG_CONFIG_HOME="+filepath.Join(home, ".config"))
+		"XDG_CONFIG_HOME="+filepath.Join(home, ".config"), "XDG_CACHE_HOME="+filepath.Join(home, ".cache"),
+		"TMPDIR="+home, "TMP="+home, "TEMP="+home, "SHELL=/bin/sh")
 }
 
 type sameHostCLI struct {
@@ -154,6 +164,11 @@ func (f *sameHostCLI) run(args ...string) (string, string, error) {
 	f.T.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	return f.runContext(ctx, args...)
+}
+
+func (f *sameHostCLI) runContext(ctx context.Context, args ...string) (string, string, error) {
+	f.T.Helper()
 	cmd := exec.CommandContext(ctx, f.binary, append([]string{"-C", f.ProjectDir}, args...)...)
 	cmd.Dir = f.ProjectDir
 	cmd.Env = identityCLIEnvironment(f.home)
@@ -179,7 +194,8 @@ func (f *sameHostCLI) json(args ...string) map[string]any {
 func (f *sameHostCLI) fails(want string, args ...string) {
 	f.T.Helper()
 	stdout, stderr, err := f.run(args...)
-	if err == nil || !strings.Contains(stdout+stderr, want) {
+	exit, ok := err.(*exec.ExitError)
+	if !ok || exit.ExitCode() != 1 || !strings.Contains(stdout+stderr, want) {
 		f.T.Fatalf("CLI %s should fail with %q: %v\nstdout: %s\nstderr: %s",
 			args[0], want, err, stdout, stderr)
 	}
@@ -263,6 +279,10 @@ func TestBuiltCLISameHostReviewIntegration(t *testing.T) {
 		f.fails("not approved", "execute", request.ID, "--session-id", requester.ID)
 		f.fails("review already exists", "approve", request.ID,
 			"--session-id", reviewer.ID, "--session-key", reviewer.SessionKey)
+		f.json("session", "end", "--session-id", reviewer.ID)
+		restarted := f.session("Reviewer", "model-b")
+		f.fails("review already exists", "approve", request.ID,
+			"--session-id", restarted.ID, "--session-key", restarted.SessionKey)
 		f.assertNotExecuted(request)
 		// Use human-readable output for the decisive review too.
 		stdout, stderr, err := f.run("approve", request.ID, "--session-id", reviewer2.ID,
@@ -490,6 +510,15 @@ func TestBuiltCLISameHostReviewIntegration(t *testing.T) {
 		{"current config opts out", func(f *sameHostCLI, request *db.Request) {
 			f.json("config", "set", "general.approval_policy", "independent")
 		}, "policy"},
+		{"current command policy becomes stricter", func(f *sameHostCLI, request *db.Request) {
+			_, err := f.DB.InsertCustomPattern("critical", `^touch\s+reviewed-marker$`, "Stricter fixture policy", "e2e")
+			testutil.RequireNoError(f.T, err, "raise current command risk")
+		}, "current policy"},
+		{"reviewer credential is rotated", func(f *sameHostCLI, request *db.Request) {
+			_, err := f.DB.Exec(`UPDATE sessions SET session_key_digest=? WHERE id=(SELECT reviewer_session_id FROM reviews WHERE request_id=?)`,
+				strings.Repeat("ab", 32), request.ID)
+			testutil.RequireNoError(f.T, err, "rotate reviewer credential")
+		}, "signature"},
 		{"request cannot promote local evidence", func(f *sameHostCLI, request *db.Request) {
 			_, err := f.DB.Exec(`UPDATE requests SET approval_policy = 'independent' WHERE id = ?`, request.ID)
 			testutil.RequireNoError(f.T, err, "relabel request")
@@ -760,5 +789,176 @@ func TestBuiltCLISameHostReviewIntegration(t *testing.T) {
 				t.Fatalf("later emergency execution overwrote earlier audit evidence: %v", err)
 			}
 		})
+	}
+}
+
+// These are distinct executable entry points: they must retain the request's
+// policy through waiting and detached process handoffs, including their logs.
+func TestBuiltCLISameHostExecutionEntryPoints(t *testing.T) {
+	binary := buildIdentityBoundaryCLI(t)
+	const label = "not independently authenticated authorization"
+
+	t.Run("yield and human-readable execution", func(t *testing.T) {
+		f := newSameHostCLI(t, binary, 1, false)
+		requester, reviewer := f.session("Requester", "model-a"), f.session("Reviewer", "model-b")
+		created := f.json("run", "touch reviewed-marker", "--yield", "--session-id", requester.ID,
+			"--reason", "Exercise yielded same-host review", "--safety", "Disposable marker only")
+		id, ok := created["request_id"].(string)
+		if !ok || id == "" || created["status"] != "pending" || created["approval_policy"] != "same_host" {
+			t.Fatalf("yield lost pending review policy: %+v", created)
+		}
+		request, err := f.DB.GetRequest(id)
+		testutil.RequireNoError(t, err, "read yielded request")
+		f.assertNotExecuted(request)
+		f.approve(request, reviewer)
+		stdout, stderr, err := f.run("execute", id, "--session-id", requester.ID)
+		if err != nil || !strings.Contains(stdout+stderr, label) {
+			t.Fatalf("human execution lost same-host notice: %v\n%s\n%s", err, stdout, stderr)
+		}
+		f.assertExecuted(id)
+	})
+
+	t.Run("background execution and historical policy", func(t *testing.T) {
+		f := newSameHostCLI(t, binary, 1, false)
+		requester, reviewer := f.session("Requester", "model-a"), f.session("Reviewer", "model-b")
+		request := f.request(requester)
+		f.approve(request, reviewer)
+		started := f.json("execute", request.ID, "--session-id", requester.ID, "--background")
+		if started["approval_policy"] != "same_host" || started["assurance"] != "same_host" {
+			t.Fatalf("background receipt lost policy/evidence: %+v", started)
+		}
+		deadline := time.After(15 * time.Second)
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+	wait:
+		for {
+			select {
+			case <-deadline:
+				t.Fatal("background supervisor did not record completion")
+			case <-ticker.C:
+				stored, err := f.DB.GetRequest(request.ID)
+				testutil.RequireNoError(t, err, "read background status")
+				if stored.Status == db.StatusExecuted {
+					break wait
+				}
+				if stored.Status == db.StatusExecutionFailed {
+					t.Fatalf("background execution failed: %+v", stored)
+				}
+			}
+		}
+		f.assertExecuted(request.ID)
+		f.json("config", "set", "general.approval_policy", "independent")
+		show := f.json("show", request.ID)
+		execution, ok := show["execution"].(map[string]any)
+		if !ok || show["approval_policy"] != "same_host" || execution["approval_policy"] != "same_host" || execution["assurance"] != "same_host" {
+			t.Fatalf("opting out relabeled execution history: %+v", show)
+		}
+		stdout, stderr, err := f.run("history", "--status", "executed", "--json")
+		var history []map[string]any
+		if err != nil || json.Unmarshal([]byte(stdout), &history) != nil || len(history) != 1 || history[0]["approval_policy"] != "same_host" {
+			t.Fatalf("current policy relabeled history: %v\n%s\n%s", err, stdout, stderr)
+		}
+	})
+
+	for _, entry := range []string{"run", "request"} {
+		t.Run("blocking "+entry, func(t *testing.T) {
+			f := newSameHostCLI(t, binary, 1, false)
+			requester, reviewer := f.session("Requester", "model-a"), f.session("Reviewer", "model-b")
+			args := []string{entry, "touch reviewed-marker", "--session-id", requester.ID,
+				"--reason", "Exercise blocking review", "--expected-effect", "Create fixture marker", "--safety", "Temporary project only", "--timeout", "15", "--json"}
+			if entry == "request" {
+				args = append(args, "--wait", "--execute")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			type result struct {
+				stdout, stderr string
+				err            error
+			}
+			finished := make(chan result, 1)
+			go func() {
+				stdout, stderr, err := f.runContext(ctx, args...)
+				finished <- result{stdout, stderr, err}
+			}()
+			var pending *db.Request
+			ticker := time.NewTicker(20 * time.Millisecond)
+			defer ticker.Stop()
+			for pending == nil {
+				select {
+				case result := <-finished:
+					t.Fatalf("blocking %s exited before review: %v\n%s\n%s", entry, result.err, result.stdout, result.stderr)
+				case <-ctx.Done():
+					t.Fatal("blocking request was never admitted")
+				case <-ticker.C:
+					requests, err := f.DB.ListPendingRequests(f.ProjectDir)
+					testutil.RequireNoError(t, err, "read blocking request")
+					if len(requests) == 1 {
+						pending = requests[0]
+					}
+				}
+			}
+			if pending.ApprovalPolicy != db.ApprovalPolicySameHost {
+				t.Fatalf("blocking entry point lost approval policy: %+v", pending)
+			}
+			f.assertNotExecuted(pending)
+			f.approve(pending, reviewer)
+			completed := <-finished
+			var output map[string]any
+			if err := json.Unmarshal([]byte(completed.stdout), &output); completed.err != nil || err != nil ||
+				output["status"] != "executed" || output["approval_policy"] != "same_host" || output["assurance"] != "same_host" {
+				t.Fatalf("blocking %s lost execution evidence: %v, %v\n%s\n%s", entry, completed.err, err, completed.stdout, completed.stderr)
+			}
+			f.assertExecuted(pending.ID)
+		})
+	}
+
+	t.Run("same-host opt-in preserves session credentials", func(t *testing.T) {
+		f := newSameHostCLI(t, binary, 1, false)
+		requester, reviewer := f.session("Requester", "model-a"), f.session("Reviewer", "model-b")
+		var plain, digest string
+		if err := f.DB.QueryRow(`SELECT session_key, session_key_digest FROM sessions WHERE id=?`, reviewer.ID).Scan(&plain, &digest); err != nil {
+			t.Fatal(err)
+		}
+		if plain != "" || digest == reviewer.SessionKey || !db.SessionKeyMatches(digest, reviewer.SessionKey) {
+			t.Fatal("same-host review weakened session key storage")
+		}
+		stdout, stderr, err := f.run("session", "list", "--json")
+		if err != nil || strings.Contains(stdout+stderr, reviewer.SessionKey) || strings.Contains(stdout+stderr, digest) {
+			t.Fatalf("session listing disclosed credentials or failed: %v", err)
+		}
+		f.fails("session", "session", "resume", "--agent", reviewer.AgentName, "--session-id", reviewer.ID)
+		f.fails("session", "session", "resume", "--agent", reviewer.AgentName, "--session-id", reviewer.ID, "--session-key", digest)
+		resumed := f.json("session", "resume", "--agent", reviewer.AgentName, "--program", "e2e", "--model", reviewer.Model,
+			"--session-id", reviewer.ID, "--session-key", reviewer.SessionKey)
+		if resumed["session_id"] != reviewer.ID || resumed["session_key"] != reviewer.SessionKey {
+			t.Fatal("authenticated resume changed the credential")
+		}
+		request := f.request(requester)
+		f.fails("session key", "approve", request.ID, "--session-id", reviewer.ID, "--session-key", digest)
+		f.assertNotExecuted(request)
+		f.approve(request, reviewer)
+	})
+}
+
+func (f *sameHostCLI) assertExecuted(id string) {
+	f.T.Helper()
+	if _, err := os.Stat(filepath.Join(f.ProjectDir, "reviewed-marker")); err != nil {
+		f.T.Fatalf("reviewed command did not execute in the disposable project: %v", err)
+	}
+	stored, err := f.DB.GetRequest(id)
+	if err != nil || stored.Status != db.StatusExecuted || stored.Execution == nil ||
+		stored.ApprovalPolicy != db.ApprovalPolicySameHost || stored.Execution.ApprovalPolicy != db.ApprovalPolicySameHost || stored.Execution.Assurance != db.AssuranceSameHost {
+		f.T.Fatalf("execution lost original same-host evidence: %+v, %v", stored, err)
+	}
+	path := stored.Execution.LogPath
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(f.ProjectDir, path)
+	}
+	data, err := os.ReadFile(path)
+	testutil.RequireNoError(f.T, err, "read execution log")
+	var evidence map[string]any
+	if err := json.NewDecoder(bytes.NewReader(data)).Decode(&evidence); err != nil || evidence["event"] != "execution_claim" ||
+		evidence["request_id"] != id || evidence["approval_policy"] != "same_host" || evidence["assurance"] != "same_host" {
+		f.T.Fatalf("execution log lost its policy/evidence header: %v\n%s", err, data)
 	}
 }

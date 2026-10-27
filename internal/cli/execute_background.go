@@ -79,7 +79,8 @@ func launchBackgroundExecution(cmd *cobra.Command, conn *db.DB, request *db.Requ
 			cmd.SilenceErrors = true
 			return errors.Join(err, writeGitHookOutput(cmd, payload))
 		}
-		return err
+		_, outputErr := fmt.Fprintf(cmd.OutOrStdout(), "Approval policy: %s\n", request.ApprovalPolicy.Label())
+		return errors.Join(err, outputErr)
 	}
 	if executionOutputStructured() {
 		return writeGitHookOutput(cmd, receipt)
@@ -154,17 +155,35 @@ func runBackgroundWorker(cmd *cobra.Command, _ []string) error {
 				message = "execution refused; inspect the supervisor log"
 			}
 		}
-		_ = json.NewEncoder(acknowledgment).Encode(background.Receipt{Version: background.Version, RequestID: job.RequestID, Error: message})
+		receipt := background.Receipt{Version: background.Version, RequestID: job.RequestID, Error: message}
+		if result != nil && result.Request != nil {
+			receipt.ApprovalPolicy = result.Request.ApprovalPolicy.Normalized()
+			receipt.ApprovalPolicyLabel = receipt.ApprovalPolicy.Label()
+		}
+		_ = json.NewEncoder(acknowledgment).Encode(receipt)
 	}
-	outcome := map[string]any{"event": "background_execution_finished", "request_id": job.RequestID, "startup_confirmed": confirmed}
+	outcome := map[string]any{"event": "background_execution_finished", "request_id": job.RequestID,
+		"startup_confirmed": confirmed, "execution_claimed": false, "status": "not_started"}
 	if result != nil {
-		outcome["exit_code"], outcome["log_path"] = result.ExitCode, result.LogPath
+		// Only a result with this attempt's log path follows a committed
+		// execution claim. A refused replay may carry an older request receipt.
+		claimed := result.LogPath != ""
+		outcome["execution_claimed"] = claimed
+		if claimed {
+			outcome["exit_code"], outcome["log_path"] = result.ExitCode, result.LogPath
+		}
 		if result.Request != nil {
-			outcome["status"] = result.Request.Status
-			addApprovalPolicyMetadata(outcome, result.Request.ApprovalPolicy)
-			if result.Request.Execution != nil {
-				outcome["assurance"] = result.Request.Execution.Assurance
+			policy := result.Request.ApprovalPolicy
+			if claimed {
+				outcome["status"] = result.Request.Status
+				if result.Request.Execution != nil {
+					policy = result.Request.Execution.ApprovalPolicy
+					outcome["assurance"] = result.Request.Execution.Assurance
+				}
+			} else {
+				outcome["request_status"] = result.Request.Status
 			}
+			addApprovalPolicyMetadata(outcome, policy)
 		}
 		if runErr == nil && result.ExitCode != 0 {
 			runErr = commandExitError{code: result.ExitCode}
@@ -179,7 +198,7 @@ func runBackgroundWorker(cmd *cobra.Command, _ []string) error {
 
 // executeBackgroundJob owns its database until the command's terminal outcome
 // is committed. It never trusts a parent-side CanExecute check as permission.
-func executeBackgroundJob(ctx context.Context, job background.Job, onStarted func(core.ExecutionStart) error) (*core.ExecutionResult, error) {
+func executeBackgroundJob(ctx context.Context, job background.Job, onStarted func(core.ExecutionStart) error) (result *core.ExecutionResult, runErr error) {
 	if err := job.Validate(); err != nil {
 		return nil, err
 	}
@@ -198,6 +217,16 @@ func executeBackgroundJob(ctx context.Context, job background.Job, onStarted fun
 	if err != nil {
 		return nil, err
 	}
+	// A preflight refusal may return no core result. Retain the policy recorded
+	// on the request for failure receipts and logs, without claiming execution
+	// or a verified evidence assurance level. Its empty LogPath distinguishes
+	// this refusal from a result produced after this worker committed a claim;
+	// request.Execution may describe an earlier execution of a refused replay.
+	defer func() {
+		if result == nil {
+			result = &core.ExecutionResult{Request: request, ExitCode: -1, Error: runErr}
+		}
+	}()
 	if request.ProjectPath != job.Project || request.Command.Hash != job.CommandHash {
 		return nil, core.ErrCommandHashMismatch
 	}

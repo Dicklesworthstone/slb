@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
 func hookHandoffDatabase(t *testing.T, project string) string {
@@ -37,8 +39,9 @@ os.environ['SLB_SESSION_ID'] = 'slb-session'
 def query_slb_daemon(command, session_id, cwd):
     assert session_id == 'slb-session'
     assert cwd == %q
-    return {'action': 'execute', 'execution_handoff': {
+    return {'action': 'execute', 'approval_policy': 'same_host', 'execution_handoff': {
         'request_id': 'req-bound', 'command_hash': 'a' * 64,
+        'approval_policy': 'same_host',
         'session_id': session_id, 'database_path': os.path.join(cwd, '.slb', 'state.db')}}
 `, root)
 	input, err := json.Marshal(map[string]any{
@@ -54,11 +57,15 @@ def query_slb_daemon(command, session_id, cwd):
 	}
 	var payload struct {
 		Output struct {
-			Input map[string]any `json:"updatedInput"`
+			Input   map[string]any `json:"updatedInput"`
+			Context string         `json:"additionalContext"`
 		} `json:"hookSpecificOutput"`
 	}
 	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(payload.Output.Context, db.ApprovalPolicySameHost.Label()) {
+		t.Fatalf("handoff omitted same-host policy notice: %q", payload.Output.Context)
 	}
 	updated := payload.Output.Input
 	command, _ := updated["command"].(string)

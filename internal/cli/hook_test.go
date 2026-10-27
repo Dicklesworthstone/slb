@@ -1119,11 +1119,11 @@ func TestHookTestCommand_SimulatedFailureUsesFallback(t *testing.T) {
 
 func TestHookCautionPolicyEmbeddedAndLocal(t *testing.T) {
 	engine := core.NewPatternEngine()
-	askScript := generateHookScriptWithCautionAction(engine, "ask")
+	askScript := generateHookScriptWithPolicy(engine, "ask", db.ApprovalPolicyIndependent)
 	if !strings.Contains(askScript, `HOOK_CAUTION_ACTION = "ask"`) || embeddedHookCautionAction([]byte(askScript)) != "ask" {
 		t.Fatal("generated hook lost explicit CAUTION ask policy")
 	}
-	blockScript := generateHookScriptWithCautionAction(engine, "invalid")
+	blockScript := generateHookScriptWithPolicy(engine, "invalid", db.ApprovalPolicyIndependent)
 	if embeddedHookCautionAction([]byte(blockScript)) != "block" {
 		t.Fatal("invalid generated CAUTION policy did not fail closed")
 	}
@@ -1132,6 +1132,39 @@ func TestHookCautionPolicyEmbeddedAndLocal(t *testing.T) {
 	}
 	if got := localHookTestResultWithCautionAction("rm build.cache", "", "ask"); got["action"] != "ask" {
 		t.Fatalf("local ask policy ignored: %+v", got)
+	}
+}
+
+func TestHookStatusCommand_DetectsChangedApprovalPolicy(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
+	h := testutil.NewHarness(t)
+	resetHookFlags()
+	t.Cleanup(resetHookFlags)
+	if _, err := executeCommandCapture(t, newTestHookCmd(h.DBPath), "-C", h.ProjectDir, "hook", "install", "-j"); err != nil {
+		t.Fatal(err)
+	}
+	h.WriteFile(".slb/config.toml", []byte("[general]\napproval_policy = 'same_host'\n"), 0600)
+	resetHookFlags()
+	stdout, err := executeCommandCapture(t, newTestHookCmd(h.DBPath), "-C", h.ProjectDir, "hook", "status", "-j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status map[string]any
+	if err := json.Unmarshal([]byte(stdout), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status["status"] != "stale" || status["approval_policy_matches"] != false ||
+		status["installed_approval_policy"] != "independent" || status["current_approval_policy"] != "same_host" {
+		t.Fatalf("policy-only change left offline hook apparently current: %+v", status)
+	}
+	resetHookFlags()
+	stdout, err = executeCommandCapture(t, newTestHookCmd(h.DBPath), "-C", h.ProjectDir, "hook", "test", "git push --force", "--local-only", "-j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout, db.ApprovalPolicySameHost.Label()) || !strings.Contains(stdout, `"approval_policy": "same_host"`) {
+		t.Fatalf("hook test omitted current same-host provenance: %s", stdout)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/daemon"
+	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/output"
 	"github.com/spf13/cobra"
 )
@@ -176,11 +177,11 @@ func runHookGenerate(cmd *cobra.Command, args []string) error {
 
 	// Generate hook script
 	engine := core.GetDefaultEngine()
-	cautionAction, err := hookCautionAction()
+	cautionAction, approvalPolicy, err := hookPolicySettings()
 	if err != nil {
 		return err
 	}
-	hookScript := generateHookScriptWithCautionAction(engine, cautionAction)
+	hookScript := generateHookScriptWithPolicy(engine, cautionAction, approvalPolicy)
 
 	// Write script
 	scriptPath := filepath.Join(outputDir, "slb_guard.py")
@@ -190,10 +191,12 @@ func runHookGenerate(cmd *cobra.Command, args []string) error {
 
 	out := output.New(output.Format(GetOutput()))
 	return out.Write(map[string]any{
-		"status":        "generated",
-		"script_path":   scriptPath,
-		"pattern_hash":  engine.ComputeHash(),
-		"pattern_count": engine.Export().Metadata.PatternCount,
+		"status":          "generated",
+		"script_path":     scriptPath,
+		"pattern_hash":    engine.ComputeHash(),
+		"pattern_count":   engine.Export().Metadata.PatternCount,
+		"approval_policy": approvalPolicy,
+		"review_notice":   approvalPolicy.Label(),
 	})
 }
 
@@ -215,11 +218,11 @@ func runHookInstall(cmd *cobra.Command, args []string) error {
 	}
 
 	engine := core.GetDefaultEngine()
-	cautionAction, err := hookCautionAction()
+	cautionAction, approvalPolicy, err := hookPolicySettings()
 	if err != nil {
 		return err
 	}
-	hookScript := generateHookScriptWithCautionAction(engine, cautionAction)
+	hookScript := generateHookScriptWithPolicy(engine, cautionAction, approvalPolicy)
 
 	hookScriptPath := filepath.Join(outputDir, "slb_guard.py")
 	if err := os.WriteFile(hookScriptPath, []byte(hookScript), 0755); err != nil {
@@ -265,6 +268,8 @@ func runHookInstall(cmd *cobra.Command, args []string) error {
 		"already_existed":         change.found && !change.upgraded,
 		"matcher":                 change.entryMatcher,
 		"sibling_hooks_preserved": change.siblingHooks,
+		"approval_policy":         approvalPolicy,
+		"review_notice":           approvalPolicy.Label(),
 	}
 	if change.upgraded {
 		result["previous_command"] = change.previousCommand
@@ -336,7 +341,7 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	currentHash := core.GetDefaultEngine().ComputeHash()
-	currentCautionAction, err := hookCautionAction()
+	currentCautionAction, currentPolicy, err := hookPolicySettings()
 	if err != nil {
 		return err
 	}
@@ -355,6 +360,10 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 		"daemon_status":                 "unreachable",
 		"daemon_pattern_hash":           "",
 		"daemon_pattern_hash_matches":   false,
+		"current_approval_policy":       currentPolicy,
+		"current_review_notice":         currentPolicy.Label(),
+		"installed_approval_policy":     "",
+		"approval_policy_matches":       false,
 	}
 
 	if info, err := os.Stat(hookScriptPath); err == nil {
@@ -368,6 +377,9 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 			installedAction := embeddedHookCautionAction(data)
 			status["installed_hook_caution_action"] = installedAction
 			status["hook_caution_action_matches"] = installedAction != "" && installedAction == currentCautionAction
+			installedPolicy := embeddedHookApprovalPolicy(data)
+			status["installed_approval_policy"] = installedPolicy
+			status["approval_policy_matches"] = installedPolicy != "" && installedPolicy == currentPolicy
 		} else {
 			status["hook_script_read_error"] = readErr.Error()
 		}
@@ -411,6 +423,9 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 			status["daemon_pattern_hash_matches"] = health.PatternHash != "" && health.PatternHash == currentHash
 			status["daemon_hook_caution_action"] = health.HookCautionAction
 			status["daemon_hook_caution_action_matches"] = health.HookCautionAction == currentCautionAction
+			status["daemon_approval_policy"] = health.ApprovalPolicy
+			status["daemon_review_notice"] = health.ReviewNotice
+			status["daemon_approval_policy_matches"] = health.ApprovalPolicy != "" && health.ApprovalPolicy == currentPolicy
 			status["daemon_pattern_count"] = health.PatternCount
 			status["daemon_uptime_seconds"] = health.Uptime
 			if health.PolicyError != "" {
@@ -421,11 +436,11 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 
 	scriptOK := status["hook_script_exists"].(bool)
 	settingsOK := status["settings_configured"].(bool)
-	fresh := status["pattern_hash_matches"].(bool) && status["hook_caution_action_matches"].(bool)
+	fresh := status["pattern_hash_matches"].(bool) && status["hook_caution_action_matches"].(bool) && status["approval_policy_matches"].(bool)
 	daemonReachable := status["daemon_reachable"].(bool)
 	daemonHealthy := !daemonReachable ||
 		(status["daemon_status"] == "ok" && status["daemon_pattern_hash_matches"] == true &&
-			status["daemon_hook_caution_action_matches"] == true)
+			status["daemon_hook_caution_action_matches"] == true && status["daemon_approval_policy_matches"] == true)
 	switch {
 	case scriptOK && settingsOK && !fresh:
 		status["status"] = "stale"
@@ -467,6 +482,20 @@ func embeddedHookCautionAction(data []byte) string {
 	return ""
 }
 
+func embeddedHookApprovalPolicy(data []byte) db.ApprovalPolicy {
+	for _, line := range strings.Split(string(data), "\n") {
+		const prefix = "HOOK_APPROVAL_POLICY = "
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		var policy db.ApprovalPolicy
+		if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, prefix))), &policy); err == nil && policy != "" && policy.Valid() {
+			return policy
+		}
+	}
+	return ""
+}
+
 func runHookHealth(cmd *cobra.Command, args []string) error {
 	if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
 		return err
@@ -480,7 +509,7 @@ func runHookHealth(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolving project path: %w", err)
 	}
 	currentHash := core.GetDefaultEngine().ComputeHash()
-	currentCautionAction, err := hookCautionAction()
+	currentCautionAction, currentPolicy, err := hookPolicySettings()
 	if err != nil {
 		return err
 	}
@@ -493,6 +522,8 @@ func runHookHealth(cmd *cobra.Command, args []string) error {
 		"current_hook_caution_action": currentCautionAction,
 		"socket_path":                 daemon.SocketPathForCWD(cwd),
 		"cwd":                         cwd,
+		"current_approval_policy":     currentPolicy,
+		"current_review_notice":       currentPolicy.Label(),
 	}
 
 	healthCtx, cancel := context.WithTimeout(cmd.Context(), hookQueryTimeout(cwd))
@@ -507,13 +538,17 @@ func runHookHealth(cmd *cobra.Command, args []string) error {
 
 	hashMatches := health.PatternHash != "" && health.PatternHash == currentHash
 	actionMatches := health.HookCautionAction == currentCautionAction
+	policyMatches := health.ApprovalPolicy != "" && health.ApprovalPolicy == currentPolicy
 	result["status"] = health.Status
 	result["daemon_reachable"] = true
-	result["healthy"] = health.Status == "ok" && hashMatches && actionMatches
+	result["healthy"] = health.Status == "ok" && hashMatches && actionMatches && policyMatches
 	result["daemon_pattern_hash"] = health.PatternHash
 	result["pattern_hash_matches"] = hashMatches
 	result["daemon_hook_caution_action"] = health.HookCautionAction
 	result["hook_caution_action_matches"] = actionMatches
+	result["daemon_approval_policy"] = health.ApprovalPolicy
+	result["daemon_review_notice"] = health.ReviewNotice
+	result["approval_policy_matches"] = policyMatches
 	result["pattern_count"] = health.PatternCount
 	result["uptime_seconds"] = health.Uptime
 	result["server_time"] = health.ServerTime
@@ -556,6 +591,7 @@ func runHookTest(cmd *cobra.Command, args []string) error {
 				"min_approvals":  live.MinApprovals,
 				"needs_approval": live.Action == "block" || live.Action == "execute",
 				"request_id":     live.RequestID, "source": "daemon", "fallback": false,
+				"approval_policy": live.ApprovalPolicy, "review_notice": live.ReviewNotice,
 			})
 		}
 		daemonErr = queryErr
@@ -563,11 +599,15 @@ func runHookTest(cmd *cobra.Command, args []string) error {
 		daemonErr = fmt.Errorf("simulated daemon failure")
 	}
 
-	cautionAction, cfgErr := hookCautionAction()
+	cautionAction, approvalPolicy, cfgErr := hookPolicySettings()
 	if cfgErr != nil {
 		return cfgErr
 	}
 	result := localHookTestResultWithCautionAction(command, cwd, cautionAction)
+	result["approval_policy"], result["review_notice"] = approvalPolicy, approvalPolicy.Label()
+	if result["action"] != "allow" {
+		result["message"] = fmt.Sprintf("%s Review policy: %s.", result["message"], approvalPolicy.Label())
+	}
 	result["source"] = "local"
 	result["fallback"] = !flagHookLocalOnly
 	result["local_only"] = flagHookLocalOnly
@@ -623,10 +663,10 @@ func localHookTestResultWithCautionAction(command, cwd, cautionAction string) ma
 
 // generateHookScript creates the complete Python hook script with embedded patterns.
 func generateHookScript(engine *core.PatternEngine) string {
-	return generateHookScriptWithCautionAction(engine, "block")
+	return generateHookScriptWithPolicy(engine, "block", db.ApprovalPolicyIndependent)
 }
 
-func generateHookScriptWithCautionAction(engine *core.PatternEngine, cautionAction string) string {
+func generateHookScriptWithPolicy(engine *core.PatternEngine, cautionAction string, policy db.ApprovalPolicy) string {
 	if cautionAction != "ask" {
 		cautionAction = "block"
 	}
@@ -642,19 +682,22 @@ func generateHookScriptWithCautionAction(engine *core.PatternEngine, cautionActi
 	script.WriteString("\nHOOK_CAUTION_ACTION = ")
 	actionJSON, _ := json.Marshal(cautionAction)
 	script.Write(actionJSON)
+	script.WriteString("\nHOOK_APPROVAL_POLICY = ")
+	policyJSON, _ := json.Marshal(policy.Normalized())
+	script.Write(policyJSON)
 	script.WriteString("\n")
 	script.WriteString(hookRuntime)
 	return script.String()
 }
 
-func hookCautionAction() (string, error) {
+func hookPolicySettings() (string, db.ApprovalPolicy, error) {
 	project, err := projectPath()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	cfg, err := config.Load(config.LoadOptions{ProjectDir: project, ConfigPath: flagConfig})
 	if err != nil {
-		return "", fmt.Errorf("loading hook caution policy: %w", err)
+		return "", "", fmt.Errorf("loading hook policy: %w", err)
 	}
-	return cfg.Integrations.HookCautionAction, nil
+	return cfg.Integrations.HookCautionAction, db.ApprovalPolicy(cfg.General.ApprovalPolicy), nil
 }

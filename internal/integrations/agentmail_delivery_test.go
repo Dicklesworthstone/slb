@@ -64,3 +64,54 @@ func TestLegacySensitiveCommandNeverFallsBackToRaw(t *testing.T) {
 		t.Fatal("lost redacted display")
 	}
 }
+
+func TestExecutionNotificationPreservesReceiptProvenance(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell transport fixture")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	bin := t.TempDir()
+	bodyPath := filepath.Join(t.TempDir(), "message-body")
+	t.Setenv("SLB_TEST_MAIL_BODY", bodyPath)
+	script := "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n" +
+		"  if [ \"$1\" = '--body-md' ]; then\n    shift\n    printf '%s' \"$1\" > \"$SLB_TEST_MAIL_BODY\"\n    exit 0\n  fi\n  shift\ndone\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(bin, "mcp-agent-mail"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	client := NewAgentMailClient(t.TempDir(), "fixture", "fixture")
+	for _, tc := range []struct {
+		name          string
+		requestPolicy db.ApprovalPolicy
+		receipt       *db.Execution
+		wantPolicy    db.ApprovalPolicy
+		wantEvidence  string
+	}{
+		{"historical receipt", db.ApprovalPolicySameHost, &db.Execution{ApprovalPolicy: db.ApprovalPolicyIndependent, Assurance: db.AssuranceLegacyUnknown}, db.ApprovalPolicyIndependent, "legacy_unknown"},
+		{"same-host receipt", db.ApprovalPolicyIndependent, &db.Execution{ApprovalPolicy: db.ApprovalPolicySameHost, Assurance: db.AssuranceSameHost}, db.ApprovalPolicySameHost, "same_host"},
+		{"missing receipt", db.ApprovalPolicySameHost, nil, db.ApprovalPolicySameHost, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := &db.Request{ID: "receipt-fixture", ApprovalPolicy: tc.requestPolicy, Command: db.CommandSpec{Raw: "echo fixture"}}
+			if err := client.NotifyRequestExecuted(request, tc.receipt, 0); err != nil {
+				t.Fatal(err)
+			}
+			body, err := os.ReadFile(bodyPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(body), "Review policy: "+tc.wantPolicy.Label()+".\n") {
+				t.Fatalf("execution notice lost receipt policy: %s", body)
+			}
+			if tc.wantEvidence == "" {
+				if strings.Contains(string(body), "Execution evidence:") {
+					t.Fatalf("missing receipt invented execution assurance: %s", body)
+				}
+			} else if !strings.Contains(string(body), "Execution evidence: "+tc.wantEvidence+".\n") {
+				t.Fatalf("execution notice relabeled receipt assurance: %s", body)
+			}
+		})
+	}
+}

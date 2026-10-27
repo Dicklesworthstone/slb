@@ -2,10 +2,12 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -119,6 +121,67 @@ func TestExecuteBackgroundSameHostCarriesAssurance(t *testing.T) {
 	if err != nil || !strings.Contains(string(log), `"approval_policy":"same_host"`) ||
 		!strings.Contains(string(log), `"assurance":"same_host"`) {
 		t.Fatalf("execution log lost low-assurance classification: %s %v", log, err)
+	}
+}
+
+func TestExecuteBackgroundSameHostRefusalRetainsStoredPolicy(t *testing.T) {
+	conn, job := backgroundExecutionFixture(t, "echo background-should-not-run", db.ApprovalPolicySameHost)
+	configuration := "[general]\napproval_policy = 'independent'\n[integrations]\nagent_mail_enabled = false\n"
+	if err := os.WriteFile(filepath.Join(job.Project, ".slb", "config.toml"), []byte(configuration), 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := executeBackgroundJob(context.Background(), job, func(core.ExecutionStart) error {
+		t.Fatal("disabled same-host background command started")
+		return nil
+	})
+	if err == nil || result == nil || result.Request == nil || result.ExitCode != -1 ||
+		result.Request.ApprovalPolicy != db.ApprovalPolicySameHost || result.Request.Execution != nil {
+		t.Fatalf("preflight refusal lost stored policy or claimed execution: %+v, %v", result, err)
+	}
+	stored, err := conn.GetRequest(job.RequestID)
+	if err != nil || stored.Status != db.StatusApproved || stored.Execution != nil || stored.ApprovalPolicy != db.ApprovalPolicySameHost {
+		t.Fatalf("background refusal consumed or relabeled approval: %+v, %v", stored, err)
+	}
+}
+
+func TestExecuteBackgroundSameHostReplayDoesNotReuseExecutionReceipt(t *testing.T) {
+	t.Setenv(db.SimulatedIdentityEnvForTest, "")
+	conn, job := backgroundExecutionFixture(t, "printf 'same-host-execute-once\\n'", db.ApprovalPolicySameHost)
+	if _, err := launchTestBackground(t, job); err != nil {
+		t.Fatal(err)
+	}
+	completed := waitBackgroundOutcome(t, conn, job.RequestID)
+	if completed.Status != db.StatusExecuted || completed.Execution == nil {
+		t.Fatalf("first execution did not complete: %+v", completed)
+	}
+	replay, err := launchTestBackground(t, job)
+	var refusal *background.StartError
+	if replay != nil || !errors.As(err, &refusal) || refusal.SupervisorLog == "" {
+		t.Fatalf("replay did not return an inspectable refusal: %+v %v", replay, err)
+	}
+	data, err := os.ReadFile(refusal.SupervisorLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var outcome map[string]any
+	for _, line := range strings.Split(string(data), "\n") {
+		var event map[string]any
+		if json.Unmarshal([]byte(line), &event) == nil && event["event"] == "background_execution_finished" {
+			outcome = event
+		}
+	}
+	if outcome["status"] != "not_started" || outcome["request_status"] != string(db.StatusExecuted) ||
+		outcome["startup_confirmed"] != false || outcome["execution_claimed"] != false || outcome["approval_policy"] != "same_host" {
+		t.Fatalf("replay refusal borrowed the previous execution status: %s", data)
+	}
+	for _, field := range []string{"assurance", "log_path", "exit_code"} {
+		if _, present := outcome[field]; present {
+			t.Fatalf("refused replay borrowed previous execution field %q: %s", field, data)
+		}
+	}
+	stored, err := conn.GetRequest(job.RequestID)
+	if err != nil || stored.Status != completed.Status || !reflect.DeepEqual(stored.Execution, completed.Execution) {
+		t.Fatalf("refused replay changed historical execution: %+v %v", stored, err)
 	}
 }
 

@@ -118,10 +118,24 @@ are not evidence that an independent person or model approved the action.
 - Returning configuration to `independent` prevents further same-host approval
   and execution, including outstanding approved same-host requests. It does not
   turn their reviews into independent authorization.
+- Approval submission reloads the current opt-in after acquiring the database
+  writer reservation, including for a long-lived review service. An open TUI
+  form is bound to the policy it displayed. Rejection remains available after
+  opting out. Configuration files are freshly read; they are not part of the
+  SQLite transaction and this is not protection against a concurrent malicious
+  process changing them.
 - Tightening conflict resolution from `first_wins` to
   `any_rejection_blocks` or `human_breaks_tie` also prevents execution of an
   outstanding approval that contains a rejection. The execution gate rechecks
   the current conflict policy; an earlier approved status cannot waive it.
+  This also applies when a SAFE rule now matches the command or a native Git
+  hook consumes the approval.
+- Background preflight refusals retain the request's policy label without
+  claiming execution assurance. A refused replay does not borrow assurance or
+  success from the previous execution. Outcome reports use the policy and
+  assurance captured in the execution receipt. The standalone Python hook
+  reports its generated policy snapshot or the daemon's live policy explicitly;
+  neither hook response is execution authorization.
 
 These checks prevent accidental evidence reuse through normal SLB operations.
 They do not make mutable local storage tamper-proof against the same OS user.

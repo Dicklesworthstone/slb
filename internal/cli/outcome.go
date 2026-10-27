@@ -106,7 +106,7 @@ This data helps improve pattern classification and identify risky commands.`,
 		}
 
 		out := output.New(output.Format(GetOutput()))
-		return out.Write(map[string]any{
+		response := map[string]any{
 			"id":                  outcome.ID,
 			"request_id":          outcome.RequestID,
 			"caused_problems":     outcome.CausedProblems,
@@ -114,7 +114,14 @@ This data helps improve pattern classification and identify risky commands.`,
 			"human_rating":        outcome.HumanRating,
 			"human_notes":         outcome.HumanNotes,
 			"recorded_at":         outcome.CreatedAt.Format(time.RFC3339),
-		})
+		}
+		policy := request.ApprovalPolicy
+		if request.Execution != nil {
+			policy = request.Execution.ApprovalPolicy
+			response["assurance"] = request.Execution.Assurance
+		}
+		addApprovalPolicyMetadata(response, policy)
+		return out.Write(response)
 	},
 }
 
@@ -142,12 +149,22 @@ var outcomeListCmd = &cobra.Command{
 		// Convert to output format
 		result := make([]map[string]any, len(outcomes))
 		for i, o := range outcomes {
+			request, err := dbConn.GetRequest(o.RequestID)
+			if err != nil {
+				return fmt.Errorf("getting outcome request %s: %w", o.RequestID, err)
+			}
 			item := map[string]any{
 				"id":              o.ID,
 				"request_id":      o.RequestID,
 				"caused_problems": o.CausedProblems,
 				"created_at":      o.CreatedAt.Format(time.RFC3339),
 			}
+			policy := request.ApprovalPolicy
+			if request.Execution != nil {
+				policy = request.Execution.ApprovalPolicy
+				item["assurance"] = request.Execution.Assurance
+			}
+			addApprovalPolicyMetadata(item, policy)
 			if o.ProblemDescription != "" {
 				item["problem_description"] = o.ProblemDescription
 			}

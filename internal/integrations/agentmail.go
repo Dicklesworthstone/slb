@@ -94,14 +94,16 @@ func (c *AgentMailClient) NotifyRequestExecuted(req *db.Request, exec *db.Execut
 	byAgent := ""
 	byModel := ""
 	logPath := ""
+	policy := req.ApprovalPolicy
 	if exec != nil {
 		byAgent = exec.ExecutedByAgent
 		byModel = exec.ExecutedByModel
 		logPath = exec.LogPath
+		policy = exec.ApprovalPolicy
 	}
 	body := fmt.Sprintf("Request %s executed by %s (%s) at %s\nExit code: %d\nLog: %s\nCommand: `%s`\n",
 		req.ID, byAgent, byModel, execTime, exitCode, logPath, safeDisplay(req))
-	body += "\nReview policy: " + req.ApprovalPolicy.Label() + ".\n"
+	body += "\nReview policy: " + policy.Label() + ".\n"
 	if exec != nil {
 		body += fmt.Sprintf("Execution evidence: %s.\n", exec.Assurance)
 	}

@@ -33,7 +33,7 @@ const maxBodyBytes = 32 * 1024
 type Renderer struct{ blocked, repeated *template.Template }
 
 func NewRenderer(blockedPath, repeatedPath string) (*Renderer, error) {
-	base := "SLB observed blocked hook decisions; this is not an execution report.\n\nProject: {{.Project}}\nSession label: {{.SessionID}}\nTier: {{.Tier}}\nAttempts in {{.WindowSeconds}} seconds: {{.Attempts}}\nCommand (redacted, quoted): {{printf \"%q\" .CommandRedacted}}\nFingerprint: {{.CommandHash}}\nFirst observed: {{.FirstAt}}\nLast observed: {{.LastAt}}\n\nInspect with slb audit and submit an intentional operation with slb request for independent review. This alert does not approve anything.\n"
+	base := "SLB observed blocked hook decisions; this is not an execution report.\n\nProject: {{.Project}}\nSession label: {{.SessionID}}\nTier: {{.Tier}}\nAttempts in {{.WindowSeconds}} seconds: {{.Attempts}}\nCommand (redacted, quoted): {{printf \"%q\" .CommandRedacted}}\nFingerprint: {{.CommandHash}}\nFirst observed: {{.FirstAt}}\nLast observed: {{.LastAt}}\n\nInspect with slb audit and submit an intentional operation with slb request under the project's configured review policy. This alert does not approve anything.\n"
 	blocked, err := loadTemplate("blocked", blockedPath, base)
 	if err != nil {
 		return nil, err

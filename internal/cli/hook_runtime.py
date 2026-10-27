@@ -98,6 +98,14 @@ def _normalized_action(action) -> str:
     return "ask"
 
 
+def _approval_policy_notice(policy):
+    if policy == "same_host":
+        return "same-host peer review (low assurance; not independently authenticated authorization)"
+    if policy == "independent":
+        return "independently authenticated authorization required"
+    return ""
+
+
 def _emit_decision(action, message: str = "") -> None:
     action = _normalized_action(action)
     permission = "deny" if action == "block" else action
@@ -142,10 +150,14 @@ def _emit_execution_handoff(response, tool_input, session_id, cwd):
     updated = dict(tool_input)
     # exec removes the wrapper shell so cancellation reaches the SLB process.
     updated["command"] = "exec " + " ".join(shlex.quote(arg) for arg in argv)
+    context = "SLB is executing the reviewed request once and recording its outcome."
+    notice = _approval_policy_notice(handoff.get("approval_policy", response.get("approval_policy")))
+    if notice:
+        context += " Review policy: " + notice + "."
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse", "permissionDecision": "allow",
         "updatedInput": updated,
-        "additionalContext": "SLB is executing the reviewed request once and recording its outcome.",
+        "additionalContext": context,
     }}))
 
 
@@ -180,7 +192,7 @@ def _execution_paths(cwd, database_path):
     return expected_db, os.path.join(state_directory, "logs")
 
 
-def _record_audit(command, session_id, cwd, action, tier, min_approvals, source, matched_pattern="") -> bool:
+def _record_audit(command, session_id, cwd, action, tier, min_approvals, source, matched_pattern="", approval_policy="") -> bool:
     """Publish the same private JSONL schema as internal/audit, without slb or a daemon."""
     action = _normalized_action(action)
     if action == "allow":
@@ -206,6 +218,10 @@ def _record_audit(command, session_id, cwd, action, tier, min_approvals, source,
             "matched_pattern": matched_pattern if isinstance(matched_pattern, str) else "",
             "source": source,
         }
+        notice = _approval_policy_notice(approval_policy)
+        if notice:
+            event["approval_policy"] = approval_policy
+            event["review_notice"] = notice
         data = (json.dumps(event, ensure_ascii=False) + "\n").encode()
         if len(data) > 65536:
             raise ValueError("audit record exceeds 64 KiB")
@@ -235,12 +251,15 @@ def _record_audit(command, session_id, cwd, action, tier, min_approvals, source,
 
 
 def _decide_and_audit(command, session_id, cwd, action, message, tier, min_approvals, source,
-                      matched_pattern="", audit_recorded=False):
+                      matched_pattern="", audit_recorded=False, approval_policy=""):
     action = _normalized_action(action)
     if not isinstance(message, str):
         message = "SLB: invalid response reason; asking for confirmation."
+    notice = _approval_policy_notice(approval_policy)
+    if action != "allow" and notice and notice not in message:
+        message += " Review policy: " + notice + "."
     if action != "allow" and audit_recorded is not True:
-        if not _record_audit(command, session_id, cwd, action, tier, min_approvals, source, matched_pattern):
+        if not _record_audit(command, session_id, cwd, action, tier, min_approvals, source, matched_pattern, approval_policy):
             message += " Audit recording failed; safety decision unchanged."
     _emit_decision(action, message)
 
@@ -279,18 +298,20 @@ def main():
             except (OSError, ValueError, TypeError):
                 _decide_and_audit(command, session_id, cwd, "block",
                                   "SLB: execution handoff unavailable or invalid; use slb execute explicitly.",
-                                  response.get("tier", "unknown"), response.get("min_approvals", 0), "hook_daemon")
+                                  response.get("tier", "unknown"), response.get("min_approvals", 0), "hook_daemon",
+                                  approval_policy=response.get("approval_policy", ""))
             return
         _decide_and_audit(command, session_id, cwd, response.get("action"), response.get("message", ""),
                           response.get("tier", "unknown"), response.get("min_approvals", 0), "hook_daemon",
-                          response.get("matched_pattern", ""), response.get("audit_recorded", False))
+                          response.get("matched_pattern", ""), response.get("audit_recorded", False),
+                          response.get("approval_policy", ""))
         return
     try:
         tier, min_approvals = classify(command)
     except Exception:
         _decide_and_audit(command, session_id, cwd, "block",
                           "SLB: classification failed; command blocked until policy is available.",
-                          "unknown", 0, "hook_offline")
+                          "unknown", 0, "hook_offline", approval_policy=HOOK_APPROVAL_POLICY)
         return
     if tier == "critical":
         action = "block"
@@ -314,7 +335,8 @@ def main():
             "confirmation required while the daemon is unavailable.")
     else:
         action, message = "block", "SLB: invalid local classification; command blocked."
-    _decide_and_audit(command, session_id, cwd, action, message, tier, min_approvals, "hook_offline")
+    _decide_and_audit(command, session_id, cwd, action, message, tier, min_approvals, "hook_offline",
+                      approval_policy=HOOK_APPROVAL_POLICY)
 
 
 if __name__ == "__main__":

@@ -416,6 +416,40 @@ func TestHookHealthReportsPolicyFailure(t *testing.T) {
 	}
 }
 
+func TestHookHealthRefreshesApprovalPolicyWithoutPatternChanges(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
+	project := t.TempDir()
+	database, err := db.OpenAndMigrate(filepath.Join(project, ".slb", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	params, err := json.Marshal(HookHealthParams{CWD: project})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &IPCServer{startTime: time.Now()}
+	var patternHash string
+	for _, policy := range []db.ApprovalPolicy{db.ApprovalPolicyIndependent, db.ApprovalPolicySameHost, db.ApprovalPolicyIndependent} {
+		if err := os.WriteFile(filepath.Join(project, ".slb", "config.toml"), []byte("[general]\napproval_policy = '"+string(policy)+"'\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		response := server.handleHookHealth(RPCRequest{Params: params, ID: 100})
+		if response.Error != nil {
+			t.Fatalf("health response: %+v", response.Error)
+		}
+		result, ok := response.Result.(HookHealthResult)
+		if !ok || result.Status != "ok" || result.ApprovalPolicy != policy || result.ReviewNotice != policy.Label() {
+			t.Fatalf("health concealed or cached stale approval policy: %+v", result)
+		}
+		if patternHash != "" && result.PatternHash != patternHash {
+			t.Fatal("fixture changed command patterns instead of only review policy")
+		}
+		patternHash = result.PatternHash
+	}
+}
+
 func TestIPCClientHookQueryRoundTrip(t *testing.T) {
 	socketPath := filepath.Join(shortSocketDir(t), "hook-client.sock")
 	srv, err := NewIPCServer(socketPath, newTestLogger())

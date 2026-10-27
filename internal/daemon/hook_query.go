@@ -451,19 +451,22 @@ type HookHealthParams struct {
 
 // HookHealthResult is the result of a hook health check.
 type HookHealthResult struct {
-	Status            string `json:"status"`
-	Uptime            int64  `json:"uptime_seconds"`
-	PatternHash       string `json:"pattern_hash"`
-	PatternCount      int    `json:"pattern_count"`
-	HookCautionAction string `json:"hook_caution_action"`
-	ServerTime        string `json:"server_time"`
-	PolicyError       string `json:"policy_error,omitempty"`
+	Status            string            `json:"status"`
+	Uptime            int64             `json:"uptime_seconds"`
+	PatternHash       string            `json:"pattern_hash"`
+	PatternCount      int               `json:"pattern_count"`
+	HookCautionAction string            `json:"hook_caution_action"`
+	ServerTime        string            `json:"server_time"`
+	PolicyError       string            `json:"policy_error,omitempty"`
+	ApprovalPolicy    db.ApprovalPolicy `json:"approval_policy,omitempty"`
+	ReviewNotice      string            `json:"review_notice,omitempty"`
 }
 
 func (s *IPCServer) handleHookHealth(req RPCRequest) *RPCResponse {
 	now := time.Now().UTC()
 	engine := core.GetDefaultEngine()
 	cautionAction := config.DefaultConfig().Integrations.HookCautionAction
+	approvalPolicy := db.ApprovalPolicyIndependent
 	if len(req.Params) != 0 {
 		var params HookHealthParams
 		if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -478,6 +481,7 @@ func (s *IPCServer) handleHookHealth(req RPCRequest) *RPCResponse {
 				}, ID: req.ID}
 			}
 			engine, cautionAction = policy.engine, policy.cautionAction
+			approvalPolicy = policy.approvalPolicy.Normalized()
 		}
 	}
 	export := engine.Export()
@@ -485,6 +489,7 @@ func (s *IPCServer) handleHookHealth(req RPCRequest) *RPCResponse {
 		Status: "ok", Uptime: int64(time.Since(s.startTime).Seconds()),
 		PatternHash: export.SHA256, PatternCount: export.Metadata.PatternCount,
 		HookCautionAction: cautionAction, ServerTime: now.Format(time.RFC3339),
+		ApprovalPolicy: approvalPolicy, ReviewNotice: approvalPolicy.Label(),
 	}
 	return &RPCResponse{Result: result, ID: req.ID}
 }
