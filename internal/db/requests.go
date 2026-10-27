@@ -436,8 +436,8 @@ func canTransition(from, to RequestStatus) bool {
 	case StatusApproved:
 		return to == StatusExecuting || to == StatusCancelled
 	case StatusExecuting:
-		// Note: StatusApproved allows reverting execution when setup fails before command starts
-		return to == StatusExecuted || to == StatusExecutionFailed || to == StatusTimedOut || to == StatusApproved
+		// A committed claim consumes approval even if process startup fails.
+		return to == StatusExecuted || to == StatusExecutionFailed || to == StatusTimedOut
 	case StatusTimeout:
 		return to == StatusEscalated
 	case StatusEscalated:

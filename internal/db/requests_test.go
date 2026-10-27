@@ -3,9 +3,12 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -377,6 +380,112 @@ func TestUpdateRequestStatusInvalid(t *testing.T) {
 	err := db.UpdateRequestStatus(r.ID, StatusExecuted)
 	if err == nil {
 		t.Error("Expected error for invalid transition")
+	}
+}
+
+func TestStatusUpdatesCannotRestoreConsumedApproval(t *testing.T) {
+	for _, status := range []RequestStatus{StatusExecuting, StatusExecuted, StatusExecutionFailed, StatusTimedOut} {
+		for _, transactional := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/transaction=%t", status, transactional), func(t *testing.T) {
+				database, request, sessions := reviewDecisionFixture(t, 2, ApprovalPolicySameHost)
+				for _, reviewer := range sessions[1:3] {
+					outcome, err := applyFixtureReview(database, request, reviewer, DecisionApprove, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost})
+					if err != nil {
+						t.Fatal(err)
+					}
+					request = outcome.Request
+				}
+				if request.Status != StatusApproved {
+					t.Fatalf("signed reviews did not satisfy the original quorum: %+v", request)
+				}
+				owner := sessions[0]
+				now := time.Now().UTC()
+				execution := &Execution{ExecutedAt: &now, ExecutedBySessionID: owner.ID,
+					ExecutedByAgent: owner.AgentName, ExecutedByModel: owner.Model,
+					LogPath: filepath.Join(request.ProjectPath, "original-claim.log")}
+				if err := database.ClaimRequestExecutionAuthenticated(request, execution, owner.SessionKey); err != nil {
+					t.Fatal(err)
+				}
+				completionStatus, exitCode := status, 0
+				switch status {
+				case StatusExecuting:
+					completionStatus = StatusExecuted
+				case StatusExecutionFailed:
+					exitCode = 7
+				case StatusTimedOut:
+					exitCode = -1
+				}
+				duration := int64(25)
+				execution.ExitCode, execution.DurationMs = &exitCode, &duration
+				if status != StatusExecuting {
+					if _, err := database.CompleteRequestExecutionAuthenticated(request.ID, status, execution, owner.SessionKey); err != nil {
+						t.Fatal(err)
+					}
+				}
+				before, votesBefore, err := database.GetRequestWithReviews(request.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				eventsBefore, err := database.ReadRequestEvents(context.Background(), request.ProjectPath, "", 100)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if transactional {
+					err = database.Transaction(func(tx *sql.Tx) error {
+						return database.UpdateRequestStatusTx(tx, request.ID, StatusApproved, status)
+					})
+				} else {
+					err = database.UpdateRequestStatus(request.ID, StatusApproved)
+				}
+				if !errors.Is(err, ErrInvalidTransition) {
+					t.Fatalf("consumed claim reopened through generic status API: %v", err)
+				}
+				otherClaim := *execution
+				otherClaim.LogPath = filepath.Join(request.ProjectPath, "second-claim.log")
+				otherClaim.ExitCode, otherClaim.DurationMs = nil, nil
+				if err := database.ClaimRequestExecutionAuthenticated(request, &otherClaim, owner.SessionKey); !errors.Is(err, ErrInvalidTransition) {
+					t.Fatalf("consumed approval authorized another claim: %v", err)
+				}
+				after, votesAfter, err := database.GetRequestWithReviews(request.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				eventsAfter, err := database.ReadRequestEvents(context.Background(), request.ProjectPath, "", 100)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(votesBefore, votesAfter) || !reflect.DeepEqual(eventsBefore, eventsAfter) {
+					t.Fatal("rejected reopening changed the request, signed reviews, claim, outcome, or audit journal")
+				}
+
+				// Refusing a new approval must not obstruct the original fenced
+				// result, nor an identical retry of an already committed result.
+				completed, err := database.CompleteRequestExecutionAuthenticated(request.ID, completionStatus, execution, owner.SessionKey)
+				if err != nil {
+					t.Fatalf("original claim could not report its outcome: %v", err)
+				}
+				if completed.Status != completionStatus || completed.Execution == nil ||
+					completed.Execution.Assurance != AssuranceSameHost || completed.Execution.LogPath != execution.LogPath {
+					t.Fatalf("completion changed the original claim: %+v", completed)
+				}
+				retried, err := database.CompleteRequestExecutionAuthenticated(request.ID, completionStatus, execution, owner.SessionKey)
+				if err != nil || !reflect.DeepEqual(completed, retried) {
+					t.Fatalf("identical completion retry lost its committed receipt: %+v %v", retried, err)
+				}
+				finalEvents, err := database.ReadRequestEvents(context.Background(), request.ProjectPath, "", 100)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantEvents := len(eventsBefore.Events)
+				if status == StatusExecuting {
+					wantEvents++
+				}
+				if len(finalEvents.Events) != wantEvents || !reflect.DeepEqual(eventsBefore.Events, finalEvents.Events[:len(eventsBefore.Events)]) {
+					t.Fatal("completion or retry replaced prior audit evidence or duplicated its terminal event")
+				}
+			})
+		}
 	}
 }
 

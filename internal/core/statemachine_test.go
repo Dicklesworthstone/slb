@@ -1,6 +1,7 @@
 package core
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -38,6 +39,7 @@ func TestCanTransition(t *testing.T) {
 		{"executing->executed", db.StatusExecuting, db.StatusExecuted, true},
 		{"executing->execution_failed", db.StatusExecuting, db.StatusExecutionFailed, true},
 		{"executing->timed_out", db.StatusExecuting, db.StatusTimedOut, true},
+		{"executing->approved (consumed approval)", db.StatusExecuting, db.StatusApproved, false},
 
 		{"executed->pending (invalid)", db.StatusExecuted, db.StatusPending, false},
 		{"rejected->approved (invalid)", db.StatusRejected, db.StatusApproved, false},
@@ -48,6 +50,26 @@ func TestCanTransition(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := CanTransition(tt.from, tt.to); got != tt.want {
 				t.Fatalf("CanTransition(%q, %q) = %v, want %v", tt.from, tt.to, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTransitionCannotRestoreConsumedApproval(t *testing.T) {
+	for _, status := range []db.RequestStatus{db.StatusExecuting, db.StatusExecuted, db.StatusExecutionFailed, db.StatusTimedOut} {
+		t.Run(string(status), func(t *testing.T) {
+			claimedAt := time.Now().UTC()
+			request := &db.Request{Status: status, ApprovalPolicy: db.ApprovalPolicySameHost,
+				Command: db.CommandSpec{Raw: "echo reviewed", Cwd: "/project", Hash: "original-command"},
+				Execution: &db.Execution{ExecutedAt: &claimedAt, ExecutedBySessionID: "executor",
+					LogPath: "/project/claimed.log", ApprovalPolicy: db.ApprovalPolicySameHost, Assurance: db.AssuranceSameHost}}
+			before, execution := *request, *request.Execution
+			before.Execution = &execution
+			if err := Transition(request, db.StatusApproved); err == nil {
+				t.Fatal("consumed execution restored an approval")
+			}
+			if !reflect.DeepEqual(&before, request) {
+				t.Fatalf("refused reversal changed the claim or minted an approval deadline: before=%+v after=%+v", before, request)
 			}
 		})
 	}
@@ -260,7 +282,7 @@ func TestGetValidTransitions(t *testing.T) {
 		{"empty->pending", "", []db.RequestStatus{db.StatusPending}},
 		{"pending", db.StatusPending, []db.RequestStatus{db.StatusApproved, db.StatusRejected, db.StatusCancelled, db.StatusTimeout}},
 		{"approved", db.StatusApproved, []db.RequestStatus{db.StatusExecuting, db.StatusCancelled}},
-		{"executing", db.StatusExecuting, []db.RequestStatus{db.StatusExecuted, db.StatusExecutionFailed, db.StatusTimedOut, db.StatusApproved}},
+		{"executing", db.StatusExecuting, []db.RequestStatus{db.StatusExecuted, db.StatusExecutionFailed, db.StatusTimedOut}},
 		{"timeout", db.StatusTimeout, []db.RequestStatus{db.StatusEscalated}},
 		{"escalated", db.StatusEscalated, []db.RequestStatus{db.StatusApproved, db.StatusRejected, db.StatusCancelled}},
 		{"terminal (executed)", db.StatusExecuted, nil},
