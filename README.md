@@ -850,22 +850,34 @@ Events are streamed as newline-delimited JSON (NDJSON) for easy programmatic con
 slb watch --session-id <id>
 ```
 
-Output:
+Selected fields from the event stream:
 ```json
-{"type":"request_pending","request_id":"abc123","tier":"dangerous","command":"rm -rf ./build","ts":"..."}
-{"type":"request_approved","request_id":"abc123","reviewer":"BlueLake","ts":"..."}
-{"type":"request_executed","request_id":"abc123","exit_code":0,"ts":"..."}
+{"event":"request_pending","request_id":"abc123","status":"pending","risk_tier":"dangerous","approvals":0,"min_approvals":1,"approval_policy":"same_host","review_notice":"same-host peer review (low assurance; not independently authenticated authorization)"}
+{"event":"request_approved","request_id":"abc123","status":"approved","approvals":1,"min_approvals":1,"approval_policy":"same_host"}
+{"event":"request_executed","request_id":"abc123","status":"executed","exit_code":0,"approval_policy":"same_host","execution_assurance":"same_host"}
 ```
+
+Request events also carry the project, redacted command display, command hash,
+requester, rejection count, original `created_at` and any `resolved_at` timestamp.
+`observed_at` records when the state was observed; it does not replace creation
+time. The approval policy and its `review_notice` remain present throughout the
+workflow, with stored execution assurance when available. Submitted vote counts
+are display information, not verified execution permission. Use `slb execute` to
+apply the current policy and verify the evidence.
 
 ### Event Types
 
 | Event | Description |
 |-------|-------------|
-| `request_pending` | New request awaiting approval |
+| `request_pending` | Request awaiting review, including changed vote counts |
 | `request_approved` | Request was approved |
 | `request_rejected` | Request was rejected |
-| `request_executed` | Approved request was executed |
+| `request_executing` | Execution was claimed |
+| `request_executed` | Command completed successfully |
+| `request_execution_failed` | Execution failed |
+| `request_timed_out` | Command execution timed out |
 | `request_timeout` | Request timed out waiting for approval |
+| `request_escalated` | Request was escalated |
 | `request_cancelled` | Request was cancelled |
 
 ### Transport Modes
@@ -877,6 +889,28 @@ Output:
 ```bash
 slb watch --poll-interval 5s
 ```
+
+Both transports start with the selected project's unresolved requests and
+completions from the last 15 minutes. A lost daemon connection emits
+`watch_degraded` before polling resumes from the current database state.
+Previously observed active requests remain tracked through their final state,
+including an outcome older than the normal window after a long disconnect.
+Old terminal requests then retire from the live watch state. Snapshots larger
+than 10,000 requests fail explicitly instead of silently dropping records.
+
+Default local discovery uses the nearest physical project containing `.slb`,
+including from a subdirectory or symlink, and pins that project's database for
+fallback. An explicit `--db` selects local polling and keeps that database and
+the selected project's path spelling throughout the watch. It is never replaced
+by a daemon's database. Missing databases produce an error rather than creating
+an empty project. When `SLB_HOST` selects a remote daemon, a lost or unavailable
+connection returns an error without switching to local records.
+`--auto-approve-caution` requires a local database.
+
+Consumers should replace state by request ID and tolerate repeated updates.
+Rapid transitions can coalesce: this feed describes current state. For every
+journaled lifecycle change and resumable replay, use `slb events --follow` and
+save the returned cursors after processing.
 
 ### Auto-Approve Mode
 

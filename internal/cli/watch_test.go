@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -268,288 +269,55 @@ func TestShouldAutoApproveCaution_AllCombinations(t *testing.T) {
 	}
 }
 
-// =============================================================================
-// TESTS for evaluateRequestForPolling
-// =============================================================================
-//
-// These tests verify the polling business logic is correct.
-// Every decision branch MUST be tested.
-//
-// Test coverage requirement: 100%
-// =============================================================================
-
-// TestEvaluateRequestForPolling_NewRequest verifies that a request not in the
-// seen map is identified as new and should emit a pending event.
-func TestEvaluateRequestForPolling_NewRequest(t *testing.T) {
-	seen := make(map[string]db.RequestStatus)
-	result := evaluateRequestForPolling("req-123", db.StatusPending, seen)
-
-	if result.Action != PollActionEmitNew {
-		t.Errorf("expected Action=PollActionEmitNew for new request, got %v", result.Action)
-	}
-	if result.EventType != "request_pending" {
-		t.Errorf("expected EventType='request_pending', got %q", result.EventType)
-	}
-	if result.Reason == "" {
-		t.Error("expected non-empty reason")
-	}
-}
-
-// TestEvaluateRequestForPolling_StatusUnchanged verifies that a request with
-// unchanged status is skipped.
-func TestEvaluateRequestForPolling_StatusUnchanged(t *testing.T) {
-	seen := map[string]db.RequestStatus{
-		"req-123": db.StatusPending,
-	}
-	result := evaluateRequestForPolling("req-123", db.StatusPending, seen)
-
-	if result.Action != PollActionSkip {
-		t.Errorf("expected Action=PollActionSkip for unchanged status, got %v", result.Action)
-	}
-	if result.Reason == "" {
-		t.Error("expected non-empty reason")
-	}
-}
-
-// TestEvaluateRequestForPolling_StatusChangedToApproved verifies that a status
-// change to approved emits the correct event.
-func TestEvaluateRequestForPolling_StatusChangedToApproved(t *testing.T) {
-	seen := map[string]db.RequestStatus{
-		"req-123": db.StatusPending,
-	}
-	result := evaluateRequestForPolling("req-123", db.StatusApproved, seen)
-
-	if result.Action != PollActionEmitStatusChange {
-		t.Errorf("expected Action=PollActionEmitStatusChange, got %v", result.Action)
-	}
-	if result.EventType != "request_approved" {
-		t.Errorf("expected EventType='request_approved', got %q", result.EventType)
-	}
-}
-
-// TestEvaluateRequestForPolling_StatusChangedToRejected verifies rejection events.
-func TestEvaluateRequestForPolling_StatusChangedToRejected(t *testing.T) {
-	seen := map[string]db.RequestStatus{
-		"req-123": db.StatusPending,
-	}
-	result := evaluateRequestForPolling("req-123", db.StatusRejected, seen)
-
-	if result.Action != PollActionEmitStatusChange {
-		t.Errorf("expected Action=PollActionEmitStatusChange, got %v", result.Action)
-	}
-	if result.EventType != "request_rejected" {
-		t.Errorf("expected EventType='request_rejected', got %q", result.EventType)
-	}
-}
-
-// TestEvaluateRequestForPolling_StatusChangedToExecuted verifies execution events.
-func TestEvaluateRequestForPolling_StatusChangedToExecuted(t *testing.T) {
-	seen := map[string]db.RequestStatus{
-		"req-123": db.StatusApproved,
-	}
-	result := evaluateRequestForPolling("req-123", db.StatusExecuted, seen)
-
-	if result.Action != PollActionEmitStatusChange {
-		t.Errorf("expected Action=PollActionEmitStatusChange, got %v", result.Action)
-	}
-	if result.EventType != "request_executed" {
-		t.Errorf("expected EventType='request_executed', got %q", result.EventType)
-	}
-}
-
-// TestEvaluateRequestForPolling_StatusChangedToExecutionFailed verifies failed execution.
-func TestEvaluateRequestForPolling_StatusChangedToExecutionFailed(t *testing.T) {
-	seen := map[string]db.RequestStatus{
-		"req-123": db.StatusApproved,
-	}
-	result := evaluateRequestForPolling("req-123", db.StatusExecutionFailed, seen)
-
-	if result.Action != PollActionEmitStatusChange {
-		t.Errorf("expected Action=PollActionEmitStatusChange, got %v", result.Action)
-	}
-	if result.EventType != "request_executed" {
-		t.Errorf("expected EventType='request_executed' for failed execution, got %q", result.EventType)
-	}
-}
-
-// TestEvaluateRequestForPolling_StatusChangedToTimeout verifies timeout events.
-func TestEvaluateRequestForPolling_StatusChangedToTimeout(t *testing.T) {
-	seen := map[string]db.RequestStatus{
-		"req-123": db.StatusPending,
-	}
-	result := evaluateRequestForPolling("req-123", db.StatusTimeout, seen)
-
-	if result.Action != PollActionEmitStatusChange {
-		t.Errorf("expected Action=PollActionEmitStatusChange, got %v", result.Action)
-	}
-	if result.EventType != "request_timeout" {
-		t.Errorf("expected EventType='request_timeout', got %q", result.EventType)
-	}
-}
-
-// TestEvaluateRequestForPolling_StatusChangedToCancelled verifies cancellation events.
-func TestEvaluateRequestForPolling_StatusChangedToCancelled(t *testing.T) {
-	seen := map[string]db.RequestStatus{
-		"req-123": db.StatusPending,
-	}
-	result := evaluateRequestForPolling("req-123", db.StatusCancelled, seen)
-
-	if result.Action != PollActionEmitStatusChange {
-		t.Errorf("expected Action=PollActionEmitStatusChange, got %v", result.Action)
-	}
-	if result.EventType != "request_cancelled" {
-		t.Errorf("expected EventType='request_cancelled', got %q", result.EventType)
-	}
-}
-
-// TestEvaluateRequestForPolling_UnknownStatusTransition verifies unknown status is skipped.
-func TestEvaluateRequestForPolling_UnknownStatusTransition(t *testing.T) {
-	seen := map[string]db.RequestStatus{
-		"req-123": db.StatusPending,
-	}
-	// Use an unknown status
-	result := evaluateRequestForPolling("req-123", db.RequestStatus("unknown"), seen)
-
-	if result.Action != PollActionSkip {
-		t.Errorf("expected Action=PollActionSkip for unknown status, got %v", result.Action)
-	}
-	if result.Reason == "" {
-		t.Error("expected non-empty reason for unknown status")
-	}
-}
-
-// TestEvaluateRequestForPolling_ReasonContainsStatusInfo verifies the reason is informative.
-func TestEvaluateRequestForPolling_ReasonContainsStatusInfo(t *testing.T) {
-	seen := map[string]db.RequestStatus{
-		"req-123": db.StatusPending,
-	}
-	result := evaluateRequestForPolling("req-123", db.StatusApproved, seen)
-
-	// Reason should mention the status transition
-	if !contains(result.Reason, "pending") || !contains(result.Reason, "approved") {
-		t.Errorf("expected reason to mention status transition, got: %s", result.Reason)
-	}
-}
-
-// =============================================================================
-// TESTS for statusToEventType
-// =============================================================================
-
-// TestStatusToEventType_AllStatuses tests all status to event type mappings.
-func TestStatusToEventType_AllStatuses(t *testing.T) {
-	tests := []struct {
-		status   db.RequestStatus
-		expected string
+func TestWatchStatePreservesExactOutcomes(t *testing.T) {
+	oldAuto := flagWatchAutoApproveCaution
+	flagWatchAutoApproveCaution = false
+	t.Cleanup(func() { flagWatchAutoApproveCaution = oldAuto })
+	for _, tc := range []struct {
+		status db.RequestStatus
+		event  string
 	}{
+		{db.StatusPending, "request_pending"},
 		{db.StatusApproved, "request_approved"},
-		{db.StatusRejected, "request_rejected"},
+		{db.StatusExecuting, "request_executing"},
 		{db.StatusExecuted, "request_executed"},
-		{db.StatusExecutionFailed, "request_executed"},
+		{db.StatusExecutionFailed, "request_execution_failed"},
+		{db.StatusTimedOut, "request_timed_out"},
 		{db.StatusTimeout, "request_timeout"},
+		{db.StatusEscalated, "request_escalated"},
+		{db.StatusRejected, "request_rejected"},
 		{db.StatusCancelled, "request_cancelled"},
-		{db.StatusPending, ""},            // Pending is not a status change event
-		{db.RequestStatus("unknown"), ""}, // Unknown status returns empty
-	}
-
-	for _, tt := range tests {
-		t.Run(string(tt.status), func(t *testing.T) {
-			result := statusToEventType(tt.status)
-			if result != tt.expected {
-				t.Errorf("statusToEventType(%s) = %q, want %q", tt.status, result, tt.expected)
+	} {
+		t.Run(string(tc.status), func(t *testing.T) {
+			code := 7
+			r := db.WatchRequestState{
+				ID: "request", ProjectPath: "/project", Status: tc.status,
+				Command: "safe display", CommandHash: "bound-command", MinApprovals: 2,
+				Approvals: 1, ExitCode: &code, CreatedAt: "2026-01-01T00:00:00Z",
+				ResolvedAt: time.Now().UTC().Format(time.RFC3339), ApprovalPolicy: db.ApprovalPolicySameHost,
+				ExecutionAssurance: db.AssuranceSameHost,
+			}
+			state := newWatchState(r.ProjectPath)
+			var buf bytes.Buffer
+			for i := 0; i < 2; i++ {
+				if err := processPolledRequest(context.Background(), r, json.NewEncoder(&buf), state); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var event daemon.RequestStreamEvent
+			if err := json.Unmarshal(buf.Bytes(), &event); err != nil {
+				// A duplicate would also make this single-object decode fail.
+				t.Fatalf("invalid or duplicated state event: %s %v", buf.String(), err)
+			}
+			if event.Event != tc.event || event.Status != tc.status || event.CommandHash != r.CommandHash ||
+				event.MinApprovals == nil || *event.MinApprovals != 2 || event.Approvals == nil || *event.Approvals != 1 ||
+				event.Rejections == nil || *event.Rejections != 0 || event.ExitCode == nil || *event.ExitCode != 7 ||
+				event.CreatedAt != r.CreatedAt || event.ResolvedAt != r.ResolvedAt || event.ObservedAt == "" ||
+				event.ApprovalPolicy != db.ApprovalPolicySameHost || event.ExecutionAssurance != db.AssuranceSameHost ||
+				!strings.Contains(event.ReviewNotice, "not independently authenticated") {
+				t.Fatalf("watch lost outcome, command binding, quorum, timestamps or assurance: %+v", event)
 			}
 		})
-	}
-}
-
-// TestPollAction_Constants verifies the PollAction constants are defined correctly.
-func TestPollAction_Constants(t *testing.T) {
-	// Verify the constants have distinct non-empty values
-	if PollActionEmitNew == "" {
-		t.Error("PollActionEmitNew should not be empty")
-	}
-	if PollActionEmitStatusChange == "" {
-		t.Error("PollActionEmitStatusChange should not be empty")
-	}
-	if PollActionSkip == "" {
-		t.Error("PollActionSkip should not be empty")
-	}
-	if PollActionEmitNew == PollActionEmitStatusChange {
-		t.Error("PollActionEmitNew and PollActionEmitStatusChange should be different")
-	}
-	if PollActionEmitNew == PollActionSkip {
-		t.Error("PollActionEmitNew and PollActionSkip should be different")
-	}
-}
-
-// TestRequestPollResult_StructFields verifies the struct can be initialized.
-func TestRequestPollResult_StructFields(t *testing.T) {
-	r := RequestPollResult{
-		Action:    PollActionEmitNew,
-		EventType: "request_pending",
-		Reason:    "test reason",
-	}
-
-	if r.Action != PollActionEmitNew {
-		t.Error("expected Action=PollActionEmitNew")
-	}
-	if r.EventType != "request_pending" {
-		t.Errorf("expected EventType='request_pending', got %q", r.EventType)
-	}
-	if r.Reason != "test reason" {
-		t.Errorf("expected Reason='test reason', got %q", r.Reason)
-	}
-}
-
-// =============================================================================
-// Table-driven comprehensive test for evaluateRequestForPolling
-// =============================================================================
-
-// TestEvaluateRequestForPolling_AllStatusTransitions tests all possible status
-// transitions to ensure correct event types are generated.
-func TestEvaluateRequestForPolling_AllStatusTransitions(t *testing.T) {
-	statuses := []db.RequestStatus{
-		db.StatusPending,
-		db.StatusApproved,
-		db.StatusRejected,
-		db.StatusExecuted,
-		db.StatusExecutionFailed,
-		db.StatusTimeout,
-		db.StatusCancelled,
-	}
-
-	for _, prevStatus := range statuses {
-		for _, newStatus := range statuses {
-			if prevStatus == newStatus {
-				continue // Skip unchanged
-			}
-			t.Run(string(prevStatus)+"_to_"+string(newStatus), func(t *testing.T) {
-				seen := map[string]db.RequestStatus{
-					"req-test": prevStatus,
-				}
-				result := evaluateRequestForPolling("req-test", newStatus, seen)
-
-				expectedEventType := statusToEventType(newStatus)
-				if expectedEventType == "" {
-					// Unknown status should skip
-					if result.Action != PollActionSkip {
-						t.Errorf("expected PollActionSkip for unknown status %s, got %v", newStatus, result.Action)
-					}
-				} else {
-					// Known status should emit event
-					if result.Action != PollActionEmitStatusChange {
-						t.Errorf("expected PollActionEmitStatusChange for %s->%s, got %v", prevStatus, newStatus, result.Action)
-					}
-					if result.EventType != expectedEventType {
-						t.Errorf("expected EventType=%q, got %q", expectedEventType, result.EventType)
-					}
-				}
-
-				// Reason should never be empty
-				if result.Reason == "" {
-					t.Error("reason should not be empty")
-				}
-			})
-		}
 	}
 }
 
@@ -621,7 +389,7 @@ func TestPollRequests_EmitsNewRequest(t *testing.T) {
 	// Set up encoder to capture output
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
-	seen := make(map[string]db.RequestStatus)
+	seen := newWatchState(tmpDir)
 
 	// Call pollRequests
 	ctx := context.Background()
@@ -652,7 +420,7 @@ func TestPollRequests_EmitsNewRequest(t *testing.T) {
 	}
 
 	// Verify request was added to seen map
-	if _, ok := seen[request.ID]; !ok {
+	if _, ok := seen.requests[request.ID]; !ok {
 		t.Error("request should be in seen map after polling")
 	}
 }
@@ -699,10 +467,7 @@ func TestPollRequests_SkipsSeenRequest(t *testing.T) {
 		t.Fatalf("failed to create request: %v", err)
 	}
 
-	// Pre-populate seen map
-	seen := map[string]db.RequestStatus{
-		request.ID: db.StatusPending,
-	}
+	seen := newWatchState(tmpDir)
 
 	// Set up encoder to capture output
 	var buf bytes.Buffer
@@ -710,6 +475,10 @@ func TestPollRequests_SkipsSeenRequest(t *testing.T) {
 
 	// Call pollRequests
 	ctx := context.Background()
+	if err := pollRequests(ctx, dbConn, enc, seen); err != nil {
+		t.Fatal(err)
+	}
+	buf.Reset()
 	if err := pollRequests(ctx, dbConn, enc, seen); err != nil {
 		t.Fatalf("pollRequests failed: %v", err)
 	}
@@ -776,14 +545,7 @@ func TestPollRequests_MultipleRequests(t *testing.T) {
 	if err := dbConn.CreateRequest(request1); err != nil {
 		t.Fatalf("failed to create request1: %v", err)
 	}
-	if err := dbConn.CreateRequest(request2); err != nil {
-		t.Fatalf("failed to create request2: %v", err)
-	}
-
-	// Pre-populate seen map with request1 only
-	seen := map[string]db.RequestStatus{
-		request1.ID: db.StatusPending,
-	}
+	seen := newWatchState(tmpDir)
 
 	// Set up encoder to capture output
 	var buf bytes.Buffer
@@ -791,6 +553,13 @@ func TestPollRequests_MultipleRequests(t *testing.T) {
 
 	// Call pollRequests
 	ctx := context.Background()
+	if err := pollRequests(ctx, dbConn, enc, seen); err != nil {
+		t.Fatal(err)
+	}
+	buf.Reset()
+	if err := dbConn.CreateRequest(request2); err != nil {
+		t.Fatalf("failed to create request2: %v", err)
+	}
 	if err := pollRequests(ctx, dbConn, enc, seen); err != nil {
 		t.Fatalf("pollRequests failed: %v", err)
 	}
@@ -815,10 +584,10 @@ func TestPollRequests_MultipleRequests(t *testing.T) {
 	}
 
 	// Both should be in seen map now
-	if _, ok := seen[request1.ID]; !ok {
+	if _, ok := seen.requests[request1.ID]; !ok {
 		t.Error("request1 should still be in seen map")
 	}
-	if _, ok := seen[request2.ID]; !ok {
+	if _, ok := seen.requests[request2.ID]; !ok {
 		t.Error("request2 should be added to seen map")
 	}
 }
@@ -835,7 +604,7 @@ func TestPollRequests_DatabaseError(t *testing.T) {
 
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
-	seen := make(map[string]db.RequestStatus)
+	seen := newWatchState(tmpDir)
 
 	ctx := context.Background()
 	err = pollRequests(ctx, dbConn, enc, seen)
@@ -888,7 +657,7 @@ func TestPollRequests_UsesDisplayRedacted(t *testing.T) {
 
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
-	seen := make(map[string]db.RequestStatus)
+	seen := newWatchState(tmpDir)
 
 	ctx := context.Background()
 	if err := pollRequests(ctx, dbConn, enc, seen); err != nil {
@@ -909,15 +678,6 @@ func TestPollRequests_UsesDisplayRedacted(t *testing.T) {
 // =============================================================================
 // pollRequests Additional Tests
 // =============================================================================
-
-// NOTE: The status change code path in pollRequests (lines 280-288) is
-// unreachable with the current implementation because:
-// 1. ListPendingRequestsAllProjects() only returns pending requests
-// 2. statusToEventType(db.StatusPending) returns ""
-// 3. Therefore, status transitions cannot be detected via polling
-//
-// This is a documented limitation. Status changes are detected via daemon IPC
-// (runWatchDaemon) which uses real-time event streaming instead.
 
 func TestPollRequests_EmptyDisplayRedactedFallback(t *testing.T) {
 	// Create test database
@@ -963,7 +723,7 @@ func TestPollRequests_EmptyDisplayRedactedFallback(t *testing.T) {
 
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
-	seen := make(map[string]db.RequestStatus)
+	seen := newWatchState(tmpDir)
 
 	ctx := context.Background()
 	if err := pollRequests(ctx, dbConn, enc, seen); err != nil {
@@ -993,17 +753,16 @@ func TestPollRequests_ContextCancellation(t *testing.T) {
 
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
-	seen := make(map[string]db.RequestStatus)
+	seen := newWatchState(tmpDir)
 
 	// Create already-cancelled context
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	// Should return without error even with cancelled context
-	// (context is only used for auto-approve, which won't trigger with no requests)
+	// The database snapshot honors cancellation, even before any requests exist.
 	err = pollRequests(ctx, dbConn, enc, seen)
-	if err != nil {
-		t.Fatalf("pollRequests should handle empty request list gracefully: %v", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("pollRequests ignored cancellation: %v", err)
 	}
 }
 
@@ -1060,7 +819,7 @@ func TestPollRequests_AutoApproveCaution(t *testing.T) {
 
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
-	seen := make(map[string]db.RequestStatus)
+	seen := newWatchState(request.ProjectPath)
 	if err := pollRequests(context.Background(), database, enc, seen); err != nil {
 		t.Fatalf("pollRequests failed: %v", err)
 	}
@@ -1088,7 +847,7 @@ func TestPollRequests_AutoApproveCautionError(t *testing.T) {
 
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
-	seen := make(map[string]db.RequestStatus)
+	seen := newWatchState(request.ProjectPath)
 	if err := pollRequests(context.Background(), database, enc, seen); err != nil {
 		t.Fatalf("pollRequests should not fail on auto-approve error: %v", err)
 	}
@@ -1134,7 +893,7 @@ func TestAutoApproveCaution_InvalidDatabase(t *testing.T) {
 	flagDB = filepath.Join(parent, "database.db")
 
 	ctx := context.Background()
-	err := autoApproveCaution(ctx, "req-123")
+	err := autoApproveCaution(ctx, GetDB(), "req-123")
 	if err == nil {
 		t.Error("expected error for invalid database path")
 	}
@@ -1159,7 +918,7 @@ func TestAutoApproveCaution_RequestNotFound(t *testing.T) {
 	flagDB = dbPath
 
 	ctx := context.Background()
-	err = autoApproveCaution(ctx, "nonexistent-request")
+	err = autoApproveCaution(ctx, GetDB(), "nonexistent-request")
 	if err == nil {
 		t.Error("expected error for nonexistent request")
 	}
@@ -1215,7 +974,7 @@ func TestAutoApproveCaution_AlreadyResolved(t *testing.T) {
 	flagDB = dbPath
 
 	ctx := context.Background()
-	err = autoApproveCaution(ctx, request.ID)
+	err = autoApproveCaution(ctx, GetDB(), request.ID)
 	// Should return nil (not an error) for already-resolved requests
 	if err != nil {
 		t.Errorf("expected no error for already-resolved request, got: %v", err)
@@ -1228,7 +987,7 @@ func TestAutoApproveCaution_WrongTier(t *testing.T) {
 	// auto-approved. Ineligibility is "no decision", not an error.
 	watchPolicySQL(t, database, `UPDATE requests SET risk_tier = 'dangerous', min_approvals = 1 WHERE id = ?`, request.ID)
 
-	if err := autoApproveCaution(context.Background(), request.ID); err != nil {
+	if err := autoApproveCaution(context.Background(), GetDB(), request.ID); err != nil {
 		t.Fatalf("ineligible request should be left alone without error, got: %v", err)
 	}
 	assertLeftPendingWithoutReviews(t, database, request.ID)
@@ -1238,7 +997,7 @@ func TestAutoApproveCaution_SuccessfulApproval(t *testing.T) {
 	database, request := watchPolicyFixture(t)
 	flagWatchSessionID = "" // No reviewer identity is needed for a policy decision.
 
-	if err := autoApproveCaution(context.Background(), request.ID); err != nil {
+	if err := autoApproveCaution(context.Background(), GetDB(), request.ID); err != nil {
 		t.Fatalf("expected successful auto-approval, got error: %v", err)
 	}
 	assertAutoApprovedWithoutReviews(t, database, request.ID)
@@ -1255,7 +1014,7 @@ func TestAutoApproveCaution_WithCustomSession(t *testing.T) {
 	)
 	flagWatchSessionID = watcher.ID
 
-	if err := autoApproveCaution(context.Background(), request.ID); err != nil {
+	if err := autoApproveCaution(context.Background(), GetDB(), request.ID); err != nil {
 		t.Fatalf("expected successful auto-approval, got error: %v", err)
 	}
 	assertAutoApprovedWithoutReviews(t, database, request.ID)
@@ -1267,7 +1026,7 @@ func TestAutoApproveCaution_MultipleApprovalsNeeded(t *testing.T) {
 	// satisfy it, partially or fully.
 	watchPolicySQL(t, database, `UPDATE requests SET min_approvals = 2 WHERE id = ?`, request.ID)
 
-	if err := autoApproveCaution(context.Background(), request.ID); err != nil {
+	if err := autoApproveCaution(context.Background(), GetDB(), request.ID); err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 	assertLeftPendingWithoutReviews(t, database, request.ID)

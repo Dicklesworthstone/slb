@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
@@ -66,7 +68,6 @@ func TestRequestStateWatchPreservesSameHostEvidence(t *testing.T) {
 	server.publishRequestState(pending)
 	conn := deliveryDial(t, addr)
 	reader := deliverySubscribe(t, conn)
-
 	for _, status := range []db.RequestStatus{db.StatusPending, db.StatusApproved, db.StatusExecuted} {
 		if status != db.StatusPending {
 			next := stateFixture(status)
@@ -77,8 +78,7 @@ func TestRequestStateWatchPreservesSameHostEvidence(t *testing.T) {
 			}
 			server.publishRequestState(next)
 		}
-		// Exercise the same wire decoding and projection as slb watch:
-		// preserving labels only in the server payload is insufficient.
+		// Exercise the public projection after actual IPC subscription delivery.
 		stream := ToRequestStreamEvent(stateReadEvent(t, reader))
 		if stream.Event != "request_"+string(status) || stream.ApprovalPolicy != db.ApprovalPolicySameHost ||
 			!strings.Contains(stream.ReviewNotice, "not independently authenticated authorization") {
@@ -195,5 +195,59 @@ func TestRequestStateEventOutcomes(t *testing.T) {
 		if pending != 0 || len(events) != 1 || events[0].Type != "request_"+string(status) || events[0].Payload.(map[string]any)["exit_code"] != 7 {
 			t.Fatalf("incorrect outcome event for %s: %+v", status, events)
 		}
+	}
+}
+
+func TestRequestStreamProjectionPreservesRealDaemonSnapshot(t *testing.T) {
+	for _, policy := range []db.ApprovalPolicy{db.ApprovalPolicyIndependent, db.ApprovalPolicySameHost} {
+		t.Run(string(policy), func(t *testing.T) {
+			state := stateFixture(db.StatusExecutionFailed)
+			row := &state.Requests[0]
+			row.ApprovalPolicy, row.MinApprovals, row.Approvals, row.Rejections = policy, 2, 1, 0
+			row.ExecutionAssurance = db.AssuranceLegacyUnknown
+			if policy == db.ApprovalPolicySameHost {
+				row.ExecutionAssurance = db.AssuranceSameHost
+			}
+			row.ResolvedAt = "2026-01-02T00:00:00Z"
+			code := 0
+			row.ExitCode = &code
+			events, _ := requestStateEvents(state)
+			direct := ToRequestStreamEvent(events[0])
+			data, err := json.Marshal(events[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wire Event
+			if err := json.Unmarshal(data, &wire); err != nil {
+				t.Fatal(err)
+			}
+			got := ToRequestStreamEvent(wire)
+			if !reflect.DeepEqual(direct, got) {
+				t.Fatalf("typed and wire snapshots disagree: direct=%+v wire=%+v", direct, got)
+			}
+			polled := RequestStreamEventFromState(*row)
+			polled.ObservedAt = got.ObservedAt
+			if !reflect.DeepEqual(polled, *got) {
+				t.Fatalf("daemon and polling project different state: daemon=%+v polling=%+v", got, polled)
+			}
+			if got.Event != "request_execution_failed" || got.Status != db.StatusExecutionFailed ||
+				got.RequestID != row.ID || got.ProjectPath != row.ProjectPath || got.CommandHash != row.CommandHash ||
+				got.MinApprovals == nil || *got.MinApprovals != 2 || got.Approvals == nil || *got.Approvals != 1 ||
+				got.Rejections == nil || *got.Rejections != 0 || got.ExitCode == nil || *got.ExitCode != 0 ||
+				got.CreatedAt != row.CreatedAt || got.ResolvedAt != row.ResolvedAt ||
+				got.ObservedAt != time.Unix(wire.Time, 0).UTC().Format(time.RFC3339) ||
+				got.ApprovalPolicy != policy || got.ReviewNotice != policy.Label() || got.ExecutionAssurance != row.ExecutionAssurance ||
+				strings.Contains(got.Command, "secret-value") {
+				t.Fatalf("public watch discarded or exposed snapshot evidence: %+v", got)
+			}
+			encoded, err := json.Marshal(got)
+			if err != nil || !strings.Contains(string(encoded), `"rejections":0`) || !strings.Contains(string(encoded), `"exit_code":0`) {
+				t.Fatalf("zero counts/outcomes omitted: %s %v", encoded, err)
+			}
+		})
+	}
+	legacy := ToRequestStreamEvent(Event{Type: "request_approved", Payload: map[string]any{"request_id": "old"}})
+	if legacy.ApprovalPolicy != "" || legacy.ExecutionAssurance != "" || legacy.ReviewNotice != "" || legacy.CreatedAt != "" {
+		t.Fatalf("missing historical evidence or creation time was invented: %+v", legacy)
 	}
 }

@@ -60,7 +60,7 @@ func TestRunWatchPolling_EmitsEvents(t *testing.T) {
 	// Run watch in background
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runWatchPolling(ctx, &buf)
+		errCh <- runWatchPolling(ctx, &buf, newWatchState(h.ProjectDir))
 	}()
 
 	// Wait for event or timeout
@@ -121,7 +121,9 @@ func TestRunWatchPolling_UpdatesOnStatusChange(t *testing.T) {
 	defer cancel()
 
 	var buf syncBuffer
-	go func() { _ = runWatchPolling(ctx, &buf) }()
+	done := make(chan error, 1)
+	go func() { done <- runWatchPolling(ctx, &buf, newWatchState(h.ProjectDir)) }()
+	defer func() { cancel(); <-done }()
 
 	// Wait for initial pending event
 	if !testutil.WaitForCondition(func() bool {
@@ -185,7 +187,9 @@ func TestRunWatchPolling_AutoApproveCaution(t *testing.T) {
 	defer cancel()
 
 	var buf syncBuffer
-	go func() { _ = runWatchPolling(ctx, &buf) }()
+	done := make(chan error, 1)
+	go func() { done <- runWatchPolling(ctx, &buf, newWatchState(h.ProjectDir)) }()
+	defer func() { cancel(); <-done }()
 
 	// Wait for approval
 	if !testutil.WaitForCondition(func() bool {

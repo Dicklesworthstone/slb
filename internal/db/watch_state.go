@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -29,11 +30,25 @@ type ProjectWatchState struct {
 // ReadProjectWatchState reads request and session state from one SQLite snapshot.
 // Keep all unresolved requests, plus recently resolved ones, so clients see
 // completions without loading an unbounded audit history or attachment bodies.
+// Previously observed active IDs may be included to recover their final state
+// after a disconnect longer than the recent-completion window. They remain
+// project-scoped and do not cause unrelated historical rows to be loaded.
 // State notifications may coalesce rapid transitions; the database is the audit
 // source of truth. A size limit fails explicitly instead of silently omitting rows.
-func (db *DB) ReadProjectWatchState(ctx context.Context, project string, since time.Time) (*ProjectWatchState, error) {
+func (db *DB) ReadProjectWatchState(ctx context.Context, project string, since time.Time, includeIDs ...string) (*ProjectWatchState, error) {
 	if project == "" {
 		return nil, errors.New("watch project is required")
+	}
+	if len(includeIDs) > 10000 {
+		return nil, errors.New("watch cannot track more than 10000 active requests")
+	}
+	args := []any{project, since.UTC().Format(time.RFC3339)}
+	includeClause := ""
+	if len(includeIDs) > 0 {
+		includeClause = " OR r.id IN (" + strings.TrimSuffix(strings.Repeat("?,", len(includeIDs)), ",") + ")"
+		for _, id := range includeIDs {
+			args = append(args, id)
+		}
 	}
 	tx, err := db.conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
@@ -49,14 +64,16 @@ func (db *DB) ReadProjectWatchState(ctx context.Context, project string, since t
 			(SELECT COUNT(*) FROM reviews v WHERE v.request_id = r.id AND v.decision = 'approve'),
 			(SELECT COUNT(*) FROM reviews v WHERE v.request_id = r.id AND v.decision = 'reject'),
 			r.execution_exit_code, r.created_at, COALESCE(r.resolved_at, ''),
-			r.approval_policy, r.execution_assurance
+			r.approval_policy,
+			CASE WHEN r.execution_log_path IS NOT NULL OR r.execution_exit_code IS NOT NULL OR r.execution_executed_at IS NOT NULL
+				THEN COALESCE(NULLIF(r.execution_assurance, ''), 'legacy_unknown') ELSE '' END
 		FROM requests r
 		WHERE r.project_path = ? AND (
 			r.status NOT IN ('executed', 'execution_failed', 'rejected', 'cancelled', 'timed_out')
 			OR julianday(COALESCE(r.resolved_at, r.created_at)) >= julianday(?)
-		)
+		`+includeClause+`)
 		ORDER BY r.created_at, r.id LIMIT 10001
-	`, project, since.UTC().Format(time.RFC3339))
+	`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("reading watch requests: %w", err)
 	}

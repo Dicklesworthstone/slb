@@ -56,9 +56,24 @@ func watchPolicySQL(t *testing.T, database *db.DB, query string, args ...any) {
 	}
 }
 
+func watchRequestSnapshot(t *testing.T, database *db.DB, request *db.Request) db.WatchRequestState {
+	t.Helper()
+	state, err := database.ReadProjectWatchState(context.Background(), request.ProjectPath, time.Now().Add(-15*time.Minute), request.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range state.Requests {
+		if row.ID == request.ID {
+			return row
+		}
+	}
+	t.Fatalf("request %s missing from watch snapshot", request.ID)
+	return db.WatchRequestState{}
+}
+
 func TestWatchApprovalUsesPolicyWithoutManufacturingReviews(t *testing.T) {
 	database, request := watchPolicyFixture(t)
-	if err := autoApproveCaution(context.Background(), request.ID); err != nil {
+	if err := autoApproveCaution(context.Background(), GetDB(), request.ID); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := database.GetRequest(request.ID)
@@ -69,7 +84,7 @@ func TestWatchApprovalUsesPolicyWithoutManufacturingReviews(t *testing.T) {
 	if err := database.QueryRow(`SELECT COUNT(*) FROM reviews WHERE request_id = ?`, request.ID).Scan(&count); err != nil || count != 0 {
 		t.Fatalf("watch manufactured reviewer evidence: %d %v", count, err)
 	}
-	if err := autoApproveCaution(context.Background(), request.ID); err != nil {
+	if err := autoApproveCaution(context.Background(), GetDB(), request.ID); err != nil {
 		t.Fatal(err)
 	}
 	again, err := database.GetRequest(request.ID)
@@ -90,7 +105,7 @@ func TestWatchApprovalCannotWaiveConstraints(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			database, request := watchPolicyFixture(t)
 			watchPolicySQL(t, database, tc.query)
-			if err := autoApproveCaution(context.Background(), request.ID); err != nil {
+			if err := autoApproveCaution(context.Background(), GetDB(), request.ID); err != nil {
 				t.Fatal(err)
 			}
 			stored, err := database.GetRequest(request.ID)
@@ -108,7 +123,7 @@ func TestWatchRevisitsKnownPendingAfterDelay(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
-	seen := map[string]db.RequestStatus{}
+	seen := newWatchState(request.ProjectPath)
 	if err := pollRequests(context.Background(), database, enc, seen); err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +131,9 @@ func TestWatchRevisitsKnownPendingAfterDelay(t *testing.T) {
 	if err != nil || stored.Status != db.StatusPending {
 		t.Fatalf("watch ignored configured delay: %+v %v", stored, err)
 	}
-	watchPolicySQL(t, database, `UPDATE requests SET created_at = ? WHERE id = ?`, time.Now().UTC().Add(-10*time.Minute).Format(time.RFC3339), request.ID)
+	if err := os.WriteFile(filepath.Join(request.ProjectPath, ".slb", "config.toml"), []byte("[patterns.caution]\nauto_approve_delay_seconds = 0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 3; i++ {
 		if err := pollRequests(context.Background(), database, enc, seen); err != nil {
 			t.Fatal(err)
@@ -133,8 +150,9 @@ func TestWatchRevisitsKnownPendingAfterDelay(t *testing.T) {
 
 func TestWatchStaleSnapshotCannotOverwriteRejection(t *testing.T) {
 	database, request := watchPolicyFixture(t)
+	snapshot := watchRequestSnapshot(t, database, request)
 	watchPolicySQL(t, database, `UPDATE requests SET status = 'rejected' WHERE id = ?`, request.ID)
-	if err := processPolledRequest(context.Background(), request, json.NewEncoder(io.Discard), map[string]db.RequestStatus{}); err != nil {
+	if err := processPolledRequest(context.Background(), snapshot, json.NewEncoder(io.Discard), newWatchState(request.ProjectPath)); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := database.GetRequest(request.ID)
@@ -149,7 +167,7 @@ func TestWatchDoesNotApplyTimeoutPolicy(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(request.ProjectPath, ".slb", "config.toml"), []byte("[general]\ntimeout_action = 'auto_approve_warn'\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := autoApproveCaution(context.Background(), request.ID); err != nil {
+	if err := autoApproveCaution(context.Background(), GetDB(), request.ID); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := database.GetRequest(request.ID)
@@ -166,15 +184,16 @@ func TestWatchApprovalFailureAndBrokenOutput(t *testing.T) {
 	database, request := watchPolicyFixture(t)
 	watchPolicySQL(t, database, `CREATE TRIGGER reject_watch_update BEFORE UPDATE OF status ON requests
 		BEGIN SELECT RAISE(ABORT, 'injected watch failure'); END`)
-	seen := map[string]db.RequestStatus{request.ID: db.StatusPending}
+	seen := newWatchState(request.ProjectPath)
+	snapshot := watchRequestSnapshot(t, database, request)
 	var buf bytes.Buffer
-	if err := processPolledRequest(context.Background(), request, json.NewEncoder(&buf), seen); err != nil {
+	if err := processPolledRequest(context.Background(), snapshot, json.NewEncoder(&buf), seen); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(buf.String(), `"event":"auto_approve_error"`) || strings.Contains(buf.String(), `"event":"request_approved"`) {
 		t.Fatalf("failed approval reported as success: %s", buf.String())
 	}
-	err := processPolledRequest(context.Background(), request, json.NewEncoder(watchFailWriter{}), seen)
+	err := processPolledRequest(context.Background(), snapshot, json.NewEncoder(watchFailWriter{}), seen)
 	if !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatalf("output failure swallowed: %v", err)
 	}
@@ -192,7 +211,7 @@ func TestWatchRejectsInvalidPollingIntervals(t *testing.T) {
 		if err := runWatch(&cobra.Command{}, nil); err == nil {
 			t.Fatal("invalid polling interval accepted")
 		}
-		if err := runWatchPolling(context.Background(), io.Discard); err == nil {
+		if err := runWatchPolling(context.Background(), io.Discard, newWatchState("/project")); err == nil {
 			t.Fatal("polling panicked or accepted an invalid interval")
 		}
 	}
@@ -220,7 +239,7 @@ func TestWatchPollingPreservesSameHostEvidenceAfterPolicyChange(t *testing.T) {
 	if err := database.CreateSession(peer); err != nil {
 		t.Fatal(err)
 	}
-	seen := make(map[string]db.RequestStatus)
+	seen := newWatchState(request.ProjectPath)
 	var output bytes.Buffer
 	observe := func(eventType string, assurance db.ReviewAssurance) {
 		t.Helper()
@@ -258,8 +277,7 @@ func TestWatchPollingPreservesSameHostEvidenceAfterPolicyChange(t *testing.T) {
 	if err := database.ClaimRequestExecutionAuthenticated(decision.Request, execution, peer.SessionKey, core.ExecutionPolicyGuard("")); err != nil {
 		t.Fatal(err)
 	}
-	// A later configuration edit cannot relabel an already-started execution.
-	// Its completion must remain reportable without granting a fresh permit.
+	// Configuration cannot relabel a started execution or grant a fresh permit.
 	if err := os.WriteFile(configPath, []byte("[general]\napproval_policy = 'independent'\n"), 0600); err != nil {
 		t.Fatal(err)
 	}

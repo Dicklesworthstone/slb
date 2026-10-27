@@ -326,14 +326,26 @@ func TestHistoryCommand_Help(t *testing.T) {
 	}
 }
 
-func TestApplyHistoryFilters(t *testing.T) {
-	// Test the in-memory filtering function
-	requests := []*db.Request{
-		{ID: "1", Status: db.StatusPending, RequestorAgent: "Agent1", RiskTier: db.RiskTierDangerous},
-		{ID: "2", Status: db.StatusApproved, RequestorAgent: "Agent2", RiskTier: db.RiskTierCritical},
-		{ID: "3", Status: db.StatusRejected, RequestorAgent: "Agent1", RiskTier: db.RiskTierCritical},
+func TestHistoryCommand_CombinedFilters(t *testing.T) {
+	h := testutil.NewHarness(t)
+	sessions := make(map[string]*db.Session)
+	for i, state := range []struct {
+		status db.RequestStatus
+		agent  string
+		tier   db.RiskTier
+	}{
+		{db.StatusPending, "Agent1", db.RiskTierDangerous},
+		{db.StatusApproved, "Agent2", db.RiskTierCritical},
+		{db.StatusRejected, "Agent1", db.RiskTierCritical},
+	} {
+		session := sessions[state.agent]
+		if session == nil {
+			session = testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent(state.agent))
+			sessions[state.agent] = session
+		}
+		testutil.MakeRequest(t, h.DB, session, testutil.WithStatus(state.status), testutil.WithRisk(state.tier),
+			testutil.WithCommand(fmt.Sprintf("echo history-%d", i), h.ProjectDir, true))
 	}
-
 	tests := []struct {
 		name     string
 		status   string
@@ -350,12 +362,17 @@ func TestApplyHistoryFilters(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			flagHistoryStatus = tt.status
-			flagHistoryAgent = tt.agent
-			flagHistoryTier = tt.tier
-			flagHistorySince = ""
-
-			result := applyHistoryFilters(requests)
+			resetHistoryFlags()
+			cmd := newTestHistoryCmd(h.DBPath)
+			stdout, err := executeCommandCapture(t, cmd, "history", "-C", h.ProjectDir, "-j",
+				"--status", tt.status, "--agent", tt.agent, "--tier", tt.tier)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result []map[string]any
+			if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+				t.Fatal(err)
+			}
 			if len(result) != tt.expected {
 				t.Errorf("expected %d results, got %d", tt.expected, len(result))
 			}
@@ -366,76 +383,55 @@ func TestApplyHistoryFilters(t *testing.T) {
 	resetHistoryFlags()
 }
 
-func TestApplyHistoryFilters_SinceDateRFC3339(t *testing.T) {
-	now := time.Now()
-	old := now.Add(-48 * time.Hour)
-	recent := now.Add(-1 * time.Hour)
-
-	requests := []*db.Request{
-		{ID: "1", Status: db.StatusPending, CreatedAt: old},
-		{ID: "2", Status: db.StatusPending, CreatedAt: recent},
+func TestHistoryCommand_SinceDates(t *testing.T) {
+	h := testutil.NewHarness(t)
+	session := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir))
+	old := testutil.MakeRequest(t, h.DB, session)
+	recent := testutil.MakeRequest(t, h.DB, session)
+	for _, entry := range []struct{ id, at string }{
+		{old.ID, "2026-01-01T12:00:00Z"}, {recent.ID, "2026-01-03T12:00:00Z"},
+	} {
+		if _, err := h.DB.Exec("UPDATE requests SET created_at = ? WHERE id = ?", entry.at, entry.id); err != nil {
+			t.Fatal(err)
+		}
 	}
-
-	// Filter to only recent (since 24 hours ago)
-	flagHistoryStatus = ""
-	flagHistoryAgent = ""
-	flagHistoryTier = ""
-	flagHistorySince = now.Add(-24 * time.Hour).Format(time.RFC3339)
-
-	result := applyHistoryFilters(requests)
-	if len(result) != 1 {
-		t.Errorf("expected 1 result with since filter, got %d", len(result))
+	for _, since := range []string{"2026-01-03", "2026-01-03T08:00:00-04:00"} {
+		t.Run(since, func(t *testing.T) {
+			resetHistoryFlags()
+			stdout, err := executeCommandCapture(t, newTestHistoryCmd(h.DBPath), "history", "-C", h.ProjectDir, "-j", "--since", since)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result []map[string]any
+			if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+				t.Fatal(err)
+			}
+			if len(result) != 1 || result[0]["request_id"] != recent.ID {
+				t.Fatalf("unexpected history: %s", stdout)
+			}
+		})
 	}
-	if len(result) > 0 && result[0].ID != "2" {
-		t.Errorf("expected request 2, got %s", result[0].ID)
-	}
-
 	resetHistoryFlags()
 }
 
-func TestApplyHistoryFilters_SinceDateOnly(t *testing.T) {
-	now := time.Now()
-	old := now.Add(-48 * time.Hour)
-	recent := now.Add(-1 * time.Hour)
-
-	requests := []*db.Request{
-		{ID: "1", Status: db.StatusPending, CreatedAt: old},
-		{ID: "2", Status: db.StatusPending, CreatedAt: recent},
+func TestHistoryCommand_RejectsInvalidFilters(t *testing.T) {
+	h := testutil.NewHarness(t)
+	// Exercise the real search evaluator rather than an empty-table query
+	// plan that can return before SQLite evaluates MATCH syntax.
+	session := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir))
+	testutil.MakeRequest(t, h.DB, session)
+	for _, args := range [][]string{
+		{"--since", "invalid-date"}, {"--limit", "-1"}, {"--limit", "0"}, {"--limit", "10001"},
+		{"--status", "made-up"}, {"--tier", "made-up"}, {"--query", "*"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			resetHistoryFlags()
+			if _, err := executeCommandCapture(t, newTestHistoryCmd(h.DBPath),
+				append([]string{"history", "-C", h.ProjectDir, "-j"}, args...)...); err == nil {
+				t.Fatalf("accepted invalid history filters: %v", args)
+			}
+		})
 	}
-
-	// Filter using date-only format
-	flagHistoryStatus = ""
-	flagHistoryAgent = ""
-	flagHistoryTier = ""
-	flagHistorySince = now.Format("2006-01-02")
-
-	result := applyHistoryFilters(requests)
-	// Both should pass since they're on or after today's date
-	// Actually, the old one is 2 days ago so it should fail
-	if len(result) != 1 {
-		t.Errorf("expected 1 result with date-only since filter, got %d", len(result))
-	}
-
-	resetHistoryFlags()
-}
-
-func TestApplyHistoryFilters_InvalidSinceDate(t *testing.T) {
-	requests := []*db.Request{
-		{ID: "1", Status: db.StatusPending, CreatedAt: time.Now()},
-	}
-
-	// Invalid date should be ignored
-	flagHistoryStatus = ""
-	flagHistoryAgent = ""
-	flagHistoryTier = ""
-	flagHistorySince = "invalid-date"
-
-	result := applyHistoryFilters(requests)
-	// Should return all since invalid date is ignored
-	if len(result) != 1 {
-		t.Errorf("expected 1 result with invalid since filter (ignored), got %d", len(result))
-	}
-
 	resetHistoryFlags()
 }
 
@@ -478,13 +474,8 @@ func TestHistoryCommand_FilterByStatusApproved(t *testing.T) {
 			break
 		}
 	}
-	if !found && len(result) > 0 {
-		// Request may have been filtered, just verify we got results
-		for _, r := range result {
-			if r["status"] != "approved" {
-				t.Errorf("expected status=approved, got %v", r["status"])
-			}
-		}
+	if !found {
+		t.Fatalf("approved request disappeared from history: %s", stdout)
 	}
 }
 
@@ -518,8 +509,69 @@ func TestHistoryCommand_FullTextSearch(t *testing.T) {
 		t.Fatalf("failed to parse JSON: %v\nstdout: %s", err, stdout)
 	}
 
-	// Should find requests containing "docker"
-	// Note: FTS might not work exactly as expected in tests, just verify no error
+	if len(result) != 1 || result[0]["command"] != "docker build -t myimage ." {
+		t.Fatalf("search did not return its match: %s", stdout)
+	}
+}
+
+func TestHistoryCommand_CompletedScopedAndRedacted(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetHistoryFlags()
+	defer resetHistoryFlags()
+	session := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir))
+	completed := testutil.MakeRequest(t, h.DB, session,
+		testutil.WithCommand("echo historyneedle", h.ProjectDir, true),
+		testutil.WithStatus(db.StatusExecuted), func(r *db.Request) { r.ApprovalPolicy = db.ApprovalPolicySameHost })
+	if _, err := h.DB.Exec("UPDATE requests SET execution_log_path = ?, execution_exit_code = 0, execution_approval_policy = 'same_host', execution_assurance = 'same_host' WHERE id = ?", "test.log", completed.ID); err != nil {
+		t.Fatal(err)
+	}
+	secret := testutil.MakeRequest(t, h.DB, session,
+		testutil.WithCommand("echo TOP-SECRET", h.ProjectDir, true),
+		testutil.WithStatus(db.StatusExecutionFailed), func(r *db.Request) { r.Command.ContainsSensitive = true })
+	foreign := testutil.MakeSession(t, h.DB, testutil.WithProject(t.TempDir()))
+	testutil.MakeRequest(t, h.DB, foreign, testutil.WithCommand("echo historyneedle foreign", foreign.ProjectPath, true), testutil.WithStatus(db.StatusExecuted))
+	for _, search := range []string{"", "historyneedle"} {
+		t.Run(search, func(t *testing.T) {
+			resetHistoryFlags()
+			args := []string{"history", "-C", h.ProjectDir, "-j"}
+			if search != "" {
+				args = append(args, "--query", search)
+			}
+			stdout, err := executeCommandCapture(t, newTestHistoryCmd(h.DBPath), args...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result []map[string]any
+			if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+				t.Fatal(err)
+			}
+			want := 2
+			if search != "" {
+				want = 1
+			}
+			if len(result) != want {
+				t.Fatalf("history omitted completed rows or leaked another project: %s", stdout)
+			}
+			found := false
+			for _, row := range result {
+				if row["project_path"] != h.ProjectDir {
+					t.Fatalf("cross-project row: %v", row)
+				}
+				if row["request_id"] == completed.ID {
+					found = true
+					if row["execution_assurance"] != "same_host" || row["approval_policy"] != "same_host" {
+						t.Fatalf("lost assurance: %v", row)
+					}
+				}
+				if row["request_id"] == secret.ID && row["command"] != "[REDACTED]" {
+					t.Fatalf("secret exposed: %v", row)
+				}
+			}
+			if !found || strings.Contains(stdout, "TOP-SECRET") {
+				t.Fatalf("invalid completed history: %s", stdout)
+			}
+		})
+	}
 }
 
 func TestHistoryCommand_TextOutput(t *testing.T) {

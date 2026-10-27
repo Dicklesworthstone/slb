@@ -7,7 +7,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/charmbracelet/log"
 )
@@ -23,10 +22,7 @@ func requestStateEvents(state *db.ProjectWatchState) ([]Event, int32) {
 		if r.Status == db.StatusPending {
 			pending++
 		}
-		command := core.ApplyRedaction(r.Command, nil)
-		if len(command) > 2048 {
-			command = command[:2048] + "..."
-		}
+		command := RequestStreamEventFromState(r).Command
 		payload := map[string]any{
 			"request_id": r.ID, "project_path": r.ProjectPath, "status": string(r.Status),
 			"risk_tier": string(r.RiskTier), "command": command, "command_hash": r.CommandHash,

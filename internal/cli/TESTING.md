@@ -455,7 +455,7 @@ func TestMyFunc_RetryLogic(t *testing.T) {
 - `shouldAutoApproveCaution` - Risk tier evaluation logic
 - `evaluateRequestForPolling` - Request filtering logic
 - `statusToEventType` - Status mapping
-- `applyHistoryFilters` - Query filters
+- `ListRequestHistory` - Project-scoped history filters applied before limiting
 - `parseTier` - Risk tier parsing
 - `outputPatterns` - Pattern formatting
 - All `init` functions

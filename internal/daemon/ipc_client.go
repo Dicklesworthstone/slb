@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
@@ -475,73 +476,72 @@ func (c *IPCClient) readEvents(ctx context.Context, connection ipcClientConnecti
 	}
 }
 
-// RequestStreamEvent is a display observation for the watch command output,
-// never an execution permit. Policy names describe requirements; only an
-// explicitly recorded assurance describes the evidence used for execution.
+// RequestStreamEvent is display state for the watch command, not execution
+// authority. Vote counts include submitted evidence without verifying it.
 type RequestStreamEvent struct {
 	Event              string             `json:"event"`
 	RequestID          string             `json:"request_id,omitempty"`
+	ProjectPath        string             `json:"project_path,omitempty"`
+	Status             db.RequestStatus   `json:"status,omitempty"`
 	RiskTier           string             `json:"risk_tier,omitempty"`
 	Command            string             `json:"command,omitempty"`
+	CommandHash        string             `json:"command_hash,omitempty"`
 	Requestor          string             `json:"requestor,omitempty"`
+	MinApprovals       *int               `json:"min_approvals,omitempty"`
+	Approvals          *int               `json:"approvals,omitempty"`
+	Rejections         *int               `json:"rejections,omitempty"`
+	ApprovalPolicy     db.ApprovalPolicy  `json:"approval_policy,omitempty"`
+	ReviewNotice       string             `json:"review_notice,omitempty"`
+	ExecutionAssurance db.ReviewAssurance `json:"execution_assurance,omitempty"`
 	ApprovedBy         string             `json:"approved_by,omitempty"`
 	RejectedBy         string             `json:"rejected_by,omitempty"`
 	Reason             string             `json:"reason,omitempty"`
 	ExitCode           *int               `json:"exit_code,omitempty"`
 	CreatedAt          string             `json:"created_at,omitempty"`
+	ResolvedAt         string             `json:"resolved_at,omitempty"`
 	ExecutedAt         string             `json:"executed_at,omitempty"`
-	ApprovalPolicy     db.ApprovalPolicy  `json:"approval_policy,omitempty"`
-	ReviewNotice       string             `json:"review_notice,omitempty"`
-	ExecutionAssurance db.ReviewAssurance `json:"execution_assurance,omitempty"`
+	ObservedAt         string             `json:"observed_at,omitempty"`
+	ActiveSessions     *int               `json:"active_sessions,omitempty"`
 }
 
 // ToRequestStreamEvent converts a daemon Event to a RequestStreamEvent.
+// Decode the actual payload schema so in-process typed values and JSON-decoded
+// wire values retain the same fields, including zero vote counts and exit codes.
+// Missing legacy assurance fields stay missing; they are not upgraded.
 func ToRequestStreamEvent(e Event) *RequestStreamEvent {
-	we := &RequestStreamEvent{Event: e.Type, CreatedAt: time.Unix(e.Time, 0).Format(time.RFC3339)}
-	if payload, ok := e.Payload.(map[string]any); ok {
-		if v, ok := payload["request_id"].(string); ok {
-			we.RequestID = v
-		}
-		if v, ok := payload["risk_tier"].(string); ok {
-			we.RiskTier = v
-		}
-		if v, ok := payload["command"].(string); ok {
-			we.Command = v
-		}
-		if v, ok := payload["requestor"].(string); ok {
-			we.Requestor = v
-		}
-		if v, ok := payload["approved_by"].(string); ok {
-			we.ApprovedBy = v
-		}
-		if v, ok := payload["rejected_by"].(string); ok {
-			we.RejectedBy = v
-		}
-		if v, ok := payload["reason"].(string); ok {
-			we.Reason = v
-		}
-		// Direct in-process events use the named database types; events
-		// decoded from the IPC wire carry strings. Preserve both without
-		// interpreting a missing category as independent authorization.
-		switch policy := payload["approval_policy"].(type) {
-		case db.ApprovalPolicy:
-			we.ApprovalPolicy = policy
-		case string:
-			we.ApprovalPolicy = db.ApprovalPolicy(policy)
-		}
-		if we.ApprovalPolicy != "" {
-			we.ReviewNotice = we.ApprovalPolicy.Label()
-		}
-		switch assurance := payload["execution_assurance"].(type) {
-		case db.ReviewAssurance:
-			we.ExecutionAssurance = assurance
-		case string:
-			we.ExecutionAssurance = db.ReviewAssurance(assurance)
-		}
-		if v, ok := payload["exit_code"].(float64); ok {
-			code := int(v)
-			we.ExitCode = &code
+	we := &RequestStreamEvent{}
+	if data, err := json.Marshal(e.Payload); err == nil {
+		var decoded RequestStreamEvent
+		if json.Unmarshal(data, &decoded) == nil {
+			*we = decoded
 		}
 	}
+	we.Event = e.Type
+	// Derive the notice from recorded policy rather than trusting a supplied
+	// description. Missing historical policy must not acquire a stronger label.
+	we.ReviewNotice = ""
+	if we.ApprovalPolicy != "" {
+		we.ReviewNotice = we.ApprovalPolicy.Label()
+	}
+	we.ObservedAt = time.Unix(e.Time, 0).UTC().Format(time.RFC3339)
 	return we
+}
+
+// RequestStreamEventFromState projects a coherent database snapshot using the
+// same contract as the daemon's state notifications. Apply default redaction
+// too, so historical raw fallbacks cannot expose secrets on either transport.
+func RequestStreamEventFromState(r db.WatchRequestState) RequestStreamEvent {
+	r.Command = core.ApplyRedaction(r.Command, nil)
+	if len(r.Command) > 2048 {
+		r.Command = r.Command[:2048] + "..."
+	}
+	return RequestStreamEvent{
+		Event: "request_" + string(r.Status), RequestID: r.ID, ProjectPath: r.ProjectPath,
+		Status: r.Status, RiskTier: string(r.RiskTier), Command: r.Command,
+		CommandHash: r.CommandHash, Requestor: r.Requestor,
+		MinApprovals: &r.MinApprovals, Approvals: &r.Approvals, Rejections: &r.Rejections,
+		ApprovalPolicy: r.ApprovalPolicy.Normalized(), ReviewNotice: r.ApprovalPolicy.Label(),
+		ExecutionAssurance: r.ExecutionAssurance, ExitCode: r.ExitCode,
+		CreatedAt: r.CreatedAt, ResolvedAt: r.ResolvedAt,
+	}
 }

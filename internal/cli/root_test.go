@@ -70,6 +70,44 @@ func newTestRootCmd() *cobra.Command {
 	return cmd
 }
 
+func TestRootRelativeProjectFlagKeepsSelectedAbsolutePath(t *testing.T) {
+	for _, selection := range []string{".", "subdir"} {
+		t.Run(selection, func(t *testing.T) {
+			base, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(filepath.Join(base, "subdir"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Chdir(base) // Restores the caller's cwd, including on test failure.
+			previous := flagProject
+			t.Cleanup(func() { flagProject = previous })
+			command := &cobra.Command{Use: "slb", PersistentPreRunE: rootCmd.PersistentPreRunE}
+			command.PersistentFlags().StringVarP(&flagProject, "project", "C", "", "project directory")
+			var selectedProject, selectedCWD string
+			command.AddCommand(&cobra.Command{
+				Use: "probe", Args: cobra.NoArgs,
+				RunE: func(*cobra.Command, []string) error {
+					var err error
+					if selectedCWD, err = os.Getwd(); err != nil {
+						return err
+					}
+					selectedProject, err = projectPath()
+					return err
+				},
+			})
+			if _, _, err := executeCommand(command, "-C", selection, "probe"); err != nil {
+				t.Fatal(err)
+			}
+			expected := filepath.Join(base, selection)
+			if selectedProject != expected || selectedCWD != expected || flagProject != expected || !filepath.IsAbs(selectedProject) {
+				t.Fatalf("relative project was lost or resolved twice: project=%q cwd=%q flag=%q want=%q", selectedProject, selectedCWD, flagProject, expected)
+			}
+		})
+	}
+}
+
 func TestRootCommand_ShowsHelp(t *testing.T) {
 	cmd := newTestRootCmd()
 	stdout, _, err := executeCommand(cmd, "--help")

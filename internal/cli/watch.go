@@ -9,6 +9,9 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"syscall"
 	"time"
 
@@ -46,19 +49,28 @@ Events are streamed as newline-delimited JSON objects.
 
 If the daemon is running, events are received in real-time via IPC subscription.
 If the daemon is not running, the command falls back to polling the database.
-If a daemon subscription is lost, a watch_degraded event precedes a fresh
-pending snapshot from polling. Consumers should deduplicate by request ID.
-Request events preserve approval_policy and review_notice in both modes.
-Execution events include the recorded execution_assurance when available.
-Same-host review is low assurance, not independently authenticated authorization.
-Events describe observed state; execution must still pass slb execute's checks.
+Both transports begin with unresolved requests and completions from the last
+15 minutes. If a daemon subscription is lost, a watch_degraded event precedes
+the current database snapshot. Previously observed active requests remain
+tracked through their final state, even after a longer disconnect.
+Consumers should replace state by request ID; rapid transitions may coalesce.
+Use 'slb events --follow' for durable, resumable lifecycle replay.
+
+Request events retain status, command hash, submitted vote counts, original
+timestamps, approval policy and execution assurance. Counts and notifications
+are display information, not execution authority. Same-host peer review is
+low assurance, not independently authenticated authorization.
 
 Event types:
   request_pending   - New request awaiting approval
   request_approved  - Request was approved
   request_rejected  - Request was rejected
-  request_executed  - Approved request was executed
+  request_executing - Command execution was claimed
+  request_executed  - Command completed successfully
+  request_execution_failed - Command execution failed
+  request_timed_out - Command execution timed out
   request_timeout   - Request timed out
+  request_escalated - Request was escalated
   request_cancelled - Request was cancelled
 
 Use --auto-approve-caution to process due CAUTION approvals. The configured
@@ -75,11 +87,23 @@ func runWatch(cmd *cobra.Command, args []string) error {
 	if ctx.Err() != nil {
 		return nil
 	}
+	state, err := resolveWatchState()
+	if err != nil {
+		return err
+	}
+	if state.remote {
+		err := runWatchDaemon(ctx, cmd.OutOrStdout(), state)
+		if ctx.Err() != nil {
+			return nil
+		}
+		return fmt.Errorf("remote watch ended; local database fallback is disabled: %w", err)
+	}
 
 	// Try daemon IPC first
-	client := daemon.NewClient()
-	if client.IsDaemonRunning() {
-		err := runWatchDaemon(ctx, client, cmd.OutOrStdout())
+	client := daemon.NewClient(daemon.WithSocketPath(state.socket),
+		daemon.WithPIDFile(daemon.PIDFileForCWD(state.project)), daemon.WithLocalOnly())
+	if state.useDaemon && client.IsDaemonRunning() {
+		err := runWatchDaemon(ctx, cmd.OutOrStdout(), state)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -95,12 +119,12 @@ func runWatch(cmd *cobra.Command, args []string) error {
 
 	// Fall back to polling
 	daemon.ShowDegradedWarningQuiet()
-	return runWatchPolling(ctx, cmd.OutOrStdout())
+	return runWatchPolling(ctx, cmd.OutOrStdout(), state)
 }
 
 // runWatchDaemon streams events via daemon IPC subscription.
-func runWatchDaemon(ctx context.Context, client *daemon.Client, out io.Writer) error {
-	ipcClient := daemon.NewIPCClient(daemon.DefaultSocketPath())
+func runWatchDaemon(ctx context.Context, out io.Writer, state *watchState) error {
+	ipcClient := daemon.NewIPCClient(state.socket)
 	defer ipcClient.Close()
 
 	events, err := ipcClient.Subscribe(ctx)
@@ -123,13 +147,14 @@ func runWatchDaemon(ctx context.Context, client *daemon.Client, out io.Writer) e
 			}
 
 			watchEvent := daemon.ToRequestStreamEvent(event)
-			if err := enc.Encode(watchEvent); err != nil {
-				return fmt.Errorf("encoding event: %w", err)
+			if err := state.emit(enc, *watchEvent); err != nil {
+				return err
 			}
+			state.retireOldCompletions(time.Now().Add(-watchRecentCompletionWindow))
 
 			// Auto-approve CAUTION tier if enabled
 			if flagWatchAutoApproveCaution && watchEvent.Event == "request_pending" && watchEvent.RiskTier == "caution" {
-				if err := autoApproveCaution(ctx, watchEvent.RequestID); err != nil {
+				if err := autoApproveCaution(ctx, state.database, watchEvent.RequestID); err != nil {
 					// Log error but continue watching
 					errEvent := map[string]any{
 						"event":      "auto_approve_error",
@@ -145,24 +170,27 @@ func runWatchDaemon(ctx context.Context, client *daemon.Client, out io.Writer) e
 	}
 }
 
-// runWatchPolling polls the database for pending requests.
-func runWatchPolling(ctx context.Context, out io.Writer) error {
+// runWatchPolling reads only the pinned local database. It must not initialize
+// an empty database when the selected project or an explicit filename is absent.
+func runWatchPolling(ctx context.Context, out io.Writer, state *watchState) error {
 	if flagWatchPollInterval <= 0 {
 		return fmt.Errorf("--poll-interval must be positive")
 	}
-	dbConn, err := db.Open(GetDB())
+	dbConn, err := db.OpenWithOptions(state.database, db.OpenOptions{InitSchema: true})
 	if err != nil {
 		return fmt.Errorf("opening database: %w", err)
 	}
 	defer dbConn.Close()
 
 	enc := json.NewEncoder(out)
-	seen := make(map[string]db.RequestStatus)
 	ticker := time.NewTicker(flagWatchPollInterval)
 	defer ticker.Stop()
 
 	// Initial poll
-	if err := pollRequests(ctx, dbConn, enc, seen); err != nil {
+	if err := pollRequests(ctx, dbConn, enc, state); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 
@@ -171,195 +199,153 @@ func runWatchPolling(ctx context.Context, out io.Writer) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := pollRequests(ctx, dbConn, enc, seen); err != nil {
+			if err := pollRequests(ctx, dbConn, enc, state); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
 				return err
 			}
 		}
 	}
 }
 
-// PollAction represents the action to take for a polled request.
-type PollAction string
+const watchRecentCompletionWindow = 15 * time.Minute
 
-const (
-	// PollActionEmitNew indicates a new pending request should be emitted.
-	PollActionEmitNew PollAction = "emit_new"
-	// PollActionEmitStatusChange indicates a status change event should be emitted.
-	PollActionEmitStatusChange PollAction = "emit_status_change"
-	// PollActionSkip indicates no event should be emitted.
-	PollActionSkip PollAction = "skip"
-)
-
-// RequestPollResult encapsulates the decision about what to do with a polled request.
-// This is returned by the pure evaluation function for testability.
-type RequestPollResult struct {
-	Action    PollAction
-	EventType string // Only set when Action is EmitStatusChange
-	Reason    string
+// watchState survives the daemon-to-polling handoff. Complete display states
+// detect submitted votes even when status stays pending. Only active IDs extend
+// the bounded completion snapshot; no stream event grants execution authority.
+type watchState struct {
+	project, database, socket string
+	remote, useDaemon         bool
+	requests                  map[string]daemon.RequestStreamEvent
 }
 
-// evaluateRequestForPolling is a pure function that determines what action to take
-// when a request is polled. This function should maintain 100% test coverage as it
-// contains the core polling business logic.
-//
-// Decision rules:
-//   - New request (not in seen map): emit "request_pending" event
-//   - Status changed: emit appropriate status change event
-//   - Status unchanged: skip (no event)
-func evaluateRequestForPolling(
-	requestID string,
-	currentStatus db.RequestStatus,
-	seen map[string]db.RequestStatus,
-) RequestPollResult {
-	prevStatus, exists := seen[requestID]
-
-	if !exists {
-		// New request - emit pending event
-		return RequestPollResult{
-			Action:    PollActionEmitNew,
-			EventType: "request_pending",
-			Reason:    "new request discovered",
-		}
-	}
-
-	if prevStatus == currentStatus {
-		// No change - skip
-		return RequestPollResult{
-			Action: PollActionSkip,
-			Reason: "status unchanged",
-		}
-	}
-
-	// Status changed - determine event type
-	eventType := statusToEventType(currentStatus)
-	if eventType == "" {
-		return RequestPollResult{
-			Action: PollActionSkip,
-			Reason: "unknown status transition: " + string(currentStatus),
-		}
-	}
-
-	return RequestPollResult{
-		Action:    PollActionEmitStatusChange,
-		EventType: eventType,
-		Reason:    "status changed from " + string(prevStatus) + " to " + string(currentStatus),
-	}
+func newWatchState(project string) *watchState {
+	return &watchState{project: project, database: filepath.Join(project, ".slb", "state.db"),
+		socket: daemon.SocketPathForCWD(project), useDaemon: true,
+		requests: make(map[string]daemon.RequestStreamEvent)}
 }
 
-// statusToEventType maps a request status to its corresponding event type string.
-// Returns empty string for unknown/unhandled statuses.
-func statusToEventType(status db.RequestStatus) string {
-	switch status {
-	case db.StatusApproved:
-		return "request_approved"
-	case db.StatusRejected:
-		return "request_rejected"
-	case db.StatusExecuted, db.StatusExecutionFailed, db.StatusTimedOut:
-		return "request_executed"
-	case db.StatusTimeout:
-		return "request_timeout"
-	case db.StatusCancelled:
-		return "request_cancelled"
-	default:
-		return ""
-	}
-}
-
-// pollRequests checks for new or changed requests and emits events.
-// It handles requests that move out of pending status by checking tracked IDs.
-func pollRequests(ctx context.Context, dbConn *db.DB, enc *json.Encoder, seen map[string]db.RequestStatus) error {
-	// Get all pending requests for all projects
-	requests, err := dbConn.ListPendingRequestsAllProjects()
+// Select one source before connecting. Default local watch uses the same
+// physical project root/database as the daemon, including from descendants or
+// aliases. An explicit database keeps the selected project spelling and cannot
+// be substituted by a daemon. Remote streams never fall back to local state.
+func resolveWatchState() (*watchState, error) {
+	project, err := projectPath()
 	if err != nil {
-		return fmt.Errorf("listing requests: %w", err)
+		return nil, err
 	}
-
-	// Track which IDs were found in the pending list
-	foundPending := make(map[string]bool)
-
-	// Process current pending requests
-	for _, req := range requests {
-		foundPending[req.ID] = true
-		if err := processPolledRequest(ctx, req, enc, seen); err != nil {
-			return err
-		}
+	project, err = filepath.Abs(project)
+	if err != nil {
+		return nil, fmt.Errorf("resolving watch project: %w", err)
 	}
-
-	// Check requests we were tracking that are no longer pending
-	// (e.g., they became approved, rejected, executed)
-	for id := range seen {
-		if foundPending[id] {
-			continue
-		}
-
-		// Fetch the latest state of the missing request
-		req, err := dbConn.GetRequest(id)
+	if flagDB != "" {
+		state := newWatchState(project)
+		state.database, err = filepath.Abs(flagDB)
 		if err != nil {
-			// If error (e.g. deleted), we stop tracking it implicit via not processing
-			// But 'seen' still has it. Ideally we should remove it?
-			// For simplicity, we just skip.
-			continue
+			return nil, fmt.Errorf("resolving watch database: %w", err)
 		}
+		state.useDaemon = false
+		return state, nil
+	}
+	if strings.TrimSpace(os.Getenv("SLB_HOST")) != "" {
+		if flagWatchAutoApproveCaution {
+			return nil, errors.New("--auto-approve-caution requires a local database; remote watch cannot make local policy decisions")
+		}
+		state := newWatchState(project)
+		state.remote = true
+		return state, nil
+	}
+	project, err = daemon.PhysicalProjectRootForCWD(project)
+	if err != nil {
+		return nil, err
+	}
+	return newWatchState(project), nil
+}
 
-		if err := processPolledRequest(ctx, req, enc, seen); err != nil {
-			return err
+func (s *watchState) emit(enc *json.Encoder, event daemon.RequestStreamEvent) error {
+	s.retireOldCompletions(time.Now().Add(-watchRecentCompletionWindow))
+	observedAt := event.ObservedAt
+	event.ObservedAt = "" // Observation time is not a change to request state.
+	if previous, exists := s.requests[event.RequestID]; event.RequestID != "" && exists && reflect.DeepEqual(previous, event) {
+		return nil
+	}
+	if event.RequestID != "" && len(s.requests) >= 10000 {
+		if _, exists := s.requests[event.RequestID]; !exists {
+			return errors.New("watch state exceeds 10000 requests; use slb events for lifecycle replay")
 		}
 	}
-
+	view := event
+	view.ObservedAt = observedAt
+	if view.ObservedAt == "" {
+		view.ObservedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	if err := enc.Encode(view); err != nil {
+		return fmt.Errorf("encoding event: %w", err)
+	}
+	if event.RequestID != "" {
+		s.requests[event.RequestID] = event
+	}
 	return nil
 }
 
-func processPolledRequest(ctx context.Context, req *db.Request, enc *json.Encoder, seen map[string]db.RequestStatus) error {
-	// Use pure function for decision logic
-	result := evaluateRequestForPolling(req.ID, req.Status, seen)
-
-	switch result.Action {
-	case PollActionEmitNew:
-		// New request - build and emit pending event
-		event := daemon.RequestStreamEvent{
-			Event:          result.EventType,
-			RequestID:      req.ID,
-			RiskTier:       string(req.RiskTier),
-			Command:        req.Command.DisplayRedacted,
-			Requestor:      req.RequestorAgent,
-			CreatedAt:      req.CreatedAt.Format(time.RFC3339),
-			ApprovalPolicy: req.ApprovalPolicy.Normalized(),
-			ReviewNotice:   req.ApprovalPolicy.Label(),
+func (s *watchState) retireOldCompletions(since time.Time) {
+	for id, event := range s.requests {
+		if !event.Status.IsTerminal() {
+			continue
 		}
-		if req.Command.DisplayRedacted == "" {
-			event.Command = req.Command.Raw
+		stamp := event.ResolvedAt
+		if stamp == "" {
+			stamp = event.CreatedAt
 		}
-		if err := enc.Encode(event); err != nil {
-			return fmt.Errorf("encoding event: %w", err)
+		resolved, err := time.Parse(time.RFC3339, stamp)
+		if err != nil || resolved.Before(since) {
+			delete(s.requests, id)
 		}
-
-	case PollActionEmitStatusChange:
-		// Status changed - emit status change event
-		event := daemon.RequestStreamEvent{
-			Event:          result.EventType,
-			RequestID:      req.ID,
-			ApprovalPolicy: req.ApprovalPolicy.Normalized(),
-			ReviewNotice:   req.ApprovalPolicy.Label(),
-		}
-		if req.Execution != nil {
-			event.ExecutionAssurance = req.Execution.Assurance
-			if event.ExecutionAssurance == "" {
-				event.ExecutionAssurance = db.AssuranceLegacyUnknown
-			}
-		}
-		if err := enc.Encode(event); err != nil {
-			return fmt.Errorf("encoding event: %w", err)
-		}
-
-	case PollActionSkip:
-		// No action needed
 	}
+}
 
-	seen[req.ID] = req.Status
+// pollRequests reads one project snapshot, including old final states only for
+// previously observed active IDs. Missing IDs are deleted or no longer in scope;
+// completed IDs retire after the same 15-minute window as daemon snapshots.
+func pollRequests(ctx context.Context, dbConn *db.DB, enc *json.Encoder, state *watchState) error {
+	activeIDs := make([]string, 0, len(state.requests))
+	for id, event := range state.requests {
+		if !event.Status.IsTerminal() {
+			activeIDs = append(activeIDs, id)
+		}
+	}
+	since := time.Now().Add(-watchRecentCompletionWindow)
+	snapshot, err := dbConn.ReadProjectWatchState(ctx, state.project, since, activeIDs...)
+	if err != nil {
+		return fmt.Errorf("reading watch state: %w", err)
+	}
+	found := make(map[string]bool, len(snapshot.Requests))
+	for _, req := range snapshot.Requests {
+		found[req.ID] = true
+	}
+	for id := range state.requests {
+		if !found[id] {
+			delete(state.requests, id)
+		}
+	}
+	for _, req := range snapshot.Requests {
+		if err := processPolledRequest(ctx, req, enc, state); err != nil {
+			return err
+		}
+	}
+	state.retireOldCompletions(since)
+	return nil
+}
+
+func processPolledRequest(ctx context.Context, req db.WatchRequestState, enc *json.Encoder, state *watchState) error {
+	if err := state.emit(enc, daemon.RequestStreamEventFromState(req)); err != nil {
+		return err
+	}
 	// Revisit pending candidates on every poll, not only discovery: the
 	// configured delay may not have elapsed when the request first appeared.
 	if flagWatchAutoApproveCaution && shouldAutoApproveCaution(req.Status, req.RiskTier).ShouldApprove {
-		if err := autoApproveCaution(ctx, req.ID); err != nil {
+		if err := autoApproveCaution(ctx, state.database, req.ID); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -420,8 +406,8 @@ func shouldAutoApproveCaution(
 // autoApproveCaution advances only eligible, due zero-review CAUTION decisions.
 // It never fabricates a reviewer identity, unsigned vote or independent status
 // write, and it cannot change the project's unrelated timeout policy.
-func autoApproveCaution(ctx context.Context, requestID string) error {
-	dbConn, err := db.Open(GetDB())
+func autoApproveCaution(ctx context.Context, databasePath, requestID string) error {
+	dbConn, err := db.OpenWithOptions(databasePath, db.OpenOptions{InitSchema: true})
 	if err != nil {
 		return fmt.Errorf("opening database: %w", err)
 	}

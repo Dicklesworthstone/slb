@@ -25,7 +25,7 @@ func init() {
 	historyCmd.Flags().StringVar(&flagHistoryAgent, "agent", "", "filter by requestor agent name")
 	historyCmd.Flags().StringVar(&flagHistoryTier, "tier", "", "filter by risk tier (safe, caution, dangerous, critical)")
 	historyCmd.Flags().StringVar(&flagHistorySince, "since", "", "only show requests after this date (RFC3339 or YYYY-MM-DD)")
-	historyCmd.Flags().IntVar(&flagHistoryLimit, "limit", 50, "max results to return")
+	historyCmd.Flags().IntVar(&flagHistoryLimit, "limit", 50, "max results to return (1-10000)")
 
 	rootCmd.AddCommand(historyCmd)
 }
@@ -41,36 +41,36 @@ Examples:
   slb history --status executed        # Show only executed requests
   slb history --tier critical          # Show only critical tier requests
   slb history --agent "BrownStone"     # Show requests from specific agent
-  slb history --since 2025-12-01       # Show requests since date`,
+  slb history --since 2025-12-01       # Show requests since date
+
+History includes completed requests in the selected project. Search and all
+filters are applied before the result limit. Stored policy and execution
+assurance describe the original workflow; history is not an execution permit.`,
+	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if flagHistoryLimit < 1 || flagHistoryLimit > 10000 {
+			return fmt.Errorf("--limit must be between 1 and 10000")
+		}
+		since, err := parseAuditTime(flagHistorySince)
+		if err != nil {
+			return fmt.Errorf("invalid --since: %w", err)
+		}
+		project, err := projectPath()
+		if err != nil {
+			return err
+		}
 		dbConn, err := db.Open(GetDB())
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}
 		defer dbConn.Close()
 
-		var requests []*db.Request
-
-		// If query is provided, use FTS search
-		if flagHistoryQuery != "" {
-			requests, err = dbConn.SearchRequests(flagHistoryQuery)
-			if err != nil {
-				return fmt.Errorf("searching requests: %w", err)
-			}
-		} else {
-			// Use filtered listing
-			requests, err = listRequestsWithFilters(dbConn)
-			if err != nil {
-				return fmt.Errorf("listing requests: %w", err)
-			}
-		}
-
-		// Apply additional filters
-		requests = applyHistoryFilters(requests)
-
-		// Limit results
-		if len(requests) > flagHistoryLimit {
-			requests = requests[:flagHistoryLimit]
+		requests, err := dbConn.ListRequestHistory(db.RequestHistoryFilter{
+			ProjectPath: project, Query: flagHistoryQuery, Status: db.RequestStatus(flagHistoryStatus),
+			Agent: flagHistoryAgent, RiskTier: db.RiskTier(flagHistoryTier), Since: since, Limit: flagHistoryLimit,
+		})
+		if err != nil {
+			return err
 		}
 
 		// Build response
@@ -102,6 +102,8 @@ Examples:
 			// Use redacted version for display if available
 			if r.Command.DisplayRedacted != "" {
 				view.Command = r.Command.DisplayRedacted
+			} else if r.Command.ContainsSensitive {
+				view.Command = "[REDACTED]"
 			}
 			if r.ResolvedAt != nil {
 				view.ResolvedAt = r.ResolvedAt.Format(time.RFC3339)
@@ -115,78 +117,4 @@ Examples:
 		out := output.New(output.Format(GetOutput()))
 		return out.Write(resp)
 	},
-}
-
-// listRequestsWithFilters retrieves requests with basic filtering.
-// For now this returns all requests - we could add more DB-level filtering.
-func listRequestsWithFilters(dbConn *db.DB) ([]*db.Request, error) {
-	project, _ := projectPath()
-
-	// If status filter is set, use status-based listing
-	if flagHistoryStatus != "" {
-		status := db.RequestStatus(flagHistoryStatus)
-		return dbConn.ListRequestsByStatus(status, project)
-	}
-
-	// Otherwise get all pending (and use in-memory filtering)
-	// Note: This is a simplification - in production we'd want a more flexible DB query
-	pending, err := dbConn.ListPendingRequests(project)
-	if err != nil {
-		return nil, err
-	}
-
-	// Also get from FTS with wildcard to get all
-	// Note: This is a workaround - ideally we'd have a ListAllRequests function
-	all, err := dbConn.SearchRequests("*")
-	if err != nil {
-		// FTS might not work with wildcard, fall back to pending only
-		return pending, nil
-	}
-
-	return all, nil
-}
-
-// applyHistoryFilters applies in-memory filters to requests.
-func applyHistoryFilters(requests []*db.Request) []*db.Request {
-	result := make([]*db.Request, 0, len(requests))
-
-	var sinceTime time.Time
-	if flagHistorySince != "" {
-		// Try parsing as RFC3339 first, then as date only
-		var err error
-		sinceTime, err = time.Parse(time.RFC3339, flagHistorySince)
-		if err != nil {
-			sinceTime, err = time.Parse("2006-01-02", flagHistorySince)
-			if err != nil {
-				// Invalid date, ignore filter
-				sinceTime = time.Time{}
-			}
-		}
-	}
-
-	for _, r := range requests {
-		// Filter by status
-		if flagHistoryStatus != "" && string(r.Status) != flagHistoryStatus {
-			continue
-		}
-
-		// Filter by agent
-		if flagHistoryAgent != "" && r.RequestorAgent != flagHistoryAgent {
-			continue
-		}
-
-		// Filter by tier
-		if flagHistoryTier != "" && string(r.RiskTier) != flagHistoryTier {
-			continue
-		}
-
-		// Filter by since
-		if !sinceTime.IsZero() && r.CreatedAt.Before(sinceTime) {
-			continue
-		}
-
-		result = append(result, r)
-	}
-
-	return result
 }
