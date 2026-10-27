@@ -111,6 +111,34 @@ This creates a `.slb/` directory with:
 - `config.toml` - Project-specific configuration
 - `pending/` - JSON files for pending requests (for watching/interop)
 
+### Working from Subdirectories
+
+Ordinary commands discover the nearest initialized project from `-C` /
+`--project`, then `SLB_PROJECT`, then the current directory. For example, a
+session started at a repository root can submit a request from `src/` and use
+the root project's database, configuration, and custom patterns. Reviewers at
+the root see that same request.
+
+Project discovery does not change the command's working directory. `-C` changes
+into the explicitly selected directory before discovery; `SLB_PROJECT` selects
+the project without changing cwd. Requests bind the exact command directory,
+and approved execution uses that recorded directory even when invoked elsewhere.
+Default foreground, background, and emergency logs belong to the owning project's
+`.slb/logs/`. An explicit `--log-dir` remains relative to the invoking directory.
+
+`slb init` intentionally initializes the selected directory itself, allowing a
+separate nested project. An existing nested `.slb` marks a project boundary;
+malformed or inaccessible markers and missing policy databases cause an error,
+instead of silently creating another database or using a home history store.
+An explicit `--db` still selects the requested database.
+
+Discovery follows filesystem aliases before selecting policy. Existing literal
+project aliases are retained when they identify that same physical root; an alias
+into another project's descendant uses the target project's policy. Stored
+session, request, and review bindings are never rewritten by discovery.
+When a selected root alias has its own recorded request identity, `slb watch`
+uses local polling to retain that exact scope.
+
 ### Same-Host Peer-Review Workflow
 
 Enable this only when the agents cooperate and you want a second session to
@@ -453,8 +481,10 @@ slb hook install --global
 ### Installation Scope
 
 `install`, `status`, and `uninstall` operate on the selected project by default.
-The project comes from `-C` / `--project`, then `SLB_PROJECT`, then the current
-working directory. Add `--global` to operate on your user installation instead.
+Discovery starts at `-C` / `--project`, then `SLB_PROJECT`, then the current
+working directory and selects the nearest initialized project. Installing from
+`src/` therefore updates that project's root settings and hook files. Add
+`--global` to operate on your user installation instead.
 
 Project installation requires a readable, initialized
 `<project>/.slb/state.db`. Initialize a new project with `slb init` first; restore

@@ -68,7 +68,11 @@ This data helps improve pattern classification and identify risky commands.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		requestID := args[0]
 
-		dbConn, err := db.Open(GetDB())
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.Open(dbPath)
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}
@@ -130,7 +134,11 @@ var outcomeListCmd = &cobra.Command{
 	Short: "List recent execution outcomes",
 	Long:  `List execution outcomes, optionally filtering by problems only.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		dbConn, err := db.Open(GetDB())
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.Open(dbPath)
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}
@@ -196,7 +204,11 @@ Shows:
 - Average human rating
 - Time-to-approval statistics`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		dbConn, err := db.Open(GetDB())
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.Open(dbPath)
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}
@@ -242,7 +254,11 @@ var outcomeAgentStatsCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		agentName := args[0]
 
-		dbConn, err := db.Open(GetDB())
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.Open(dbPath)
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}

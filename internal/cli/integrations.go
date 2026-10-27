@@ -37,17 +37,9 @@ var cursorRulesCmd = &cobra.Command{
 			mode = integrations.CursorRulesReplace
 		}
 
-		projectDir := flagProject
-		if projectDir == "" {
-			if env := os.Getenv("SLB_PROJECT"); env != "" {
-				projectDir = env
-			} else {
-				wd, err := os.Getwd()
-				if err != nil {
-					return err
-				}
-				projectDir = wd
-			}
+		projectDir, err := projectPath()
+		if err != nil {
+			return err
 		}
 
 		path := filepath.Join(projectDir, ".cursorrules")

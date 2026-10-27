@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
@@ -37,7 +36,7 @@ func init() {
 	emergencyCmd.Flags().BoolVar(&flagEmergencyCapture, "capture-rollback", false, "capture state for rollback")
 	// No -t shorthand: -t (--toon) is owned by the root persistent flags.
 	emergencyCmd.Flags().IntVar(&flagEmergencyTimeout, "timeout", 300, "execution timeout in seconds")
-	emergencyCmd.Flags().StringVar(&flagEmergencyLogDir, "log-dir", ".slb/logs", "directory for execution logs")
+	emergencyCmd.Flags().StringVar(&flagEmergencyLogDir, "log-dir", "", "directory for execution logs (default: <project>/.slb/logs)")
 
 	rootCmd.AddCommand(emergencyCmd)
 }
@@ -134,7 +133,11 @@ To get the command hash for --ack, run:
 
 		// Confirmation identifies a local action, never a reviewer or human
 		// authority. No request, approval, or synthetic session is created.
-		dbConn, err := db.OpenAndMigrate(GetDB())
+		database, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.OpenAndMigrate(database)
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}
@@ -177,7 +180,7 @@ To get the command hash for --ack, run:
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		logDir, err := filepath.Abs(flagEmergencyLogDir)
+		logDir, err := executionLogDirectory(project, flagEmergencyLogDir)
 		if err != nil {
 			return fmt.Errorf("resolving log directory: %w", err)
 		}

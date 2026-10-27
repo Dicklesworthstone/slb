@@ -66,7 +66,11 @@ var sessionStartCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		dbConn, err := db.OpenAndMigrate(GetDB())
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.OpenAndMigrate(dbPath)
 		if err != nil {
 			return err
 		}
@@ -107,7 +111,11 @@ var sessionEndCmd = &cobra.Command{
 		if flagSessionID == "" {
 			return fmt.Errorf("--session-id is required")
 		}
-		dbConn, err := db.Open(GetDB())
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.Open(dbPath)
 		if err != nil {
 			return err
 		}
@@ -153,7 +161,11 @@ If no active session exists, --create-if-missing starts one by default.`,
 		if err != nil {
 			return err
 		}
-		dbConn, err := db.OpenAndMigrate(GetDB())
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.OpenAndMigrate(dbPath)
 		if err != nil {
 			return err
 		}
@@ -195,7 +207,11 @@ var sessionListCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		dbConn, err := db.Open(GetDB())
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.Open(dbPath)
 		if err != nil {
 			return err
 		}
@@ -241,7 +257,11 @@ var sessionHeartbeatCmd = &cobra.Command{
 		if flagSessionID == "" {
 			return fmt.Errorf("--session-id is required")
 		}
-		dbConn, err := db.Open(GetDB())
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.Open(dbPath)
 		if err != nil {
 			return err
 		}
@@ -267,7 +287,11 @@ var sessionResetLimitsCmd = &cobra.Command{
 			return fmt.Errorf("--session-id is required")
 		}
 
-		dbConn, err := db.OpenAndMigrate(GetDB())
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.OpenAndMigrate(dbPath)
 		if err != nil {
 			return err
 		}
@@ -296,7 +320,11 @@ var sessionGcCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		dbConn, err := db.OpenAndMigrate(GetDB())
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.OpenAndMigrate(dbPath)
 		if err != nil {
 			return err
 		}
@@ -413,12 +441,9 @@ var sessionGcCmd = &cobra.Command{
 }
 
 func projectPath() (string, error) {
-	if flagProject != "" {
-		return flagProject, nil
-	}
-	pwd, err := os.Getwd()
+	selected, err := selectedProjectDir()
 	if err != nil {
 		return "", err
 	}
-	return pwd, nil
+	return resolveProjectRoot(selected)
 }

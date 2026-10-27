@@ -171,6 +171,45 @@ func OpenAndMigrate(path string) (*DB, error) {
 	return db, nil
 }
 
+// ProjectDatabasePath returns the state path for a discovered project without
+// creating it. An uninitialized directory may create its first database, but
+// an existing marker with missing or unreadable state may have lost custom
+// policy and must be repaired or explicitly initialized before ordinary use.
+func ProjectDatabasePath(project string) (string, error) {
+	if project == "" {
+		return "", fmt.Errorf("project directory is required")
+	}
+	marker := filepath.Join(project, ".slb")
+	path := filepath.Join(marker, "state.db")
+	if _, err := os.Lstat(marker); os.IsNotExist(err) {
+		return path, nil
+	} else if err != nil {
+		return "", fmt.Errorf("reading project state directory: %w", err)
+	}
+	info, err := os.Stat(marker)
+	if err != nil {
+		return "", fmt.Errorf("reading project state directory: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("project state path %q is not a directory", marker)
+	}
+	info, err = os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("project state database %q is unavailable; restore it or initialize this project explicitly with slb init: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("project state database %q is not a regular file", path)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("reading project state database %q: %w", path, err)
+	}
+	if err := file.Close(); err != nil {
+		return "", fmt.Errorf("closing project state database %q: %w", path, err)
+	}
+	return path, nil
+}
+
 // OpenProjectDB opens the project-level database at .slb/state.db.
 func OpenProjectDB(projectPath string) (*DB, error) {
 	dbPath := filepath.Join(projectPath, ".slb", "state.db")

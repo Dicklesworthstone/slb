@@ -71,7 +71,10 @@ database contains the request you want to reject.
 		if err != nil {
 			return err
 		}
-		sourceDBPath := GetDB()
+		sourceDBPath, err := GetDB()
+		if err != nil {
+			return err
+		}
 		project := sourceProject
 
 		// Use target project if specified (for cross-project rejections).
@@ -86,13 +89,17 @@ database contains the request you want to reject.
 			if absErr != nil {
 				return fmt.Errorf("resolving source project: %w", absErr)
 			}
-			project = filepath.Clean(targetAbs)
+			project, err = resolveProjectRoot(targetAbs)
+			if err != nil {
+				return fmt.Errorf("resolving target project: %w", err)
+			}
 			crossProject = filepath.Clean(sourceAbs) != project
 			dbPath = filepath.Join(project, ".slb", "state.db")
 		}
 
-		// Open database
-		dbConn, err := db.OpenAndMigrate(dbPath)
+		// A review requires an existing request. Never create state in a
+		// missing or mistyped target; retain schema migrations for history.
+		dbConn, err := db.OpenWithOptions(dbPath, db.OpenOptions{InitSchema: true})
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}

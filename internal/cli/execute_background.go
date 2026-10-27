@@ -30,17 +30,13 @@ func executionTimeoutDuration(seconds int) (time.Duration, error) {
 	return time.Duration(seconds) * time.Second, nil
 }
 
-func launchBackgroundExecution(cmd *cobra.Command, conn *db.DB, request *db.Request, sessionID, expectedHash string, timeout time.Duration, cfg config.Config) error {
+func launchBackgroundExecution(cmd *cobra.Command, conn *db.DB, request *db.Request, sessionID, expectedHash string, timeout time.Duration, cfg config.Config, logDir string) error {
 	var receipt *background.Receipt
 	launch := func() error {
 		if expectedHash != "" && expectedHash != request.Command.Hash {
 			return core.ErrCommandHashMismatch
 		}
 		database, err := filepath.Abs(conn.Path())
-		if err != nil {
-			return err
-		}
-		logDir, err := filepath.Abs(flagExecuteLogDir)
 		if err != nil {
 			return err
 		}

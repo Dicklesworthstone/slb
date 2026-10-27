@@ -37,7 +37,11 @@ func loadCustomPatternsIntoDefaultEngine() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return loadCustomPatternsForProject(project, GetDB(), flagConfig, flagDB != "")
+	path, err := GetDB()
+	if err != nil {
+		return 0, err
+	}
+	return loadCustomPatternsForProject(project, path, flagConfig, flagDB != "")
 }
 
 // loadCustomPatternsForProject also lets scoped integrations load the selected

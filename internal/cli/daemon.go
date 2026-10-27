@@ -43,9 +43,18 @@ var daemonCmd = &cobra.Command{
 	Use:   "daemon",
 	Short: "Manage the SLB daemon",
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		// Override the root command's -C handling: resolve a relative flag or
-		// SLB_PROJECT once, before changing directory, then keep the absolute
-		// project root for every lifecycle command.
+		if err := enterProjectDir(); err != nil {
+			return err
+		}
+		// Resolve relative config paths in the caller's selected directory,
+		// before daemon lifecycle commands switch to the discovered root.
+		if flagConfig != "" {
+			configPath, err := filepath.Abs(flagConfig)
+			if err != nil {
+				return fmt.Errorf("resolving daemon config: %w", err)
+			}
+			flagConfig = configPath
+		}
 		project, err := daemonProjectPath()
 		if err != nil {
 			return err
@@ -208,35 +217,17 @@ var daemonLogsCmd = &cobra.Command{
 }
 
 func daemonProjectPath() (string, error) {
-	project := flagProject
-	if project == "" {
-		project = os.Getenv("SLB_PROJECT")
-	}
-	if project == "" {
-		var err error
-		project, err = os.Getwd()
-		if err != nil {
-			return "", err
-		}
-	}
-	abs, err := filepath.Abs(project)
+	selected, err := selectedProjectDir()
 	if err != nil {
 		return "", fmt.Errorf("resolving daemon project: %w", err)
-	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return "", fmt.Errorf("resolving daemon project: %w", err)
-	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("daemon project is not a directory: %s", abs)
 	}
 	// Match the physical working directory used after -C, including aliases
-	// that point into a project's descendants rather than its root.
-	abs, err = filepath.EvalSymlinks(abs)
+	// into descendants, and refuse malformed markers instead of skipping them.
+	project, err := daemon.PhysicalProjectRootForCWD(selected)
 	if err != nil {
 		return "", fmt.Errorf("resolving daemon project: %w", err)
 	}
-	return daemon.ProjectRootForCWD(abs), nil
+	return project, nil
 }
 
 func daemonProjectStats(projectPath string) (pendingCount int, activeSessions int) {

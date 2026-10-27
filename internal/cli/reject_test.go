@@ -349,6 +349,10 @@ func TestRejectCommand_Help(t *testing.T) {
 func TestRejectCommand_CrossProject(t *testing.T) {
 	targetH := testutil.NewHarness(t)
 	currentH := testutil.NewHarness(t)
+	targetChild := filepath.Join(targetH.ProjectDir, "src", "deep")
+	if err := os.MkdirAll(targetChild, 0700); err != nil {
+		t.Fatal(err)
+	}
 	resetRejectFlags()
 
 	requestorSess := testutil.MakeSession(t, targetH.DB,
@@ -377,7 +381,7 @@ func TestRejectCommand_CrossProject(t *testing.T) {
 		"-k", reviewerSess.SessionKey,
 		"-r", "Command too risky for cross-project operation",
 		"-C", currentH.ProjectDir,
-		"--target-project", targetH.ProjectDir,
+		"--target-project", targetChild,
 		"-j",
 	)
 	if err != nil {
@@ -397,6 +401,9 @@ func TestRejectCommand_CrossProject(t *testing.T) {
 	reviews, err := targetH.DB.ListReviewsForRequest(req.ID)
 	if err != nil || len(reviews) != 1 || reviews[0].ReviewerAgent != reviewerSess.AgentName {
 		t.Fatalf("delegated rejection missing: %+v err=%v", reviews, err)
+	}
+	if _, err := os.Lstat(filepath.Join(targetChild, ".slb")); !os.IsNotExist(err) {
+		t.Fatalf("cross-project rejection created shadow target state: %v", err)
 	}
 }
 

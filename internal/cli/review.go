@@ -57,7 +57,11 @@ var reviewListCmd = &cobra.Command{
 			return err
 		}
 
-		dbConn, err := db.Open(GetDB())
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.Open(dbPath)
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}
@@ -146,7 +150,11 @@ var reviewShowCmd = &cobra.Command{
 }
 
 func showRequestDetails(requestID string) error {
-	dbConn, err := db.Open(GetDB())
+	dbPath, err := GetDB()
+	if err != nil {
+		return err
+	}
+	dbConn, err := db.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("opening database: %w", err)
 	}

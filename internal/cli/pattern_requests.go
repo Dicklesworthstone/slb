@@ -29,7 +29,11 @@ func queuePatternChange(pattern, tierName, changeType, reason string) error {
 		}
 	}
 
-	conn, err := db.OpenAndMigrate(GetDB())
+	dbPath, err := GetDB()
+	if err != nil {
+		return err
+	}
+	conn, err := db.OpenAndMigrate(dbPath)
 	if err != nil {
 		return fmt.Errorf("opening project database for pattern review: %w", err)
 	}

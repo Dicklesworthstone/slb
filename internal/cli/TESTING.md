@@ -551,7 +551,11 @@ For complex system-level functions, extract testable business logic:
 ```go
 // System-level function (hard to test)
 func autoApproveCaution(ctx context.Context, req *db.Request) error {
-    database, _ := db.Open(GetDB())
+    path, err := GetDB()
+    if err != nil {
+        return err
+    }
+    database, _ := db.Open(path)
     sess, _ := database.GetSession(flagWatchSessionID)
 
     if !shouldAutoApproveCaution(req, sess, database) {

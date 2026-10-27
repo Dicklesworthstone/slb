@@ -798,6 +798,66 @@ func TestDaemonProjectPathRejectsInvalidDirectory(t *testing.T) {
 	}
 }
 
+func TestDaemonLifecycleRejectsMalformedProjectMarker(t *testing.T) {
+	resetDaemonFlags()
+	t.Cleanup(resetDaemonFlags)
+	t.Setenv("SLB_PROJECT", "")
+	project := t.TempDir()
+	nested := filepath.Join(project, "src")
+	for _, path := range []string{filepath.Join(project, ".slb"), nested} {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(nested, ".slb"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(nested)
+	root := newTestDaemonLifecycleCommand("stop", func(_ *cobra.Command, _ []string) error {
+		t.Fatal("malformed marker reached a daemon lifecycle operation")
+		return nil
+	})
+	if _, _, err := executeCommand(root, "daemon", "stop"); err == nil {
+		t.Fatal("malformed marker silently selected the ancestor daemon")
+	}
+}
+
+func TestDaemonLifecyclePinsConfigBeforeChangingToProjectRoot(t *testing.T) {
+	project := physicalDaemonTestPath(t, t.TempDir())
+	nested := filepath.Join(project, "src")
+	outside := physicalDaemonTestPath(t, t.TempDir())
+	for _, path := range []string{filepath.Join(project, ".slb"), nested} {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		name, cwd, env, configDir string
+		args                      []string
+	}{
+		{"cwd", nested, "", nested, nil},
+		{"flag", outside, "", nested, []string{"-C", nested}},
+		{"environment", outside, nested, outside, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetDaemonFlags()
+			t.Cleanup(resetDaemonFlags)
+			t.Chdir(tc.cwd)
+			t.Setenv("SLB_PROJECT", tc.env)
+			root := newTestDaemonLifecycleCommand("start", func(_ *cobra.Command, _ []string) error {
+				if flagProject != project || flagConfig != filepath.Join(tc.configDir, "team review.toml") {
+					t.Fatalf("project discovery rebased config: project=%q config=%q", flagProject, flagConfig)
+				}
+				return nil
+			})
+			args := append([]string{"daemon", "start", "--config", "team review.toml"}, tc.args...)
+			if _, _, err := executeCommand(root, args...); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestDaemonStatusSymlinkProjectMatchesWorkingDirectory(t *testing.T) {
 	resetDaemonFlags()
 	t.Cleanup(resetDaemonFlags)

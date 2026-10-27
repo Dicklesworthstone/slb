@@ -109,7 +109,11 @@ Examples:
 			if selected.ProjectPath, err = projectPath(); err != nil {
 				return err
 			}
-			database, err := db.OpenAndMigrate(GetDB())
+			dbPath, err := GetDB()
+			if err != nil {
+				return err
+			}
+			database, err := db.OpenAndMigrate(dbPath)
 			if err != nil {
 				return fmt.Errorf("opening emergency ledger: %w", err)
 			}

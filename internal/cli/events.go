@@ -70,7 +70,10 @@ command does not prune records or acknowledge work on behalf of a consumer.`,
 			if err != nil {
 				return err
 			}
-			path := GetDB()
+			path, err := GetDB()
+			if err != nil {
+				return err
+			}
 			// A read command must not silently initialize a new empty project.
 			if _, err := os.Stat(path); err != nil {
 				return fmt.Errorf("opening existing request journal (run slb init first): %w", err)

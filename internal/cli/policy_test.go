@@ -14,30 +14,30 @@ import (
 func TestPolicyReloadReplacesProjectAndRemovedRules(t *testing.T) {
 	a := testutil.NewHarness(t)
 	b := testutil.NewHarness(t)
-	previousDB := flagDB
+	previousDB, previousProject := flagDB, flagProject
 	t.Cleanup(func() {
-		flagDB = previousDB
+		flagDB, flagProject = previousDB, previousProject
 		core.GetDefaultEngine().LoadDefaultPatterns()
 	})
 	pattern := `^policy-snapshot-project-command$`
 	if _, err := a.DB.InsertCustomPattern("safe", pattern, "only project A", "human"); err != nil {
 		t.Fatal(err)
 	}
-	flagDB = a.DBPath
+	flagDB, flagProject = a.DBPath, a.ProjectDir
 	if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
 		t.Fatal(err)
 	}
 	if !core.Classify("policy-snapshot-project-command", "").IsSafe {
 		t.Fatal("project A allow rule was not loaded")
 	}
-	flagDB = b.DBPath
+	flagDB, flagProject = b.DBPath, b.ProjectDir
 	if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
 		t.Fatal(err)
 	}
 	if core.Classify("policy-snapshot-project-command", "").IsSafe {
 		t.Fatal("project A allow rule leaked into project B")
 	}
-	flagDB = a.DBPath
+	flagDB, flagProject = a.DBPath, a.ProjectDir
 	if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
 		t.Fatal(err)
 	}
@@ -58,9 +58,9 @@ func TestPolicyLoadRejectsInvalidRows(t *testing.T) {
 	} {
 		t.Run(row.tier+row.pattern, func(t *testing.T) {
 			h := testutil.NewHarness(t)
-			previousDB := flagDB
-			flagDB = h.DBPath
-			t.Cleanup(func() { flagDB = previousDB })
+			previousDB, previousProject := flagDB, flagProject
+			flagDB, flagProject = h.DBPath, h.ProjectDir
+			t.Cleanup(func() { flagDB, flagProject = previousDB, previousProject })
 			if _, err := h.DB.InsertCustomPattern(row.tier, row.pattern, "invalid", "human"); err != nil {
 				t.Fatal(err)
 			}
@@ -76,12 +76,14 @@ func TestPolicyLoadRejectsInvalidRows(t *testing.T) {
 }
 
 func TestPolicyConsumersFailClosedOnCorruptDatabase(t *testing.T) {
-	previousDB := flagDB
+	previousDB, previousProject := flagDB, flagProject
 	previousDir := flagHookOutputDir
 	previousFile := flagPatternOutputFile
 	t.Cleanup(func() {
 		flagDB, flagHookOutputDir, flagPatternOutputFile = previousDB, previousDir, previousFile
+		flagProject = previousProject
 	})
+	flagProject = t.TempDir()
 	flagDB = filepath.Join(t.TempDir(), "corrupt.db")
 	if err := os.WriteFile(flagDB, []byte("not a SQLite database"), 0600); err != nil {
 		t.Fatal(err)
@@ -118,8 +120,9 @@ func TestPolicyConsumersFailClosedOnCorruptDatabase(t *testing.T) {
 }
 
 func TestPolicyLoadDoesNotCreateExplicitMissingDatabase(t *testing.T) {
-	previousDB := flagDB
-	t.Cleanup(func() { flagDB = previousDB })
+	previousDB, previousProject := flagDB, flagProject
+	t.Cleanup(func() { flagDB, flagProject = previousDB, previousProject })
+	flagProject = t.TempDir()
 	flagDB = filepath.Join(t.TempDir(), "missing.db")
 	if _, err := loadCustomPatternsIntoDefaultEngine(); err == nil {
 		t.Fatal("explicit missing database was accepted")
@@ -130,8 +133,9 @@ func TestPolicyLoadDoesNotCreateExplicitMissingDatabase(t *testing.T) {
 }
 
 func TestPatternFailedPersistenceDoesNotPublishAllowRule(t *testing.T) {
-	previousDB, previousTier := flagDB, flagPatternTier
-	t.Cleanup(func() { flagDB, flagPatternTier = previousDB, previousTier })
+	previousDB, previousProject, previousTier := flagDB, flagProject, flagPatternTier
+	t.Cleanup(func() { flagDB, flagProject, flagPatternTier = previousDB, previousProject, previousTier })
+	flagProject = t.TempDir()
 	flagDB = t.TempDir() // A directory cannot serve as a database.
 	flagPatternTier = "safe"
 	before := core.GetDefaultEngine().ComputeHash()

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/charmbracelet/log"
 )
 
@@ -211,6 +212,13 @@ func lifecycleProject(t *testing.T) string {
 	}
 	config := "[daemon]\nuse_file_watcher = false\ntcp_addr = ''\n[notifications]\ndesktop_enabled = false\n"
 	if err := os.WriteFile(filepath.Join(project, ".slb", "config.toml"), []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.OpenAndMigrate(filepath.Join(project, ".slb", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
 	return project
@@ -665,6 +673,13 @@ tcp_addr = "127.0.0.1:0"
 tcp_require_auth = false
 `
 	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.OpenAndMigrate(filepath.Join(slbDir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
 

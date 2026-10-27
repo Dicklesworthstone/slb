@@ -6,7 +6,49 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/slb/internal/testutil"
 )
+
+func TestInitCommandSelectedDirectoryDoesNotDiscoverAncestor(t *testing.T) {
+	for _, explicitFlag := range []bool{false, true} {
+		name := "environment"
+		if explicitFlag {
+			name = "flag overrides environment"
+		}
+		t.Run(name, func(t *testing.T) {
+			h := testutil.NewHarness(t)
+			selected := filepath.Join(h.ProjectDir, "nested")
+			if err := os.Mkdir(selected, 0700); err != nil {
+				t.Fatal(err)
+			}
+			cwd, unselected := t.TempDir(), t.TempDir()
+			t.Chdir(cwd)
+			oldProject, oldForce, oldOutput, oldJSON := flagProject, flagInitForce, flagOutput, flagJSON
+			t.Cleanup(func() { flagProject, flagInitForce, flagOutput, flagJSON = oldProject, oldForce, oldOutput, oldJSON })
+			flagProject, flagInitForce, flagOutput, flagJSON = "", false, "json", false
+			t.Setenv("SLB_PROJECT", selected)
+			if explicitFlag {
+				flagProject = selected
+				t.Setenv("SLB_PROJECT", unselected)
+			}
+			if err := runInit(nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(filepath.Join(selected, ".slb", "state.db")); err != nil {
+				t.Fatalf("selected nested project was not initialized: %v", err)
+			}
+			for _, dir := range []string{cwd, unselected} {
+				if _, err := os.Stat(filepath.Join(dir, ".slb")); !os.IsNotExist(err) {
+					t.Fatalf("initialization wrote outside the selected directory: %s, %v", dir, err)
+				}
+			}
+			if current, err := os.Getwd(); err != nil || current != cwd {
+				t.Fatalf("environment project selection changed command cwd: %q, %v", current, err)
+			}
+		})
+	}
+}
 
 func TestInitCommand_NewProject(t *testing.T) {
 	tmpDir := t.TempDir()

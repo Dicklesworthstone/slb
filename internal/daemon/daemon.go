@@ -50,7 +50,7 @@ func DefaultServerOptions() ServerOptions {
 // StartDaemon starts the daemon in process if SLB_DAEMON_MODE=1, or launches
 // the same executable in daemon mode otherwise.
 func StartDaemon() error {
-	return StartDaemonWithOptions(context.Background(), DefaultServerOptions())
+	return StartDaemonWithOptions(context.Background(), ServerOptions{})
 }
 
 func StartDaemonWithOptions(ctx context.Context, opts ServerOptions) error {
@@ -70,6 +70,9 @@ func StartDaemonWithOptions(ctx context.Context, opts ServerOptions) error {
 	opts, err := resolveServerOptions(opts)
 	if err != nil {
 		return err
+	}
+	if _, err := db.ProjectDatabasePath(opts.ProjectDir); err != nil {
+		return fmt.Errorf("resolving daemon database: %w", err)
 	}
 	if running, pid := daemonRunning(opts); running {
 		return fmt.Errorf("daemon already running (pid=%d)", pid)
@@ -170,7 +173,7 @@ func daemonReady(ctx context.Context, opts ServerOptions, pid int) bool {
 }
 
 func StopDaemon(timeout time.Duration) error {
-	return StopDaemonWithOptions(DefaultServerOptions(), timeout)
+	return StopDaemonWithOptions(ServerOptions{}, timeout)
 }
 
 func StopDaemonWithOptions(opts ServerOptions, timeout time.Duration) error {
@@ -264,6 +267,10 @@ func RunDaemon(ctx context.Context, opts ServerOptions) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	dbPath, err := db.ProjectDatabasePath(opts.ProjectDir)
+	if err != nil {
+		return fmt.Errorf("resolving daemon database: %w", err)
+	}
 	logger := opts.Logger
 	if logger == nil {
 		l, err := utils.InitDaemonLogger()
@@ -294,7 +301,6 @@ func RunDaemon(ctx context.Context, opts ServerOptions) error {
 		// A daemon running a weaker default policy is not graceful degradation.
 		return fmt.Errorf("loading daemon config: %w", err)
 	}
-	dbPath := filepath.Join(projectPath, ".slb", "state.db")
 	database, err := db.OpenAndMigrate(dbPath)
 	if err != nil {
 		return fmt.Errorf("opening daemon database: %w", err)
@@ -384,14 +390,7 @@ func resolveServerOptions(opts ServerOptions) (ServerOptions, error) {
 	if err != nil {
 		return opts, fmt.Errorf("resolving daemon project: %w", err)
 	}
-	info, err := os.Stat(opts.ProjectDir)
-	if err != nil {
-		return opts, fmt.Errorf("resolving daemon project: %w", err)
-	}
-	if !info.IsDir() {
-		return opts, fmt.Errorf("daemon project is not a directory: %s", opts.ProjectDir)
-	}
-	opts.ProjectDir, err = filepath.EvalSymlinks(opts.ProjectDir)
+	opts.ProjectDir, err = PhysicalProjectRootForCWD(opts.ProjectDir)
 	if err != nil {
 		return opts, fmt.Errorf("resolving daemon project: %w", err)
 	}

@@ -268,7 +268,7 @@ func TestRunDaemonInvalidExplicitConfigDoesNotOpenDatabase(t *testing.T) {
 		{"directory", "explicit daemon config is not a regular file"},
 	} {
 		t.Run(fixture.name, func(t *testing.T) {
-			project := lifecycleProject(t)
+			project := t.TempDir()
 			configPath := filepath.Join(t.TempDir(), "invalid.toml")
 			switch fixture.name {
 			case "malformed":

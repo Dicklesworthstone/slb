@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -1172,6 +1173,362 @@ func TestBuiltCLISameHostExecutionEntryPoints(t *testing.T) {
 		f.assertNotExecuted(request)
 		f.approve(request, reviewer)
 	})
+}
+
+// Project discovery must keep cooperating agents on one policy/database while
+// retaining the exact directory bound to each command. These subprocesses do
+// not inject -C, except where explicit selection itself is under test.
+func TestBuiltCLIProjectDiscoveryIntegration(t *testing.T) {
+	binary := buildIdentityBoundaryCLI(t)
+	fixture := func(t *testing.T, quorum int, differentModel bool) *sameHostCLI {
+		t.Helper()
+		f := newSameHostCLI(t, binary, quorum, differentModel)
+		project, err := filepath.EvalSymlinks(f.ProjectDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.ProjectDir = project
+		return f
+	}
+	runAt := func(t *testing.T, f *sameHostCLI, cwd string, extraEnv []string, args ...string) (string, string, error) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, binary, args...)
+		cmd.Dir, cmd.Env = cwd, append(identityCLIEnvironment(f.home), extraEnv...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		return stdout.String(), stderr.String(), err
+	}
+	jsonAt := func(t *testing.T, f *sameHostCLI, cwd string, extraEnv []string, args ...string) map[string]any {
+		t.Helper()
+		stdout, stderr, err := runAt(t, f, cwd, extraEnv, append(args, "--json")...)
+		var result map[string]any
+		if err != nil || json.Unmarshal([]byte(stdout), &result) != nil {
+			t.Fatalf("CLI %v from %s failed: %v\nstdout=%s\nstderr=%s", args, cwd, err, stdout, stderr)
+		}
+		return result
+	}
+	noMarker := func(t *testing.T, dirs ...string) {
+		t.Helper()
+		for _, dir := range dirs {
+			if _, err := os.Lstat(filepath.Join(dir, ".slb")); !os.IsNotExist(err) {
+				t.Fatalf("ordinary workflow created a shadow project at %s: %v", dir, err)
+			}
+		}
+	}
+	requestID := func(t *testing.T, view map[string]any) string {
+		t.Helper()
+		id, ok := view["request_id"].(string)
+		if !ok || id == "" || view["status"] != "pending" {
+			t.Fatalf("request did not enter peer review: %+v", view)
+		}
+		return id
+	}
+
+	t.Run("nested workflow retains policy cwd and root artifacts", func(t *testing.T) {
+		f := fixture(t, 2, true)
+		f.WriteFile(".slb/config.toml", []byte(`[general]
+approval_policy = "same_host"
+require_different_model = true
+enable_dry_run = false
+enable_rollback_capture = false
+[patterns.critical]
+patterns = ['^touch nested-review-marker$', '^echo config-policy-probe$']
+min_approvals = 2
+[patterns.dangerous]
+min_approvals = 2
+[integrations]
+agent_mail_enabled = false
+[notifications]
+desktop_enabled = false
+`), 0600)
+		deep := filepath.Join(f.ProjectDir, "src", "deep")
+		sibling := filepath.Join(f.ProjectDir, "other")
+		for _, dir := range []string{deep, sibling} {
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		requester := f.session("Requester", "model-a")
+		reviewer := f.session("Reviewer", "model-b")
+		second := f.session("SecondReviewer", "model-c")
+		f.json("patterns", "add", "^echo database-policy-probe$", "--tier", "critical", "--reason", "Test discovered project policy")
+		for _, command := range []string{"echo config-policy-probe", "echo database-policy-probe"} {
+			view := jsonAt(t, f, deep, nil, "check", command)
+			if view["tier"] != "critical" || view["min_approvals"] != float64(2) || view["needs_approval"] != true {
+				t.Fatalf("subdirectory command lost parent policy: %+v", view)
+			}
+		}
+		view := jsonAt(t, f, deep, nil, "request", "touch nested-review-marker", "--session-id", requester.ID,
+			"--reason", "Create one marker in the reviewed subdirectory", "--expected-effect", "Create nested-review-marker",
+			"--safety", "Only a disposable test directory is affected")
+		id := requestID(t, view)
+		request, err := f.DB.GetRequest(id)
+		if err != nil || request.ProjectPath != f.ProjectDir || request.Command.Cwd != deep || request.RiskTier != db.RiskTierCritical ||
+			request.MinApprovals != 2 || !request.RequireDifferentModel || request.Command.Hash != db.ComputeCommandHash(request.Command) ||
+			request.ApprovalPolicy != db.ApprovalPolicySameHost {
+			t.Fatalf("discovered request lost project, cwd or review requirements: %+v %v", request, err)
+		}
+		stdout, stderr, err := runAt(t, f, f.ProjectDir, nil, "pending", "--json")
+		var pending []map[string]any
+		if err != nil || json.Unmarshal([]byte(stdout), &pending) != nil || len(pending) != 1 || pending[0]["request_id"] != id {
+			t.Fatalf("root reviewer cannot discover subdirectory request: %v\n%s\n%s", err, stdout, stderr)
+		}
+		installed := jsonAt(t, f, deep, nil, "hook", "install")
+		if installed["settings_path"] != filepath.Join(f.ProjectDir, ".claude", "settings.json") ||
+			installed["hook_script"] != filepath.Join(f.ProjectDir, ".slb", "hooks", "slb_guard.py") {
+			t.Fatalf("subdirectory installation created another hook scope: %+v", installed)
+		}
+		status := jsonAt(t, f, deep, nil, "hook", "status")
+		if status["settings_configured"] != true || status["settings_path"] != installed["settings_path"] {
+			t.Fatalf("subdirectory status missed installed project guard: %+v", status)
+		}
+		// Run exactly the command installed for Claude Code, while offline.
+		input, err := json.Marshal(map[string]any{"tool_name": "Bash", "cwd": deep,
+			"tool_input": map[string]any{"command": "echo database-policy-probe"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		guard := exec.CommandContext(ctx, "/bin/sh", "-c", installed["hook_command"].(string))
+		guard.Dir, guard.Env, guard.Stdin = deep, identityCLIEnvironment(f.home), bytes.NewReader(input)
+		data, err := guard.CombinedOutput()
+		cancel()
+		var decision struct {
+			Specific struct {
+				Decision string `json:"permissionDecision"`
+				Reason   string `json:"permissionDecisionReason"`
+			} `json:"hookSpecificOutput"`
+		}
+		if err != nil || json.Unmarshal(data, &decision) != nil || decision.Specific.Decision != "deny" ||
+			!strings.Contains(decision.Specific.Reason, "CRITICAL") || !strings.Contains(decision.Specific.Reason, "same-host") {
+			t.Fatalf("installed guard lost discovered database policy: %v\n%s", err, data)
+		}
+		noMarker(t, filepath.Dir(deep), deep, sibling)
+		f.approve(request, reviewer)
+		if stdout, stderr, err := runAt(t, f, sibling, nil, "execute", id, "--session-id", requester.ID); err == nil {
+			t.Fatalf("subdirectory execution bypassed quorum: %s\n%s", stdout, stderr)
+		}
+		jsonAt(t, f, deep, nil, "approve", id, "--session-id", second.ID, "--session-key", second.SessionKey)
+		result := jsonAt(t, f, sibling, nil, "execute", id, "--session-id", requester.ID)
+		if result["status"] != "executed" || result["exit_code"] != float64(0) || result["assurance"] != "same_host" {
+			t.Fatalf("reviewed subdirectory command did not execute: %+v", result)
+		}
+		stored, reviews, err := f.DB.GetRequestWithReviews(id)
+		if err != nil || stored.Command.Cwd != deep || stored.Command.Hash != request.Command.Hash || len(reviews) != 2 ||
+			stored.Execution == nil || stored.Execution.Assurance != db.AssuranceSameHost ||
+			!strings.HasPrefix(stored.Execution.LogPath, filepath.Join(f.ProjectDir, ".slb", "logs")+string(os.PathSeparator)) {
+			t.Fatalf("execution changed binding, assurance or log scope: %+v %+v %v", stored, reviews, err)
+		}
+		if _, err := os.Stat(filepath.Join(deep, "nested-review-marker")); err != nil {
+			t.Fatalf("command did not execute in its reviewed cwd: %v", err)
+		}
+		for _, dir := range []string{f.ProjectDir, sibling} {
+			if _, err := os.Stat(filepath.Join(dir, "nested-review-marker")); !os.IsNotExist(err) {
+				t.Fatalf("command executed in unreviewed directory %s: %v", dir, err)
+			}
+		}
+		backgroundView := jsonAt(t, f, deep, nil, "request", "touch background-nested-marker", "--session-id", requester.ID,
+			"--reason", "Retain project policy through detached execution")
+		backgroundID := requestID(t, backgroundView)
+		backgroundRequest, err := f.DB.GetRequest(backgroundID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.approve(backgroundRequest, reviewer)
+		f.approve(backgroundRequest, second)
+		receipt := jsonAt(t, f, sibling, nil, "execute", backgroundID, "--session-id", requester.ID, "--background")
+		if receipt["assurance"] != "same_host" || receipt["approval_policy"] != "same_host" {
+			t.Fatalf("background handoff lost review assurance: %+v", receipt)
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			completed, err := f.DB.GetRequest(backgroundID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if completed.Status == db.StatusExecuted {
+				if completed.Command.Cwd != deep || completed.Command.Hash != backgroundRequest.Command.Hash ||
+					completed.Execution == nil || completed.Execution.Assurance != db.AssuranceSameHost ||
+					!strings.HasPrefix(completed.Execution.LogPath, filepath.Join(f.ProjectDir, ".slb", "logs")+string(os.PathSeparator)) {
+					t.Fatalf("background worker changed execution binding or log scope: %+v", completed)
+				}
+				break
+			}
+			if time.Now().After(deadline) || completed.Status != db.StatusExecuting {
+				t.Fatalf("background request did not complete: %+v", completed)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if _, err := os.Stat(filepath.Join(deep, "background-nested-marker")); err != nil {
+			t.Fatalf("background command did not run in its reviewed cwd: %v", err)
+		}
+		// Environment project selection does not chdir the requested command.
+		envRequest := jsonAt(t, f, sibling, []string{"SLB_PROJECT=" + deep}, "request", "touch env-selection-marker",
+			"--session-id", requester.ID, "--reason", "Keep selected project separate from command cwd")
+		envStored, err := f.DB.GetRequest(requestID(t, envRequest))
+		if err != nil || envStored.ProjectPath != f.ProjectDir || envStored.Command.Cwd != sibling {
+			t.Fatalf("SLB_PROJECT changed cwd or created another project: %+v %v", envStored, err)
+		}
+		noMarker(t, filepath.Dir(deep), deep, sibling)
+	})
+
+	t.Run("explicit nested initialization remains isolated", func(t *testing.T) {
+		f := fixture(t, 1, false)
+		requester := f.session("ParentRequester", "model-a")
+		f.json("patterns", "add", "^echo parent-only-probe$", "--tier", "critical", "--reason", "Parent-only custom policy")
+		nested := filepath.Join(f.ProjectDir, "nested")
+		child := filepath.Join(nested, "src")
+		if err := os.MkdirAll(child, 0700); err != nil {
+			t.Fatal(err)
+		}
+		initialized := jsonAt(t, f, f.ProjectDir, nil, "-C", nested, "init")
+		if initialized["database"] != filepath.Join(nested, ".slb", "state.db") {
+			t.Fatalf("intentional nested init was redirected to its parent: %+v", initialized)
+		}
+		if stdout, stderr, err := runAt(t, f, child, nil, "request", "touch nested-owned-marker", "--session-id", requester.ID,
+			"--reason", "Foreign parent session must not enter nested project"); err == nil {
+			t.Fatalf("nested project borrowed the parent's session: %s\n%s", stdout, stderr)
+		}
+		local := jsonAt(t, f, child, nil, "session", "start", "--agent", "NestedRequester", "--program", "e2e", "--model", "model-b")
+		view := jsonAt(t, f, child, nil, "request", "touch nested-owned-marker", "--session-id", local["session_id"].(string),
+			"--reason", "Remain in the explicitly initialized project")
+		if view["approval_policy"] != "independent" {
+			t.Fatalf("nested project inherited parent's same-host opt-in: %+v", view)
+		}
+		nestedDB, err := db.OpenWithOptions(filepath.Join(nested, ".slb", "state.db"), db.OpenOptions{ReadOnly: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer nestedDB.Close()
+		id := requestID(t, view)
+		request, err := nestedDB.GetRequest(id)
+		if err != nil || request.ProjectPath != nested || request.Command.Cwd != child {
+			t.Fatalf("nested request stored under another identity: %+v %v", request, err)
+		}
+		if _, err := f.DB.GetRequest(id); !errors.Is(err, db.ErrRequestNotFound) {
+			t.Fatalf("nested request leaked into parent database: %v", err)
+		}
+		classification := jsonAt(t, f, child, nil, "check", "echo parent-only-probe")
+		if classification["tier"] == "critical" {
+			t.Fatalf("nested project borrowed parent custom patterns: %+v", classification)
+		}
+		noMarker(t, child)
+	})
+
+	t.Run("explicit database remains authoritative", func(t *testing.T) {
+		f := fixture(t, 1, false)
+		child := filepath.Join(f.ProjectDir, "src")
+		if err := os.Mkdir(child, 0700); err != nil {
+			t.Fatal(err)
+		}
+		selected := filepath.Join(t.TempDir(), "selected.db")
+		owner := jsonAt(t, f, child, nil, "--db", selected, "session", "start", "--agent", "SelectedRequester", "--program", "e2e", "--model", "model-a")
+		peer := jsonAt(t, f, f.ProjectDir, nil, "--db", selected, "session", "start", "--agent", "SelectedReviewer", "--program", "e2e", "--model", "model-b")
+		view := jsonAt(t, f, child, nil, "--db", selected, "request", "touch selected-db-marker", "--session-id", owner["session_id"].(string),
+			"--reason", "Use the explicitly selected database")
+		id := requestID(t, view)
+		if _, err := f.DB.GetRequest(id); !errors.Is(err, db.ErrRequestNotFound) {
+			t.Fatalf("--db request entered the default project store: %v", err)
+		}
+		jsonAt(t, f, f.ProjectDir, nil, "--db", selected, "approve", id, "--session-id", peer["session_id"].(string), "--session-key", peer["session_key"].(string))
+		result := jsonAt(t, f, f.ProjectDir, nil, "--db", selected, "execute", id, "--session-id", owner["session_id"].(string))
+		if result["status"] != "executed" || result["assurance"] != "same_host" {
+			t.Fatalf("explicit-store review could not execute: %+v", result)
+		}
+		selectedDB, err := db.OpenWithOptions(selected, db.OpenOptions{ReadOnly: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer selectedDB.Close()
+		stored, err := selectedDB.GetRequest(id)
+		if err != nil || stored.ProjectPath != f.ProjectDir || stored.Command.Cwd != child || stored.Command.Hash != db.ComputeCommandHash(stored.Command) {
+			t.Fatalf("explicit database changed discovered project or cwd: %+v %v", stored, err)
+		}
+		if _, err := os.Stat(filepath.Join(child, "selected-db-marker")); err != nil {
+			t.Fatal(err)
+		}
+		noMarker(t, child)
+	})
+
+	t.Run("explicit project alias retains historical identity", func(t *testing.T) {
+		f := fixture(t, 1, false)
+		original := f.session("PhysicalRequester", "model-a")
+		alias := filepath.Join(t.TempDir(), "project alias")
+		if err := os.Symlink(f.ProjectDir, alias); err != nil {
+			t.Fatal(err)
+		}
+		owner := jsonAt(t, f, f.ProjectDir, nil, "-C", alias, "session", "start", "--agent", "AliasRequester", "--program", "e2e", "--model", "model-a")
+		peer := jsonAt(t, f, f.ProjectDir, nil, "-C", alias, "session", "start", "--agent", "AliasReviewer", "--program", "e2e", "--model", "model-b")
+		view := jsonAt(t, f, f.ProjectDir, nil, "-C", alias, "request", "touch alias-reviewed-marker", "--session-id", owner["session_id"].(string),
+			"--reason", "Preserve the project's recorded path spelling")
+		id := requestID(t, view)
+		request, err := f.DB.GetRequest(id)
+		if err != nil || request.ProjectPath != alias {
+			t.Fatalf("alias request identity was silently rewritten: %+v %v", request, err)
+		}
+		jsonAt(t, f, f.ProjectDir, nil, "-C", alias, "approve", id, "--session-id", peer["session_id"].(string), "--session-key", peer["session_key"].(string))
+		jsonAt(t, f, f.ProjectDir, nil, "-C", alias, "execute", id, "--session-id", owner["session_id"].(string))
+		stored, err := f.DB.GetRequest(id)
+		if err != nil || stored.ProjectPath != alias || stored.Command.Hash != request.Command.Hash || stored.Command.Cwd != request.Command.Cwd || stored.Execution == nil || stored.Execution.Assurance != db.AssuranceSameHost {
+			t.Fatalf("alias execution changed stored identity or binding: %+v %v", stored, err)
+		}
+		historical, err := f.DB.GetSession(original.ID)
+		if err != nil || historical.ProjectPath != original.ProjectPath {
+			t.Fatalf("alias discovery rewrote an older project binding: %+v %v", historical, err)
+		}
+	})
+
+	for _, markerKind := range []string{"file", "dangling symlink", "missing database", "unreadable"} {
+		t.Run("unavailable marker/"+markerKind, func(t *testing.T) {
+			f := fixture(t, 1, false)
+			broken := filepath.Join(f.ProjectDir, "broken")
+			child := filepath.Join(broken, "src")
+			if err := os.MkdirAll(child, 0700); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(broken, ".slb")
+			switch markerKind {
+			case "file":
+				if err := os.WriteFile(marker, []byte("do not replace this marker"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "dangling symlink":
+				if err := os.Symlink(filepath.Join(broken, "missing-state"), marker); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				if err := os.Mkdir(marker, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if markerKind == "unreadable" {
+					if err := os.WriteFile(filepath.Join(marker, "state.db"), nil, 0600); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Chmod(marker, 0000); err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = os.Chmod(marker, 0700) })
+				}
+			}
+			for _, args := range [][]string{{"session", "start", "--agent", "Unexpected", "--program", "e2e"}, {"history", "--json"}} {
+				if stdout, stderr, err := runAt(t, f, child, nil, args...); err == nil {
+					t.Fatalf("unavailable project policy fell through: %v\n%s\n%s", args, stdout, stderr)
+				}
+			}
+			noMarker(t, child)
+			if _, err := os.Stat(filepath.Join(f.home, ".slb", "history.db")); !os.IsNotExist(err) {
+				t.Fatalf("project lookup failure created a fallback history database: %v", err)
+			}
+			if markerKind == "missing database" {
+				if _, err := os.Stat(filepath.Join(marker, "state.db")); !os.IsNotExist(err) {
+					t.Fatalf("missing project state was silently recreated: %v", err)
+				}
+			}
+		})
+	}
 }
 
 func (f *sameHostCLI) assertExecuted(id string) {

@@ -172,6 +172,20 @@ They do not make mutable local storage tamper-proof against the same OS user.
 
 ### Project scope and delegated review
 
+CLI project discovery, hooks, and daemon lifecycle operations select the nearest
+physical project boundary. A descendant command uses that project's policy and
+database while retaining its original cwd in the command hash. Invalid or
+inaccessible `.slb` markers are not skipped in favor of an ancestor's policy;
+an initialized project's unavailable state is not silently recreated. Default
+execution logs also remain in the owning project so logging cannot accidentally
+create a new descendant policy boundary.
+
+An equivalent literal project alias remains part of existing session and request
+identity. An alias into another project's descendant cannot select its lexical
+parent's policy. Hook approval lookup checks the exact command cwd, requesting
+session and stored project binding against the physical policy root; it does not
+rewrite or upgrade historical review evidence.
+
 Ordinary approvals and rejections require the reviewer's recorded project path
 to match the request's, even when projects share a database through `--db`.
 Cross-project review uses the explicit `--target-project` delegation workflow;

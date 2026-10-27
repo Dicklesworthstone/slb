@@ -209,7 +209,11 @@ Examples:
 			return queuePatternChange(pattern, string(tier), db.PatternChangeTypeAdd, flagPatternReason)
 		}
 
-		conn, err := db.OpenAndMigrate(GetDB())
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		conn, err := db.OpenAndMigrate(dbPath)
 		if err != nil {
 			return fmt.Errorf("opening project database to persist pattern: %w", err)
 		}

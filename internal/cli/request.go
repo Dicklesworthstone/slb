@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
@@ -107,7 +108,11 @@ commands must go through 'slb run'; attach their saved output with --attach-file
 			cwd = project
 		}
 
-		dbConn, err := db.OpenAndMigrate(GetDB())
+		database, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.OpenAndMigrate(database)
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}
@@ -236,7 +241,7 @@ commands must go through 'slb run'; attach their saved output with --attach-file
 			execResult, execErr := executor.ExecuteApprovedRequest(cmd.Context(), core.ExecuteOptions{
 				RequestID:         request.ID,
 				SessionID:         flagSessionID,
-				LogDir:            ".slb/logs",
+				LogDir:            filepath.Join(request.ProjectPath, ".slb", "logs"),
 				SuppressOutput:    executionOutputStructured(),
 				CaptureRollback:   cfg.General.EnableRollbackCapture,
 				MaxRollbackSizeMB: cfg.General.MaxRollbackSizeMB,

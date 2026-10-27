@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"runtime"
 
+	"github.com/Dicklesworthstone/slb/internal/daemon"
+	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/output"
 	"github.com/spf13/cobra"
 )
@@ -80,8 +82,14 @@ var versionCmd = &cobra.Command{
 			home, _ := os.UserHomeDir()
 			configPath = filepath.Join(home, ".slb", "config.toml")
 		}
-		dbPath := GetDB()
-		projectPath, _ := os.Getwd()
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		projectPath, err := projectPath()
+		if err != nil {
+			return err
+		}
 
 		payload := map[string]any{
 			"version":      version,
@@ -172,17 +180,58 @@ func enterProjectDir() error {
 	return nil
 }
 
-// GetDB returns the database path.
-func GetDB() string {
+// selectedProjectDir selects the discovery starting directory without changing
+// command cwd. Only enterProjectDir applies -C's explicit directory change.
+func selectedProjectDir() (string, error) {
+	selected := flagProject
+	if selected == "" {
+		selected = os.Getenv("SLB_PROJECT")
+	}
+	if selected == "" {
+		return os.Getwd()
+	}
+	abs, err := filepath.Abs(selected)
+	if err != nil {
+		return "", fmt.Errorf("resolving selected project directory: %w", err)
+	}
+	return abs, nil
+}
+
+// resolveProjectRoot first discovers physical policy/state, then preserves a
+// literal root alias only when it names that same project. A symlink into a
+// different project's descendant must not borrow its lexical parent's policy.
+func resolveProjectRoot(start string) (string, error) {
+	physical, err := daemon.PhysicalProjectRootForCWD(start)
+	if err != nil {
+		return "", err
+	}
+	for candidate := filepath.Clean(start); ; candidate = filepath.Dir(candidate) {
+		resolved, err := filepath.EvalSymlinks(candidate)
+		if err != nil {
+			return "", fmt.Errorf("resolving project identity: %w", err)
+		}
+		if resolved == physical {
+			return candidate, nil
+		}
+		if filepath.Dir(candidate) == candidate {
+			return physical, nil
+		}
+	}
+}
+
+// GetDB returns the explicitly selected database or the discovered project's
+// database. Resolution failures must never select a different history store.
+// Once a project marker exists, missing state may mean lost custom policy;
+// only an explicit init may recreate it.
+func GetDB() (string, error) {
 	if flagDB != "" {
-		return flagDB
+		return flagDB, nil
 	}
 	project, err := projectPath()
-	if err == nil && project != "" {
-		return filepath.Join(project, ".slb", "state.db")
+	if err != nil {
+		return "", fmt.Errorf("resolving project database: %w", err)
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".slb", "history.db")
+	return db.ProjectDatabasePath(project)
 }
 
 // GetActor returns the actor identifier.

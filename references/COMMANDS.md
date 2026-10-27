@@ -47,6 +47,17 @@ retained.
 
 ## Request & Run
 
+Commands discover the nearest initialized project from `-C` / `--project`,
+`SLB_PROJECT`, or the current directory, in that order. Requests from descendants
+use the root project's sessions, policy, custom patterns, and default database.
+`-C` changes cwd first; `SLB_PROJECT` changes only project selection. The exact
+command cwd remains part of the request binding and is used at execution.
+
+An explicit `--db` remains authoritative. Invalid or inaccessible project markers
+and missing initialized policy databases cause an error; SLB does not silently
+select home history or create a child project. `slb init` operates on its selected
+directory directly, so an intentionally initialized nested project remains separate.
+
 ```bash
 # Primary command (atomic: check, request, wait, execute)
 slb run "<command>" --reason "..." --session-id <id>
@@ -97,6 +108,12 @@ labels. Quorum, model-difference checks, signatures and expiration still apply.
 ---
 
 ## Execution
+
+Default execution logs are stored in the request's project under `.slb/logs/`,
+including detached execution. Emergency logs use the selected project's same
+directory and retain their separate `emergency_unreviewed` evidence. Explicit
+`--log-dir` overrides are resolved from the invoking cwd. Discovering a parent
+project does not relocate the command itself.
 
 ```bash
 slb execute <request-id> --session-id <id>    # Execute after rechecking policy and evidence
@@ -210,8 +227,8 @@ slb integrations claude-hooks --install [--global]  # Same scoped hook installer
 slb integrations cursor-rules > .cursorrules
 ```
 
-The default scope is the project selected by `-C` / `--project`, `SLB_PROJECT`,
-or the current directory, in that order. Its registration is
+The default scope is the nearest initialized project discovered from `-C` /
+`--project`, `SLB_PROJECT`, or the current directory, in that order. Its registration is
 `<project>/.claude/settings.json`; `--global` selects `~/.claude/settings.json`.
 The standalone fallback script lives under that scope's `.slb/hooks/` directory.
 Status reports the selected scope only. Existing user installations from older

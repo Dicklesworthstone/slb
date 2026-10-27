@@ -42,7 +42,11 @@ the target project's policy explicitly contains your reviewer identity.`,
 			return err
 		}
 
-		dbConn, err := db.Open(GetDB())
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.Open(dbPath)
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}

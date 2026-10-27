@@ -748,6 +748,10 @@ func TestApproveCommand_SameHostCrossProjectRetainsProvenance(t *testing.T) {
 	t.Setenv("USERPROFILE", t.TempDir())
 	target := testutil.NewHarness(t)
 	source := testutil.NewHarness(t)
+	targetChild := filepath.Join(target.ProjectDir, "src", "deep")
+	if err := os.MkdirAll(targetChild, 0700); err != nil {
+		t.Fatal(err)
+	}
 	resetApproveFlags()
 	t.Cleanup(resetApproveFlags)
 	requester := testutil.MakeSession(t, target.DB, testutil.WithProject(target.ProjectDir),
@@ -770,7 +774,7 @@ func TestApproveCommand_SameHostCrossProjectRetainsProvenance(t *testing.T) {
 		resetApproveFlags()
 		return executeCommandCapture(t, newTestApproveCmd(source.DBPath), "approve", requestID,
 			"--session-id", reviewer.ID, "-k", key, "-C", source.ProjectDir,
-			"--target-project", target.ProjectDir, "-j")
+			"--target-project", targetChild, "-j")
 	}
 
 	writePolicy("same_host")
@@ -825,6 +829,57 @@ func TestApproveCommand_SameHostCrossProjectRetainsProvenance(t *testing.T) {
 	stored, err := target.DB.GetRequest(approved.ID)
 	if err != nil || stored.Status != db.StatusApproved || stored.ApprovalPolicy != db.ApprovalPolicySameHost {
 		t.Fatalf("policy change relabeled delegated approval history: %+v, %v", stored, err)
+	}
+	if _, err := os.Lstat(filepath.Join(targetChild, ".slb")); !os.IsNotExist(err) {
+		t.Fatalf("cross-project approval created shadow target state: %v", err)
+	}
+}
+
+func TestReviewTargetNeverCreatesMissingState(t *testing.T) {
+	for _, operation := range []string{"approve", "reject"} {
+		for _, markerExists := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/marker=%t", operation, markerExists), func(t *testing.T) {
+				source := testutil.NewHarness(t)
+				target := t.TempDir()
+				child := filepath.Join(target, "src")
+				if err := os.Mkdir(child, 0700); err != nil {
+					t.Fatal(err)
+				}
+				marker := filepath.Join(target, ".slb")
+				if markerExists {
+					if err := os.Mkdir(marker, 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				resetApproveFlags()
+				resetRejectFlags()
+				t.Cleanup(resetApproveFlags)
+				t.Cleanup(resetRejectFlags)
+				args := []string{operation, "missing-request", "--session-id", "reviewer", "--session-key", "key",
+					"-C", source.ProjectDir, "--target-project", child}
+				var command *cobra.Command
+				if operation == "approve" {
+					command = newTestApproveCmd(source.DBPath)
+				} else {
+					command = newTestRejectCmd(source.DBPath)
+					args = append(args, "--reason", "Target state must already exist")
+				}
+				if _, err := executeCommandCapture(t, command, args...); err == nil || !strings.Contains(err.Error(), "opening database") {
+					t.Fatalf("missing review target was not refused before request lookup: %v", err)
+				}
+				if _, err := os.Lstat(filepath.Join(child, ".slb")); !os.IsNotExist(err) {
+					t.Fatalf("review created shadow target state: %v", err)
+				}
+				if _, err := os.Stat(filepath.Join(marker, "state.db")); !os.IsNotExist(err) {
+					t.Fatalf("review recreated lost target state: %v", err)
+				}
+				if !markerExists {
+					if _, err := os.Lstat(marker); !os.IsNotExist(err) {
+						t.Fatalf("review initialized a target project: %v", err)
+					}
+				}
+			})
+		}
 	}
 }
 

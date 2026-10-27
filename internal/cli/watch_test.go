@@ -893,7 +893,7 @@ func TestAutoApproveCaution_InvalidDatabase(t *testing.T) {
 	flagDB = filepath.Join(parent, "database.db")
 
 	ctx := context.Background()
-	err := autoApproveCaution(ctx, GetDB(), "req-123")
+	err := autoApproveCaution(ctx, watchDatabasePath(t), "req-123")
 	if err == nil {
 		t.Error("expected error for invalid database path")
 	}
@@ -918,7 +918,7 @@ func TestAutoApproveCaution_RequestNotFound(t *testing.T) {
 	flagDB = dbPath
 
 	ctx := context.Background()
-	err = autoApproveCaution(ctx, GetDB(), "nonexistent-request")
+	err = autoApproveCaution(ctx, watchDatabasePath(t), "nonexistent-request")
 	if err == nil {
 		t.Error("expected error for nonexistent request")
 	}
@@ -974,7 +974,7 @@ func TestAutoApproveCaution_AlreadyResolved(t *testing.T) {
 	flagDB = dbPath
 
 	ctx := context.Background()
-	err = autoApproveCaution(ctx, GetDB(), request.ID)
+	err = autoApproveCaution(ctx, watchDatabasePath(t), request.ID)
 	// Should return nil (not an error) for already-resolved requests
 	if err != nil {
 		t.Errorf("expected no error for already-resolved request, got: %v", err)
@@ -987,7 +987,7 @@ func TestAutoApproveCaution_WrongTier(t *testing.T) {
 	// auto-approved. Ineligibility is "no decision", not an error.
 	watchPolicySQL(t, database, `UPDATE requests SET risk_tier = 'dangerous', min_approvals = 1 WHERE id = ?`, request.ID)
 
-	if err := autoApproveCaution(context.Background(), GetDB(), request.ID); err != nil {
+	if err := autoApproveCaution(context.Background(), watchDatabasePath(t), request.ID); err != nil {
 		t.Fatalf("ineligible request should be left alone without error, got: %v", err)
 	}
 	assertLeftPendingWithoutReviews(t, database, request.ID)
@@ -997,7 +997,7 @@ func TestAutoApproveCaution_SuccessfulApproval(t *testing.T) {
 	database, request := watchPolicyFixture(t)
 	flagWatchSessionID = "" // No reviewer identity is needed for a policy decision.
 
-	if err := autoApproveCaution(context.Background(), GetDB(), request.ID); err != nil {
+	if err := autoApproveCaution(context.Background(), watchDatabasePath(t), request.ID); err != nil {
 		t.Fatalf("expected successful auto-approval, got error: %v", err)
 	}
 	assertAutoApprovedWithoutReviews(t, database, request.ID)
@@ -1014,7 +1014,7 @@ func TestAutoApproveCaution_WithCustomSession(t *testing.T) {
 	)
 	flagWatchSessionID = watcher.ID
 
-	if err := autoApproveCaution(context.Background(), GetDB(), request.ID); err != nil {
+	if err := autoApproveCaution(context.Background(), watchDatabasePath(t), request.ID); err != nil {
 		t.Fatalf("expected successful auto-approval, got error: %v", err)
 	}
 	assertAutoApprovedWithoutReviews(t, database, request.ID)
@@ -1026,7 +1026,7 @@ func TestAutoApproveCaution_MultipleApprovalsNeeded(t *testing.T) {
 	// satisfy it, partially or fully.
 	watchPolicySQL(t, database, `UPDATE requests SET min_approvals = 2 WHERE id = ?`, request.ID)
 
-	if err := autoApproveCaution(context.Background(), GetDB(), request.ID); err != nil {
+	if err := autoApproveCaution(context.Background(), watchDatabasePath(t), request.ID); err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 	assertLeftPendingWithoutReviews(t, database, request.ID)

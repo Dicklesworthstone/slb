@@ -29,7 +29,11 @@ Use --session-id/-s to specify your session if not using environment.`,
 			return fmt.Errorf("--session-id is required to cancel a request")
 		}
 
-		dbConn, err := db.Open(GetDB())
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.Open(dbPath)
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}

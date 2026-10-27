@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -743,14 +744,14 @@ func TestSessionCommand_Help(t *testing.T) {
 
 func TestProjectPath_WithFlag(t *testing.T) {
 	resetSessionFlags()
-	flagProject = "/test/path"
+	flagProject = t.TempDir()
 
 	result, err := projectPath()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result != "/test/path" {
-		t.Errorf("expected '/test/path', got %q", result)
+	if result != flagProject {
+		t.Errorf("expected selected project %q, got %q", flagProject, result)
 	}
 }
 
@@ -776,12 +777,12 @@ func TestProjectPath_DocumentedLimitations(t *testing.T) {
 	resetSessionFlags()
 
 	// Test 1: Flag path always takes precedence
-	flagProject = "/explicit/project/path"
+	flagProject = t.TempDir()
 	result, err := projectPath()
 	if err != nil {
 		t.Fatalf("unexpected error with flag: %v", err)
 	}
-	if result != "/explicit/project/path" {
+	if result != flagProject {
 		t.Errorf("flag path should take precedence, got %q", result)
 	}
 
@@ -810,19 +811,23 @@ func TestProjectPath_DocumentedLimitations(t *testing.T) {
 // TestProjectPath_AbsolutePaths verifies that projectPath handles absolute paths correctly.
 func TestProjectPath_AbsolutePaths(t *testing.T) {
 	resetSessionFlags()
+	base := t.TempDir()
 
 	tests := []struct {
 		name     string
 		flagPath string
 		want     string
 	}{
-		{"unix absolute path", "/home/user/project", "/home/user/project"},
-		{"path with spaces", "/home/user/my project", "/home/user/my project"},
-		{"nested path", "/a/b/c/d/e", "/a/b/c/d/e"},
+		{"absolute path", filepath.Join(base, "project"), filepath.Join(base, "project")},
+		{"path with spaces", filepath.Join(base, "my project"), filepath.Join(base, "my project")},
+		{"nested path", filepath.Join(base, "a", "b", "c"), filepath.Join(base, "a", "b", "c")},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if err := os.MkdirAll(tt.flagPath, 0700); err != nil {
+				t.Fatal(err)
+			}
 			flagProject = tt.flagPath
 			result, err := projectPath()
 			if err != nil {

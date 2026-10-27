@@ -361,6 +361,50 @@ func TestWatchExplicitDatabaseOverridesDaemonAndRemoteEnvironment(t *testing.T) 
 	}
 }
 
+func TestWatchRootAliasPreservesStoredProjectScope(t *testing.T) {
+	h := testutil.NewHarness(t)
+	physical, err := filepath.EvalSymlinks(h.ProjectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "project-alias")
+	if err := os.Symlink(physical, alias); err != nil {
+		t.Skipf("directory symlinks unavailable: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(physical, "src"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	requester := testutil.MakeSession(t, h.DB, testutil.WithProject(alias))
+	request := testutil.MakeRequest(t, h.DB, requester)
+	other := testutil.MakeSession(t, h.DB, testutil.WithProject(physical))
+	wrong := testutil.MakeRequest(t, h.DB, other)
+	oldDB, oldProject, oldAuto := flagDB, flagProject, flagWatchAutoApproveCaution
+	t.Cleanup(func() { flagDB, flagProject, flagWatchAutoApproveCaution = oldDB, oldProject, oldAuto })
+	flagDB, flagProject, flagWatchAutoApproveCaution = "", filepath.Join(alias, "src"), false
+	t.Setenv("SLB_HOST", "")
+	state, err := resolveWatchState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.project != alias || state.database != filepath.Join(alias, ".slb", "state.db") || state.useDaemon {
+		t.Fatalf("watch substituted a different stored project identity: %+v", state)
+	}
+	var buf bytes.Buffer
+	for range 2 {
+		if err := pollRequests(context.Background(), h.DB, json.NewEncoder(&buf), state); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events := decodeWatchEvents(t, buf.String())
+	if len(events) != 1 || events[0].RequestID != request.ID || events[0].ProjectPath != alias || strings.Contains(buf.String(), wrong.ID) {
+		t.Fatalf("watch omitted, duplicated, or broadened alias-bound requests: %s", buf.String())
+	}
+	stored, err := h.DB.GetRequest(request.ID)
+	if err != nil || stored.ProjectPath != alias || stored.Command.Hash != request.Command.Hash {
+		t.Fatalf("watch rewrote stored request evidence: %+v, %v", stored, err)
+	}
+}
+
 func TestWatchRemoteDisconnectDoesNotSwitchToLocalDatabase(t *testing.T) {
 	h := testutil.NewHarness(t)
 	requester := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir))

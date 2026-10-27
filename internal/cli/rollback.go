@@ -77,7 +77,11 @@ Examples:
 		requestID := args[0]
 
 		// Open database
-		dbConn, err := db.OpenAndMigrate(GetDB())
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.OpenAndMigrate(dbPath)
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}

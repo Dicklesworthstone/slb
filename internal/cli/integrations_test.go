@@ -249,6 +249,46 @@ func TestCursorRulesIntegration_Generate(t *testing.T) {
 	}
 }
 
+func TestCursorRulesInstallDiscoversNearestProject(t *testing.T) {
+	for _, nestedProject := range []bool{false, true} {
+		name := "ancestor project"
+		if nestedProject {
+			name = "separately initialized nested project"
+		}
+		t.Run(name, func(t *testing.T) {
+			resetHookFlags()
+			t.Cleanup(resetHookFlags)
+			t.Setenv("SLB_PROJECT", "")
+			project := t.TempDir()
+			nested := filepath.Join(project, "src")
+			if err := os.Mkdir(nested, 0700); err != nil {
+				t.Fatal(err)
+			}
+			initializeClaudeHookTestProject(t, project)
+			want, untouched := project, nested
+			if nestedProject {
+				initializeClaudeHookTestProject(t, nested)
+				want, untouched = nested, project
+			}
+			t.Chdir(nested)
+			cmd := &cobra.Command{Use: "cursor-rules", RunE: cursorRulesCmd.RunE}
+			cmd.Flags().Bool("install", true, "install")
+			cmd.Flags().Bool("preview", false, "preview")
+			cmd.Flags().Bool("append", true, "append")
+			cmd.Flags().Bool("replace", false, "replace")
+			if err := cmd.RunE(cmd, nil); err != nil {
+				t.Fatal(err)
+			}
+			if data, err := os.ReadFile(filepath.Join(want, ".cursorrules")); err != nil || !strings.Contains(string(data), integrations.CursorRulesSection()) {
+				t.Fatalf("rules missing from selected project: %v, %s", err, data)
+			}
+			if _, err := os.Stat(filepath.Join(untouched, ".cursorrules")); !os.IsNotExist(err) {
+				t.Fatalf("rules written outside the selected project: %v", err)
+			}
+		})
+	}
+}
+
 func TestCursorRulesIntegration_Apply(t *testing.T) {
 	// Test applying to empty content
 	result, changed := integrations.ApplyCursorRules("", integrations.CursorRulesAppend)

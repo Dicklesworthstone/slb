@@ -466,23 +466,24 @@ func findHookApproval(conn *db.DB, engine *core.PatternEngine, params HookQueryP
 	var id string
 	err := conn.QueryRow(`
 		SELECT r.id FROM requests r JOIN sessions s ON s.id = r.requestor_session_id
-		WHERE r.command_raw = ? AND r.command_cwd = ? AND r.project_path = ?
+		WHERE r.command_raw = ? AND r.command_cwd = ?
 			AND r.requestor_session_id = ? AND r.status = 'approved'
 			AND s.ended_at IS NULL AND s.project_path = r.project_path
 			AND (r.approval_expires_at IS NULL OR julianday(r.approval_expires_at) > julianday('now'))
 		ORDER BY r.created_at DESC, r.id DESC LIMIT 1
-	`, params.Command, params.CWD, ProjectRootForCWD(params.CWD), params.SessionID).Scan(&id)
+	`, params.Command, params.CWD, params.SessionID).Scan(&id)
 	if err != nil {
 		return nil
 	}
 	req, err := conn.GetRequest(id)
-	if err != nil || req.Status != db.StatusApproved || req.ProjectPath != ProjectRootForCWD(params.CWD) || req.Command.Raw != params.Command ||
+	if err != nil || req.Status != db.StatusApproved || req.Command.Raw != params.Command ||
 		req.Command.Cwd != params.CWD || req.RequestorSessionID != params.SessionID {
 		return nil
 	}
-	// Keep the exact stored path, cwd and hash binding above, including root
-	// aliases. A lexical ancestor across a descendant alias must nevertheless
-	// belong to the physical project whose policy and database we selected.
+	// Keep the stored requester/project identity and exact command cwd. Its
+	// spelling may predate discovery or use a root alias, so do not infer it
+	// from the query cwd. It must still belong to the physical project whose
+	// policy and database we selected; CanExecute re-verifies the signed hash.
 	approvedRoot, err := PhysicalProjectRootForCWD(req.ProjectPath)
 	if err != nil || approvedRoot != projectRoot {
 		return nil

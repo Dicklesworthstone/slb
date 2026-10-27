@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/core"
@@ -24,7 +25,7 @@ func init() {
 	// shorthand: -t remains the persistent --toon.
 	executeCmd.Flags().IntVar(&flagExecuteTimeout, "timeout", 300, "execution timeout in seconds")
 	executeCmd.Flags().BoolVar(&flagExecuteBackground, "background", false, "run in background, return immediately")
-	executeCmd.Flags().StringVar(&flagExecuteLogDir, "log-dir", ".slb/logs", "directory for execution logs")
+	executeCmd.Flags().StringVar(&flagExecuteLogDir, "log-dir", "", "directory for execution logs (default: <project>/.slb/logs)")
 	executeCmd.Flags().String("expected-command-hash", "", "require the command hash observed before handing off execution")
 	rootCmd.AddCommand(executeCmd)
 }
@@ -90,7 +91,11 @@ Examples:
 			return err
 		}
 
-		dbConn, err := db.OpenAndMigrate(GetDB())
+		database, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.OpenAndMigrate(database)
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}
@@ -111,12 +116,16 @@ Examples:
 		if err != nil {
 			return fmt.Errorf("loading custom patterns: %w", err)
 		}
+		logDir, err := executionLogDirectory(req.ProjectPath, flagExecuteLogDir)
+		if err != nil {
+			return err
+		}
 
 		executor := core.NewExecutor(dbConn, engine).WithNotifier(buildAgentMailNotifier(req.ProjectPath, cfg))
 		format := GetOutput()
 		structured := format == "json" || format == "yaml" || format == "toon"
 		if flagExecuteBackground {
-			return launchBackgroundExecution(cmd, dbConn, req, sessionID, expectedHash, executionTimeout, cfg)
+			return launchBackgroundExecution(cmd, dbConn, req, sessionID, expectedHash, executionTimeout, cfg, logDir)
 		}
 		if !structured {
 			fmt.Printf("Approval policy: %s\n", req.ApprovalPolicy.Label())
@@ -126,7 +135,7 @@ Examples:
 			ExpectedCommandHash: expectedHash,
 			SessionID:           sessionID,
 			Timeout:             executionTimeout,
-			LogDir:              flagExecuteLogDir,
+			LogDir:              logDir,
 			SuppressOutput:      structured,
 			CaptureRollback:     cfg.General.EnableRollbackCapture,
 			MaxRollbackSizeMB:   cfg.General.MaxRollbackSizeMB,
@@ -188,4 +197,22 @@ Examples:
 		}
 		return execErr
 	},
+}
+
+// Default logs belong to the request's project, not the caller's directory.
+// Creating .slb/logs in a descendant would turn it into a shadow project for
+// subsequent policy and daemon discovery. Explicit overrides remain relative
+// to the invocation directory and are made absolute before detached execution.
+func executionLogDirectory(project, override string) (string, error) {
+	if override == "" {
+		if project == "" {
+			return "", fmt.Errorf("execution log project is required")
+		}
+		override = filepath.Join(project, ".slb", "logs")
+	}
+	path, err := filepath.Abs(override)
+	if err != nil {
+		return "", fmt.Errorf("resolving execution log directory: %w", err)
+	}
+	return path, nil
 }

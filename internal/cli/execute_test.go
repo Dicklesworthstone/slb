@@ -37,7 +37,7 @@ func newTestExecuteCmd(dbPath string) *cobra.Command {
 	}
 	execCmd.Flags().IntVar(&flagExecuteTimeout, "timeout", 300, "timeout seconds")
 	execCmd.Flags().BoolVar(&flagExecuteBackground, "background", false, "run in background")
-	execCmd.Flags().StringVar(&flagExecuteLogDir, "log-dir", ".slb/logs", "log directory")
+	execCmd.Flags().StringVar(&flagExecuteLogDir, "log-dir", "", "log directory")
 	execCmd.Flags().String("expected-command-hash", "", "require the observed command hash")
 
 	root.AddCommand(execCmd)
@@ -55,7 +55,7 @@ func resetExecuteFlags() {
 	flagSessionID = ""
 	flagExecuteTimeout = 300
 	flagExecuteBackground = false
-	flagExecuteLogDir = ".slb/logs"
+	flagExecuteLogDir = ""
 }
 
 func TestExecuteCommand_RequiresRequestID(t *testing.T) {

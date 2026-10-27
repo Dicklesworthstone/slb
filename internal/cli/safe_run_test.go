@@ -117,11 +117,20 @@ func TestSafeRunRechecksBeforeLogsAndSpawn(t *testing.T) {
 			session := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("safe-probe"))
 			flagSessionID, flagOutput = session.ID, "json"
 			path := filepath.Join(h.ProjectDir, ".slb", "config.toml")
-			if err := os.WriteFile(path, []byte("[patterns.safe]\npatterns = ['^printf safe-run-probe$']\n"), 0600); err != nil {
+			if err := os.WriteFile(path, []byte("[patterns.safe]\npatterns = ['^safe-run-probe$']\n"), 0600); err != nil {
 				t.Fatal(err)
 			}
 			marker := filepath.Join(h.ProjectDir, "spawn-marker")
-			command := fmt.Sprintf("printf safe-run-probe > %q", marker)
+			// The explicitly allowlisted helper proves whether a process ran.
+			// A visible shell write redirection correctly has a CAUTION floor
+			// and therefore cannot serve as a SAFE pre-execution fixture.
+			if err := os.WriteFile(filepath.Join(h.ProjectDir, "safe-run-probe"),
+				[]byte("#!/bin/sh\nprintf safe-run-probe > \"$SLB_TEST_SAFE_RUN_MARKER\"\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", h.ProjectDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("SLB_TEST_SAFE_RUN_MARKER", marker)
+			command := "safe-run-probe"
 			old, err := core.LoadCommandPolicy(h.DB, config.LoadOptions{ProjectDir: h.ProjectDir})
 			if err != nil || !old.ClassifyCommand(command, h.ProjectDir).IsSafe {
 				t.Fatalf("probe did not start SAFE: %v", err)

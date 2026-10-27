@@ -105,7 +105,11 @@ Examples:
 			return fmt.Errorf("capturing command working directory: %w", err)
 		}
 
-		dbConn, err := db.OpenAndMigrate(GetDB())
+		database, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.OpenAndMigrate(database)
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}
@@ -335,7 +339,7 @@ func runApprovedRequest(ctx context.Context, out *output.Writer, dbConn *db.DB, 
 	execResult, execErr := executor.ExecuteApprovedRequest(ctx, core.ExecuteOptions{
 		RequestID:         requestID,
 		SessionID:         flagSessionID,
-		LogDir:            ".slb/logs",
+		LogDir:            filepath.Join(project, ".slb", "logs"),
 		SuppressOutput:    executionOutputStructured(),
 		CaptureRollback:   cfg.General.EnableRollbackCapture,
 		MaxRollbackSizeMB: cfg.General.MaxRollbackSizeMB,

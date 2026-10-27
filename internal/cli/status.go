@@ -32,7 +32,11 @@ rejection, timeout or escalation). Due policy is processed without a daemon.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		requestID := args[0]
 
-		dbConn, err := db.Open(GetDB())
+		dbPath, err := GetDB()
+		if err != nil {
+			return err
+		}
+		dbConn, err := db.Open(dbPath)
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}

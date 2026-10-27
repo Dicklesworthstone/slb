@@ -19,6 +19,15 @@ import (
 	"github.com/spf13/cobra"
 )
 
+func watchDatabasePath(t *testing.T) string {
+	t.Helper()
+	path, err := GetDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func watchPolicyFixture(t *testing.T) (*db.DB, *db.Request) {
 	t.Helper()
 	h := testutil.NewHarness(t)
@@ -73,7 +82,7 @@ func watchRequestSnapshot(t *testing.T, database *db.DB, request *db.Request) db
 
 func TestWatchApprovalUsesPolicyWithoutManufacturingReviews(t *testing.T) {
 	database, request := watchPolicyFixture(t)
-	if err := autoApproveCaution(context.Background(), GetDB(), request.ID); err != nil {
+	if err := autoApproveCaution(context.Background(), watchDatabasePath(t), request.ID); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := database.GetRequest(request.ID)
@@ -84,7 +93,7 @@ func TestWatchApprovalUsesPolicyWithoutManufacturingReviews(t *testing.T) {
 	if err := database.QueryRow(`SELECT COUNT(*) FROM reviews WHERE request_id = ?`, request.ID).Scan(&count); err != nil || count != 0 {
 		t.Fatalf("watch manufactured reviewer evidence: %d %v", count, err)
 	}
-	if err := autoApproveCaution(context.Background(), GetDB(), request.ID); err != nil {
+	if err := autoApproveCaution(context.Background(), watchDatabasePath(t), request.ID); err != nil {
 		t.Fatal(err)
 	}
 	again, err := database.GetRequest(request.ID)
@@ -105,7 +114,7 @@ func TestWatchApprovalCannotWaiveConstraints(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			database, request := watchPolicyFixture(t)
 			watchPolicySQL(t, database, tc.query)
-			if err := autoApproveCaution(context.Background(), GetDB(), request.ID); err != nil {
+			if err := autoApproveCaution(context.Background(), watchDatabasePath(t), request.ID); err != nil {
 				t.Fatal(err)
 			}
 			stored, err := database.GetRequest(request.ID)
@@ -167,7 +176,7 @@ func TestWatchDoesNotApplyTimeoutPolicy(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(request.ProjectPath, ".slb", "config.toml"), []byte("[general]\ntimeout_action = 'auto_approve_warn'\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := autoApproveCaution(context.Background(), GetDB(), request.ID); err != nil {
+	if err := autoApproveCaution(context.Background(), watchDatabasePath(t), request.ID); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := database.GetRequest(request.ID)

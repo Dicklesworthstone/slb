@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,7 +47,7 @@ func newTestEmergencyCmd(dbPath string) *cobra.Command {
 	emCmd.Flags().BoolVar(&flagEmergencyCapture, "capture-rollback", false, "capture state for rollback")
 	// No -t shorthand: -t (--toon) is owned by the root persistent flags.
 	emCmd.Flags().IntVar(&flagEmergencyTimeout, "timeout", 300, "execution timeout")
-	emCmd.Flags().StringVar(&flagEmergencyLogDir, "log-dir", ".slb/logs", "log directory")
+	emCmd.Flags().StringVar(&flagEmergencyLogDir, "log-dir", "", "log directory")
 
 	root.AddCommand(emCmd)
 
@@ -66,7 +67,50 @@ func resetEmergencyFlags() {
 	flagEmergencyAck = ""
 	flagEmergencyCapture = false
 	flagEmergencyTimeout = 300
-	flagEmergencyLogDir = ".slb/logs"
+	flagEmergencyLogDir = ""
+}
+
+func TestEmergencyCommand_SubdirectoryLogsUseProject(t *testing.T) {
+	t.Cleanup(resetEmergencyFlags)
+	h := testutil.NewHarness(t)
+	nested := filepath.Join(h.ProjectDir, "src")
+	if err := os.Mkdir(nested, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(nested)
+	t.Setenv("SLB_PROJECT", "")
+	command := "printf subdirectory"
+	ack := fmt.Sprintf("%x", sha256.Sum256([]byte(command)))
+	for _, explicit := range []bool{false, true} {
+		resetEmergencyFlags()
+		cmd := newTestEmergencyCmd(h.DBPath)
+		args := []string{"emergency-execute", command, "--reason", "Test isolated subdirectory audit placement", "--yes", "--ack", ack, "--json"}
+		wantLogDir := filepath.Join(h.ProjectDir, ".slb", "logs")
+		if explicit {
+			args = append(args, "--log-dir", "custom-audit")
+			wantLogDir = filepath.Join(nested, "custom-audit")
+		}
+		stdout, err := executeCommandCapture(t, cmd, args...)
+		var result map[string]any
+		if err != nil || json.Unmarshal([]byte(stdout), &result) != nil {
+			t.Fatalf("emergency execution failed: %v\n%s", err, stdout)
+		}
+		logPath, ok := result["log_path"].(string)
+		if !ok || filepath.Dir(logPath) != wantLogDir || result["assurance"] != "emergency_unreviewed" {
+			t.Fatalf("log scope or emergency assurance changed: %+v", result)
+		}
+		id, ok := result["emergency_id"].(string)
+		if !ok {
+			t.Fatalf("missing emergency evidence: %+v", result)
+		}
+		record, err := h.DB.GetEmergencyExecution(id)
+		if err != nil || record.ProjectPath != h.ProjectDir || record.Command.Cwd != nested || record.LogPath != logPath {
+			t.Fatalf("emergency evidence lost command cwd or project: %+v %v", record, err)
+		}
+		if _, err := os.Stat(filepath.Join(nested, ".slb")); !os.IsNotExist(err) {
+			t.Fatalf("execution created a shadow project marker: %v", err)
+		}
+	}
 }
 
 func TestEmergencyCommand_RequiresCommand(t *testing.T) {

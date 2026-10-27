@@ -335,7 +335,10 @@ func TestGetDB(t *testing.T) {
 	t.Run("explicit db flag", func(t *testing.T) {
 		flagDB = "/custom/path/db.sqlite"
 		flagProject = ""
-		got := GetDB()
+		got, err := GetDB()
+		if err != nil {
+			t.Fatal(err)
+		}
 		if got != "/custom/path/db.sqlite" {
 			t.Errorf("GetDB() = %v, want /custom/path/db.sqlite", got)
 		}
@@ -351,7 +354,10 @@ func TestGetDB(t *testing.T) {
 		_ = os.Chdir(h.ProjectDir)
 		defer func() { _ = os.Chdir(origWd) }()
 
-		got := GetDB()
+		got, err := GetDB()
+		if err != nil {
+			t.Fatal(err)
+		}
 		expected := filepath.Join(h.ProjectDir, ".slb", "state.db")
 		if got != expected {
 			t.Errorf("GetDB() = %v, want %v", got, expected)
@@ -368,7 +374,10 @@ func TestGetDB(t *testing.T) {
 		_ = os.Chdir(tmpDir)
 		defer func() { _ = os.Chdir(origWd) }()
 
-		got := GetDB()
+		got, err := GetDB()
+		if err != nil {
+			t.Fatal(err)
+		}
 		// When in a directory, GetDB returns path based on cwd
 		// Resolve symlinks for comparison (macOS /var -> /private/var)
 		tmpDirResolved, _ := filepath.EvalSymlinks(tmpDir)
@@ -412,8 +421,8 @@ func TestEnterProjectDir_RelativeFlagResolvesOnce(t *testing.T) {
 	if got, err := projectPath(); err != nil || got != project {
 		t.Fatalf("projectPath() = %q, %v; want %q", got, err, project)
 	}
-	if got, want := GetDB(), filepath.Join(project, ".slb", "state.db"); got != want {
-		t.Fatalf("GetDB() = %s, want %s", got, want)
+	if got, err := GetDB(); err != nil || got != filepath.Join(project, ".slb", "state.db") {
+		t.Fatalf("GetDB() = %s, %v; want project database", got, err)
 	}
 }
 
@@ -481,24 +490,7 @@ func TestGetActor(t *testing.T) {
 	})
 }
 
-// TestGetDB_HomeFallback tests the home directory fallback path.
-// Note: This path is only reachable when projectPath() returns an error,
-// which happens when os.Getwd() fails - a rare system-level condition.
-// We test the behavior when we can construct such a scenario.
-func TestGetDB_HomeFallbackDocumented(t *testing.T) {
-	// This test documents the expected behavior of the home fallback
-	// even though we can't easily trigger it in unit tests.
-	//
-	// The home fallback occurs when:
-	// 1. flagDB is empty (no explicit --db flag)
-	// 2. projectPath() returns an error OR empty string
-	//
-	// Since projectPath() only fails when os.Getwd() fails, and that's
-	// rare, this path is effectively unreachable in normal unit tests.
-	//
-	// Coverage acceptance: This is an intentional gap documented in TESTING.md
-
-	// We can at least verify the function doesn't panic with various inputs
+func TestGetDBResolutionErrorNeverSelectsHomeHistory(t *testing.T) {
 	origDB := flagDB
 	origProject := flagProject
 	defer func() {
@@ -506,15 +498,182 @@ func TestGetDB_HomeFallbackDocumented(t *testing.T) {
 		flagProject = origProject
 	}()
 
-	// Test with empty flags - should return project-based path (not home)
 	flagDB = ""
-	flagProject = ""
-	result := GetDB()
-	if result == "" {
-		t.Error("GetDB() should never return empty string")
+	flagProject = filepath.Join(t.TempDir(), "missing-project")
+	if result, err := GetDB(); err == nil || result != "" {
+		t.Fatalf("invalid project silently selected another store: %q %v", result, err)
 	}
-	if !strings.Contains(result, "state.db") && !strings.Contains(result, "history.db") {
-		t.Errorf("GetDB() returned unexpected path: %s", result)
+
+	flagDB = filepath.Join(t.TempDir(), "explicit.db")
+	if result, err := GetDB(); err != nil || result != flagDB {
+		t.Fatalf("explicit --db must remain authoritative: %q %v", result, err)
+	}
+}
+
+func TestProjectDiscoveryUsesAncestorWithoutChangingCommandCWD(t *testing.T) {
+	origProject, origDB := flagProject, flagDB
+	t.Cleanup(func() { flagProject, flagDB = origProject, origDB })
+	h := testutil.NewHarness(t)
+	other := testutil.NewHarness(t)
+	child := filepath.Join(h.ProjectDir, "src", "deep")
+	otherChild := filepath.Join(other.ProjectDir, "src")
+	for _, dir := range []string{child, otherChild} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name, selectedFlag, selectedEnv, wantProject string
+	}{
+		{name: "cwd", wantProject: h.ProjectDir},
+		{name: "project flag descendant", selectedFlag: child, wantProject: h.ProjectDir},
+		{name: "environment descendant", selectedEnv: otherChild, wantProject: other.ProjectDir},
+		{name: "flag overrides environment", selectedFlag: child, selectedEnv: otherChild, wantProject: h.ProjectDir},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(child)
+			t.Setenv("SLB_PROJECT", tc.selectedEnv)
+			flagProject, flagDB = tc.selectedFlag, ""
+			before, err := os.Getwd()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if project, err := projectPath(); err != nil || project != tc.wantProject {
+				t.Fatalf("projectPath() = %q, %v; want %q", project, err, tc.wantProject)
+			}
+			wantDB := filepath.Join(tc.wantProject, ".slb", "state.db")
+			if path, err := GetDB(); err != nil || path != wantDB {
+				t.Fatalf("GetDB() = %q, %v; want %q", path, err, wantDB)
+			}
+			if after, err := os.Getwd(); err != nil || after != before {
+				t.Fatalf("discovery changed the command cwd: before=%q after=%q error=%v", before, after, err)
+			}
+			if _, err := os.Lstat(filepath.Join(child, ".slb")); !os.IsNotExist(err) {
+				t.Fatalf("discovery created a shadow project: %v", err)
+			}
+		})
+	}
+}
+
+func TestProjectDiscoveryKeepsNestedProjectsIsolated(t *testing.T) {
+	origProject, origDB := flagProject, flagDB
+	t.Cleanup(func() { flagProject, flagDB = origProject, origDB })
+	t.Setenv("SLB_PROJECT", "")
+	h := testutil.NewHarness(t)
+	nested := filepath.Join(h.ProjectDir, "nested")
+	child := filepath.Join(nested, "src")
+	if err := os.MkdirAll(filepath.Join(nested, ".slb"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(child, 0700); err != nil {
+		t.Fatal(err)
+	}
+	wantDB := filepath.Join(nested, ".slb", "state.db")
+	testutil.NewTestDBAtPath(t, wantDB)
+	flagProject, flagDB = child, ""
+	if project, err := projectPath(); err != nil || project != nested {
+		t.Fatalf("nested project escaped to parent: %q %v", project, err)
+	}
+	if path, err := GetDB(); err != nil || path != wantDB {
+		t.Fatalf("nested database escaped to parent: %q %v", path, err)
+	}
+}
+
+func TestProjectDiscoveryPreservesOnlyEquivalentRootAliases(t *testing.T) {
+	h := testutil.NewHarness(t)
+	other := testutil.NewHarness(t)
+	otherChild := filepath.Join(other.ProjectDir, "src", "deep")
+	if err := os.MkdirAll(otherChild, 0700); err != nil {
+		t.Fatal(err)
+	}
+	rootAlias := filepath.Join(h.ProjectDir, "other-root")
+	descendantAlias := filepath.Join(h.ProjectDir, "other-descendant")
+	if err := os.Symlink(other.ProjectDir, rootAlias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(filepath.Dir(otherChild), descendantAlias); err != nil {
+		t.Fatal(err)
+	}
+	physicalOther, err := filepath.EvalSymlinks(other.ProjectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ start, want string }{
+		{filepath.Join(rootAlias, "src", "deep"), rootAlias},
+		{filepath.Join(descendantAlias, "deep"), physicalOther},
+	} {
+		if project, err := resolveProjectRoot(tc.start); err != nil || project != tc.want {
+			t.Errorf("resolveProjectRoot(%q) = %q, %v; want %q", tc.start, project, err, tc.want)
+		}
+	}
+}
+
+func TestGetDBRefusesUnavailableNestedState(t *testing.T) {
+	origProject, origDB := flagProject, flagDB
+	t.Cleanup(func() { flagProject, flagDB = origProject, origDB })
+	t.Setenv("SLB_PROJECT", "")
+	for _, kind := range []string{"marker file", "dangling marker", "missing database", "database directory", "unreadable database", "inaccessible marker"} {
+		t.Run(kind, func(t *testing.T) {
+			h := testutil.NewHarness(t)
+			nested := filepath.Join(h.ProjectDir, "nested")
+			child := filepath.Join(nested, "src")
+			if err := os.MkdirAll(child, 0700); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(nested, ".slb")
+			state := filepath.Join(marker, "state.db")
+			switch kind {
+			case "marker file":
+				if err := os.WriteFile(marker, []byte("invalid marker"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "dangling marker":
+				if err := os.Symlink(filepath.Join(nested, "missing-state"), marker); err != nil {
+					t.Skipf("symlinks unavailable: %v", err)
+				}
+			default:
+				if err := os.Mkdir(marker, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "database directory" {
+					if err := os.Mkdir(state, 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if kind == "unreadable database" {
+					if err := os.WriteFile(state, nil, 0000); err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = os.Chmod(state, 0600) })
+					if file, err := os.Open(state); err == nil {
+						_ = file.Close()
+						t.Skip("current user bypasses file permissions")
+					}
+				}
+				if kind == "inaccessible marker" {
+					if err := os.Chmod(marker, 0000); err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = os.Chmod(marker, 0700) })
+					if _, err := os.Stat(state); !os.IsPermission(err) {
+						t.Skip("current user bypasses directory permissions")
+					}
+				}
+			}
+			flagProject, flagDB = child, ""
+			if path, err := GetDB(); err == nil || path != "" {
+				t.Fatalf("unavailable nested state selected or created another database: %q %v", path, err)
+			}
+			if _, err := os.Lstat(filepath.Join(child, ".slb")); !os.IsNotExist(err) {
+				t.Fatalf("failed discovery created child state: %v", err)
+			}
+			if kind == "missing database" {
+				if _, err := os.Stat(state); !os.IsNotExist(err) {
+					t.Fatalf("failed discovery recreated missing state: %v", err)
+				}
+			}
+		})
 	}
 }
 
@@ -573,7 +732,10 @@ func TestGetDB_PrecedenceOrder(t *testing.T) {
 	// 1. Explicit --db flag has highest precedence
 	flagDB = "/explicit/db/path.db"
 	flagProject = h.ProjectDir
-	result := GetDB()
+	result, err := GetDB()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if result != "/explicit/db/path.db" {
 		t.Errorf("explicit --db flag should take precedence, got %s", result)
 	}
@@ -581,7 +743,10 @@ func TestGetDB_PrecedenceOrder(t *testing.T) {
 	// 2. Project path fallback when no explicit flag
 	flagDB = ""
 	flagProject = h.ProjectDir
-	result = GetDB()
+	result, err = GetDB()
+	if err != nil {
+		t.Fatal(err)
+	}
 	expected := filepath.Join(h.ProjectDir, ".slb", "state.db")
 	if result != expected {
 		t.Errorf("project path fallback failed: got %s, want %s", result, expected)

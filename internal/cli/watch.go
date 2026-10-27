@@ -226,10 +226,10 @@ func newWatchState(project string) *watchState {
 		requests: make(map[string]daemon.RequestStreamEvent)}
 }
 
-// Select one source before connecting. Default local watch uses the same
-// physical project root/database as the daemon, including from descendants or
-// aliases. An explicit database keeps the selected project spelling and cannot
-// be substituted by a daemon. Remote streams never fall back to local state.
+// Select one source before connecting. Discovery chooses the same database as
+// the daemon, while a stored literal root alias keeps its exact query identity
+// through polling. An explicit database cannot be substituted by a daemon.
+// Remote streams never fall back to local state.
 func resolveWatchState() (*watchState, error) {
 	project, err := projectPath()
 	if err != nil {
@@ -256,11 +256,15 @@ func resolveWatchState() (*watchState, error) {
 		state.remote = true
 		return state, nil
 	}
-	project, err = daemon.PhysicalProjectRootForCWD(project)
+	physical, err := daemon.PhysicalProjectRootForCWD(project)
 	if err != nil {
 		return nil, err
 	}
-	return newWatchState(project), nil
+	state := newWatchState(project)
+	// Daemon streams query the physical project identity. Substituting that
+	// stream would omit requests stored under this existing literal root alias.
+	state.useDaemon = project == physical
+	return state, nil
 }
 
 func (s *watchState) emit(enc *json.Encoder, event daemon.RequestStreamEvent) error {

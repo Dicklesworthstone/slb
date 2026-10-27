@@ -43,7 +43,11 @@ func completeSessionIDs(cmd *cobra.Command, args []string, toComplete string) ([
 		ReadOnly:          true,
 	}
 
-	database, err := db.OpenWithOptions(GetDB(), opts)
+	path, err := GetDB()
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	database, err := db.OpenWithOptions(path, opts)
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}

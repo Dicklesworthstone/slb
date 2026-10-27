@@ -43,10 +43,16 @@ Also adds .slb/ to .gitignore if not already present.`,
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
-	// Determine project directory
-	projectDir, err := os.Getwd()
+	// Initialization targets the selected directory exactly, allowing an
+	// intentionally separate project beneath an already initialized ancestor.
+	projectDir, err := selectedProjectDir()
 	if err != nil {
-		return fmt.Errorf("getting working directory: %w", err)
+		return err
+	}
+	if info, err := os.Stat(projectDir); err != nil {
+		return fmt.Errorf("reading initialization directory: %w", err)
+	} else if !info.IsDir() {
+		return fmt.Errorf("initialization directory %q is not a directory", projectDir)
 	}
 
 	slbDir := filepath.Join(projectDir, ".slb")

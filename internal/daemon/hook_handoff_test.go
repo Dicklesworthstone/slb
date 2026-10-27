@@ -299,3 +299,33 @@ func TestHookApprovalRejectsLexicalProjectAcrossDescendantAlias(t *testing.T) {
 		t.Fatalf("project B approval was handed off using project A's state: %+v", result)
 	}
 }
+
+func TestHookApprovalDescendantAliasUsesStoredProjectBinding(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
+	project := hookPolicyProject(t)
+	other := hookPolicyProject(t)
+	nested := filepath.Join(project, "src")
+	if err := os.Mkdir(nested, 0700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(other, "project-alias")
+	if err := os.Symlink(nested, alias); err != nil {
+		t.Skipf("directory symlinks unavailable: %v", err)
+	}
+	conn, req, params := hookApprovalFixtureForPaths(t, project, project, alias)
+	result := (&IPCServer{}).classifyCommand(params)
+	if result.Action != "execute" || result.ExecutionHandoff == nil || result.RequestID != req.ID {
+		t.Fatalf("physical project approval was lost through a descendant alias: %+v", result)
+	}
+	if result.ExecutionHandoff.CommandHash != req.Command.Hash || result.ExecutionHandoff.DatabasePath != filepath.Join(project, ".slb", "state.db") {
+		t.Fatalf("handoff changed the stored command or database binding: %+v", result.ExecutionHandoff)
+	}
+	stored, err := conn.GetRequest(req.ID)
+	if err != nil || stored.ProjectPath != project || stored.Command.Cwd != alias || stored.Command.Hash != req.Command.Hash {
+		t.Fatalf("discovery rewrote stored approval evidence: %+v, %v", stored, err)
+	}
+	params.CWD = nested
+	if result := (&IPCServer{}).classifyCommand(params); result.Action != "block" || result.ExecutionHandoff != nil {
+		t.Fatalf("physical equivalence waived the exact cwd binding: %+v", result)
+	}
+}

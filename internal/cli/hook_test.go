@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -1150,6 +1151,83 @@ func TestHookTestCommand_UnknownRequiresOfflineConfirmation(t *testing.T) {
 	}
 }
 
+func TestHookTestCommandPreservesSubdirectoryCWD(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetHookFlags()
+	t.Cleanup(resetHookFlags)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SLB_PROJECT", "")
+	nested := filepath.Join(h.ProjectDir, "src")
+	if err := os.Mkdir(nested, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(nested)
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pattern := `^project-cleanup\s+` + regexp.QuoteMeta(filepath.Join(cwd, "target")) + `$`
+	if _, err := h.DB.InsertCustomPattern("critical", pattern, "protect the subdirectory target", "human"); err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := executeCommandCapture(t, newTestHookCmd(""), "hook", "test", "project-cleanup ./target", "--local-only", "-j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result["action"] != "block" || result["tier"] != "critical" || result["matched_pattern"] != pattern {
+		t.Fatalf("hook test rebased the command or ignored ancestor policy: %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(nested, ".slb")); !os.IsNotExist(err) {
+		t.Fatalf("hook test created child project state: %v", err)
+	}
+}
+
+func TestHookTestPreservesSelectedScopeWithReachableDaemon(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix daemon transport")
+	}
+	for _, explicitDB := range []bool{false, true} {
+		name := "selected project"
+		if explicitDB {
+			name = "explicit database"
+		}
+		t.Run(name, func(t *testing.T) {
+			resetHookFlags()
+			t.Cleanup(resetHookFlags)
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("SLB_PROJECT", "")
+			t.Setenv("SLB_HOST", "")
+			current, selected := testutil.NewHarness(t), testutil.NewHarness(t)
+			t.Chdir(current.ProjectDir)
+			if _, err := selected.DB.InsertCustomPattern("critical", "^selected-cleanup$", "selected policy", "human"); err != nil {
+				t.Fatal(err)
+			}
+			fakeHookDaemon(t, current.ProjectDir, 0) // Would allow the command.
+			databasePath := ""
+			if explicitDB {
+				databasePath = selected.DBPath
+			} else {
+				t.Setenv("SLB_PROJECT", selected.ProjectDir)
+			}
+			stdout, err := executeCommandCapture(t, newTestHookCmd(databasePath), "hook", "test", "selected-cleanup", "-j")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result map[string]any
+			if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+				t.Fatal(err)
+			}
+			if result["source"] != "local" || result["action"] != "block" || result["tier"] != "critical" || result["daemon_error"] == nil {
+				t.Fatalf("reachable daemon replaced selected policy: %+v", result)
+			}
+		})
+	}
+}
+
 func TestHookHealthCommand_UnreachableDaemonReportsFallback(t *testing.T) {
 	h := testutil.NewHarness(t)
 	resetHookFlags()
@@ -1776,6 +1854,50 @@ func TestHookUnavailableSelectedPolicyPreservesInstallation(t *testing.T) {
 					if err != nil || !bytes.Equal(before, after) {
 						t.Fatalf("%s changed an earlier installation with %s selected config: %s (%v)", operation[0], kind, path, err)
 					}
+				}
+			}
+		})
+	}
+}
+
+func TestHookMissingProjectStatePreservesInstallation(t *testing.T) {
+	for _, global := range []bool{false, true} {
+		name := "project"
+		if global {
+			name = "global"
+		}
+		t.Run(name, func(t *testing.T) {
+			resetHookFlags()
+			t.Cleanup(resetHookFlags)
+			project, home := t.TempDir(), t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("SLB_PROJECT", "")
+			if err := os.Mkdir(filepath.Join(project, ".slb"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			base := project
+			args := []string{"-C", project, "hook", "install", "-j"}
+			if global {
+				base = home
+				args = append(args, "--global")
+			}
+			settings := filepath.Join(base, ".claude", "settings.json")
+			if err := os.MkdirAll(filepath.Dir(settings), 0700); err != nil {
+				t.Fatal(err)
+			}
+			const original = `{"env":{"KEEP":"yes"}}`
+			if err := os.WriteFile(settings, []byte(original), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := executeCommandCapture(t, newTestHookCmd(""), args...); err == nil || !strings.Contains(err.Error(), "state.db") {
+				t.Fatalf("missing project state was replaced by default hook policy: %v", err)
+			}
+			if data, err := os.ReadFile(settings); err != nil || string(data) != original {
+				t.Fatalf("failed installation changed existing settings: %s, %v", data, err)
+			}
+			for _, path := range []string{filepath.Join(project, ".slb", "state.db"), filepath.Join(base, ".slb", "hooks", "slb_guard.py")} {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatalf("failed installation created %s: %v", path, err)
 				}
 			}
 		})

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -453,6 +454,41 @@ func TestResolveServerOptions_PinsExplicitConfigBeforeProjectDiscovery(t *testin
 	}
 }
 
+func TestResolveServerOptions_RejectsMalformedProjectMarker(t *testing.T) {
+	t.Setenv(daemonModeEnv, "")
+	for _, dangling := range []bool{false, true} {
+		t.Run(fmt.Sprintf("dangling=%t", dangling), func(t *testing.T) {
+			project := t.TempDir()
+			nested := filepath.Join(project, "src")
+			for _, dir := range []string{filepath.Join(project, ".slb"), nested} {
+				if err := os.MkdirAll(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			marker := filepath.Join(nested, ".slb")
+			if dangling {
+				if err := os.Symlink(filepath.Join(nested, "missing"), marker); err != nil {
+					t.Skipf("directory symlinks unavailable: %v", err)
+				}
+			} else if err := os.WriteFile(marker, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if opts, err := resolveServerOptions(ServerOptions{ProjectDir: nested}); err == nil {
+				t.Fatalf("malformed nested marker silently selected another daemon: %+v", opts)
+			}
+			t.Chdir(nested)
+			for name, operation := range map[string]func() error{
+				"start": StartDaemon,
+				"stop":  func() error { return StopDaemon(time.Millisecond) },
+			} {
+				if err := operation(); err == nil || !strings.Contains(err.Error(), marker) {
+					t.Fatalf("%s wrapper lost the malformed working-directory marker: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
 func TestNormalizeServerOptions_WhitespacePaths(t *testing.T) {
 	opts := normalizeServerOptions(ServerOptions{
 		SocketPath: "   ",
@@ -581,6 +617,13 @@ func TestRunDaemon_ShutdownDuringStartupIsCleanStop(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(project, ".slb", "config.toml"), []byte("[daemon]\nuse_file_watcher = false\n[notifications]\ndesktop_enabled = false\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	database, err := db.OpenAndMigrate(filepath.Join(project, ".slb", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
 	old, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -602,5 +645,36 @@ func TestRunDaemon_ShutdownDuringStartupIsCleanStop(t *testing.T) {
 	}
 	if _, err := os.Stat(pidFile); !os.IsNotExist(err) {
 		t.Fatalf("pid file left behind after startup shutdown: %v", err)
+	}
+}
+
+func TestDaemonStartupRefusesMissingStateInMarkedProject(t *testing.T) {
+	for _, detached := range []bool{false, true} {
+		t.Run(fmt.Sprintf("detached=%t", detached), func(t *testing.T) {
+			project := t.TempDir()
+			if err := os.Mkdir(filepath.Join(project, ".slb"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			resources := shortSocketDir(t)
+			opts := ServerOptions{ProjectDir: project, SocketPath: filepath.Join(resources, "s.sock"),
+				PIDFile: filepath.Join(resources, "slb.pid"), Logger: log.New(io.Discard)}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			var err error
+			if detached {
+				t.Setenv(daemonModeEnv, "")
+				err = StartDaemonWithOptions(ctx, opts)
+			} else {
+				err = RunDaemon(ctx, opts)
+			}
+			if err == nil || !strings.Contains(err.Error(), "state.db") {
+				t.Fatalf("startup accepted missing project state: %v", err)
+			}
+			for _, path := range []string{filepath.Join(project, ".slb", "state.db"), opts.SocketPath, opts.PIDFile} {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatalf("refused startup created %s: %v", path, err)
+				}
+			}
+		})
 	}
 }

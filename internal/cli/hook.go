@@ -242,26 +242,14 @@ type claudeHookPaths struct {
 
 func resolveClaudeHookPaths(global bool) (claudeHookPaths, error) {
 	var paths claudeHookPaths
-	project := flagProject
-	if project == "" {
-		project = os.Getenv("SLB_PROJECT")
-	}
-	if project == "" {
-		project = "."
-	}
-	project, err := filepath.Abs(project)
+	project, err := projectPath()
 	if err != nil {
 		return paths, fmt.Errorf("resolving hook project directory: %w", err)
 	}
-	if info, err := os.Stat(project); err != nil {
-		return paths, fmt.Errorf("reading hook project directory: %w", err)
-	} else if !info.IsDir() {
-		return paths, fmt.Errorf("hook project %q is not a directory", project)
-	}
 	paths.project = project
-	paths.databasePath = flagDB
-	if paths.databasePath == "" {
-		paths.databasePath = filepath.Join(project, ".slb", "state.db")
+	paths.databasePath, err = GetDB()
+	if err != nil {
+		return paths, fmt.Errorf("resolving hook policy database: %w", err)
 	}
 	base := project
 	paths.scope = "project"
@@ -822,17 +810,22 @@ func runHookTest(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	cwd, err := filepath.Abs(project)
+	// Classify relative command paths in the caller's directory, while the
+	// selected project supplies policy. Discovery must not rebase a command.
+	cwd, err := os.Getwd()
 	if err != nil {
-		return fmt.Errorf("resolving project path: %w", err)
+		return fmt.Errorf("resolving command directory: %w", err)
 	}
-	configPath, configProject, err := selectedHookPolicy(cwd, flagConfig)
+	configPath, configProject, err := selectedHookPolicy(project, flagConfig)
 	if err != nil {
 		return err
 	}
 
 	var daemonErr error
 	if !flagHookLocalOnly && !flagHookSimulateFailure {
+		daemonErr = hookTestDaemonScopeError(project, cwd)
+	}
+	if !flagHookLocalOnly && !flagHookSimulateFailure && daemonErr == nil {
 		queryCtx, cancel := context.WithTimeout(cmd.Context(), hookQueryTimeout(cwd))
 		client := daemon.NewIPCClient(daemon.SocketPathForCWD(cwd))
 		live, queryErr := client.HookQuery(queryCtx, daemon.HookQueryParams{
@@ -876,6 +869,33 @@ func runHookTest(cmd *cobra.Command, args []string) error {
 		result["daemon_error"] = daemonErr.Error()
 	}
 	return output.New(output.Format(GetOutput())).Write(result)
+}
+
+// The daemon chooses policy by command cwd. A CLI-selected project or database
+// outside that scope must use the already loaded local policy instead.
+func hookTestDaemonScopeError(project, cwd string) error {
+	selectedRoot, err := daemon.PhysicalProjectRootForCWD(project)
+	if err != nil {
+		return err
+	}
+	commandRoot, err := daemon.PhysicalProjectRootForCWD(cwd)
+	if err != nil {
+		return err
+	}
+	if commandRoot != selectedRoot {
+		return fmt.Errorf("selected project differs from the command directory's daemon policy; using selected local policy")
+	}
+	if flagDB != "" {
+		selected, err := os.Stat(flagDB)
+		if err != nil {
+			return fmt.Errorf("reading selected database: %w", err)
+		}
+		projectDB, err := os.Stat(filepath.Join(commandRoot, ".slb", "state.db"))
+		if err != nil || !os.SameFile(selected, projectDB) {
+			return fmt.Errorf("selected database differs from the daemon policy database; using selected local policy")
+		}
+	}
+	return nil
 }
 
 func localHookTestResult(command, cwd string) map[string]any {
