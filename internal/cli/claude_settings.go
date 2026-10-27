@@ -41,6 +41,20 @@ func (o *settingsObject) set(key string, value any) {
 	o.values[key] = value
 }
 
+func (o *settingsObject) remove(key string) bool {
+	if _, exists := o.values[key]; !exists {
+		return false
+	}
+	delete(o.values, key)
+	for i, existing := range o.keys {
+		if existing == key {
+			o.keys = append(o.keys[:i], o.keys[i+1:]...)
+			break
+		}
+	}
+	return true
+}
+
 // decodeSettingsJSON parses a settings document preserving object key order
 // and number spelling. The document must be a single JSON object.
 func decodeSettingsJSON(data []byte) (*settingsObject, error) {
@@ -382,7 +396,28 @@ func findSLBHooks(entries []any, isSLB func(string) bool) []slbHookLocation {
 				continue
 			}
 			command, _ := hook.values["command"].(string)
-			if command == "" || !isSLB(command) {
+			if command == "" {
+				continue
+			}
+			owned := isSLB(command)
+			if !owned {
+				// With args present, command is one executable path, not shell
+				// text. Quote every literal word before checking the invocation.
+				if args, ok := hook.values["args"].([]any); ok {
+					words := []string{hookShellQuote(command)}
+					valid := true
+					for _, rawArg := range args {
+						arg, ok := rawArg.(string)
+						if !ok {
+							valid = false
+							break
+						}
+						words = append(words, hookShellQuote(arg))
+					}
+					owned = valid && isSLB(strings.Join(words, " "))
+				}
+			}
+			if !owned {
 				continue
 			}
 			here = append(here, slbHookLocation{entry: entry, entryIndex: i, hookIndex: j, hook: hook,
@@ -451,7 +486,7 @@ type slbHookInstallResult struct {
 //   - an existing SLB hook (native or legacy Python) in an entry that covers
 //     Bash has its command updated in place; sibling hooks and any other keys
 //     on the hook object (e.g. "timeout") are kept unless force is set, except
-//     that SLB always runs synchronously with onFailure: block;
+//     that SLB always uses shell form, synchronously with onFailure: block;
 //   - extra SLB hooks elsewhere are removed so there is exactly one guard;
 //   - otherwise the hook is appended to the first "Bash" entry, or a new
 //     "Bash" entry is appended when there is none.
@@ -502,6 +537,12 @@ func installSLBHook(f *claudeSettingsFile, guardCommand string, isSLB func(strin
 			}
 			if location.command != guardCommand {
 				location.hook.set("command", guardCommand)
+				result.changed = true
+			}
+			// Even an empty args array selects direct execution in Claude Code.
+			// Our canonical command includes shell-quoted arguments, so retaining
+			// args would try to execute that entire string as a filename.
+			if location.hook.remove("args") {
 				result.changed = true
 			}
 			if location.hook.values["onFailure"] != "block" {

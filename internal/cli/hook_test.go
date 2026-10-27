@@ -1573,6 +1573,27 @@ func TestNativeHookCommandRecognition(t *testing.T) {
 	if !isSLBHookCommand("python3 /tmp/slb_guard.py", "/tmp/slb_guard.py") {
 		t.Fatal("legacy Python guard was not recognized")
 	}
+	for _, tc := range []struct {
+		command string
+		owned   bool
+	}{
+		{"/tmp/slb_guard.py", true},
+		{"/usr/bin/python3.12 -I -u -- '/old path/slb_guard.py'", true},
+		{"echo slb_guard.py", false},
+		{"grep slb_guard.py settings.json", false},
+		{"python3 audit.py /tmp/slb_guard.py", false},
+		{`python3 -c 'print("slb_guard.py")'`, false},
+		{"python3 -m slb_guard.py", false},
+		{"python3 /tmp/slb_guard.py.bak", false},
+		{"python3 /tmp/not_slb_guard.py", false},
+		{"python3 /tmp/slb_guard.py; another-guard", false},
+		{"/opt/slb hook guard && another-guard", false},
+		{"/opt/slb hook guard\nanother-guard", false},
+	} {
+		if got := isSLBHookCommand(tc.command, "/tmp/slb_guard.py"); got != tc.owned {
+			t.Errorf("ownership of %q = %t, want %t", tc.command, got, tc.owned)
+		}
+	}
 }
 
 func TestHookInstallAutoUpgradesLegacyPythonGuard(t *testing.T) {

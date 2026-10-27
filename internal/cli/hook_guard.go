@@ -26,6 +26,7 @@ const maxHookGuardInputBytes = 1 << 20
 
 var hookRequestIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
 var hookCommandHashPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+var hookPythonExecutablePattern = regexp.MustCompile(`^python(?:[0-9]+(?:\.[0-9]+)*)?$`)
 
 func init() {
 	hookCmd.AddCommand(hookGuardCmd)
@@ -409,12 +410,20 @@ func nativeHookGuardCommand() (string, error) {
 }
 
 func isSLBHookCommand(command, generatedScript string) bool {
+	// A composite hook may also run another tool. Do not take ownership of
+	// multiline commands or the first command of a pipeline/command list.
+	if strings.ContainsAny(command, "\r\n") {
+		return false
+	}
 	parser := shellwords.NewParser()
 	parser.ParseEnv = false
 	parser.ParseBacktick = false
 	tokens, err := parser.Parse(command)
-	if err == nil && len(tokens) >= 3 && tokens[1] == "hook" && tokens[2] == "guard" {
-		base := strings.TrimSuffix(strings.ToLower(filepath.Base(tokens[0])), ".exe")
+	if err != nil || len(tokens) == 0 || parser.Position >= 0 {
+		return false
+	}
+	base := strings.TrimSuffix(strings.ToLower(filepath.Base(tokens[0])), ".exe")
+	if len(tokens) >= 3 && tokens[1] == "hook" && tokens[2] == "guard" {
 		if base == "slb" {
 			return true
 		}
@@ -426,7 +435,30 @@ func isSLBHookCommand(command, generatedScript string) bool {
 			}
 		}
 	}
-	return generatedScript != "" && strings.Contains(command, filepath.Base(generatedScript))
+	if generatedScript == "" {
+		return false
+	}
+	scriptName := filepath.Base(generatedScript)
+	if filepath.Base(tokens[0]) == scriptName {
+		return true
+	}
+	if !hookPythonExecutablePattern.MatchString(base) {
+		return false
+	}
+	for i := 1; i < len(tokens); i++ {
+		switch tokens[i] {
+		case "--":
+			return i+1 < len(tokens) && filepath.Base(tokens[i+1]) == scriptName
+		case "-B", "-E", "-I", "-O", "-OO", "-q", "-s", "-S", "-u", "-v":
+			// These interpreter options do not consume another argument.
+			continue
+		default:
+			// Do not mistake -c code, -m modules, other scripts' arguments,
+			// or option operands for our generated script.
+			return !strings.HasPrefix(tokens[i], "-") && filepath.Base(tokens[i]) == scriptName
+		}
+	}
+	return false
 }
 
 func hookShellQuote(value string) string {

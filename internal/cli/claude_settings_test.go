@@ -337,8 +337,8 @@ func TestHookInstallNormalizesBlockingGuardOptions(t *testing.T) {
     "PreToolUse": [{
       "matcher": "Bash",
       "hooks": [
-        {"type":"command","command":"/opt/slb/slb hook guard","onFailure":"continue","async":true,"asyncRewake":true,"timeout":45},
-        {"type":"command","command":"notify-other-tool","onFailure":"continue","async":true,"asyncRewake":true}
+        {"type":"command","command":"/opt/slb/slb hook guard","args":[],"onFailure":"continue","async":true,"asyncRewake":true,"timeout":45},
+        {"type":"command","command":"notify-other-tool","args":["slb_guard.py"],"onFailure":"continue","async":true,"asyncRewake":true}
       ]
     }]
   }
@@ -368,6 +368,10 @@ func TestHookInstallNormalizesBlockingGuardOptions(t *testing.T) {
 	if managed.values["timeout"] != json.Number("45") {
 		t.Fatalf("unrelated managed options were lost: %#v", managed.values)
 	}
+	encoded, err := encodeSettingsJSON(managed, "  ")
+	if err != nil || strings.Contains(string(encoded), `"args"`) {
+		t.Fatalf("shell-form guard retained exec-form arguments: %v\n%s", err, encoded)
+	}
 	siblingAfter, err := encodeSettingsJSON(hooks[1].(*settingsObject), "  ")
 	if err != nil || !bytes.Equal(siblingBefore, siblingAfter) {
 		t.Fatalf("normalization altered another tool's hook: %v\nbefore: %s\nafter: %s", err, siblingBefore, siblingAfter)
@@ -390,6 +394,70 @@ func TestHookInstallNormalizesBlockingGuardOptions(t *testing.T) {
 	siblingAfter, err = encodeSettingsJSON(hooks[1].(*settingsObject), "  ")
 	if err != nil || !bytes.Equal(siblingBefore, siblingAfter) {
 		t.Fatalf("force reset altered another tool's hook: %v\nbefore: %s\nafter: %s", err, siblingBefore, siblingAfter)
+	}
+}
+
+func TestHookInstallAndUninstallRecognizeExecFormGuards(t *testing.T) {
+	const guardCommand = "/current/slb hook guard"
+	const script = "/tmp/slb_guard.py"
+	isSLB := func(command string) bool { return isSLBHookCommand(command, script) }
+	for _, registration := range []string{
+		`{"type":"command","command":"/old path/slb","args":["hook","guard"],"timeout":45}`,
+		`{"type":"command","command":"python3","args":["/old path/slb_guard.py"],"timeout":45}`,
+	} {
+		t.Run(registration, func(t *testing.T) {
+			const sibling = `{"type":"command","command":"printf","args":["slb_guard.py"],"timeout":17}`
+			original := `{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[` + registration + `,` + sibling + `]}]}}`
+			load := func() *claudeSettingsFile {
+				t.Helper()
+				root, err := decodeSettingsJSON([]byte(original))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return &claudeSettingsFile{root: root}
+			}
+			list := func(file *claudeSettingsFile) []any {
+				t.Helper()
+				_, entries, _, err := file.preToolUse()
+				if err != nil || len(entries) != 1 {
+					t.Fatalf("unexpected matcher entries: %+v %v", entries, err)
+				}
+				return entries[0].(*settingsObject).values["hooks"].([]any)
+			}
+			file := load()
+			siblingBefore, err := encodeSettingsJSON(list(file)[1].(*settingsObject), "  ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			change, err := installSLBHook(file, guardCommand, isSLB, false)
+			if err != nil || !change.found || !change.upgraded || len(list(file)) != 2 {
+				t.Fatalf("exec-form guard was duplicated instead of upgraded: %+v %v", change, err)
+			}
+			managed := list(file)[0].(*settingsObject)
+			encoded, err := encodeSettingsJSON(managed, "  ")
+			if err != nil || strings.Contains(string(encoded), `"args"`) || managed.values["command"] != guardCommand ||
+				managed.values["timeout"] != json.Number("45") || managed.values["onFailure"] != "block" {
+				t.Fatalf("exec-form upgrade cannot invoke the intended guard: %v\n%s", err, encoded)
+			}
+			siblingAfter, err := encodeSettingsJSON(list(file)[1].(*settingsObject), "  ")
+			if err != nil || !bytes.Equal(siblingBefore, siblingAfter) {
+				t.Fatalf("upgrade modified another tool's invocation: %v\n%s", err, siblingAfter)
+			}
+			if again, err := installSLBHook(file, guardCommand, isSLB, false); err != nil || again.changed {
+				t.Fatalf("exec-form upgrade was not idempotent: %+v %v", again, err)
+			}
+			// Uninstall must also recognize exec form before any upgrade, and
+			// leave an unrelated hook whose argument mentions our filename.
+			file = load()
+			removed, err := uninstallSLBHook(file, isSLB)
+			if err != nil || removed != 1 || len(list(file)) != 1 {
+				t.Fatalf("exec-form uninstall removed the wrong hooks: %d %v", removed, err)
+			}
+			remaining, err := encodeSettingsJSON(list(file)[0].(*settingsObject), "  ")
+			if err != nil || !bytes.Equal(siblingBefore, remaining) {
+				t.Fatalf("uninstall changed another tool's invocation: %v\n%s", err, remaining)
+			}
+		})
 	}
 }
 
