@@ -140,6 +140,138 @@ func TestSameHostExecutionPolicyRevocationIsCheckedAtClaim(t *testing.T) {
 	}
 }
 
+func sameHostPolicyText(resolution string, quorum int) string {
+	return fmt.Sprintf("[general]\napproval_policy = 'same_host'\nconflict_resolution = %q\nrequire_different_model = true\n[patterns.dangerous]\npatterns = ['^printf same-host-policy$']\nmin_approvals = %d\ndynamic_quorum = false\n[integrations]\nagent_mail_enabled = false\n", resolution, quorum)
+}
+
+func sameHostPolicyFixture(t *testing.T, quorum int) (*db.DB, *db.Request, *db.Session, []*db.Session) {
+	t.Helper()
+	t.Setenv(db.SimulatedIdentityEnvForTest, "")
+	t.Setenv("HOME", testutil.NonSystemTempDir(t))
+	t.Setenv("USERPROFILE", testutil.NonSystemTempDir(t))
+	project := testutil.NonSystemTempDir(t)
+	database, err := db.OpenAndMigrate(filepath.Join(project, ".slb", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	writeExecutionPolicy(t, project, sameHostPolicyText(string(ConflictFirstWins), quorum))
+	author := &db.Session{AgentName: "same-host-author", Model: "model-a", ProjectPath: project}
+	peers := []*db.Session{
+		{AgentName: "first-peer", Model: "model-b", ProjectPath: project},
+		{AgentName: "second-peer", Model: "model-c", ProjectPath: project},
+		{AgentName: "third-peer", Model: "model-d", ProjectPath: project},
+	}
+	for _, session := range append([]*db.Session{author}, peers...) {
+		if err := database.CreateSession(session); err != nil {
+			t.Fatal(err)
+		}
+	}
+	engine, err := LoadCommandPolicy(database, config.LoadOptions{ProjectDir: project})
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := DefaultRequestCreatorConfig()
+	options.ApprovalPolicy = db.ApprovalPolicySameHost
+	options.AgentMailEnabled, options.EnableDryRun = false, false
+	created, err := NewRequestCreator(database, nil, engine, options).CreateRequest(CreateRequestOptions{
+		SessionID: author.ID, Command: "printf same-host-policy", Cwd: project,
+		Justification: Justification{Reason: "disposable same-host policy fixture"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Request.ApprovalPolicy != db.ApprovalPolicySameHost || created.Request.MinApprovals != quorum {
+		t.Fatalf("wrong fixture admission: %+v", created.Request)
+	}
+	return database, created.Request, author, peers
+}
+
+func applySameHostFixtureReview(t *testing.T, database *db.DB, request *db.Request, reviewer *db.Session, decision db.Decision) {
+	t.Helper()
+	options := DefaultReviewConfig()
+	options.ApprovalPolicy, options.ConflictResolution = db.ApprovalPolicySameHost, ConflictFirstWins
+	result, err := NewReviewService(database, options).SubmitReview(ReviewOptions{
+		RequestID: request.ID, SessionID: reviewer.ID, SessionKey: reviewer.SessionKey, Decision: decision,
+	})
+	if err != nil || result == nil || !db.VerifyReviewEvidenceSignature(result.Review, reviewer.SessionKey) {
+		t.Fatalf("same-host fixture review: %+v %v", result, err)
+	}
+}
+
+func TestSameHostReviewServiceReloadsPolicyBeforeCommit(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		t.Run(fmt.Sprintf("explicit=%t", explicit), func(t *testing.T) {
+			database, request, _, peers := sameHostPolicyFixture(t, 1)
+			options := DefaultReviewConfig()
+			options.ApprovalPolicy = db.ApprovalPolicySameHost
+			path := filepath.Join(request.ProjectPath, ".slb", "config.toml")
+			if explicit {
+				path = filepath.Join(t.TempDir(), "explicit-policy.toml")
+				options.ConfigPath = path
+				if err := os.WriteFile(path, []byte(sameHostPolicyText(string(ConflictFirstWins), 1)), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			service := NewReviewService(database, options)
+			// The service retains its original configuration while the operator
+			// revokes local approval in its actual policy source.
+			if err := os.WriteFile(path, []byte("[general]\napproval_policy = 'independent'\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			review := ReviewOptions{RequestID: request.ID, SessionID: peers[0].ID, SessionKey: peers[0].SessionKey, Decision: db.DecisionApprove}
+			if _, err := service.SubmitReview(review); !errors.Is(err, db.ErrReviewPolicyMismatch) {
+				t.Fatalf("long-lived reviewer ignored opt-out: %v", err)
+			}
+			if reviews, err := database.ListReviewsForRequest(request.ID); err != nil || len(reviews) != 0 {
+				t.Fatalf("refused approval left evidence: %+v %v", reviews, err)
+			}
+			// Opt-out must still allow an authenticated reviewer to reject.
+			review.Decision = db.DecisionReject
+			if _, err := service.SubmitReview(review); err != nil {
+				t.Fatalf("policy opt-out disabled rejection: %v", err)
+			}
+		})
+	}
+}
+
+func TestSameHostExecutionUsesCurrentConflictPolicy(t *testing.T) {
+	for _, resolution := range []ConflictResolution{ConflictFirstWins, ConflictAnyRejectionBlocks, ConflictHumanBreaksTie} {
+		for _, safe := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/safe=%t", resolution, safe), func(t *testing.T) {
+				database, request, author, peers := sameHostPolicyFixture(t, 2)
+				for i, decision := range []db.Decision{db.DecisionApprove, db.DecisionReject, db.DecisionApprove} {
+					applySameHostFixtureReview(t, database, request, peers[i], decision)
+				}
+				request, err := database.VerifyRequestApproval(request.ID)
+				if err != nil {
+					t.Fatalf("valid first-wins proof rejected: %v", err)
+				}
+				if err := CheckExecutionPolicy(database, request, ""); err != nil {
+					t.Fatalf("first-wins advisory rejected: %v", err)
+				}
+				policy := sameHostPolicyText(string(resolution), 2)
+				if safe {
+					policy += "[patterns.safe]\npatterns = ['^printf same-host-policy$']\n"
+				}
+				writeExecutionPolicy(t, request.ProjectPath, policy)
+				advisoryErr := CheckExecutionPolicy(database, request, "")
+				claimErr := database.ClaimRequestExecution(request, policyExecutionIdentity(author), ExecutionPolicyGuard(""))
+				if resolution == ConflictFirstWins {
+					if advisoryErr != nil || claimErr != nil {
+						t.Fatalf("unchanged first-wins should permit quorum: advisory=%v claim=%v", advisoryErr, claimErr)
+					}
+					return
+				}
+				if !errors.Is(advisoryErr, ErrApprovalPolicyChanged) || !errors.Is(claimErr, ErrApprovalPolicyChanged) {
+					t.Fatalf("current conflict policy was ignored: advisory=%v claim=%v", advisoryErr, claimErr)
+				}
+				assertPolicyUnclaimed(t, database, request.ID)
+			})
+		}
+	}
+}
+
 func TestExecutionPolicyRejectsChangesBeforePreflight(t *testing.T) {
 	db.SimulateIndependentIdentityForTest(t)
 	for _, tc := range []struct {

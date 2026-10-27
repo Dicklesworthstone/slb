@@ -52,9 +52,15 @@ type ReviewPolicy struct {
 	// Optional view bindings are checked under the writer reservation. They
 	// prevent a delayed UI submission from reviewing a different command or
 	// applying policy loaded for a different project.
-	ExpectedCommandHash string
-	ExpectedProjectPath string
-	DelegatedReviewer   *DelegatedReviewerIdentity
+	ExpectedCommandHash    string
+	ExpectedProjectPath    string
+	ExpectedApprovalPolicy ApprovalPolicy
+	DelegatedReviewer      *DelegatedReviewerIdentity
+	// PolicyCheck reloads current project policy after the writer reservation
+	// is acquired. It applies to approvals only: opting out must not prevent
+	// rejection of an outstanding request. The callback must not mutate the
+	// request or access this database while its transaction is open.
+	PolicyCheck func(*Request) error
 }
 
 // ReviewOutcome describes only committed state. Notifications must use Request,
@@ -120,8 +126,14 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 			return ErrReviewPolicyMismatch
 		}
 		if (policy.ExpectedCommandHash != "" && request.Command.Hash != policy.ExpectedCommandHash) ||
-			(policy.ExpectedProjectPath != "" && request.ProjectPath != policy.ExpectedProjectPath) {
+			(policy.ExpectedProjectPath != "" && request.ProjectPath != policy.ExpectedProjectPath) ||
+			(policy.ExpectedApprovalPolicy != "" && request.ApprovalPolicy.Normalized() != policy.ExpectedApprovalPolicy.Normalized()) {
 			return ErrReviewTargetChanged
+		}
+		if accepted.Decision == DecisionApprove && policy.PolicyCheck != nil {
+			if err := policy.PolicyCheck(request); err != nil {
+				return fmt.Errorf("checking current review policy: %w", err)
+			}
 		}
 		now := time.Now().UTC()
 		if request.Status != StatusPending && request.Status != StatusEscalated {
@@ -333,6 +345,9 @@ func deriveDelegatedReviewKey(sourceSessionKey, targetProject, sourceProject, so
 func (p ReviewPolicy) validate() error {
 	if !p.ApprovalPolicy.Valid() {
 		return fmt.Errorf("unknown approval policy %q", p.ApprovalPolicy)
+	}
+	if !p.ExpectedApprovalPolicy.Valid() {
+		return fmt.Errorf("unknown expected approval policy %q", p.ExpectedApprovalPolicy)
 	}
 	switch p.ConflictResolution {
 	case "", "any_rejection_blocks", "first_wins", "human_breaks_tie":

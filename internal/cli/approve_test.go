@@ -538,6 +538,91 @@ func TestApproveCommand_CrossProjectRequiresTargetPolicy(t *testing.T) {
 	}
 }
 
+func TestApproveCommand_SameHostCrossProjectRetainsProvenance(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
+	target := testutil.NewHarness(t)
+	source := testutil.NewHarness(t)
+	resetApproveFlags()
+	t.Cleanup(resetApproveFlags)
+	requester := testutil.MakeSession(t, target.DB, testutil.WithProject(target.ProjectDir),
+		testutil.WithAgent("CooperativeRequestor"), testutil.WithModel("author-model"))
+	reviewer := testutil.MakeSession(t, source.DB, testutil.WithProject(source.ProjectDir),
+		testutil.WithAgent("CooperativeReviewer"), testutil.WithModel("reviewer-model"))
+	writePolicy := func(policy string) {
+		t.Helper()
+		target.WriteFile(".slb/config.toml", []byte("[general]\napproval_policy = '"+policy+"'\ncross_project_reviews = true\nreview_pool = ['CooperativeReviewer']\n[integrations]\nagent_mail_enabled = false\n"), 0600)
+	}
+	newRequest := func() *db.Request {
+		t.Helper()
+		return testutil.MakeRequest(t, target.DB, requester,
+			testutil.WithCommand("echo cooperative-cross-project-fixture", target.ProjectDir, false),
+			testutil.WithRequireDifferentModel(true),
+			func(request *db.Request) { request.ApprovalPolicy = db.ApprovalPolicySameHost })
+	}
+	approve := func(requestID, key string) (string, error) {
+		t.Helper()
+		resetApproveFlags()
+		return executeCommandCapture(t, newTestApproveCmd(source.DBPath), "approve", requestID,
+			"--session-id", reviewer.ID, "-k", key, "-C", source.ProjectDir,
+			"--target-project", target.ProjectDir, "-j")
+	}
+
+	writePolicy("same_host")
+	approved := newRequest()
+	if _, err := approve(approved.ID, "wrong-source-credential"); err == nil {
+		t.Fatal("same-host cross-project review bypassed source authentication")
+	}
+	if reviews, err := target.DB.ListReviewsForRequest(approved.ID); err != nil || len(reviews) != 0 {
+		t.Fatalf("failed source authentication committed a vote: %+v, %v", reviews, err)
+	}
+	stdout, err := approve(approved.ID, reviewer.SessionKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response map[string]any
+	if err := json.Unmarshal([]byte(stdout), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["approval_policy"] != "same_host" || response["assurance"] != "same_host" ||
+		response["approval_policy_label"] != db.ApprovalPolicySameHost.Label() || response["request_status_changed"] != true {
+		t.Fatalf("same-host cross-project output lost provenance: %+v", response)
+	}
+	verified, err := target.DB.VerifyRequestApproval(approved.ID)
+	if err != nil || verified.ApprovalPolicy != db.ApprovalPolicySameHost || verified.Status != db.StatusApproved {
+		t.Fatalf("delegated approval failed signed-proof validation: %+v, %v", verified, err)
+	}
+	reviews, err := target.DB.ListReviewsForRequest(approved.ID)
+	if err != nil || len(reviews) != 1 || reviews[0].ApprovalPolicy != db.ApprovalPolicySameHost || reviews[0].Assurance != db.AssuranceSameHost ||
+		reviews[0].ReviewerAgent != reviewer.AgentName || reviews[0].ReviewerSessionID == reviewer.ID {
+		t.Fatalf("delegated review provenance missing: %+v, %v", reviews, err)
+	}
+	provenance, err := target.DB.GetSession(reviews[0].ReviewerSessionID)
+	if err != nil || provenance.EndedAt == nil || provenance.SessionKey != "" {
+		t.Fatalf("delegated provenance retained active capacity or a credential: %+v, %v", provenance, err)
+	}
+	active, err := target.DB.ListActiveSessions(target.ProjectDir)
+	if err != nil || len(active) != 1 || active[0].ID != requester.ID {
+		t.Fatalf("delegation changed target reviewer capacity: %+v, %v", active, err)
+	}
+	if _, err := source.DB.AuthenticateSession(reviewer.ID, reviewer.SessionKey); err != nil {
+		t.Fatalf("delegation damaged source session authentication: %v", err)
+	}
+
+	revoked := newRequest()
+	writePolicy("independent")
+	if _, err := approve(revoked.ID, reviewer.SessionKey); err == nil {
+		t.Fatal("target policy disablement retained same-host cross-project authority")
+	}
+	if reviews, err := target.DB.ListReviewsForRequest(revoked.ID); err != nil || len(reviews) != 0 {
+		t.Fatalf("disabled target committed a same-host vote: %+v, %v", reviews, err)
+	}
+	stored, err := target.DB.GetRequest(approved.ID)
+	if err != nil || stored.Status != db.StatusApproved || stored.ApprovalPolicy != db.ApprovalPolicySameHost {
+		t.Fatalf("policy change relabeled delegated approval history: %+v, %v", stored, err)
+	}
+}
+
 // TestApproveCommand_Help_IncludesTargetProject verifies help mentions --target-project.
 func TestApproveCommand_Help_IncludesTargetProject(t *testing.T) {
 	h := testutil.NewHarness(t)

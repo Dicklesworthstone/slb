@@ -4,9 +4,11 @@ package core
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/integrations"
 )
@@ -56,6 +58,9 @@ type ReviewConfig struct {
 	// ApprovalPolicy must match the request's stored policy. same_host is
 	// an explicit low-assurance workflow, never independent authorization.
 	ApprovalPolicy db.ApprovalPolicy
+	// ConfigPath preserves an explicit policy source for the fresh check under
+	// the review transaction's writer reservation.
+	ConfigPath string
 	// ConflictResolution specifies how to handle conflicting reviews.
 	ConflictResolution ConflictResolution
 	// TrustedSelfApprove lists agents that can self-approve after delay.
@@ -195,6 +200,7 @@ func (rs *ReviewService) submitReview(opts ReviewOptions, delegated *db.Delegate
 	}
 	outcome, err := rs.db.ApplyReview(review, opts.SessionKey, db.ReviewPolicy{
 		ApprovalPolicy:          rs.config.ApprovalPolicy,
+		PolicyCheck:             ReviewPolicyGuard(rs.config.ConfigPath),
 		ConflictResolution:      string(rs.config.ConflictResolution),
 		TrustedSelfApprove:      rs.config.TrustedSelfApprove,
 		TrustedSelfApproveDelay: rs.config.TrustedSelfApproveDelay,
@@ -223,6 +229,35 @@ func (rs *ReviewService) submitReview(opts ReviewOptions, delegated *db.Delegate
 		_ = rs.notifier.NotifyRequestRejected(outcome.Request, outcome.Review)
 	}
 	return result, nil
+}
+
+// ReviewPolicyGuard reloads the target's current opt-in after the DB obtains its
+// writer reservation. A service created before opt-out cannot commit a stale
+// same-host approval. Rejections remain available after opt-out.
+func ReviewPolicyGuard(configPath string) func(*db.Request) error {
+	return func(request *db.Request) error {
+		if request == nil {
+			return errors.New("request is required for review policy check")
+		}
+		if configPath != "" {
+			info, err := os.Stat(configPath)
+			if err != nil {
+				return fmt.Errorf("reading explicit review config: %w", err)
+			}
+			if !info.Mode().IsRegular() {
+				return errors.New("explicit review config is not a regular file")
+			}
+		}
+		cfg, err := config.Load(config.LoadOptions{ProjectDir: request.ProjectPath, ConfigPath: configPath})
+		if err != nil {
+			return fmt.Errorf("loading current review policy: %w", err)
+		}
+		if request.ApprovalPolicy.Normalized() != db.ApprovalPolicy(cfg.General.ApprovalPolicy) {
+			return fmt.Errorf("%w: request approval policy is %q, current policy is %q; submit a new request",
+				db.ErrReviewPolicyMismatch, request.ApprovalPolicy.Normalized(), cfg.General.ApprovalPolicy)
+		}
+		return nil
+	}
 }
 
 // isTrustedSelfApprove checks if an agent is in the trusted self-approve list.

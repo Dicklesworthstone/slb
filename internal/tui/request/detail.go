@@ -567,6 +567,10 @@ func (m *DetailModel) ApplySnapshot(target *db.Request, reviews []db.Review, ses
 		m.SnapshotError = "Command changed while this form was open. Cancel the form and refresh before reviewing."
 		return
 	}
+	if m.Mode != DetailModeView && target.ApprovalPolicy.Normalized() != m.Request.ApprovalPolicy.Normalized() {
+		m.SnapshotError = "Review policy changed while this form was open. Cancel the form and refresh before reviewing."
+		return
+	}
 	m.Request, m.Reviews, m.Session = target, reviews, session
 	m.SnapshotError = ""
 	if m.approveForm != nil {

@@ -64,7 +64,7 @@ func TestInteractiveSameHostReviewPolicyAndEvidence(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			result := submitInteractiveReview(opts, target.ID, target.Command.Hash, db.DecisionApprove, "Checked the exact command and expected effects")
+			result := submitInteractiveReview(opts, target.ID, target.Command.Hash, target.ApprovalPolicy, db.DecisionApprove, "Checked the exact command and expected effects")
 			if revoke {
 				if result.Err == nil || result.Recorded {
 					t.Fatalf("UI ignored policy revocation: %+v", result)
@@ -85,6 +85,29 @@ func TestInteractiveSameHostReviewPolicyAndEvidence(t *testing.T) {
 			_, _ = model.Update(tea.WindowSizeMsg{Width: 120, Height: 50})
 			if view := model.View(); !strings.Contains(view, "not independently authenticated authorization") || !strings.Contains(view, "same_host") {
 				t.Fatalf("UI concealed the low-assurance category: %s", view)
+			}
+		})
+	}
+}
+
+func TestInteractiveReviewBindsDisplayedApprovalPolicy(t *testing.T) {
+	for _, decision := range []db.Decision{db.DecisionApprove, db.DecisionReject} {
+		t.Run(string(decision), func(t *testing.T) {
+			t.Setenv(db.SimulatedIdentityEnvForTest, "")
+			database, target, reviewer, opts := interactiveReviewFixture(t, 1, db.ApprovalPolicySameHost)
+			// The form still displays the independent-policy snapshot. Capture
+			// that view, then simulate a refresh before its worker runs.
+			displayed := *target
+			displayed.ApprovalPolicy = db.ApprovalPolicyIndependent
+			model := interactiveReviewModel(opts, &displayed, reviewer)
+			worker := model.submitReview(target.ID, decision, "reviewed the displayed policy")
+			model.detail.Request = target
+			result, ok := worker().(request.ReviewSubmittedMsg)
+			if !ok || result.Recorded || !errors.Is(result.Err, db.ErrReviewTargetChanged) {
+				t.Fatalf("review silently switched displayed policy: %+v", result)
+			}
+			if reviews, err := database.ListReviewsForRequest(target.ID); err != nil || len(reviews) != 0 {
+				t.Fatalf("retargeted review left evidence: %+v %v", reviews, err)
 			}
 		})
 	}
@@ -166,7 +189,7 @@ func TestInteractiveReviewKeyboardCommitsDecision(t *testing.T) {
 func TestInteractiveReviewPartialQuorum(t *testing.T) {
 	db.SimulateIndependentIdentityForTest(t)
 	database, target, reviewer, opts := interactiveReviewFixture(t, 2)
-	first := submitInteractiveReview(opts, target.ID, target.Command.Hash, db.DecisionApprove, "first vote")
+	first := submitInteractiveReview(opts, target.ID, target.Command.Hash, target.ApprovalPolicy, db.DecisionApprove, "first vote")
 	if first.Err != nil || !first.Recorded || first.Request.Status != db.StatusPending || first.Approvals != 1 || first.Request.ApprovalExpiresAt != nil {
 		t.Fatalf("partial vote fabricated approval: %+v", first)
 	}
@@ -175,7 +198,7 @@ func TestInteractiveReviewPartialQuorum(t *testing.T) {
 		t.Fatal(err)
 	}
 	opts.SessionID, opts.SessionKey = second.ID, second.SessionKey
-	final := submitInteractiveReview(opts, target.ID, target.Command.Hash, db.DecisionApprove, "second vote")
+	final := submitInteractiveReview(opts, target.ID, target.Command.Hash, target.ApprovalPolicy, db.DecisionApprove, "second vote")
 	if final.Err != nil || !final.Recorded || final.Approvals != 2 || final.Request.Status != db.StatusApproved {
 		t.Fatalf("quorum failed: %+v", final)
 	}
@@ -237,7 +260,7 @@ func TestInteractiveReviewFailuresDoNotCommit(t *testing.T) {
 					t.Fatal(err)
 				}
 			case "duplicate-agent":
-				first := submitInteractiveReview(opts, target.ID, hash, db.DecisionApprove, "first")
+				first := submitInteractiveReview(opts, target.ID, hash, target.ApprovalPolicy, db.DecisionApprove, "first")
 				if first.Err != nil {
 					t.Fatal(first.Err)
 				}
@@ -251,7 +274,7 @@ func TestInteractiveReviewFailuresDoNotCommit(t *testing.T) {
 				}
 				opts.SessionID, opts.SessionKey = restarted.ID, restarted.SessionKey
 			}
-			result := submitInteractiveReview(opts, target.ID, hash, db.DecisionApprove, "must not commit")
+			result := submitInteractiveReview(opts, target.ID, hash, target.ApprovalPolicy, db.DecisionApprove, "must not commit")
 			if result.Err == nil || result.Recorded || result.Review != nil {
 				t.Fatalf("failed review presented as recorded: %+v", result)
 			}
@@ -328,7 +351,7 @@ func TestInteractiveReviewEscalatedStillRequiresQuorum(t *testing.T) {
 	if _, err := database.Exec(`UPDATE requests SET status=?,expires_at=? WHERE id=?`, string(db.StatusEscalated), time.Now().Add(-time.Minute).UTC().Format(time.RFC3339), target.ID); err != nil {
 		t.Fatal(err)
 	}
-	result := submitInteractiveReview(opts, target.ID, target.Command.Hash, db.DecisionApprove, "one human vote")
+	result := submitInteractiveReview(opts, target.ID, target.Command.Hash, target.ApprovalPolicy, db.DecisionApprove, "one human vote")
 	if result.Err != nil || !result.Recorded || result.Request.Status != db.StatusEscalated || result.Approvals != 1 {
 		t.Fatalf("escalation bypassed quorum: %+v", result)
 	}

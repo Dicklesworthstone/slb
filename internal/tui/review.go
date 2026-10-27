@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
+	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/integrations"
 	"github.com/Dicklesworthstone/slb/internal/tui/request"
@@ -19,11 +20,13 @@ import (
 func (m *Model) submitReview(requestID string, decision db.Decision, comments string) tea.Cmd {
 	opts := m.options
 	commandHash := ""
+	approvalPolicy := db.ApprovalPolicyIndependent
 	if m.detail != nil && m.detail.Request != nil && m.detail.Request.ID == requestID {
 		commandHash = m.detail.Request.Command.Hash
+		approvalPolicy = m.detail.Request.ApprovalPolicy.Normalized()
 	}
 	return func() tea.Msg {
-		return submitInteractiveReview(opts, requestID, commandHash, decision, comments)
+		return submitInteractiveReview(opts, requestID, commandHash, approvalPolicy, decision, comments)
 	}
 }
 
@@ -35,7 +38,7 @@ func (m *Model) rejectRequest(requestID, reason string) tea.Cmd {
 	return m.submitReview(requestID, db.DecisionReject, reason)
 }
 
-func submitInteractiveReview(opts Options, id, commandHash string, decision db.Decision, comments string) request.ReviewSubmittedMsg {
+func submitInteractiveReview(opts Options, id, commandHash string, approvalPolicy db.ApprovalPolicy, decision db.Decision, comments string) request.ReviewSubmittedMsg {
 	result := request.ReviewSubmittedMsg{RequestID: id, Decision: decision}
 	fail := func(err error) request.ReviewSubmittedMsg {
 		result.Err = err
@@ -69,6 +72,8 @@ func submitInteractiveReview(opts Options, id, commandHash string, decision db.D
 	}
 	policy.ExpectedCommandHash = commandHash
 	policy.ExpectedProjectPath = target.ProjectPath
+	policy.ExpectedApprovalPolicy = approvalPolicy.Normalized()
+	policy.PolicyCheck = core.ReviewPolicyGuard(opts.ConfigPath)
 	review := &db.Review{RequestID: id, ReviewerSessionID: opts.SessionID, Decision: decision, Comments: comments}
 	outcome, err := database.ApplyReview(review, opts.SessionKey, policy)
 	if err != nil {

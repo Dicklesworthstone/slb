@@ -10,8 +10,75 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
+
+func TestSameHostGitHookRechecksCurrentPolicy(t *testing.T) {
+	for _, change := range []string{"none", "opt-out-before", "opt-out-during", "blocked-requester", "conflict-before", "conflict-during"} {
+		t.Run(change, func(t *testing.T) {
+			quorum := 1
+			if strings.HasPrefix(change, "conflict-") {
+				quorum = 2
+			}
+			database, pending, author, peers := sameHostPolicyFixture(t, quorum)
+			intent := GitHookIntent{Operation: "pre-commit", ProjectPath: pending.ProjectPath,
+				Snapshot: strings.Repeat("a", 64), Evidence: "disposable snapshot; no Git operation runs"}
+			engine, err := LoadCommandPolicy(database, config.LoadOptions{ProjectDir: intent.ProjectPath})
+			if err != nil {
+				t.Fatal(err)
+			}
+			options := DefaultRequestCreatorConfig()
+			options.ApprovalPolicy, options.AgentMailEnabled = db.ApprovalPolicySameHost, false
+			request, err := NewRequestCreator(database, nil, engine, options).CreateGitHookRequest(context.Background(), intent, author.ID, "verify current native Git review policy")
+			if err != nil {
+				t.Fatal(err)
+			}
+			applySameHostFixtureReview(t, database, request, peers[0], db.DecisionApprove)
+			if quorum == 2 {
+				applySameHostFixtureReview(t, database, request, peers[1], db.DecisionReject)
+				applySameHostFixtureReview(t, database, request, peers[2], db.DecisionApprove)
+			}
+			mutate := func() {
+				policy := "[general]\napproval_policy = 'independent'\n"
+				switch change {
+				case "blocked-requester":
+					policy = sameHostPolicyText(string(ConflictFirstWins), quorum) + "[agents]\nblocked = ['" + author.AgentName + "']\n"
+				case "conflict-before", "conflict-during":
+					policy = sameHostPolicyText(string(ConflictAnyRejectionBlocks), quorum) + "[patterns.safe]\npatterns = ['.*']\n"
+				}
+				writeExecutionPolicy(t, intent.ProjectPath, policy)
+			}
+			if change == "opt-out-before" || change == "blocked-requester" || change == "conflict-before" {
+				mutate()
+			}
+			result, err := NewExecutor(database, engine).AuthorizeGitHook(context.Background(), intent, request.ID, author.ID, func(context.Context) error {
+				if change == "opt-out-during" || change == "conflict-during" {
+					mutate()
+				}
+				return nil
+			})
+			if change != "none" {
+				want := ErrApprovalPolicyChanged
+				if change == "blocked-requester" {
+					want = ErrAgentBlocked
+				}
+				if !errors.Is(err, want) {
+					t.Fatalf("native Git ignored %s: %v", change, err)
+				}
+				assertPolicyUnclaimed(t, database, request.ID)
+				return
+			}
+			if err != nil || result.Execution == nil || result.Execution.ApprovalPolicy != db.ApprovalPolicySameHost || result.Execution.Assurance != db.AssuranceSameHost {
+				t.Fatalf("native same-host authorization: %+v %v", result, err)
+			}
+			receipt, err := os.ReadFile(result.Execution.LogPath)
+			if err != nil || !strings.Contains(string(receipt), `"approval_policy":"same_host"`) || !strings.Contains(string(receipt), "not independently authenticated authorization") {
+				t.Fatalf("native receipt lost review category: %s %v", receipt, err)
+			}
+		})
+	}
+}
 
 func gitHookApprovalFixture(t *testing.T, operation ...string) (*db.DB, GitHookIntent, *db.Request, *db.Session) {
 	t.Helper()

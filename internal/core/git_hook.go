@@ -144,6 +144,14 @@ func (intent GitHookIntent) checkPolicy(reader PolicyReader, request *db.Request
 	if err := checkApprovalPolicy(request, cfg.General.ApprovalPolicy); err != nil {
 		return err
 	}
+	for _, blocked := range cfg.Agents.Blocked {
+		if strings.EqualFold(blocked, request.RequestorAgent) {
+			return fmt.Errorf("%w: requester %q cannot execute an outstanding approval", ErrAgentBlocked, request.RequestorAgent)
+		}
+	}
+	if err := checkReviewConflictPolicy(reader, request, cfg.General.ConflictResolution); err != nil {
+		return err
+	}
 	tier := intent.effectiveTier(engine)
 	if tierHigher(tier, request.RiskTier) {
 		return ErrTierEscalated
@@ -220,6 +228,11 @@ func (e *Executor) AuthorizeGitHook(ctx context.Context, intent GitHookIntent, r
 			return err
 		}
 		if err := revalidate(ctx); err != nil {
+			return err
+		}
+		// Snapshot revalidation can take time. Recheck configuration after it
+		// so an opt-out or stricter conflict rule cannot use the earlier load.
+		if err := intent.checkPolicy(tx, current, e.configPath); err != nil {
 			return err
 		}
 		return ctx.Err()

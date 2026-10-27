@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -274,6 +275,112 @@ func TestApplyReviewWaitsForWriterThenRevalidatesSession(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("review did not finish after writer committed")
+	}
+}
+
+func TestSameHostReviewBindsDisplayedPolicy(t *testing.T) {
+	for _, decision := range []Decision{DecisionApprove, DecisionReject} {
+		t.Run(string(decision), func(t *testing.T) {
+			database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+			out, err := applyFixtureReview(database, request, sessions[1], decision, ReviewPolicy{
+				ApprovalPolicy: ApprovalPolicySameHost, ExpectedApprovalPolicy: ApprovalPolicyIndependent,
+			})
+			if out != nil || !errors.Is(err, ErrReviewTargetChanged) {
+				t.Fatalf("review accepted a different policy from the displayed request: %+v %v", out, err)
+			}
+			approvals, rejections, err := database.CountReviewsByDecision(request.ID)
+			if err != nil || approvals+rejections != 0 {
+				t.Fatalf("stale view persisted a vote: %d/%d %v", approvals, rejections, err)
+			}
+		})
+	}
+}
+
+func TestSameHostReviewRechecksPolicyAfterWriterReservation(t *testing.T) {
+	database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+	other, err := Open(filepath.Join(request.ProjectPath, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	tx, err := database.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE requests SET id = id WHERE id = ?`, request.ID); err != nil {
+		t.Fatal(err)
+	}
+	var revoked atomic.Bool
+	checked := make(chan struct{})
+	result := make(chan error, 1)
+	review := &Review{RequestID: request.ID, ReviewerSessionID: sessions[1].ID, Decision: DecisionApprove}
+	go func() {
+		_, err := other.ApplyReview(review, sessions[1].SessionKey, ReviewPolicy{
+			ApprovalPolicy: ApprovalPolicySameHost,
+			PolicyCheck: func(current *Request) error {
+				close(checked)
+				if current.ID != request.ID || current.ApprovalPolicy != ApprovalPolicySameHost {
+					return fmt.Errorf("policy guard received a different request")
+				}
+				if revoked.Load() {
+					return ErrReviewPolicyMismatch
+				}
+				return nil
+			},
+		})
+		result <- err
+	}()
+	// The fresh-policy callback cannot run while another connection owns the
+	// writer reservation, even if ApplyReview was called with an older opt-in.
+	select {
+	case <-checked:
+		t.Error("policy check ran before acquiring the writer reservation")
+	case <-time.After(100 * time.Millisecond):
+	}
+	revoked.Store(true)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrReviewPolicyMismatch) {
+			t.Fatalf("review ignored current policy revocation: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("review did not finish after writer committed")
+	}
+	if review.ID != "" || review.Signature != "" {
+		t.Fatal("policy denial changed the caller's review")
+	}
+	stored, err := database.GetRequest(request.ID)
+	if err != nil || stored.Status != StatusPending || stored.ApprovalExpiresAt != nil {
+		t.Fatalf("policy denial changed request state: %+v %v", stored, err)
+	}
+	approvals, rejections, err := database.CountReviewsByDecision(request.ID)
+	if err != nil || approvals+rejections != 0 {
+		t.Fatalf("policy denial persisted a vote: %d/%d %v", approvals, rejections, err)
+	}
+}
+
+func TestSameHostReviewAllowsRejectionAfterOptOut(t *testing.T) {
+	database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+	checked := false
+	out, err := applyFixtureReview(database, request, sessions[1], DecisionReject, ReviewPolicy{
+		ApprovalPolicy: ApprovalPolicyIndependent, ExpectedApprovalPolicy: ApprovalPolicySameHost,
+		PolicyCheck: func(*Request) error {
+			checked = true
+			return ErrReviewPolicyMismatch
+		},
+	})
+	if err != nil || out == nil || out.Request.Status != StatusRejected {
+		t.Fatalf("opt-out prevented rejection of a same-host request: %+v %v", out, err)
+	}
+	if checked {
+		t.Fatal("rejection unexpectedly required current approval authorization")
+	}
+	if out.Review.ApprovalPolicy != ApprovalPolicySameHost || out.Review.Assurance != AssuranceSameHost {
+		t.Fatalf("rejection lost its original same-host policy and assurance: %+v", out.Review)
 	}
 }
 

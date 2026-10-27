@@ -160,6 +160,30 @@ func TestDetailSnapshotNeverRetargetsOpenForm(t *testing.T) {
 	}
 }
 
+func TestDetailSnapshotNeverRetargetsReviewPolicyInOpenForm(t *testing.T) {
+	for _, key := range []rune{'a', 'r'} {
+		t.Run(string(key), func(t *testing.T) {
+			model := submissionDetail()
+			model.Request.ApprovalPolicy = db.ApprovalPolicyIndependent
+			model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{key}})
+			changed := *model.Request
+			changed.ApprovalPolicy = db.ApprovalPolicySameHost
+			model.ApplySnapshot(&changed, nil, model.Session, nil)
+			if model.Request.ApprovalPolicy != db.ApprovalPolicyIndependent || !strings.Contains(model.View(), "Review policy changed") {
+				t.Fatalf("open form silently switched review policy: %s", model.View())
+			}
+			if model.canApprove() || model.canReject() {
+				t.Fatal("stale policy form still permits review")
+			}
+			model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			model.ApplySnapshot(&changed, nil, model.Session, nil)
+			if model.SnapshotError != "" || model.Request.ApprovalPolicy != db.ApprovalPolicySameHost || !model.canApprove() {
+				t.Fatal("cancelling the stale form did not permit a fresh policy view")
+			}
+		})
+	}
+}
+
 func TestDetailSnapshotUpdatesFormEligibilityWithoutLosingText(t *testing.T) {
 	m := submissionDetail()
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})

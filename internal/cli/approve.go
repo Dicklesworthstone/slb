@@ -219,6 +219,7 @@ func buildConfiguredReviewService(database *db.DB, requestID string) (*core.Revi
 	}
 	review := core.DefaultReviewConfig()
 	review.ApprovalPolicy = db.ApprovalPolicy(cfg.General.ApprovalPolicy)
+	review.ConfigPath = flagConfig
 	review.ConflictResolution = core.ConflictResolution(cfg.General.ConflictResolution)
 	review.TrustedSelfApprove = cfg.Agents.TrustedSelfApprove
 	review.TrustedSelfApproveDelay = time.Duration(cfg.Agents.TrustedSelfApproveDelaySecs) * time.Second

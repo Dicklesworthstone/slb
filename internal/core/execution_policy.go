@@ -87,8 +87,9 @@ func CompileCommandPolicy(cfg config.Config, custom []Pattern, configPath string
 	return engine, nil
 }
 
-// CountPolicyReviewers counts independent, active identities only in the
+// CountPolicyReviewers counts distinct active agent labels only in the
 // request's project. The requester and duplicate agent sessions do not count.
+// These local labels do not establish independent reviewer identities.
 func CountPolicyReviewers(reader PolicyReader, project, sessionID, agent string) (int, error) {
 	rows, err := reader.Query(`SELECT COUNT(DISTINCT agent_name) FROM sessions
 		WHERE project_path = ? AND ended_at IS NULL AND id <> ? AND agent_name <> ? AND agent_name <> ''`,
@@ -138,11 +139,45 @@ func CheckExecutionPolicy(reader PolicyReader, request *db.Request, configPath s
 			return fmt.Errorf("%w: requester %q cannot execute an outstanding approval", ErrAgentBlocked, request.RequestorAgent)
 		}
 	}
+	if err := checkReviewConflictPolicy(reader, request, cfg.General.ConflictResolution); err != nil {
+		return err
+	}
 	available, err := CountPolicyReviewers(reader, request.ProjectPath, request.RequestorSessionID, request.RequestorAgent)
 	if err != nil {
 		return err
 	}
 	return engine.checkRequestPolicy(request, available)
+}
+
+// A first-wins decision can contain a later rejection while still satisfying
+// quorum. Changing to a policy that blocks on that rejection revokes execution,
+// even when the command now matches a SAFE rule. Signed review evidence remains
+// unchanged and is independently validated by the DB claim.
+func checkReviewConflictPolicy(reader PolicyReader, request *db.Request, resolution string) error {
+	rows, err := reader.Query(`SELECT decision FROM reviews WHERE request_id = ? ORDER BY rowid`, request.ID)
+	if err != nil {
+		return fmt.Errorf("reading review conflict evidence: %w", err)
+	}
+	defer rows.Close()
+	var first string
+	hasRejection := false
+	for rows.Next() {
+		var decision string
+		if err := rows.Scan(&decision); err != nil {
+			return fmt.Errorf("reading review conflict decision: %w", err)
+		}
+		if first == "" {
+			first = decision
+		}
+		hasRejection = hasRejection || decision == string(db.DecisionReject)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if hasRejection && (resolution != string(ConflictFirstWins) || first != string(db.DecisionApprove)) {
+		return fmt.Errorf("%w: current conflict policy %q does not permit these rejection votes", ErrApprovalPolicyChanged, resolution)
+	}
+	return nil
 }
 
 // A change in assurance requires a new request and new reviews. In particular,

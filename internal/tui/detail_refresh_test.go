@@ -52,7 +52,7 @@ func TestDetailRefreshIgnoresReadsBeforeLocalCommitAndOldViews(t *testing.T) {
 	m = next.(Model)
 	before := read().(detailRefreshResult)
 	m.detail.ReviewPending = true
-	committed := submitInteractiveReview(opts, target.ID, target.Command.Hash, db.DecisionApprove, "approved")
+	committed := submitInteractiveReview(opts, target.ID, target.Command.Hash, target.ApprovalPolicy, db.DecisionApprove, "approved")
 	if committed.Err != nil {
 		t.Fatal(committed.Err)
 	}
