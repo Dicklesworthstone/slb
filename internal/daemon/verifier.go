@@ -126,6 +126,9 @@ func (v *Verifier) VerifyAndMarkExecuting(p VerifyExecuteParams) (*VerificationR
 		ExecutedByAgent: session.AgentName, ExecutedByModel: session.Model,
 		LogPath: receipt,
 	}
+	// This notary claim performs no rollback capture. Do not reuse metadata
+	// left by an earlier local preflight for the remote execution attempt.
+	result.Request.Rollback = nil
 	if err := v.db.ClaimRequestExecutionAuthenticated(result.Request, execution, p.SessionKey, core.ExecutionPolicyGuard("")); err != nil {
 		if errors.Is(err, db.ErrExecutionAuthentication) || errors.Is(err, db.ErrInvalidTransition) ||
 			errors.Is(err, core.ErrApprovalPolicyChanged) || errors.Is(err, core.ErrTierEscalated) {

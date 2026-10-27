@@ -45,6 +45,186 @@ func TestTierHigher(t *testing.T) {
 	}
 }
 
+func sameHostFilesystemExecutionFixture(t *testing.T) (*db.DB, *db.Request, *db.Session, string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX rm execution fixture")
+	}
+	database, pending, author, peers := sameHostPolicyFixture(t, 1)
+	target := filepath.Join(pending.ProjectPath, "rollback-target.txt")
+	if err := os.WriteFile(target, []byte("version 1"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	request := &db.Request{
+		ProjectPath: pending.ProjectPath, ApprovalPolicy: db.ApprovalPolicySameHost,
+		RequestorSessionID: author.ID, RequestorAgent: author.AgentName, RequestorModel: author.Model,
+		Command:  db.CommandSpec{Raw: "rm -f -- rollback-target.txt", Argv: []string{"rm", "-f", "--", "rollback-target.txt"}, Cwd: pending.ProjectPath},
+		RiskTier: db.RiskTierDangerous, MinApprovals: 1, RequireDifferentModel: true,
+		Justification: db.Justification{Reason: "remove only a disposable rollback fixture"},
+	}
+	if err := database.CreateRequest(request); err != nil {
+		t.Fatal(err)
+	}
+	applySameHostFixtureReview(t, database, request, peers[0], db.DecisionApprove)
+	request, err := database.GetRequest(request.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return database, request, author, target
+}
+
+func TestSameHostExecutionRollbackCapturesCurrentAttempt(t *testing.T) {
+	for _, scenario := range []string{"fresh execution", "retry after refused claim"} {
+		t.Run(scenario, func(t *testing.T) {
+			database, request, author, target := sameHostFilesystemExecutionFixture(t)
+			previous, err := CaptureRollbackState(context.Background(), request, RollbackCaptureOptions{})
+			if err != nil || previous == nil || previous.Filesystem == nil {
+				t.Fatalf("prepare previous capture: %+v %v", previous, err)
+			}
+			if err := database.UpdateRequestRollbackPath(request.ID, previous.RollbackPath); err != nil {
+				t.Fatal(err)
+			}
+			previousRestore := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+			if err := database.UpdateRequestRolledBackAt(request.ID, previousRestore); err != nil {
+				t.Fatal(err)
+			}
+			current := "version 2"
+			if err := os.WriteFile(target, []byte(current), 0600); err != nil {
+				t.Fatal(err)
+			}
+			executor := NewExecutor(database, NewPatternEngine())
+			opts := ExecuteOptions{RequestID: request.ID, SessionID: author.ID, CaptureRollback: true,
+				LogDir: filepath.Join(request.ProjectPath, ".slb", "logs"), SuppressOutput: true}
+			var refusedPath string
+			if scenario == "retry after refused claim" {
+				// This trigger fails the final claim after capture has finished.
+				// It must not publish the candidate or run the deletion.
+				if _, err := database.Exec(`CREATE TRIGGER refuse_rollback_execution
+					BEFORE UPDATE OF execution_log_path ON requests WHEN new.status = 'executing'
+					BEGIN SELECT RAISE(ABORT, 'rollback fixture claim rejected'); END`); err != nil {
+					t.Fatal(err)
+				}
+				result, err := executor.ExecuteApprovedRequest(context.Background(), opts)
+				if result != nil || err == nil || !strings.Contains(err.Error(), "rollback fixture claim rejected") {
+					t.Fatalf("final claim failure was not observed: %+v %v", result, err)
+				}
+				stored, err := database.GetRequest(request.ID)
+				if err != nil || stored.Status != db.StatusApproved || stored.Execution != nil || stored.Rollback == nil ||
+					stored.Rollback.Path != previous.RollbackPath || stored.Rollback.RolledBackAt == nil || !stored.Rollback.RolledBackAt.Equal(previousRestore) {
+					t.Fatalf("refused claim published recovery state: %+v %v", stored, err)
+				}
+				if data, err := os.ReadFile(target); err != nil || string(data) != current {
+					t.Fatalf("refused claim changed the target: %q %v", data, err)
+				}
+				entries, err := os.ReadDir(filepath.Dir(previous.RollbackPath))
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, entry := range entries {
+					path := filepath.Join(filepath.Dir(previous.RollbackPath), entry.Name())
+					if !entry.IsDir() || path == previous.RollbackPath {
+						continue
+					}
+					if refusedPath != "" {
+						t.Fatal("one refused execution created multiple candidate snapshots")
+					}
+					refusedPath = path
+				}
+				if refusedPath == "" {
+					t.Fatal("execution reused the old snapshot instead of capturing before its refused claim")
+				}
+				refused, err := LoadRollbackData(refusedPath)
+				if err != nil || refused.Filesystem == nil {
+					t.Fatalf("refused attempt did not finish capture: %+v %v", refused, err)
+				}
+				if archive := readSnapshotArchive(t, refused); archive["p0"] != current {
+					t.Fatalf("refused attempt captured stale contents: %q", archive)
+				}
+				current = "version 3 after the refused attempt"
+				if err := os.WriteFile(target, []byte(current), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := database.Exec(`DROP TRIGGER refuse_rollback_execution`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result, err := executor.ExecuteApprovedRequest(context.Background(), opts)
+			if err != nil || result == nil || result.ExitCode != 0 || result.Request == nil || result.Request.Rollback == nil {
+				t.Fatalf("reviewed execution with capture failed: %+v %v", result, err)
+			}
+			stored, err := database.GetRequest(request.ID)
+			if err != nil || stored.Rollback == nil || stored.Execution == nil || stored.Status != db.StatusExecuted {
+				t.Fatalf("execution did not persist its recovery metadata: %+v %v", stored, err)
+			}
+			if stored.Rollback.Path == previous.RollbackPath || stored.Rollback.Path == refusedPath ||
+				stored.Rollback.Path != result.Request.Rollback.Path || stored.Rollback.RolledBackAt != nil || result.Request.Rollback.RolledBackAt != nil ||
+				stored.Execution.LogPath != result.LogPath {
+				t.Fatalf("winning execution did not own a fresh capture: stored=%+v returned=%+v", stored, result.Request)
+			}
+			if _, err := os.Stat(target); !os.IsNotExist(err) {
+				t.Fatalf("reviewed deletion did not run: %v", err)
+			}
+			if archive := readSnapshotArchive(t, previous); archive["p0"] != "version 1" {
+				t.Fatalf("a later attempt changed the previous capture: %q", archive)
+			}
+			accepted, err := LoadRollbackData(stored.Rollback.Path)
+			if err != nil || accepted.Filesystem == nil {
+				t.Fatalf("accepted capture is unreadable: %+v %v", accepted, err)
+			}
+			if err := RestoreRollbackState(context.Background(), accepted, RollbackRestoreOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			if data, err := os.ReadFile(target); err != nil || string(data) != current {
+				t.Fatalf("rollback restored another attempt's state: got=%q want=%q error=%v", data, current, err)
+			}
+		})
+	}
+}
+
+func TestSameHostExecutionWithoutCaptureClearsStagedRollback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX execution fixtures")
+	}
+	for _, scenario := range []string{"capture disabled", "unsupported command"} {
+		t.Run(scenario, func(t *testing.T) {
+			var database *db.DB
+			var request *db.Request
+			var author *db.Session
+			var target string
+			if scenario == "capture disabled" {
+				database, request, author, target = sameHostFilesystemExecutionFixture(t)
+			} else {
+				var peers []*db.Session
+				database, request, author, peers = sameHostPolicyFixture(t, 1)
+				applySameHostFixtureReview(t, database, request, peers[0], db.DecisionApprove)
+			}
+			stagedPath := filepath.Join(request.ProjectPath, "previous-preflight")
+			if err := database.UpdateRequestRollbackPath(request.ID, stagedPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := database.UpdateRequestRolledBackAt(request.ID, time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)); err != nil {
+				t.Fatal(err)
+			}
+			result, err := NewExecutor(database, NewPatternEngine()).ExecuteApprovedRequest(context.Background(), ExecuteOptions{
+				RequestID: request.ID, SessionID: author.ID, CaptureRollback: scenario == "unsupported command",
+				LogDir: filepath.Join(request.ProjectPath, ".slb", "logs"), SuppressOutput: true,
+			})
+			if err != nil || result == nil || result.ExitCode != 0 || result.Request == nil || result.Request.Rollback != nil {
+				t.Fatalf("execution advertised recovery it did not capture: %+v %v", result, err)
+			}
+			stored, err := database.GetRequest(request.ID)
+			if err != nil || stored.Status != db.StatusExecuted || stored.Rollback != nil {
+				t.Fatalf("execution retained stale recovery metadata: %+v %v", stored, err)
+			}
+			if target != "" {
+				if _, err := os.Stat(target); !os.IsNotExist(err) {
+					t.Fatalf("capture-disabled execution did not delete its fixture: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestNewExecutor(t *testing.T) {
 	t.Run("with nil pattern engine uses default", func(t *testing.T) {
 		dbConn, err := db.Open(":memory:")

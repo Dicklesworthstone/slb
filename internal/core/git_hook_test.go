@@ -39,6 +39,14 @@ func TestSameHostGitHookRechecksCurrentPolicy(t *testing.T) {
 				applySameHostFixtureReview(t, database, request, peers[1], db.DecisionReject)
 				applySameHostFixtureReview(t, database, request, peers[2], db.DecisionApprove)
 			}
+			stagedPath := filepath.Join(intent.ProjectPath, "previous-preflight")
+			stagedAt := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+			if err := database.UpdateRequestRollbackPath(request.ID, stagedPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := database.UpdateRequestRolledBackAt(request.ID, stagedAt); err != nil {
+				t.Fatal(err)
+			}
 			mutate := func() {
 				policy := "[general]\napproval_policy = 'independent'\n"
 				switch change {
@@ -67,10 +75,22 @@ func TestSameHostGitHookRechecksCurrentPolicy(t *testing.T) {
 					t.Fatalf("native Git ignored %s: %v", change, err)
 				}
 				assertPolicyUnclaimed(t, database, request.ID)
+				stored, err := database.GetRequest(request.ID)
+				if err != nil || stored.Rollback == nil || stored.Rollback.Path != stagedPath ||
+					stored.Rollback.RolledBackAt == nil || !stored.Rollback.RolledBackAt.Equal(stagedAt) {
+					t.Fatalf("refused Git claim changed recovery metadata: %+v %v", stored, err)
+				}
 				return
 			}
-			if err != nil || result.Execution == nil || result.Execution.ApprovalPolicy != db.ApprovalPolicySameHost || result.Execution.Assurance != db.AssuranceSameHost {
+			if err != nil || result == nil || result.Execution == nil || result.Execution.ApprovalPolicy != db.ApprovalPolicySameHost || result.Execution.Assurance != db.AssuranceSameHost {
 				t.Fatalf("native same-host authorization: %+v %v", result, err)
+			}
+			if result.Rollback != nil {
+				t.Fatalf("Git authorization advertised a previous preflight as its own capture: %+v", result.Rollback)
+			}
+			stored, err := database.GetRequest(request.ID)
+			if err != nil || stored.Status != db.StatusExecuted || stored.Rollback != nil {
+				t.Fatalf("Git authorization retained recovery metadata without capturing state: %+v %v", stored, err)
 			}
 			receipt, err := os.ReadFile(result.Execution.LogPath)
 			if err != nil || !strings.Contains(string(receipt), `"approval_policy":"same_host"`) || !strings.Contains(string(receipt), "not independently authenticated authorization") {

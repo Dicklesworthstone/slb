@@ -214,7 +214,11 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 		return nil, fmt.Errorf("creating log file: %w", err)
 	}
 
-	if opts.CaptureRollback && (request.Rollback == nil || request.Rollback.Path == "") {
+	// A previous preflight is not recovery evidence for this execution attempt.
+	// Capture anew and keep the candidate private until this attempt wins the
+	// atomic claim; a losing executor must never replace the winner's snapshot.
+	request.Rollback = nil
+	if opts.CaptureRollback {
 		data, err := CaptureRollbackState(ctx, request, RollbackCaptureOptions{
 			MaxSizeBytes: int64(opts.MaxRollbackSizeMB) * 1024 * 1024,
 		})
@@ -223,9 +227,6 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 		}
 		if data != nil && data.RollbackPath != "" {
 			request.Rollback = &db.Rollback{Path: data.RollbackPath}
-			if err := e.db.UpdateRequestRollbackPath(opts.RequestID, data.RollbackPath); err != nil {
-				return nil, fmt.Errorf("recording rollback path: %w", err)
-			}
 		}
 	}
 

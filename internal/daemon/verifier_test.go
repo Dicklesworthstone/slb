@@ -115,6 +115,7 @@ func requireNotaryClaim(t *testing.T, v *Verifier, p VerifyExecuteParams) *Verif
 }
 
 func TestVerifierSameHostClaimLabelsAndCurrentPolicy(t *testing.T) {
+	t.Setenv(db.SimulatedIdentityEnvForTest, "")
 	t.Setenv("HOME", t.TempDir())
 	for _, revoke := range []bool{false, true} {
 		t.Run(fmt.Sprint("revoke=", revoke), func(t *testing.T) {
@@ -147,6 +148,14 @@ func TestVerifierSameHostClaimLabelsAndCurrentPolicy(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			stagedPath := filepath.Join(project, "previous-preflight")
+			stagedAt := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+			if err := database.UpdateRequestRollbackPath(request.ID, stagedPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := database.UpdateRequestRolledBackAt(request.ID, stagedAt); err != nil {
+				t.Fatal(err)
+			}
 			v := NewVerifier(database)
 			params := VerifyExecuteParams{RequestID: request.ID, SessionID: author.ID,
 				SessionKey: author.SessionKey, CommandHash: request.Command.Hash}
@@ -161,13 +170,25 @@ func TestVerifierSameHostClaimLabelsAndCurrentPolicy(t *testing.T) {
 			}
 			claim, err := v.VerifyAndMarkExecuting(params)
 			if revoke {
-				if err != nil || claim.Allowed || !strings.Contains(claim.Reason, "approval policy") {
+				if err != nil || claim == nil || claim.Allowed || !strings.Contains(claim.Reason, "approval policy") {
 					t.Fatalf("notary ignored current policy: %+v %v", claim, err)
+				}
+				stored, err := database.GetRequest(request.ID)
+				if err != nil || stored.Status != db.StatusApproved || stored.Execution != nil || stored.Rollback == nil ||
+					stored.Rollback.Path != stagedPath || stored.Rollback.RolledBackAt == nil || !stored.Rollback.RolledBackAt.Equal(stagedAt) {
+					t.Fatalf("refused notary claim changed recovery metadata: %+v %v", stored, err)
 				}
 				return
 			}
-			if err != nil || !claim.Allowed {
+			if err != nil || claim == nil || !claim.Allowed || claim.Request == nil {
 				t.Fatalf("claim failed: %+v %v", claim, err)
+			}
+			if claim.Request.Rollback != nil {
+				t.Fatalf("notary advertised a previous preflight as its own capture: %+v", claim.Request.Rollback)
+			}
+			claimed, err := database.GetRequest(request.ID)
+			if err != nil || claimed.Status != db.StatusExecuting || claimed.Rollback != nil {
+				t.Fatalf("notary retained recovery metadata without capturing state: %+v %v", claimed, err)
 			}
 			response := claim.ToIPCResponse()
 			if response.ApprovalPolicy != db.ApprovalPolicySameHost || response.Assurance != db.AssuranceSameHost ||
@@ -195,7 +216,7 @@ func TestVerifierSameHostClaimLabelsAndCurrentPolicy(t *testing.T) {
 				t.Fatalf("completion receipt reinterpreted historical execution: %+v", completed.Result)
 			}
 			stored, err := database.GetRequest(request.ID)
-			if err != nil || stored.Status != db.StatusExecuted || stored.Execution == nil || stored.Execution.Assurance != db.AssuranceSameHost || stored.Execution.ApprovalPolicy != db.ApprovalPolicySameHost {
+			if err != nil || stored.Status != db.StatusExecuted || stored.Execution == nil || stored.Execution.Assurance != db.AssuranceSameHost || stored.Execution.ApprovalPolicy != db.ApprovalPolicySameHost || stored.Rollback != nil {
 				t.Fatalf("completed execution lost captured evidence category: %+v %v", stored, err)
 			}
 		})

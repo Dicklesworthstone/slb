@@ -79,6 +79,7 @@ func TestClaimRequestExecutionRejectsChangedEligibility(t *testing.T) {
 
 func TestClaimRequestExecutionAuditFailureIsAtomic(t *testing.T) {
 	database, req, execution := executionClaimFixture(t)
+	req.Rollback = &Rollback{Path: filepath.Join(req.ProjectPath, "candidate-backup")}
 	_, err := database.Exec(`CREATE TRIGGER refuse_claim BEFORE UPDATE OF execution_log_path ON requests
 		BEGIN SELECT RAISE(ABORT, 'injected audit write failure'); END`)
 	if err != nil {
@@ -91,7 +92,7 @@ func TestClaimRequestExecutionAuditFailureIsAtomic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.Status != StatusApproved || stored.Execution != nil {
+	if stored.Status != StatusApproved || stored.Execution != nil || stored.Rollback != nil {
 		t.Fatalf("claim was not atomic: %+v", stored)
 	}
 }
@@ -138,6 +139,101 @@ func TestClaimRequestExecutionConcurrentSingleWinner(t *testing.T) {
 	}
 	if stored.Status != StatusExecuting || stored.Execution == nil || stored.Execution.ExecutedBySessionID != execution.ExecutedBySessionID {
 		t.Fatalf("winning claim lacks execution identity: %+v", stored)
+	}
+}
+
+func TestClaimRequestExecutionRollbackBelongsToWinningClaim(t *testing.T) {
+	database, req, execution := executionClaimFixture(t)
+	other, err := Open(filepath.Join(req.ProjectPath, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	connections := []*DB{database, other}
+	type claimResult struct {
+		logPath, rollbackPath string
+		err                   error
+	}
+	const workers = 12
+	start := make(chan struct{})
+	results := make(chan claimResult, workers)
+	for i := 0; i < workers; i++ {
+		go func(i int) {
+			candidate := *req
+			candidate.Rollback = &Rollback{Path: filepath.Join(req.ProjectPath, fmt.Sprintf("backup-%d", i))}
+			attempt := *execution
+			attempt.LogPath = fmt.Sprintf("%s-%d", execution.LogPath, i)
+			<-start
+			err := connections[i%len(connections)].ClaimRequestExecution(&candidate, &attempt)
+			results <- claimResult{attempt.LogPath, candidate.Rollback.Path, err}
+		}(i)
+	}
+	close(start)
+	var winner claimResult
+	winners := 0
+	for i := 0; i < workers; i++ {
+		result := <-results
+		if result.err == nil {
+			winner = result
+			winners++
+		} else if !errors.Is(result.err, ErrInvalidTransition) {
+			t.Errorf("unexpected claim error: %v", result.err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("got %d successful claims, want one", winners)
+	}
+	stored, err := database.GetRequest(req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Execution == nil || stored.Execution.LogPath != winner.logPath || stored.Rollback == nil || stored.Rollback.Path != winner.rollbackPath {
+		t.Fatalf("rollback is not bound to the winning execution: execution=%+v rollback=%+v winner=%+v", stored.Execution, stored.Rollback, winner)
+	}
+	if err := database.UpdateRequestRollbackPath(req.ID, filepath.Join(req.ProjectPath, "late-loser-backup")); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("a late capture overwrote the winning rollback: %v", err)
+	}
+	stored, err = database.GetRequest(req.ID)
+	if err != nil || stored.Rollback == nil || stored.Rollback.Path != winner.rollbackPath {
+		t.Fatalf("winning snapshot changed after a rejected update: %+v %v", stored, err)
+	}
+}
+
+func TestClaimRequestExecutionClearsUncapturedRollback(t *testing.T) {
+	database, req, execution := executionClaimFixture(t)
+	if err := database.UpdateRequestRollbackPath(req.ID, filepath.Join(req.ProjectPath, "previous-preflight")); err != nil {
+		t.Fatal(err)
+	}
+	// This attempt did not capture a snapshot. An old preflight must not be
+	// advertised as recovery evidence for the execution that now wins.
+	if err := database.ClaimRequestExecution(req, execution); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := database.GetRequest(req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Rollback != nil {
+		t.Fatalf("uncaptured execution retained stale recovery evidence: %+v", stored.Rollback)
+	}
+}
+
+func TestUpdateRequestRollbackPathRejectsClaimedAndTerminalRequests(t *testing.T) {
+	for _, status := range []RequestStatus{StatusExecuting, StatusExecuted, StatusExecutionFailed, StatusTimedOut, StatusCancelled, StatusRejected} {
+		t.Run(string(status), func(t *testing.T) {
+			database, req, _ := executionClaimFixture(t)
+			original := filepath.Join(req.ProjectPath, "winning-backup")
+			if _, err := database.Exec(`UPDATE requests SET status = ?, rollback_path = ? WHERE id = ?`, status, original, req.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := database.UpdateRequestRollbackPath(req.ID, filepath.Join(req.ProjectPath, "late-backup")); !errors.Is(err, ErrInvalidTransition) {
+				t.Fatalf("rollback update accepted after %s: %v", status, err)
+			}
+			stored, err := database.GetRequest(req.ID)
+			if err != nil || stored.Rollback == nil || stored.Rollback.Path != original {
+				t.Fatalf("execution recovery evidence was overwritten: %+v %v", stored, err)
+			}
+		})
 	}
 }
 

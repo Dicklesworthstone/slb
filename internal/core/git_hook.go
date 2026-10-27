@@ -243,6 +243,9 @@ func (e *Executor) AuthorizeGitHook(ctx context.Context, intent GitHookIntent, r
 		}
 		return ctx.Err()
 	}
+	// The hook consumes approval for Git's operation without capturing state.
+	// An earlier executor's preflight must not become this action's recovery.
+	request.Rollback = nil
 	if err := e.db.ClaimRequestExecution(request, execution, guard); err != nil {
 		return nil, err
 	}

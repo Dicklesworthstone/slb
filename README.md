@@ -663,6 +663,12 @@ enable_rollback_capture = true
 max_rollback_size_mb = 100
 ```
 
+Each execution attempt captures fresh state. Its recovery path is recorded
+atomically with the successful execution claim, so a refused or competing
+attempt cannot replace the winning execution's snapshot. Retrying after a
+failed preflight captures the current state again. An execution without capture
+does not inherit a snapshot left by an earlier preflight.
+
 Captured state includes:
 - **Filesystem**: Tar archive of affected paths
 - **Git**: HEAD commit, branch, dirty state, untracked files

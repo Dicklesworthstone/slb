@@ -19,6 +19,8 @@ type ExecutionPolicyCheck func(tx *sql.Tx, request *Request) error
 // ClaimRequestExecution atomically claims the reviewed command and records who
 // will execute it. A failed write must never authorize starting the process.
 // This local API assumes its caller already has trusted database access.
+// expected.Rollback must be a fresh capture for this attempt, or nil when this
+// attempt did not capture one. Its path is committed with the winning claim.
 func (db *DB) ClaimRequestExecution(expected *Request, execution *Execution, checks ...ExecutionPolicyCheck) error {
 	return db.claimRequestExecution(expected, execution, nil, checks)
 }
@@ -44,6 +46,10 @@ func (db *DB) claimRequestExecution(expected *Request, execution *Execution, ses
 		return fmt.Errorf("encoding execution arguments: %w", err)
 	}
 	accepted := *execution
+	rollbackPath := ""
+	if expected.Rollback != nil {
+		rollbackPath = expected.Rollback.Path
+	}
 
 	err = db.Transaction(func(tx *sql.Tx) error {
 		if _, err := tx.Exec(`UPDATE requests SET id = id WHERE id = ?`, expected.ID); err != nil {
@@ -86,7 +92,8 @@ func (db *DB) claimRequestExecution(expected *Request, execution *Execution, ses
 				execution_executed_at = ?, execution_executed_by_session_id = ?,
 				execution_executed_by_agent = ?, execution_executed_by_model = ?,
 				execution_log_path = ?, execution_exit_code = NULL, execution_duration_ms = NULL,
-				execution_approval_policy = ?, execution_assurance = ?
+				execution_approval_policy = ?, execution_assurance = ?,
+				rollback_path = ?, rollback_rolled_back_at = NULL
 			WHERE id = ? AND status = 'approved'
 				AND project_path = ?
 				AND command_hash = ? AND command_raw = ? AND command_cwd = ?
@@ -100,7 +107,7 @@ func (db *DB) claimRequestExecution(expected *Request, execution *Execution, ses
 				)
 		`, execution.ExecutedAt.UTC().Format(time.RFC3339), execution.ExecutedBySessionID,
 			execution.ExecutedByAgent, execution.ExecutedByModel, execution.LogPath,
-			string(accepted.ApprovalPolicy), string(accepted.Assurance),
+			string(accepted.ApprovalPolicy), string(accepted.Assurance), nullString(rollbackPath),
 			expected.ID, expected.ProjectPath, expected.Command.Hash, expected.Command.Raw, expected.Command.Cwd,
 			string(argv), boolToInt(expected.Command.Shell), string(expected.RiskTier), expected.MinApprovals,
 			boolToInt(expected.RequireDifferentModel), string(expected.ApprovalPolicy.Normalized()), execution.ExecutedBySessionID,

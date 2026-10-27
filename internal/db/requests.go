@@ -411,14 +411,23 @@ func (db *DB) UpdateRequestExecution(id string, exec *Execution) error {
 	return nil
 }
 
-// UpdateRequestRollbackPath records the rollback capture directory path for a request.
+// UpdateRequestRollbackPath stages recovery metadata before execution. Execution
+// captures belong in ClaimRequestExecution so a late preflight cannot replace
+// the snapshot attached to an already claimed or completed execution.
 func (db *DB) UpdateRequestRollbackPath(id, rollbackPath string) error {
-	_, err := db.Exec(`
+	result, err := db.Exec(`
 		UPDATE requests SET rollback_path = ?
-		WHERE id = ?
+		WHERE id = ? AND status IN ('pending', 'approved')
 	`, nullString(rollbackPath), id)
 	if err != nil {
 		return fmt.Errorf("updating request rollback path: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking request rollback update: %w", err)
+	}
+	if count != 1 {
+		return fmt.Errorf("%w: recovery metadata can only be staged before execution", ErrInvalidTransition)
 	}
 	return nil
 }
