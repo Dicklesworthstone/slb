@@ -233,7 +233,7 @@ func RestoreRollbackState(ctx context.Context, data *RollbackData, opts Rollback
 
 	switch data.Kind {
 	case rollbackKindFilesystem:
-		return restoreFilesystemRollback(data, opts)
+		return restoreFilesystemRollback(ctx, data, opts)
 	case rollbackKindGit:
 		return restoreGitRollback(ctx, data, opts)
 	case rollbackKindKubernetes:
@@ -730,34 +730,272 @@ func ensureNoSymlinkParents(rootPath, targetPath string) error {
 	return nil
 }
 
-func restoreFilesystemRollback(data *RollbackData, opts RollbackRestoreOptions) error {
+const (
+	maxFilesystemRollbackEntries       = 100000
+	maxFilesystemRollbackMetadataBytes = 64 << 20
+)
+
+type filesystemRollbackEntry struct {
+	kind    byte
+	mode    os.FileMode
+	size    int64
+	modTime time.Time
+	link    string
+	digest  [sha256.Size]byte
+}
+
+type filesystemRollbackReader struct {
+	ctx               context.Context
+	reader            io.Reader
+	metadataRemaining *int64
+}
+
+func (r filesystemRollbackReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if r.metadataRemaining != nil {
+		if *r.metadataRemaining < 0 {
+			return 0, fmt.Errorf("filesystem rollback metadata exceeds its size limit")
+		}
+		if int64(len(p)) > *r.metadataRemaining+1 {
+			p = p[:*r.metadataRemaining+1]
+		}
+	}
+	n, err := r.reader.Read(p)
+	if r.metadataRemaining != nil {
+		*r.metadataRemaining -= int64(n)
+		if *r.metadataRemaining < 0 {
+			return 0, fmt.Errorf("filesystem rollback metadata exceeds its size limit")
+		}
+	}
+	return n, err
+}
+
+// Filesystem recovery validates all contents and destinations before changing
+// live files. The recorded payload size bounds decoding without introducing a
+// new payload cap for historical captures. Header/padding and entry limits bound
+// the recovery plan itself. These checks do not provide atomic restoration or
+// isolation from another process changing paths/files between checks and writes.
+func restoreFilesystemRollback(ctx context.Context, data *RollbackData, opts RollbackRestoreOptions) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if data.Filesystem == nil {
 		return fmt.Errorf("filesystem rollback data missing")
 	}
+	if data.Filesystem.TotalBytes < 0 || data.Filesystem.TotalBytes > (1<<63-1)-maxFilesystemRollbackMetadataBytes-1 {
+		return fmt.Errorf("invalid filesystem rollback payload size")
+	}
+	if len(data.Filesystem.Roots) == 0 || len(data.Filesystem.Roots) > maxFilesystemRollbackEntries {
+		return fmt.Errorf("filesystem rollback roots missing or excessive")
+	}
 	rootMap := make(map[string]string, len(data.Filesystem.Roots))
 	for _, r := range data.Filesystem.Roots {
-		if r.ID != "" && r.Path != "" {
-			rootMap[r.ID] = r.Path
+		if r.ID == "" || r.ID == "." || r.ID == ".." || strings.ContainsAny(r.ID, "/\\\x00") ||
+			!filepath.IsAbs(r.Path) || filepath.Clean(r.Path) != r.Path || strings.ContainsRune(r.Path, 0) {
+			return fmt.Errorf("filesystem rollback roots missing or invalid")
 		}
+		if _, exists := rootMap[r.ID]; exists {
+			return fmt.Errorf("duplicate filesystem rollback root id: %s", r.ID)
+		}
+		rootMap[r.ID] = r.Path
 	}
-	if len(rootMap) == 0 {
-		return fmt.Errorf("filesystem rollback roots missing")
+	if data.Filesystem.TarGz == "" || !filepath.IsLocal(filepath.FromSlash(data.Filesystem.TarGz)) {
+		return fmt.Errorf("invalid filesystem rollback archive path")
 	}
-
 	tarPath := filepath.Join(data.RollbackPath, data.Filesystem.TarGz)
+	if err := ensureNoSymlinkParents(data.RollbackPath, tarPath); err != nil {
+		return err
+	}
+	info, err := os.Lstat(tarPath)
+	if err != nil {
+		return fmt.Errorf("opening rollback tar.gz: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("filesystem rollback archive must be a regular file")
+	}
 	f, err := os.Open(tarPath)
 	if err != nil {
 		return fmt.Errorf("opening rollback tar.gz: %w", err)
 	}
 	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return fmt.Errorf("filesystem rollback archive changed while opening")
+	}
 
-	gr, err := gzip.NewReader(f)
+	plan := make(map[string]filesystemRollbackEntry)
+	err = walkFilesystemRollbackArchive(ctx, f, rootMap, data.Filesystem.TotalBytes, maxFilesystemRollbackMetadataBytes, func(hdr *tar.Header, target string, body io.Reader) error {
+		entry := filesystemRollbackEntry{
+			kind: hdr.Typeflag, mode: os.FileMode(hdr.Mode) & os.ModePerm,
+			size: hdr.Size, modTime: hdr.ModTime, link: hdr.Linkname,
+		}
+		if entry.kind == tar.TypeRegA {
+			entry.kind = tar.TypeReg
+		}
+		hash := sha256.New()
+		if _, err := io.Copy(hash, body); err != nil {
+			return fmt.Errorf("validating rollback payload: %w", err)
+		}
+		copy(entry.digest[:], hash.Sum(nil))
+		if previous, exists := plan[target]; exists {
+			// Overlapping rm operands can capture one destination under two
+			// root IDs. Preserve those historical captures only when both
+			// copies describe exactly the same restoration.
+			if previous.kind != entry.kind || previous.mode != entry.mode || previous.size != entry.size ||
+				!previous.modTime.Equal(entry.modTime) || previous.link != entry.link || previous.digest != entry.digest {
+				return fmt.Errorf("conflicting filesystem rollback destination: %s", target)
+			}
+			return nil
+		}
+		plan[target] = entry
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for target, entry := range plan {
+		if err := validateFilesystemRollbackDestination(ctx, target, entry.kind, opts); err != nil {
+			return err
+		}
+		for parent := filepath.Dir(target); ; parent = filepath.Dir(parent) {
+			if ancestor, exists := plan[parent]; exists && ancestor.kind != tar.TypeDir {
+				return fmt.Errorf("filesystem rollback entry has a file or symlink parent: %s", target)
+			}
+			if filepath.Dir(parent) == parent {
+				break
+			}
+		}
+	}
+	current, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if current.Size() != opened.Size() || !current.ModTime().Equal(opened.ModTime()) {
+		return fmt.Errorf("filesystem rollback archive changed during validation")
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	restored := make(map[string]bool, len(plan))
+	return walkFilesystemRollbackArchive(ctx, f, rootMap, data.Filesystem.TotalBytes, maxFilesystemRollbackMetadataBytes, func(hdr *tar.Header, target string, body io.Reader) error {
+		if restored[target] {
+			return nil
+		}
+		if err := validateFilesystemRollbackDestination(ctx, target, hdr.Typeflag, opts); err != nil {
+			return err
+		}
+		mode := os.FileMode(hdr.Mode) & os.ModePerm
+		if hdr.Typeflag == tar.TypeDir {
+			if err := os.MkdirAll(target, mode); err != nil {
+				return fmt.Errorf("creating dir %s: %w", target, err)
+			}
+			restored[target] = true
+			return nil
+		}
+		if info, err := os.Lstat(target); err == nil {
+			if !opts.Force {
+				return fmt.Errorf("path exists: %s (use --force to overwrite)", target)
+			}
+			if info.IsDir() {
+				err = os.RemoveAll(target)
+			} else {
+				err = os.Remove(target)
+			}
+			if err != nil {
+				return fmt.Errorf("removing %s: %w", target, err)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("lstat %s: %w", target, err)
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			return fmt.Errorf("creating parent dir: %w", err)
+		}
+		if err := ensureFilesystemRollbackParents(ctx, target); err != nil {
+			return err
+		}
+		if hdr.Typeflag == tar.TypeSymlink {
+			if err := os.Symlink(hdr.Linkname, target); err != nil {
+				return fmt.Errorf("creating symlink %s: %w", target, err)
+			}
+		} else {
+			file, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+			if err != nil {
+				return fmt.Errorf("creating file %s: %w", target, err)
+			}
+			_, copyErr := io.Copy(file, body)
+			if err := errors.Join(copyErr, file.Close()); err != nil {
+				return fmt.Errorf("writing file %s: %w", target, err)
+			}
+			_ = os.Chtimes(target, hdr.ModTime, hdr.ModTime)
+		}
+		restored[target] = true
+		return nil
+	})
+}
+
+// A captured root can itself be a file or a symlink. Its parent chain must be
+// checked all the way to the filesystem root, not just below the captured root.
+// The leaf is intentionally excluded so a captured symlink can be recreated.
+func ensureFilesystemRollbackParents(ctx context.Context, target string) error {
+	for parent := filepath.Dir(target); ; parent = filepath.Dir(parent) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		info, err := os.Lstat(parent)
+		if err == nil && !info.IsDir() {
+			return fmt.Errorf("refusing filesystem rollback through a non-directory or symlink parent: %s", parent)
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("checking filesystem rollback parent: %w", err)
+		}
+		if filepath.Dir(parent) == parent {
+			return nil
+		}
+	}
+}
+
+func validateFilesystemRollbackDestination(ctx context.Context, target string, kind byte, opts RollbackRestoreOptions) error {
+	if err := ensureFilesystemRollbackParents(ctx, target); err != nil {
+		return err
+	}
+	info, err := os.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("checking filesystem rollback destination: %w", err)
+	}
+	if kind == tar.TypeDir {
+		if !info.IsDir() {
+			return fmt.Errorf("filesystem rollback directory conflicts with an existing path: %s", target)
+		}
+	} else if !opts.Force {
+		return fmt.Errorf("path exists: %s (use --force to overwrite)", target)
+	}
+	return nil
+}
+
+func walkFilesystemRollbackArchive(ctx context.Context, source io.Reader, roots map[string]string, totalBytes, metadataBytes int64, visit func(*tar.Header, string, io.Reader) error) error {
+	if totalBytes < 0 || metadataBytes < 0 || totalBytes > (1<<63-1)-metadataBytes-1 {
+		return fmt.Errorf("invalid filesystem rollback decoding limits")
+	}
+	gr, err := gzip.NewReader(filesystemRollbackReader{ctx: ctx, reader: source})
 	if err != nil {
 		return fmt.Errorf("opening gzip: %w", err)
 	}
 	defer gr.Close()
-
-	tr := tar.NewReader(gr)
+	decoded := &filesystemRollbackReader{ctx: ctx, reader: gr, metadataRemaining: &metadataBytes}
+	limited := &io.LimitedReader{R: decoded, N: totalBytes + metadataBytes + 1}
+	tr := tar.NewReader(limited)
+	remaining := totalBytes
+	names := make(map[string]bool)
+	seenRoots := make(map[string]bool, len(roots))
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -767,117 +1005,88 @@ func restoreFilesystemRollback(data *RollbackData, opts RollbackRestoreOptions) 
 			return fmt.Errorf("reading tar: %w", err)
 		}
 
-		clean := path.Clean(strings.TrimPrefix(hdr.Name, "./"))
-		if clean == "." || strings.HasPrefix(clean, "../") || strings.Contains(clean, "\\") {
+		clean := strings.TrimSuffix(strings.TrimPrefix(hdr.Name, "./"), "/")
+		if clean == "" || clean == "." || path.Clean(clean) != clean || path.IsAbs(clean) ||
+			strings.HasPrefix(clean, "../") || strings.ContainsAny(clean, "\\\x00") {
 			return fmt.Errorf("invalid tar entry name: %q", hdr.Name)
 		}
-		parts := strings.Split(strings.TrimSuffix(clean, "/"), "/")
-		if len(parts) == 0 || parts[0] == "" {
-			continue
+		if names[clean] {
+			return fmt.Errorf("duplicate filesystem rollback archive entry: %s", clean)
 		}
+		names[clean] = true
+		if len(names) > maxFilesystemRollbackEntries {
+			return fmt.Errorf("filesystem rollback archive contains too many entries")
+		}
+		parts := strings.SplitN(clean, "/", 2)
 		rootID := parts[0]
-		rootPath, ok := rootMap[rootID]
+		rootPath, ok := roots[rootID]
 		if !ok {
 			return fmt.Errorf("unknown rollback root id: %s", rootID)
 		}
-
-		rel := strings.Join(parts[1:], "/")
-		if strings.HasPrefix(rel, "../") || rel == ".." {
-			return fmt.Errorf("invalid rollback relative path: %q", rel)
-		}
-		relOS := filepath.FromSlash(rel)
-		if filepath.IsAbs(relOS) || filepath.VolumeName(relOS) != "" {
-			return fmt.Errorf("invalid rollback relative path: %q", rel)
-		}
-
 		target := rootPath
-		if rel != "" && rel != "." {
-			target = filepath.Join(rootPath, relOS)
+		if len(parts) == 1 {
+			seenRoots[rootID] = true
+		} else {
+			rel := filepath.FromSlash(parts[1])
+			if !filepath.IsLocal(rel) || filepath.VolumeName(rel) != "" {
+				return fmt.Errorf("invalid rollback relative path: %q", rel)
+			}
+			target = filepath.Join(rootPath, rel)
 		}
-
-		mode := os.FileMode(hdr.Mode) & os.ModePerm
-
 		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if err := ensureNoSymlinkParents(rootPath, target); err != nil {
-				return err
-			}
-			if err := os.MkdirAll(target, mode); err != nil {
-				return fmt.Errorf("creating dir %s: %w", target, err)
-			}
-		case tar.TypeSymlink:
-			parent := filepath.Dir(target)
-			if filepath.Clean(target) != filepath.Clean(rootPath) {
-				if err := ensureNoSymlinkParents(rootPath, parent); err != nil {
-					return err
-				}
-			}
-			if info, err := os.Lstat(target); err == nil {
-				if !opts.Force {
-					return fmt.Errorf("path exists: %s (use --force to overwrite)", target)
-				}
-				if info.IsDir() {
-					if err := os.RemoveAll(target); err != nil {
-						return fmt.Errorf("removing %s: %w", target, err)
-					}
-				} else {
-					if err := os.Remove(target); err != nil {
-						return fmt.Errorf("removing %s: %w", target, err)
-					}
-				}
-			} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("lstat %s: %w", target, err)
-			}
-			if err := os.MkdirAll(parent, 0755); err != nil {
-				return fmt.Errorf("creating parent dir: %w", err)
-			}
-			if err := os.Symlink(hdr.Linkname, target); err != nil {
-				return fmt.Errorf("creating symlink %s: %w", target, err)
+		case tar.TypeDir, tar.TypeSymlink:
+			if hdr.Size != 0 || strings.ContainsRune(hdr.Linkname, 0) || (hdr.Typeflag == tar.TypeSymlink && hdr.Linkname == "") {
+				return fmt.Errorf("invalid filesystem rollback directory or symlink: %s", hdr.Name)
 			}
 		case tar.TypeReg, tar.TypeRegA:
-			parent := filepath.Dir(target)
-			if filepath.Clean(target) != filepath.Clean(rootPath) {
-				if err := ensureNoSymlinkParents(rootPath, parent); err != nil {
-					return err
-				}
+			if hdr.Size < 0 || hdr.Size > remaining {
+				return fmt.Errorf("filesystem rollback payload exceeds its recorded size")
 			}
-			if info, err := os.Lstat(target); err == nil {
-				if !opts.Force {
-					return fmt.Errorf("path exists: %s (use --force to overwrite)", target)
-				}
-				if info.IsDir() {
-					if err := os.RemoveAll(target); err != nil {
-						return fmt.Errorf("removing %s: %w", target, err)
-					}
-				} else {
-					if err := os.Remove(target); err != nil {
-						return fmt.Errorf("removing %s: %w", target, err)
-					}
-				}
-			} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("lstat %s: %w", target, err)
-			}
-			if err := os.MkdirAll(parent, 0755); err != nil {
-				return fmt.Errorf("creating parent dir: %w", err)
-			}
-			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
-			if err != nil {
-				return fmt.Errorf("creating file %s: %w", target, err)
-			}
-			if _, err := io.Copy(f, tr); err != nil {
-				f.Close()
-				return fmt.Errorf("writing file %s: %w", target, err)
-			}
-			if err := f.Close(); err != nil {
-				return fmt.Errorf("closing file %s: %w", target, err)
-			}
-			modTime := hdr.ModTime
-			_ = os.Chtimes(target, modTime, modTime)
+			remaining -= hdr.Size
 		default:
-			// Skip unsupported types.
+			return fmt.Errorf("unsupported filesystem rollback entry type for %s", hdr.Name)
+		}
+		// Header parsing (including PAX headers hidden inside tar.Next) and
+		// padding have an independent budget. A large payload allowance must
+		// not subsidize arbitrarily large metadata or retained entry names.
+		decoded.metadataRemaining = nil
+		if err := visit(hdr, target, tr); err != nil {
+			return err
+		}
+		if _, err := io.Copy(io.Discard, tr); err != nil {
+			return fmt.Errorf("reading filesystem rollback payload: %w", err)
+		}
+		decoded.metadataRemaining = &metadataBytes
+	}
+	// tar EOF does not establish gzip integrity: consume the trailer too.
+	// Only ordinary zero padding may follow the tar end marker, not another
+	// hidden archive or unbounded decompressed data.
+	var padding [32 << 10]byte
+	for {
+		n, err := limited.Read(padding[:])
+		if limited.N == 0 {
+			return fmt.Errorf("filesystem rollback metadata or padding exceeds its size limit")
+		}
+		for _, b := range padding[:n] {
+			if b != 0 {
+				return fmt.Errorf("unexpected data after filesystem rollback archive")
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("validating filesystem rollback gzip trailer: %w", err)
 		}
 	}
-
+	if remaining != 0 {
+		return fmt.Errorf("filesystem rollback payload does not match its recorded size")
+	}
+	for id := range roots {
+		if !seenRoots[id] {
+			return fmt.Errorf("filesystem rollback archive is missing root %s", id)
+		}
+	}
 	return nil
 }
 

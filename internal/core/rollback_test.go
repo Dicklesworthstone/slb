@@ -2,6 +2,7 @@ package core
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -233,6 +234,410 @@ func TestRollbackFilesystemRestoreRefusesSymlinkParents(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(outside, "a.txt")); err == nil {
 		t.Fatalf("restore wrote through symlink parent to outside path")
+	}
+}
+
+func TestRollbackFilesystemRestoreRefusesRedirectedAncestors(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fixture requires symlink support")
+	}
+	for _, kind := range []string{"file", "directory", "symlink"} {
+		for _, force := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/force=%v", kind, force), func(t *testing.T) {
+				project := t.TempDir()
+				parent := filepath.Join(project, "parent")
+				outside := filepath.Join(project, "unrelated")
+				for _, dir := range []string{parent, outside} {
+					if err := os.Mkdir(dir, 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				target := filepath.Join(parent, "item")
+				switch kind {
+				case "directory":
+					if err := os.Mkdir(target, 0700); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(target, "leaf"), []byte("captured"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				case "symlink":
+					if err := os.Symlink("saved-link-target", target); err != nil {
+						t.Fatal(err)
+					}
+				default:
+					if err := os.WriteFile(target, []byte("captured"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				data, err := CaptureRollbackState(context.Background(), &db.Request{
+					ID: "redirected-ancestor", ProjectPath: project,
+					Command: db.CommandSpec{Raw: "rm -rf parent/item", Cwd: project},
+				}, RollbackCaptureOptions{MaxSizeBytes: 1 << 20})
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Preserve the original tree while redirecting its old pathname.
+				if err := os.Rename(parent, filepath.Join(project, "saved-parent")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, parent); err != nil {
+					t.Fatal(err)
+				}
+				unrelated := filepath.Join(outside, "item")
+				if force {
+					if kind == "directory" {
+						if err := os.Mkdir(unrelated, 0700); err != nil {
+							t.Fatal(err)
+						}
+						unrelated = filepath.Join(unrelated, "leaf")
+					}
+					if err := os.WriteFile(unrelated, []byte("unrelated current work"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := RestoreRollbackState(context.Background(), data, RollbackRestoreOptions{Force: force}); err == nil {
+					t.Error("restoration accepted an ancestor redirected to another directory")
+				}
+				if force {
+					got, err := os.ReadFile(unrelated)
+					if err != nil || string(got) != "unrelated current work" {
+						t.Fatalf("restoration changed unrelated contents: %q, %v", got, err)
+					}
+				} else if _, err := os.Lstat(unrelated); !os.IsNotExist(err) {
+					t.Fatalf("restoration created an entry in the unrelated directory: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestRollbackFilesystemRestorePreflightsCompleteArchive(t *testing.T) {
+	for _, damage := range []string{
+		"unknown root", "truncated body", "unsupported type", "gzip checksum",
+		"duplicate name", "path traversal", "payload exceeds record", "payload below record",
+	} {
+		t.Run(damage, func(t *testing.T) {
+			project := t.TempDir()
+			for _, name := range []string{"a", "b"} {
+				if err := os.WriteFile(filepath.Join(project, name), []byte("captured"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			data, err := CaptureRollbackState(context.Background(), &db.Request{
+				ID: "archive-preflight", ProjectPath: project,
+				Command: db.CommandSpec{Raw: "rm a b", Cwd: project},
+			}, RollbackCaptureOptions{MaxSizeBytes: 1 << 20})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"a", "b"} {
+				if err := os.WriteFile(filepath.Join(project, name), []byte("current "+name), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var encoded bytes.Buffer
+			gz := gzip.NewWriter(&encoded)
+			tw := tar.NewWriter(gz)
+			if err := tw.WriteHeader(&tar.Header{Name: "p0", Mode: 0600, Typeflag: tar.TypeReg, Size: 8}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tw.Write([]byte("captured")); err != nil {
+				t.Fatal(err)
+			}
+			second := &tar.Header{Name: "p1", Mode: 0600, Typeflag: tar.TypeReg, Size: 8}
+			if damage == "unknown root" {
+				second.Name = "not-a-captured-root"
+			}
+			if damage == "duplicate name" {
+				second.Name = "p0"
+			}
+			if damage == "path traversal" {
+				second.Name = "p1/../p0"
+			}
+			if damage == "payload exceeds record" {
+				data.Filesystem.TotalBytes--
+			}
+			if damage == "payload below record" {
+				data.Filesystem.TotalBytes++
+			}
+			if damage == "unsupported type" {
+				second.Typeflag, second.Size, second.Linkname = tar.TypeLink, 0, "p0"
+			}
+			if err := tw.WriteHeader(second); err != nil {
+				t.Fatal(err)
+			}
+			if second.Size > 0 {
+				body := "captured"
+				if damage == "truncated body" {
+					body = "cut"
+				}
+				if _, err := tw.Write([]byte(body)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Complete the gzip stream even when the enclosed tar body is short.
+			if damage != "truncated body" {
+				if err := tw.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := gz.Close(); err != nil {
+				t.Fatal(err)
+			}
+			archive := encoded.Bytes()
+			if damage == "gzip checksum" {
+				archive[len(archive)-8] ^= 0xff
+			}
+			if err := os.WriteFile(filepath.Join(data.RollbackPath, data.Filesystem.TarGz), archive, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := RestoreRollbackState(context.Background(), data, RollbackRestoreOptions{Force: true}); err == nil {
+				t.Error("restoration accepted a malformed archive")
+			}
+			for _, name := range []string{"a", "b"} {
+				got, err := os.ReadFile(filepath.Join(project, name))
+				if err != nil || string(got) != "current "+name {
+					t.Errorf("malformed archive changed live file %s before rejection: %q, %v", name, got, err)
+				}
+			}
+		})
+	}
+}
+
+func TestRollbackFilesystemRestoreRefusesPlannedNonDirectoryAncestors(t *testing.T) {
+	for _, kind := range []byte{tar.TypeReg, tar.TypeSymlink} {
+		for _, parentFirst := range []bool{false, true} {
+			t.Run(fmt.Sprintf("type=%d/parent-first=%v", kind, parentFirst), func(t *testing.T) {
+				project := t.TempDir()
+				outside := filepath.Join(project, "unrelated")
+				if err := os.Mkdir(outside, 0700); err != nil {
+					t.Fatal(err)
+				}
+				outsideFile := filepath.Join(outside, "child")
+				if err := os.WriteFile(outsideFile, []byte("unrelated current work"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				parent := filepath.Join(project, "restore-parent")
+				data := &RollbackData{
+					Kind: rollbackKindFilesystem, RollbackPath: t.TempDir(),
+					Filesystem: &FilesystemRollbackData{
+						TarGz: rollbackFilesystemTarGz, TotalBytes: 8,
+						Roots: []FilesystemRoot{{ID: "p0", Path: parent}, {ID: "p1", Path: filepath.Join(parent, "child")}},
+					},
+				}
+				parentHeader := tar.Header{Name: "p0", Typeflag: kind, Mode: 0700, Linkname: outside}
+				if kind == tar.TypeReg {
+					parentHeader.Size, parentHeader.Linkname = 8, ""
+					data.Filesystem.TotalBytes += 8
+				}
+				headers := []tar.Header{parentHeader, {Name: "p1", Typeflag: tar.TypeReg, Mode: 0600, Size: 8}}
+				if !parentFirst {
+					headers[0], headers[1] = headers[1], headers[0]
+				}
+				var encoded bytes.Buffer
+				gz := gzip.NewWriter(&encoded)
+				tw := tar.NewWriter(gz)
+				for _, hdr := range headers {
+					if err := tw.WriteHeader(&hdr); err != nil {
+						t.Fatal(err)
+					}
+					if hdr.Size > 0 {
+						if _, err := tw.Write([]byte("captured")); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				if err := tw.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if err := gz.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(data.RollbackPath, data.Filesystem.TarGz), encoded.Bytes(), 0600); err != nil {
+					t.Fatal(err)
+				}
+				err := RestoreRollbackState(context.Background(), data, RollbackRestoreOptions{Force: true})
+				if err == nil || !strings.Contains(err.Error(), "file or symlink parent") {
+					t.Fatalf("planned non-directory ancestor was not rejected: %v", err)
+				}
+				if _, err := os.Lstat(parent); !os.IsNotExist(err) {
+					t.Fatalf("invalid restore plan changed a destination: %v", err)
+				}
+				got, err := os.ReadFile(outsideFile)
+				if err != nil || string(got) != "unrelated current work" {
+					t.Fatalf("invalid restore plan changed unrelated contents: %q, %v", got, err)
+				}
+			})
+		}
+	}
+}
+
+func TestRollbackFilesystemRestorePreservesHistoricalCaptures(t *testing.T) {
+	for _, variant := range []string{"empty", "overlapping operands", "leaf symlink"} {
+		t.Run(variant, func(t *testing.T) {
+			if variant == "leaf symlink" && runtime.GOOS == "windows" {
+				t.Skip("fixture requires symlink support")
+			}
+			project := t.TempDir()
+			tree := filepath.Join(project, "tree")
+			if err := os.MkdirAll(filepath.Join(tree, "empty-directory"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			body := ""
+			if variant != "empty" {
+				body = "captured contents"
+			}
+			if err := os.WriteFile(filepath.Join(tree, "file"), []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if variant == "leaf symlink" {
+				if err := os.WriteFile(filepath.Join(project, "unrelated"), []byte("keep unchanged"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("../unrelated", filepath.Join(tree, "link")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			argv := []string{"rm", "-rf", "tree"}
+			if variant == "overlapping operands" {
+				argv = append(argv, "tree/file")
+			}
+			data, err := CaptureRollbackState(context.Background(), &db.Request{
+				ID: "historical-filesystem", ProjectPath: project,
+				Command: db.CommandSpec{Raw: strings.Join(argv, " "), Argv: argv, Cwd: project},
+			}, RollbackCaptureOptions{MaxSizeBytes: 1 << 20})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if variant == "empty" && data.Filesystem.TotalBytes != 0 {
+				t.Fatalf("expected a zero-payload capture: %+v", data.Filesystem)
+			}
+			if err := os.Rename(tree, filepath.Join(project, "retained-tree")); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := LoadRollbackData(data.RollbackPath)
+			if err != nil || loaded.Version != 1 {
+				t.Fatalf("reading existing snapshot format: %+v, %v", loaded, err)
+			}
+			if err := RestoreRollbackState(context.Background(), loaded, RollbackRestoreOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(filepath.Join(tree, "file"))
+			if err != nil || string(got) != body {
+				t.Fatalf("historical file was not restored: %q, %v", got, err)
+			}
+			if info, err := os.Stat(filepath.Join(tree, "empty-directory")); err != nil || !info.IsDir() {
+				t.Fatalf("empty directory was not restored: %v", err)
+			}
+			if variant == "leaf symlink" {
+				if target, err := os.Readlink(filepath.Join(tree, "link")); err != nil || target != "../unrelated" {
+					t.Fatalf("leaf symlink was not preserved: %q, %v", target, err)
+				}
+				got, err := os.ReadFile(filepath.Join(project, "unrelated"))
+				if err != nil || string(got) != "keep unchanged" {
+					t.Fatalf("restoration followed a leaf symlink: %q, %v", got, err)
+				}
+			}
+		})
+	}
+}
+
+func TestRollbackFilesystemRestorePreflightsConflictsAndCancellation(t *testing.T) {
+	project := t.TempDir()
+	for _, name := range []string{"a", "b"} {
+		if err := os.WriteFile(filepath.Join(project, name), []byte("captured "+name), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := CaptureRollbackState(context.Background(), &db.Request{
+		ID: "destination-preflight", ProjectPath: project,
+		Command: db.CommandSpec{Raw: "rm a b", Cwd: project},
+	}, RollbackCaptureOptions{MaxSizeBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(project, "a"), filepath.Join(project, "retained-a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, "b"), []byte("current b"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := RestoreRollbackState(ctx, data, RollbackRestoreOptions{Force: true}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("restore ignored cancellation: %v", err)
+	}
+	if err := RestoreRollbackState(context.Background(), data, RollbackRestoreOptions{}); err == nil || !strings.Contains(err.Error(), "use --force") {
+		t.Fatalf("existing destination was not rejected: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(project, "a")); !os.IsNotExist(err) {
+		t.Fatalf("restore changed the first destination before refusing the later conflict: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(project, "b")); err != nil || string(got) != "current b" {
+		t.Fatalf("restore changed an existing destination: %q, %v", got, err)
+	}
+	if err := RestoreRollbackState(context.Background(), data, RollbackRestoreOptions{Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a", "b"} {
+		if got, err := os.ReadFile(filepath.Join(project, name)); err != nil || string(got) != "captured "+name {
+			t.Fatalf("explicit force restore failed for %s: %q, %v", name, got, err)
+		}
+	}
+}
+
+func TestRollbackFilesystemRestoreSeparatesMetadataAndPayloadBudgets(t *testing.T) {
+	for _, scenario := range []string{"payload fits", "PAX header exceeds budget", "trailing padding exceeds budget"} {
+		t.Run(scenario, func(t *testing.T) {
+			body := strings.Repeat("x", 16<<10)
+			hdr := &tar.Header{Name: "p0", Typeflag: tar.TypeReg, Mode: 0600, Size: int64(len(body)), Format: tar.FormatUSTAR}
+			payloadBudget, metadataBudget := int64(len(body)), int64(3*512)
+			if scenario == "PAX header exceeds budget" {
+				hdr.Name, hdr.Format = "p0/"+strings.Repeat("long-name", 40), tar.FormatPAX
+				// A large declared payload cannot pay for metadata consumed by
+				// tar.Next before it even exposes an entry to the validator.
+				payloadBudget, metadataBudget = 1<<30, 512
+			}
+			var encoded bytes.Buffer
+			gz := gzip.NewWriter(&encoded)
+			tw := tar.NewWriter(gz)
+			if err := tw.WriteHeader(hdr); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tw.Write([]byte(body)); err != nil {
+				t.Fatal(err)
+			}
+			if err := tw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "trailing padding exceeds budget" {
+				if _, err := gz.Write(make([]byte, 512)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := gz.Close(); err != nil {
+				t.Fatal(err)
+			}
+			visited := 0
+			err := walkFilesystemRollbackArchive(context.Background(), bytes.NewReader(encoded.Bytes()),
+				map[string]string{"p0": filepath.Join(t.TempDir(), "restored")}, payloadBudget, metadataBudget,
+				func(_ *tar.Header, _ string, body io.Reader) error {
+					visited++
+					_, err := io.Copy(io.Discard, body)
+					return err
+				})
+			if scenario == "payload fits" {
+				if err != nil || visited != 1 {
+					t.Fatalf("valid payload was charged to the metadata budget: visited=%d, %v", visited, err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "metadata") || !strings.Contains(err.Error(), "size limit") {
+				t.Fatalf("metadata budget was not enforced independently: %v", err)
+			}
+			if scenario == "PAX header exceeds budget" && visited != 0 {
+				t.Fatal("oversized metadata was decoded before its budget was enforced")
+			}
+		})
 	}
 }
 

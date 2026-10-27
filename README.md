@@ -782,6 +782,16 @@ slb rollback <request-id>           # Restore captured state
 slb rollback <request-id> --force   # Force overwrite
 ```
 
+Filesystem recovery validates the complete archive and all destination paths
+before changing live files. Damaged gzip data, incomplete payloads, unsupported
+entries, conflicting roots and symlinked destination ancestors are refused;
+`--force` does not waive these checks. Valid version-1 snapshots, empty captures
+and identical overlapping targets retain their existing format. Decoding is
+bounded by the recorded payload size, 100,000 entries and 64 MiB of archive
+metadata/padding. Stop concurrent writers before restoring: these checks are
+preflight validation, not an atomic filesystem transaction, and a later I/O
+failure or concurrent path change can still interrupt restoration.
+
 Kubernetes capture supports literal `kubectl delete` commands with named
 `type/name` or `type name` targets. Context, kubeconfig and namespace flags can
 appear before or after `delete`; ordinary force, wait, grace-period, cascade and
