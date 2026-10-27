@@ -156,9 +156,10 @@ func TestRollbackCommandRejectsUnrelatedRecovery(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			h, request, capture, target := rollbackRequestFixture(t)
 			project := h.ProjectDir
-			if scenario == "foreign selected project" {
+			switch scenario {
+			case "foreign selected project":
 				project = testutil.NewHarness(t).ProjectDir
-			} else if scenario == "changed argv" || scenario == "changed shell" {
+			case "changed argv", "changed shell":
 				spec := request.Command
 				if scenario == "changed argv" {
 					spec.Argv = []string{"rm", "different-target"}
@@ -173,7 +174,7 @@ func TestRollbackCommandRejectsUnrelatedRecovery(t *testing.T) {
 					string(argv), spec.Shell, db.ComputeCommandHash(spec), request.ID); err != nil {
 					t.Fatal(err)
 				}
-			} else {
+			default:
 				path := filepath.Join(capture.RollbackPath, "metadata.json")
 				encoded, err := os.ReadFile(path)
 				if err != nil {

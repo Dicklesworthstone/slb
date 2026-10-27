@@ -1802,9 +1802,10 @@ func TestCrossProjectReviewSharedStoresPreserveCompletedEvidence(t *testing.T) {
 				}
 				t.Cleanup(func() { _ = target.Close() })
 				source := target
-				if store == "separate shared-file handles" {
+				switch store {
+				case "separate shared-file handles":
 					source, err = db.OpenWithOptions(path, db.OpenOptions{})
-				} else if store == "separate stores" {
+				case "separate stores":
 					source, err = db.Open(filepath.Join(sourceProject, "source.db"))
 				}
 				if err != nil {
