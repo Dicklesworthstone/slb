@@ -36,7 +36,7 @@ var reviewCmd = &cobra.Command{
 If a request ID is provided, shows full details including command, justification,
 risk tier, and any existing reviews.
 
-Use 'slb review list' to see all pending requests.`,
+Use 'slb review list' to see pending and escalated requests awaiting review.`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {
@@ -50,7 +50,7 @@ Use 'slb review list' to see all pending requests.`,
 
 var reviewListCmd = &cobra.Command{
 	Use:   "list",
-	Short: "List pending requests awaiting review",
+	Short: "List pending and escalated requests awaiting review",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		project, err := projectPath()
 		if err != nil {
@@ -66,11 +66,11 @@ var reviewListCmd = &cobra.Command{
 		var requests []*db.Request
 		switch {
 		case flagReviewAll:
-			requests, err = dbConn.ListPendingRequestsAllProjects()
+			requests, err = dbConn.ListReviewableRequests("")
 		case flagReviewPool:
-			requests, err = dbConn.ListPendingRequestsAllProjects()
+			requests, err = dbConn.ListReviewableRequests("")
 		default:
-			requests, err = dbConn.ListPendingRequests(project)
+			requests, err = dbConn.ListReviewableRequests(project)
 		}
 		if err != nil {
 			return fmt.Errorf("listing requests: %w", err)
@@ -87,7 +87,7 @@ var reviewListCmd = &cobra.Command{
 			if GetOutput() == "json" {
 				return out.Write([]any{})
 			}
-			fmt.Println("No pending requests found.")
+			fmt.Println("No pending or escalated requests found.")
 			return nil
 		}
 
@@ -95,6 +95,7 @@ var reviewListCmd = &cobra.Command{
 		type requestSummary struct {
 			approvalPolicyView
 			ID             string `json:"id"`
+			Status         string `json:"status"`
 			Command        string `json:"command"`
 			RiskTier       string `json:"risk_tier"`
 			RequestorAgent string `json:"requestor_agent"`
@@ -117,6 +118,7 @@ var reviewListCmd = &cobra.Command{
 			summary := requestSummary{
 				approvalPolicyView: policyView(r.ApprovalPolicy),
 				ID:                 r.ID,
+				Status:             string(r.Status),
 				Command:            cmd,
 				RiskTier:           string(r.RiskTier),
 				RequestorAgent:     r.RequestorAgent,

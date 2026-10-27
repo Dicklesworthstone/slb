@@ -22,6 +22,9 @@ type HookQueryParams struct {
 	SessionID        string `json:"session_id"`
 	CWD              string `json:"cwd"`
 	ExecutionHandoff bool   `json:"execution_handoff,omitempty"`
+	// ConfigPath asserts the caller's selected policy; it never overrides
+	// the daemon's configuration or chooses another file for the daemon.
+	ConfigPath string `json:"config_path,omitempty"`
 }
 
 // HookExecutionHandoff is an instruction to invoke the atomic SLB executor,
@@ -34,6 +37,8 @@ type HookExecutionHandoff struct {
 	DatabasePath   string            `json:"database_path"`
 	ApprovalPolicy db.ApprovalPolicy `json:"approval_policy"`
 	ReviewNotice   string            `json:"review_notice"`
+	ConfigPath     string            `json:"config_path,omitempty"`
+	ConfigProject  string            `json:"config_project,omitempty"`
 }
 
 // HookQueryResult is the result of a hook query.
@@ -49,6 +54,8 @@ type HookQueryResult struct {
 	AuditError       string                `json:"audit_error,omitempty"`
 	ApprovalPolicy   db.ApprovalPolicy     `json:"approval_policy,omitempty"`
 	ReviewNotice     string                `json:"review_notice,omitempty"`
+	ConfigPath       string                `json:"config_path,omitempty"`
+	ConfigProject    string                `json:"config_project,omitempty"`
 }
 
 // slowHookQueryThreshold is well above the typical 10-30ms policy load.
@@ -369,12 +376,25 @@ func (s *IPCServer) classifyCommand(params HookQueryParams) *HookQueryResult {
 			Message: "SLB: project policy could not be loaded; command blocked until policy is repaired.",
 		}
 	}
+	configPath, configProject := policy.engine.PolicyConfigPath(), ""
+	if configPath != "" {
+		configProject = policy.projectRoot
+	}
+	if params.ConfigPath != "" && !sameHookConfigFile(params.ConfigPath, configPath) {
+		return &HookQueryResult{
+			Action: "block", Tier: "unknown", MatchedPattern: "policy_config_mismatch",
+			Message:        "SLB: hook and daemon selected different policy files; restart the daemon with the hook's --config before retrying.",
+			ApprovalPolicy: policy.approvalPolicy.Normalized(), ReviewNotice: policy.approvalPolicy.Label(),
+			ConfigPath: configPath, ConfigProject: configProject,
+		}
+	}
 	engine, cautionAction := policy.engine, policy.cautionAction
 	classification := engine.ClassifyCommand(params.Command, params.CWD)
 	result := &HookQueryResult{
 		Tier: string(classification.Tier), MatchedPattern: classification.MatchedPattern,
 		MinApprovals:   classification.MinApprovals,
 		ApprovalPolicy: policy.approvalPolicy.Normalized(), ReviewNotice: policy.approvalPolicy.Label(),
+		ConfigPath: configPath, ConfigProject: configProject,
 	}
 	switch {
 	case classification.IsSafe:
@@ -421,10 +441,25 @@ func (s *IPCServer) classifyCommand(params HookQueryParams) *HookQueryResult {
 			RequestID: approved.ID, CommandHash: approved.Command.Hash,
 			SessionID: params.SessionID, DatabasePath: policy.statePath,
 			ApprovalPolicy: result.ApprovalPolicy, ReviewNotice: result.ReviewNotice,
+			ConfigPath: configPath, ConfigProject: configProject,
 		}
 	}
 	// Old clients must never get a raw-shell permit from this lookup.
 	return result
+}
+
+// A caller may name the same policy through a symlink. Comparing file identity
+// accepts that spelling without allowing a query to load or replace policy.
+func sameHookConfigFile(expected, actual string) bool {
+	if !filepath.IsAbs(expected) || !filepath.IsAbs(actual) {
+		return false
+	}
+	left, err := os.Stat(expected)
+	if err != nil || !left.Mode().IsRegular() {
+		return false
+	}
+	right, err := os.Stat(actual)
+	return err == nil && right.Mode().IsRegular() && os.SameFile(left, right)
 }
 
 func findHookApproval(conn *db.DB, engine *core.PatternEngine, params HookQueryParams, projectRoot string) *db.Request {
@@ -476,6 +511,8 @@ type HookHealthResult struct {
 	PolicyError       string            `json:"policy_error,omitempty"`
 	ApprovalPolicy    db.ApprovalPolicy `json:"approval_policy,omitempty"`
 	ReviewNotice      string            `json:"review_notice,omitempty"`
+	ConfigPath        string            `json:"config_path,omitempty"`
+	ConfigProject     string            `json:"config_project,omitempty"`
 }
 
 func (s *IPCServer) handleHookHealth(req RPCRequest) *RPCResponse {
@@ -483,6 +520,7 @@ func (s *IPCServer) handleHookHealth(req RPCRequest) *RPCResponse {
 	engine := core.GetDefaultEngine()
 	cautionAction := config.DefaultConfig().Integrations.HookCautionAction
 	approvalPolicy := db.ApprovalPolicyIndependent
+	configPath, configProject := "", ""
 	if len(req.Params) != 0 {
 		var params HookHealthParams
 		if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -498,6 +536,10 @@ func (s *IPCServer) handleHookHealth(req RPCRequest) *RPCResponse {
 			}
 			engine, cautionAction = policy.engine, policy.cautionAction
 			approvalPolicy = policy.approvalPolicy.Normalized()
+			configPath = engine.PolicyConfigPath()
+			if configPath != "" {
+				configProject = policy.projectRoot
+			}
 		}
 	}
 	export := engine.Export()
@@ -506,6 +548,7 @@ func (s *IPCServer) handleHookHealth(req RPCRequest) *RPCResponse {
 		PatternHash: export.SHA256, PatternCount: export.Metadata.PatternCount,
 		HookCautionAction: cautionAction, ServerTime: now.Format(time.RFC3339),
 		ApprovalPolicy: approvalPolicy, ReviewNotice: approvalPolicy.Label(),
+		ConfigPath: configPath, ConfigProject: configProject,
 	}
 	return &RPCResponse{Result: result, ID: req.ID}
 }

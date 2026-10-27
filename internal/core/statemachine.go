@@ -36,8 +36,9 @@ var validTransitions = map[db.RequestStatus][]db.RequestStatus{
 		db.StatusEscalated,
 	},
 	db.StatusEscalated: {
-		db.StatusApproved, // Human can approve after escalation
-		db.StatusRejected, // Human can reject after escalation
+		db.StatusApproved,  // Human can approve after escalation
+		db.StatusRejected,  // Human can reject after escalation
+		db.StatusCancelled, // Requester can withdraw work before execution
 	},
 }
 
@@ -203,7 +204,7 @@ func CanExecute(status db.RequestStatus) bool {
 
 // CanCancel checks if a request can be cancelled.
 func CanCancel(status db.RequestStatus) bool {
-	return status == db.StatusPending || status == db.StatusApproved
+	return status == db.StatusPending || status == db.StatusApproved || status == db.StatusEscalated
 }
 
 // CheckExpiry checks if a pending request has expired.

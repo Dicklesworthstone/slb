@@ -28,6 +28,7 @@ func TestCanTransition(t *testing.T) {
 
 		{"escalated->approved", db.StatusEscalated, db.StatusApproved, true},
 		{"escalated->rejected", db.StatusEscalated, db.StatusRejected, true},
+		{"escalated->cancelled", db.StatusEscalated, db.StatusCancelled, true},
 		{"escalated->executing (invalid)", db.StatusEscalated, db.StatusExecuting, false},
 
 		{"approved->executing", db.StatusApproved, db.StatusExecuting, true},
@@ -261,7 +262,7 @@ func TestGetValidTransitions(t *testing.T) {
 		{"approved", db.StatusApproved, []db.RequestStatus{db.StatusExecuting, db.StatusCancelled}},
 		{"executing", db.StatusExecuting, []db.RequestStatus{db.StatusExecuted, db.StatusExecutionFailed, db.StatusTimedOut, db.StatusApproved}},
 		{"timeout", db.StatusTimeout, []db.RequestStatus{db.StatusEscalated}},
-		{"escalated", db.StatusEscalated, []db.RequestStatus{db.StatusApproved, db.StatusRejected}},
+		{"escalated", db.StatusEscalated, []db.RequestStatus{db.StatusApproved, db.StatusRejected, db.StatusCancelled}},
 		{"terminal (executed)", db.StatusExecuted, nil},
 		{"terminal (rejected)", db.StatusRejected, nil},
 	}
@@ -409,6 +410,7 @@ func TestCanCancel(t *testing.T) {
 	}{
 		{db.StatusPending, true},
 		{db.StatusApproved, true},
+		{db.StatusEscalated, true},
 		{db.StatusExecuting, false},
 		{db.StatusExecuted, false},
 		{db.StatusRejected, false},

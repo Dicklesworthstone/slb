@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -137,12 +138,19 @@ def _emit_execution_handoff(response, tool_input, session_id, cwd):
     if not session_id or handoff.get("session_id") != session_id or "\x00" in session_id:
         raise ValueError("session mismatch")
     database_path, log_directory = _execution_paths(cwd, database_path)
+    config_path = _execution_config(cwd, handoff.get("config_path", ""), handoff.get("config_project", ""))
+    if config_path or response.get("config_path") or response.get("config_project"):
+        actual = _execution_config(cwd, response.get("config_path", ""), response.get("config_project", ""))
+        if not config_path or not actual or not os.path.samefile(config_path, actual):
+            raise ValueError("handoff policy differs from daemon classification")
     executable = shutil.which("slb")
     if executable is None:
         raise ValueError("slb executable unavailable")
     argv = [os.path.abspath(executable), "execute", "--db", database_path,
             "--log-dir", log_directory,
             "--session-id", session_id, "--expected-command-hash", command_hash, "--json"]
+    if config_path:
+        argv += ["--config", config_path]
     timeout = tool_input.get("timeout")
     if type(timeout) is int and timeout > 0:
         argv += ["--timeout", str(max(1, timeout // 1000))]
@@ -159,6 +167,51 @@ def _emit_execution_handoff(response, tool_input, session_id, cwd):
         "updatedInput": updated,
         "additionalContext": context,
     }}))
+
+
+def _execution_config(cwd, config_path, config_project):
+    if config_path == "":
+        if config_project != "":
+            raise ValueError("hook policy scope has no config file")
+        return ""
+    if (not isinstance(config_path, str) or not isinstance(config_project, str)
+            or not os.path.isabs(config_path) or not os.path.isabs(config_project)
+            or "\x00" in config_path or "\x00" in config_project):
+        raise ValueError("hook policy paths must be absolute")
+    if (not os.path.isdir(config_project)
+            or os.path.realpath(config_project) != _project_root_for_socket(cwd)
+            or not os.path.isfile(config_path)):
+        raise ValueError("hook policy file or project unavailable")
+    return os.path.normpath(config_path)
+
+
+def _forward_selected_policy(input_data):
+    """Use current native policy instead of an old embedded config snapshot.
+
+    The native guard scopes this override to its owner, so a global hook used
+    in another or nested initialized project selects that project's own rules.
+    """
+    config_path = globals().get("HOOK_POLICY_CONFIG", "")
+    config_project = globals().get("HOOK_POLICY_PROJECT", "")
+    if (not isinstance(config_path, str) or not isinstance(config_project, str)
+            or not os.path.isabs(config_path) or not os.path.isabs(config_project)
+            or "\x00" in config_path or "\x00" in config_project):
+        raise ValueError("invalid installed hook policy binding")
+    executable = shutil.which("slb")
+    if executable is None:
+        raise ValueError("selected policy requires the native slb guard")
+    result = subprocess.run([os.path.abspath(executable), "hook", "guard",
+                             "--config", config_path, "--policy-project", config_project],
+                            input=json.dumps(input_data), text=True, capture_output=True,
+                            timeout=15, check=False)
+    if result.returncode != 0 or len(result.stdout) > 2 * 1024 * 1024:
+        raise ValueError("native selected-policy guard failed")
+    payload = json.loads(result.stdout)
+    specific = payload.get("hookSpecificOutput") if isinstance(payload, dict) else None
+    if (not isinstance(specific, dict) or specific.get("hookEventName") != "PreToolUse"
+            or specific.get("permissionDecision") not in ("allow", "deny", "ask")):
+        raise ValueError("native selected-policy guard returned invalid output")
+    print(json.dumps(payload))
 
 
 def _execution_paths(cwd, database_path):
@@ -289,6 +342,14 @@ def main():
     cwd = input_data.get("cwd", os.getcwd())
     if not isinstance(cwd, str) or not os.path.isabs(cwd) or "\x00" in cwd:
         _emit_decision("ask", "SLB: invalid working directory; unable to inspect the command.")
+        return
+    if globals().get("HOOK_POLICY_CONFIG", "") or globals().get("HOOK_POLICY_PROJECT", ""):
+        try:
+            _forward_selected_policy(input_data)
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+            _decide_and_audit(command, session_id, cwd, "block",
+                              "SLB: selected hook policy unavailable; restore its file and native slb guard before retrying.",
+                              "unknown", 0, "hook_offline", "policy_load_error")
         return
     response = query_slb_daemon(command, session_id, cwd)
     if response is not None:

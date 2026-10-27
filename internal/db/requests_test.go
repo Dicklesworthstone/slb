@@ -2,8 +2,10 @@
 package db
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -122,6 +124,205 @@ func TestListPendingRequests(t *testing.T) {
 		if r.Status != StatusPending {
 			t.Errorf("Expected status pending, got %s", r.Status)
 		}
+	}
+}
+
+func TestListReviewableRequestsIncludesEscalationWithoutChangingPendingQueries(t *testing.T) {
+	database := journalTestDB(t)
+	for _, project := range []string{t.TempDir(), t.TempDir()} {
+		session := &Session{AgentName: "requester", Model: "model-a", ProjectPath: project}
+		if err := database.CreateSession(session); err != nil {
+			t.Fatal(err)
+		}
+		for _, status := range []RequestStatus{StatusPending, StatusEscalated, StatusApproved, StatusExecuting, StatusRejected, StatusTimeout, StatusCancelled} {
+			expired := time.Now().Add(-time.Minute)
+			request := &Request{ProjectPath: project, RequestorSessionID: session.ID,
+				RequestorAgent: session.AgentName, RequestorModel: session.Model,
+				Command: CommandSpec{Raw: "echo reviewable", Argv: []string{"echo", "reviewable"}, Cwd: project},
+				Status:  status, ApprovalPolicy: ApprovalPolicySameHost, RiskTier: RiskTierDangerous,
+				MinApprovals: 2, RequireDifferentModel: true, ExpiresAt: &expired,
+				Justification: Justification{Reason: "review queue fixture; never execute"},
+			}
+			if err := database.CreateRequest(request); err != nil {
+				t.Fatal(err)
+			}
+		}
+		requests, err := database.ListReviewableRequests(project)
+		if err != nil || len(requests) != 2 {
+			t.Fatalf("reviewable project queue: %+v %v", requests, err)
+		}
+		seen := map[RequestStatus]bool{}
+		for _, request := range requests {
+			seen[request.Status] = true
+			if request.ProjectPath != project || request.ApprovalPolicy != ApprovalPolicySameHost || request.MinApprovals != 2 || !request.RequireDifferentModel {
+				t.Fatalf("queue changed scope or review requirements: %+v", request)
+			}
+		}
+		if !seen[StatusPending] || !seen[StatusEscalated] {
+			t.Fatalf("missing reviewable state: %+v", seen)
+		}
+		pending, err := database.ListPendingRequests(project)
+		if err != nil || len(pending) != 1 || pending[0].Status != StatusPending {
+			t.Fatalf("timer query included escalated work: %+v %v", pending, err)
+		}
+		if count, err := database.CountPendingBySession(session.ID); err != nil || count != 1 {
+			t.Fatalf("pending quota changed: count=%d error=%v", count, err)
+		}
+	}
+	all, err := database.ListReviewableRequests("")
+	if err != nil || len(all) != 4 {
+		t.Fatalf("all-project review queue: %+v %v", all, err)
+	}
+}
+
+func TestCancelEscalatedRequestPreservesEvidenceAndJournal(t *testing.T) {
+	for _, failJournal := range []bool{false, true} {
+		t.Run(fmt.Sprintf("journal failure=%t", failJournal), func(t *testing.T) {
+			database := journalTestDB(t)
+			project := t.TempDir()
+			author := &Session{AgentName: "author", Model: "model-a", ProjectPath: project}
+			peer := &Session{AgentName: "peer", Model: "model-b", ProjectPath: project}
+			for _, session := range []*Session{author, peer} {
+				if err := database.CreateSession(session); err != nil {
+					t.Fatal(err)
+				}
+			}
+			expired := time.Now().Add(-time.Minute)
+			request := &Request{ProjectPath: project, RequestorSessionID: author.ID,
+				RequestorAgent: author.AgentName, RequestorModel: author.Model,
+				Command: CommandSpec{Raw: "echo evidence", Argv: []string{"echo", "evidence"}, Cwd: project},
+				Status:  StatusEscalated, ApprovalPolicy: ApprovalPolicySameHost, RiskTier: RiskTierDangerous,
+				MinApprovals: 2, RequireDifferentModel: true, ExpiresAt: &expired,
+				Justification: Justification{Reason: "keep completed reviews when withdrawing work"},
+			}
+			if err := database.CreateRequest(request); err != nil {
+				t.Fatal(err)
+			}
+			review := &Review{RequestID: request.ID, ReviewerSessionID: peer.ID, Decision: DecisionApprove, Comments: "one of two required votes"}
+			outcome, err := database.ApplyReview(review, peer.SessionKey, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost})
+			if err != nil || outcome.Request.Status != StatusEscalated {
+				t.Fatalf("partial escalated review: %+v %v", outcome, err)
+			}
+			before := journalPage(t, database, project, "", 100)
+			if failJournal {
+				journalExec(t, database, `CREATE TRIGGER deny_cancel_journal BEFORE INSERT ON request_events
+					WHEN NEW.kind = 'request_status_changed'
+					BEGIN SELECT RAISE(ABORT, 'injected journal failure'); END`)
+			}
+			cancelled, err := database.CancelRequest(request.ID, author.ID)
+			if failJournal && (err == nil || cancelled != nil) {
+				t.Fatalf("journal failure reported successful cancellation: %+v %v", cancelled, err)
+			}
+			if !failJournal && (err != nil || cancelled.Status != StatusCancelled || cancelled.ResolvedAt == nil) {
+				t.Fatalf("owner could not cancel escalation: %+v %v", cancelled, err)
+			}
+			stored, err := database.GetRequest(request.ID)
+			wantStatus := StatusCancelled
+			if failJournal {
+				wantStatus = StatusEscalated
+			}
+			if err != nil || stored.Status != wantStatus || stored.Command.Hash != request.Command.Hash || stored.ApprovalPolicy != ApprovalPolicySameHost ||
+				stored.MinApprovals != 2 || !stored.RequireDifferentModel || stored.Execution != nil {
+				t.Fatalf("cancellation changed evidence or partially committed: %+v %v", stored, err)
+			}
+			reviews, err := database.ListReviewsForRequest(request.ID)
+			if err != nil || len(reviews) != 1 || reviews[0].ID != review.ID || reviews[0].Signature != review.Signature ||
+				reviews[0].Assurance != AssuranceSameHost || !VerifyReviewEvidenceSignature(reviews[0], peer.SessionKey) {
+				t.Fatalf("completed review evidence changed: %+v %v", reviews, err)
+			}
+			after := journalPage(t, database, project, before.Cursor, 100)
+			if failJournal {
+				if len(after.Events) != 0 {
+					t.Fatalf("failed cancellation left journal events: %+v", after.Events)
+				}
+				return
+			}
+			if len(after.Events) != 1 || after.Events[0].Kind != "request_status_changed" || after.Events[0].PreviousStatus == nil ||
+				*after.Events[0].PreviousStatus != string(StatusEscalated) || after.Events[0].State.Status != string(StatusCancelled) ||
+				after.Events[0].State.ApprovalPolicy != ApprovalPolicySameHost || after.Events[0].State.Approvals != 1 {
+				t.Fatalf("cancellation audit lost original state or assurance: %+v", after.Events)
+			}
+		})
+	}
+}
+
+func TestCancelRequestChecksCurrentOwnerAndState(t *testing.T) {
+	for _, status := range []RequestStatus{StatusPending, StatusApproved, StatusEscalated, StatusExecuting, StatusExecuted, StatusExecutionFailed, StatusRejected, StatusTimeout, StatusTimedOut, StatusCancelled} {
+		t.Run(string(status), func(t *testing.T) {
+			database := journalTestDB(t)
+			author, request := createTestRequest(t, database)
+			journalExec(t, database, `UPDATE requests SET status = ? WHERE id = ?`, string(status), request.ID)
+			before := journalPage(t, database, request.ProjectPath, "", 100)
+			if _, err := database.CancelRequest(request.ID, "other-session"); !errors.Is(err, ErrRequestNotOwner) {
+				t.Fatalf("foreign requester cancellation: %v", err)
+			}
+			cancelled, err := database.CancelRequest(request.ID, author.ID)
+			allowed := status == StatusPending || status == StatusApproved || status == StatusEscalated
+			if allowed {
+				if err != nil || cancelled.Status != StatusCancelled {
+					t.Fatalf("cancellable state failed: %+v %v", cancelled, err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrInvalidTransition) || cancelled != nil {
+				t.Fatalf("cancelled executing/closed work: %+v %v", cancelled, err)
+			}
+			stored, err := database.GetRequest(request.ID)
+			if err != nil || stored.Status != status {
+				t.Fatalf("refused cancellation changed status: %+v %v", stored, err)
+			}
+			if after := journalPage(t, database, request.ProjectPath, before.Cursor, 100); len(after.Events) != 0 {
+				t.Fatalf("refused cancellation changed audit history: %+v", after.Events)
+			}
+		})
+	}
+}
+
+func TestCancellationAndExecutionClaimHaveOneWinner(t *testing.T) {
+	database, request, execution, session := authenticatedClaimFixture(t)
+	other, err := Open(database.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	start := make(chan struct{})
+	cancelResult, claimResult := make(chan error, 1), make(chan error, 1)
+	go func() {
+		<-start
+		_, err := database.CancelRequest(request.ID, session.ID)
+		cancelResult <- err
+	}()
+	go func() {
+		<-start
+		claimResult <- other.ClaimRequestExecutionAuthenticated(request, execution, session.SessionKey)
+	}()
+	close(start)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var cancelErr, claimErr error
+	select {
+	case cancelErr = <-cancelResult:
+	case <-ctx.Done():
+		t.Fatal("cancellation did not finish")
+	}
+	select {
+	case claimErr = <-claimResult:
+	case <-ctx.Done():
+		t.Fatal("execution claim did not finish")
+	}
+	if (cancelErr == nil) == (claimErr == nil) {
+		t.Fatalf("expected exactly one winner: cancellation=%v execution=%v", cancelErr, claimErr)
+	}
+	stored, err := database.GetRequest(request.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelErr == nil {
+		if !errors.Is(claimErr, ErrInvalidTransition) || stored.Status != StatusCancelled || stored.Execution != nil {
+			t.Fatalf("execution overwrote cancellation: %+v %v", stored, claimErr)
+		}
+	} else if !errors.Is(cancelErr, ErrInvalidTransition) || stored.Status != StatusExecuting || stored.Execution == nil || stored.Execution.LogPath != execution.LogPath {
+		t.Fatalf("cancellation overwrote claimed execution: %+v %v", stored, cancelErr)
 	}
 }
 

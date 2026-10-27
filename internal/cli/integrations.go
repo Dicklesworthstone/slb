@@ -110,7 +110,15 @@ missing or failed guard from silently allowing the tool call.`,
 		}
 
 		if preview {
-			guardCommand, err := nativeHookGuardCommand()
+			paths, err := resolveClaudeHookPaths(global)
+			if err != nil {
+				return err
+			}
+			configPath, configProject, err := selectedHookPolicy(paths.project, flagConfig)
+			if err != nil {
+				return err
+			}
+			guardCommand, err := nativeHookGuardCommand(configPath, configProject)
 			if err != nil {
 				return fmt.Errorf("resolving native hook command: %w", err)
 			}

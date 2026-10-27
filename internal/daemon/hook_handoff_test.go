@@ -98,6 +98,71 @@ func TestHookApprovalHandoffRequiresAtomicExecutor(t *testing.T) {
 	}
 }
 
+func TestHookHandoffPreservesSelectedPolicy(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
+	conn, req, params := hookApprovalFixture(t)
+	selected := filepath.Join(t.TempDir(), "selected hook policy.toml")
+	if err := os.WriteFile(selected, []byte("[patterns.dangerous]\nmin_approvals = 1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	server := &IPCServer{hookPolicies: hookPolicyCache{projectPath: req.ProjectPath, configPath: selected}}
+	params.ConfigPath = selected
+	result := server.classifyCommand(params)
+	if result.Action != "execute" || result.ExecutionHandoff == nil {
+		t.Fatalf("selected-policy approval not handed off: %+v", result)
+	}
+	if result.ConfigPath != selected || result.ConfigProject != req.ProjectPath ||
+		result.ExecutionHandoff.ConfigPath != selected || result.ExecutionHandoff.ConfigProject != req.ProjectPath {
+		t.Fatalf("handoff dropped selected policy: %+v, %+v", result, result.ExecutionHandoff)
+	}
+	stored, err := conn.GetRequest(req.ID)
+	if err != nil || stored.Status != db.StatusApproved {
+		t.Fatalf("handoff consumed the approval: %+v %v", stored, err)
+	}
+	if err := os.WriteFile(selected, []byte("[patterns.dangerous]\nmin_approvals = 2\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if result := server.classifyCommand(params); result.Action != "block" || result.ExecutionHandoff != nil {
+		t.Fatalf("handoff reused policy after a quorum increase: %+v", result)
+	}
+}
+
+func TestHookSelectedConfigAssertionCannotChangeDaemonPolicy(t *testing.T) {
+	_, req, params := hookApprovalFixture(t)
+	selected := filepath.Join(t.TempDir(), "selected.toml")
+	other := filepath.Join(t.TempDir(), "different.toml")
+	for _, path := range []string{selected, other} {
+		if err := os.WriteFile(path, []byte("[general]\napproval_policy = 'independent'\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := &IPCServer{hookPolicies: hookPolicyCache{projectPath: req.ProjectPath, configPath: selected}}
+	params.Command = "git stash" // Normally SAFE: a mismatch must block even this.
+	for _, path := range []string{other, "relative.toml", filepath.Join(t.TempDir(), "missing.toml")} {
+		params.ConfigPath = path
+		result := server.classifyCommand(params)
+		if result.Action != "block" || result.MatchedPattern != "policy_config_mismatch" || result.ExecutionHandoff != nil {
+			t.Fatalf("query substituted %q for daemon policy: %+v", path, result)
+		}
+	}
+	params.ConfigPath = selected
+	if result := server.classifyCommand(params); result.Action != "allow" || result.ConfigPath != selected || result.ConfigProject != req.ProjectPath {
+		t.Fatalf("matching policy assertion failed: %+v", result)
+	}
+	alias := filepath.Join(t.TempDir(), "policy alias.toml")
+	if err := os.Symlink(selected, alias); err == nil {
+		params.ConfigPath = alias
+		if result := server.classifyCommand(params); result.Action != "allow" {
+			t.Fatalf("alias of selected file was rejected: %+v", result)
+		}
+	}
+	// A project daemon without an override must not read a supplied file.
+	params.ConfigPath = selected
+	if result := (&IPCServer{}).classifyCommand(params); result.Action != "block" || result.MatchedPattern != "policy_config_mismatch" {
+		t.Fatalf("default daemon accepted caller-supplied policy: %+v", result)
+	}
+}
+
 func TestHookApprovalHandoffRejectsIneligibleRequests(t *testing.T) {
 	for _, tc := range []struct {
 		name string

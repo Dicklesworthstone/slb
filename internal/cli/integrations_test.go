@@ -314,6 +314,55 @@ func TestClaudeHooksPreview(t *testing.T) {
 	}
 }
 
+func TestClaudeHooksPreviewPersistsSelectedPolicy(t *testing.T) {
+	project, home := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SLB_PROJECT", "")
+	selected := filepath.Join(project, "team's review policy.toml")
+	if err := os.WriteFile(selected, []byte("[general]\napproval_policy = 'same_host'\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	physical, err := filepath.EvalSymlinks(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, global := range []bool{false, true} {
+		args := []string{"--preview", "--config", selected}
+		if global {
+			args = append(args, "--global")
+		}
+		stdout, err := runClaudeHooksCommand(t, project, args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var preview struct {
+			Hooks struct {
+				PreToolUse []struct {
+					Hooks []struct {
+						Command string `json:"command"`
+					} `json:"hooks"`
+				} `json:"PreToolUse"`
+			} `json:"hooks"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &preview); err != nil {
+			t.Fatal(err)
+		}
+		if len(preview.Hooks.PreToolUse) != 1 || len(preview.Hooks.PreToolUse[0].Hooks) != 1 {
+			t.Fatalf("unexpected preview: %s", stdout)
+		}
+		command := preview.Hooks.PreToolUse[0].Hooks[0].Command
+		path, owner, native := configuredHookPolicy(command)
+		if !native || path != selected || owner != physical || !isSLBHookCommand(command, "") {
+			t.Fatalf("preview lost scoped selected policy: %s", stdout)
+		}
+	}
+	for _, path := range []string{filepath.Join(project, ".claude"), filepath.Join(project, ".slb"), filepath.Join(home, ".claude"), filepath.Join(home, ".slb")} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("preview wrote %s: %v", path, err)
+		}
+	}
+}
+
 func TestClaudeHooksIntegration_RejectsConflictingActions(t *testing.T) {
 	project := t.TempDir()
 	t.Setenv("HOME", t.TempDir())
@@ -388,7 +437,7 @@ func assertClaudeNativeSettings(t *testing.T, data []byte) {
 	if err := json.Unmarshal(settings.Hooks["PreToolUse"], &entries); err != nil {
 		t.Fatalf("missing current hook event: %v\n%s", err, data)
 	}
-	expected, err := nativeHookGuardCommand()
+	expected, err := nativeHookGuardCommand("", "")
 	if err != nil {
 		t.Fatal(err)
 	}

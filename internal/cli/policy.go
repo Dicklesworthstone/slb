@@ -37,18 +37,18 @@ func loadCustomPatternsIntoDefaultEngine() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return loadCustomPatternsForProject(project, GetDB(), flagDB != "")
+	return loadCustomPatternsForProject(project, GetDB(), flagConfig, flagDB != "")
 }
 
 // loadCustomPatternsForProject also lets scoped integrations load the selected
 // project's policy without changing process-wide flags or the working directory.
-func loadCustomPatternsForProject(project, path string, requireDatabase bool) (int, error) {
-	cfg, err := config.Load(config.LoadOptions{ProjectDir: project, ConfigPath: flagConfig})
+func loadCustomPatternsForProject(project, path, configPath string, requireDatabase bool) (int, error) {
+	cfg, err := config.Load(config.LoadOptions{ProjectDir: project, ConfigPath: configPath})
 	if err != nil {
 		return 0, fmt.Errorf("loading command policy config: %w", err)
 	}
-	if flagConfig != "" {
-		if info, err := os.Stat(flagConfig); err != nil {
+	if configPath != "" {
+		if info, err := os.Stat(configPath); err != nil {
 			return 0, fmt.Errorf("reading explicit policy config: %w", err)
 		} else if !info.Mode().IsRegular() {
 			return 0, fmt.Errorf("explicit policy config is not a regular file")
@@ -56,7 +56,7 @@ func loadCustomPatternsForProject(project, path string, requireDatabase bool) (i
 	}
 	info, err := os.Stat(path)
 	if os.IsNotExist(err) && !requireDatabase {
-		return core.GetDefaultEngine().ReplacePolicy(cfg, nil, flagConfig)
+		return core.GetDefaultEngine().ReplacePolicy(cfg, nil, configPath)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("reading project policy database %q: %w", path, err)
@@ -78,5 +78,5 @@ func loadCustomPatternsForProject(project, path string, requireDatabase bool) (i
 		patterns = append(patterns, core.Pattern{Tier: core.RiskTier(row.Tier),
 			Pattern: row.Pattern, Description: row.Description, Source: row.Source})
 	}
-	return core.GetDefaultEngine().ReplacePolicy(cfg, patterns, flagConfig)
+	return core.GetDefaultEngine().ReplacePolicy(cfg, patterns, configPath)
 }

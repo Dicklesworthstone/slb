@@ -136,6 +136,21 @@ are not evidence that an independent person or model approved the action.
   assurance captured in the execution receipt. The standalone Python hook
   reports its generated policy snapshot or the daemon's live policy explicitly;
   neither hook response is execution authorization.
+- Hooks installed with `--config` retain the selected absolute filename and its
+  owning physical project. The daemon must acknowledge the same selected file;
+  the query cannot replace the daemon's policy. Offline native classification
+  and the final executor reload that filename, preserving the hook's selected
+  alias when the daemon uses another equivalent path. Replacing that alias after
+  lookup therefore cannot silently preserve an old opt-in. The Python artifact delegates explicit
+  policy bindings to the native guard so an old embedded snapshot cannot restore
+  a removed opt-in. Missing or invalid selected policy fails closed, and separately
+  initialized nested projects do not inherit the parent's explicit override.
+- Escalated requests remain visible in reviewer queues and retain their original
+  review requirements. The requester may cancel them before execution. Ownership
+  and status are checked in the same writer transaction, so cancellation cannot
+  replace an execution claim or terminal result. Cancellation retains prior signed
+  reviews and records the original policy and review counts in the event journal;
+  it supplies no execution assurance.
 
 These checks prevent accidental evidence reuse through normal SLB operations.
 They do not make mutable local storage tamper-proof against the same OS user.

@@ -54,9 +54,20 @@ slb run "<command>" --reason "..." --session-id <id>
 # Plumbing commands
 slb request "<command>" --reason "..."         # Create request only
 slb status <request-id> --wait                 # Check/wait for status
-slb pending --all-projects                     # List pending requests
-slb cancel <request-id>                        # Cancel own request
+slb pending --all-projects                     # List pending and escalated requests
+slb cancel <request-id> --session-id <id>       # Withdraw own unexecuted request
 ```
+
+`pending` and `review list` show requests whose status is `pending` or `escalated`.
+Their project and `--review-pool` filters remain in force, and output identifies
+the status and approval policy. Eligible peers can complete review after escalation;
+the original quorum, model restrictions and command binding still apply.
+
+The requester can cancel `pending`, `approved` or `escalated` work. Cancellation
+checks ownership and current state atomically, preserves existing signed reviews,
+and records the transition in the request journal. Once execution has claimed the
+request, cancellation is refused. Resolving or withdrawing an escalated request
+also removes that request's obstacle to session identity rotation.
 
 ---
 
@@ -186,6 +197,7 @@ slb init                                       # Initialize project policy first
 slb hook install                               # Install project PreToolUse hook
 slb -C /path/to/project init                    # Initialize a different project
 slb -C /path/to/project hook install            # Select the project explicitly
+slb -C /path/to/project --config /path/to/policy.toml hook install
 slb hook install --global                      # Install in user settings
 slb hook status [--global]                      # Inspect the selected scope
 slb hook test "<command>"                      # Test classification, no execution
@@ -215,6 +227,20 @@ keeps the script and the other scope's registration. Preview changes no files.
 The native registration uses `onFailure: "block"`, which requires Claude Code
 v2.1.295 or later for hook startup failures and timeouts to block the action.
 See [Claude Code's hook failure behavior](https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails).
+
+An explicit `--config` is retained as an absolute path bound to the installation's
+physical project. Use the same file when starting the daemon and submitting or
+reviewing requests. The guard uses it offline and includes it in the execution
+handoff. An unavailable or malformed selected file blocks the action. A running
+daemon with a different selected policy must be restarted; queries cannot override
+its configuration. A separately initialized nested project keeps its own policy,
+including when the registration is global.
+
+The generated Python artifact retains this explicit binding and invokes the native
+guard to read current policy; a missing native guard blocks the action. Without an
+explicit file, the generated artifact can still classify from its embedded snapshot.
+Every reviewed execution remains single-use and rechecks policy, signatures,
+command binding, quorum and expiry when it claims the request.
 
 ---
 

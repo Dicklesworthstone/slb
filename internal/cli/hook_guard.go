@@ -24,11 +24,14 @@ import (
 
 const maxHookGuardInputBytes = 1 << 20
 
+var flagHookPolicyProject string
+
 var hookRequestIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
 var hookCommandHashPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 var hookPythonExecutablePattern = regexp.MustCompile(`^python(?:[0-9]+(?:\.[0-9]+)*)?$`)
 
 func init() {
+	hookGuardCmd.Flags().StringVar(&flagHookPolicyProject, "policy-project", "", "physical project owning an installed explicit hook policy")
 	hookCmd.AddCommand(hookGuardCmd)
 }
 
@@ -68,6 +71,17 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 			sessionID = providerSession
 		}
 	}
+	policyOptions, err := nativeHookPolicyOptions(cwd)
+	if err == nil && policyOptions.ConfigPath != "" {
+		// An online daemon must not hide a missing or invalid explicitly
+		// selected file. The same file will be checked again by the executor.
+		_, err = config.Load(policyOptions)
+	}
+	if err != nil {
+		return decideAndAuditNativeHook(cmd, command, sessionID, cwd, "block",
+			"SLB: selected hook policy could not be loaded; command blocked until policy is repaired.",
+			"unknown", 0, "policy_load_error", "hook_native_policy", false, "")
+	}
 
 	parent := cmd.Context()
 	if parent == nil {
@@ -78,12 +92,19 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 	client := daemon.NewIPCClient(daemon.SocketPathForCWD(cwd))
 	live, liveErr := client.HookQuery(queryCtx, daemon.HookQueryParams{
 		Command: command, SessionID: sessionID, CWD: cwd, ExecutionHandoff: true,
+		ConfigPath: policyOptions.ConfigPath,
 	})
 	cancel()
 	_ = client.Close()
 	if liveErr == nil {
+		if live == nil || (policyOptions.ConfigPath != "" && !nativeHookPolicyAcknowledged(live, cwd, policyOptions.ConfigPath)) {
+			recorded := live != nil && live.AuditRecorded && live.Action == "block" && live.MatchedPattern == "policy_config_mismatch"
+			return decideAndAuditNativeHook(cmd, command, sessionID, cwd, "block",
+				"SLB: daemon did not acknowledge the hook's selected policy; restart it with the same --config before retrying.",
+				"unknown", 0, "policy_config_mismatch", "hook_native_daemon", recorded, "")
+		}
 		if live.Action == "execute" {
-			if err := emitNativeExecutionHandoff(cmd, live, toolInput, sessionID, cwd); err == nil {
+			if err := emitNativeExecutionHandoff(cmd, live, toolInput, sessionID, cwd, policyOptions.ConfigPath); err == nil {
 				return nil
 			}
 			return decideAndAuditNativeHook(cmd, command, sessionID, cwd, "block",
@@ -122,8 +143,8 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 // config and fails closed on it.
 func hookQueryTimeout(cwd string) time.Duration {
 	ms := config.DefaultHookQueryTimeoutMS
-	if root, err := daemon.PhysicalProjectRootForCWD(cwd); err == nil {
-		if cfg, err := config.Load(config.LoadOptions{ProjectDir: root}); err == nil {
+	if opts, err := nativeHookPolicyOptions(cwd); err == nil {
+		if cfg, err := config.Load(opts); err == nil {
 			ms = cfg.Integrations.HookQueryTimeoutMS
 		}
 	}
@@ -131,6 +152,65 @@ func hookQueryTimeout(cwd string) time.Duration {
 		ms = config.DefaultHookQueryTimeoutMS
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+// Installed overrides belong to one physical project, even when the hook is
+// registered globally. A nested initialized project keeps its own policy.
+// Direct --config calls use the normal CLI project selection as their scope.
+func nativeHookPolicyOptions(cwd string) (config.LoadOptions, error) {
+	root, err := daemon.PhysicalProjectRootForCWD(cwd)
+	if err != nil {
+		return config.LoadOptions{}, err
+	}
+	opts := config.LoadOptions{ProjectDir: root}
+	if flagConfig == "" {
+		if flagHookPolicyProject != "" {
+			return opts, errors.New("hook policy project requires --config")
+		}
+		return opts, nil
+	}
+	owner := flagHookPolicyProject
+	if owner == "" {
+		owner, err = projectPath()
+		if err != nil {
+			return opts, err
+		}
+		owner, err = daemon.PhysicalProjectRootForCWD(owner)
+	} else if !filepath.IsAbs(owner) || strings.ContainsRune(owner, 0) {
+		return opts, errors.New("hook policy project must be absolute")
+	} else {
+		owner, err = filepath.EvalSymlinks(owner)
+	}
+	if err != nil {
+		return opts, err
+	}
+	if root != owner {
+		return opts, nil
+	}
+	selected, err := filepath.Abs(flagConfig)
+	if err != nil {
+		return opts, err
+	}
+	if info, err := os.Stat(selected); err != nil {
+		return opts, err
+	} else if !info.Mode().IsRegular() {
+		return opts, errors.New("selected hook policy is not a regular file")
+	}
+	opts.ConfigPath = selected
+	return opts, nil
+}
+
+func nativeHookPolicyAcknowledged(response *daemon.HookQueryResult, cwd, expected string) bool {
+	actual, err := hookExecutionConfig(cwd, response.ConfigPath, response.ConfigProject)
+	if err != nil || actual == "" {
+		return false
+	}
+	left, err := os.Stat(expected)
+	if err != nil {
+		return false
+	}
+	right, err := os.Stat(actual)
+	return err == nil && os.SameFile(left, right)
 }
 
 func readHookGuardInput(r io.Reader) (map[string]any, error) {
@@ -173,11 +253,11 @@ func hookGuardCWD(input map[string]any) (string, error) {
 }
 
 func classifyNativeHookFallback(command, cwd string) (*daemon.HookQueryResult, error) {
-	root, err := daemon.PhysicalProjectRootForCWD(cwd)
+	opts, err := nativeHookPolicyOptions(cwd)
 	if err != nil {
 		return nil, err
 	}
-	opts := config.LoadOptions{ProjectDir: root}
+	root := opts.ProjectDir
 	cfg, err := config.Load(opts)
 	if err != nil {
 		return nil, err
@@ -298,7 +378,7 @@ func emitHookDecision(cmd *cobra.Command, action, message string) error {
 }
 
 func emitNativeExecutionHandoff(cmd *cobra.Command, response *daemon.HookQueryResult, toolInput map[string]any,
-	sessionID, cwd string,
+	sessionID, cwd, selectedConfig string,
 ) error {
 	handoff := response.ExecutionHandoff
 	if handoff == nil || !hookRequestIDPattern.MatchString(handoff.RequestID) ||
@@ -309,6 +389,23 @@ func emitNativeExecutionHandoff(cmd *cobra.Command, response *daemon.HookQueryRe
 	databasePath, logDirectory, err := hookExecutionPaths(cwd, handoff.DatabasePath)
 	if err != nil {
 		return err
+	}
+	configPath, err := hookExecutionConfig(cwd, handoff.ConfigPath, handoff.ConfigProject)
+	if err != nil {
+		return err
+	}
+	if (configPath != "" || response.ConfigPath != "" || response.ConfigProject != "") && !nativeHookPolicyAcknowledged(response, cwd, configPath) {
+		return errors.New("execution handoff policy differs from daemon classification")
+	}
+	if selectedConfig != "" {
+		selectedConfig, err = hookExecutionConfig(cwd, selectedConfig, handoff.ConfigProject)
+		if err != nil || !nativeHookPolicyAcknowledged(response, cwd, selectedConfig) {
+			return errors.New("execution handoff policy differs from selected hook policy")
+		}
+		// Preserve the hook's selected filename, even when the daemon names the
+		// same file through another alias. The executor must reload this source
+		// so replacing or retargeting it can still revoke the reviewed command.
+		configPath = selectedConfig
 	}
 	executable, err := os.Executable()
 	if err != nil {
@@ -322,6 +419,9 @@ func emitNativeExecutionHandoff(cmd *cobra.Command, response *daemon.HookQueryRe
 		executable, "execute", "--db", databasePath,
 		"--log-dir", logDirectory,
 		"--session-id", sessionID, "--expected-command-hash", handoff.CommandHash, "--json",
+	}
+	if configPath != "" {
+		args = append(args, "--config", configPath)
 	}
 	if rawTimeout, ok := toolInput["timeout"]; ok {
 		if timeout, ok := hookJSONPositiveInt(rawTimeout); ok {
@@ -350,6 +450,32 @@ func emitNativeExecutionHandoff(cmd *cobra.Command, response *daemon.HookQueryRe
 			"additionalContext": "SLB is executing the reviewed request once and recording its outcome. Review policy: " + handoff.ApprovalPolicy.Label() + ".",
 		},
 	})
+}
+
+func hookExecutionConfig(cwd, configPath, configProject string) (string, error) {
+	if configPath == "" {
+		if configProject != "" {
+			return "", errors.New("hook policy scope has no config path")
+		}
+		return "", nil
+	}
+	if !filepath.IsAbs(configPath) || !filepath.IsAbs(configProject) || strings.ContainsRune(configPath+configProject, 0) {
+		return "", errors.New("hook policy paths must be absolute")
+	}
+	root, err := daemon.PhysicalProjectRootForCWD(cwd)
+	if err != nil {
+		return "", err
+	}
+	owner, err := filepath.EvalSymlinks(configProject)
+	if err != nil || owner != root {
+		return "", errors.New("hook policy belongs to a different project")
+	}
+	if info, err := os.Stat(configPath); err != nil {
+		return "", err
+	} else if !info.Mode().IsRegular() {
+		return "", errors.New("hook policy config is not a regular file")
+	}
+	return filepath.Clean(configPath), nil
 }
 
 func hookExecutionPaths(cwd, databasePath string) (string, string, error) {
@@ -397,7 +523,7 @@ func hookJSONPositiveInt(value any) (int, bool) {
 	return int(parsed), true
 }
 
-func nativeHookGuardCommand() (string, error) {
+func nativeHookGuardCommand(configPath, configProject string) (string, error) {
 	executable, err := os.Executable()
 	if err != nil {
 		return "", err
@@ -406,7 +532,16 @@ func nativeHookGuardCommand() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return hookShellQuote(executable) + " hook guard", nil
+	command := hookShellQuote(executable) + " hook guard"
+	if configPath != "" {
+		if !filepath.IsAbs(configPath) || !filepath.IsAbs(configProject) || strings.ContainsRune(configPath+configProject, 0) {
+			return "", errors.New("installed hook policy paths must be absolute")
+		}
+		command += " --config " + hookShellQuote(configPath) + " --policy-project " + hookShellQuote(configProject)
+	} else if configProject != "" {
+		return "", errors.New("installed hook policy project requires a config file")
+	}
+	return command, nil
 }
 
 func isSLBHookCommand(command, generatedScript string) bool {

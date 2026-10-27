@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -19,6 +20,130 @@ import (
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 )
+
+// A timeout escalates unresolved work; it does not hide it from cooperating
+// reviewers or strand the requester's immutable session identity forever.
+func TestBuiltCLIEscalatedRequestRecoveryIntegration(t *testing.T) {
+	binary := buildIdentityBoundaryCLI(t)
+	f := newSameHostCLI(t, binary, 2, true)
+	f.json("config", "set", "general.request_timeout", "1")
+	requester := f.session("Requester", "model-a")
+	reviewer := f.session("Reviewer", "model-b")
+	second := f.session("SecondReviewer", "model-c")
+	escalate := func(command string) *db.Request {
+		t.Helper()
+		view := f.json("request", command, "--session-id", requester.ID,
+			"--reason", "Test recovery of timed-out review", "--expected-effect", "Create an isolated marker",
+			"--safety", "Harmless command in a temporary project", "--wait", "--timeout", "10")
+		id, ok := view["request_id"].(string)
+		if !ok || view["status"] != "escalated" || view["approval_policy"] != "same_host" {
+			t.Fatalf("request did not escalate under its own deadline: %+v", view)
+		}
+		request, err := f.DB.GetRequest(id)
+		if err != nil || request.Status != db.StatusEscalated || request.MinApprovals != 2 || !request.RequireDifferentModel {
+			t.Fatalf("escalation weakened review requirements: %+v %v", request, err)
+		}
+		return request
+	}
+	queueContains := func(id string, want bool, args ...string) {
+		t.Helper()
+		stdout, stderr, err := f.run(append(args, "--json")...)
+		var rows []map[string]any
+		if err != nil || json.Unmarshal([]byte(stdout), &rows) != nil {
+			t.Fatalf("reviewer queue failed: %v\n%s\n%s", err, stdout, stderr)
+		}
+		found := false
+		for _, row := range rows {
+			if row["request_id"] == id || row["id"] == id {
+				found = true
+				if row["status"] != "escalated" || row["approval_policy"] != "same_host" {
+					t.Fatalf("queue obscured escalated low-assurance status: %+v", row)
+				}
+			}
+		}
+		if found != want {
+			t.Fatalf("queue %v includes request %s: got %t, want %t (%s)", args, id, found, want, stdout)
+		}
+	}
+	queues := [][]string{
+		{"pending"}, {"review", "list"},
+		{"pending", "--review-pool", "--session-id", second.ID},
+		{"review", "list", "--review-pool", "--session-id", second.ID},
+	}
+	approved := escalate("touch recovered-escalation-marker")
+	for _, args := range queues {
+		queueContains(approved.ID, true, args...)
+	}
+	f.fails("cannot review your own request", "approve", approved.ID,
+		"--session-id", requester.ID, "--session-key", requester.SessionKey)
+	f.approve(approved, reviewer)
+	partial, err := f.DB.GetRequest(approved.ID)
+	if err != nil || partial.Status != db.StatusEscalated || partial.ApprovalExpiresAt != nil {
+		t.Fatalf("one vote bypassed quorum on an escalated request: %+v %v", partial, err)
+	}
+	queueContains(approved.ID, true, "pending")
+	f.approve(approved, second)
+	result := f.json("execute", approved.ID, "--session-id", requester.ID)
+	if result["status"] != "executed" || result["exit_code"] != float64(0) || result["assurance"] != "same_host" {
+		t.Fatalf("reviewed escalated request could not execute: %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(f.ProjectDir, "recovered-escalation-marker")); err != nil {
+		t.Fatal(err)
+	}
+	queueContains(approved.ID, false, "pending")
+
+	withdrawn := escalate("touch withdrawn-escalation-marker")
+	f.approve(withdrawn, reviewer)
+	before, reviews, err := f.DB.GetRequestWithReviews(withdrawn.ID)
+	if err != nil || before.Status != db.StatusEscalated || len(reviews) != 1 || reviews[0].Assurance != db.AssuranceSameHost {
+		t.Fatalf("partial review evidence missing before withdrawal: %+v %+v %v", before, reviews, err)
+	}
+	f.fails("session has outstanding requests", "session", "resume", "--agent", requester.AgentName,
+		"--session-id", requester.ID, "--session-key", requester.SessionKey, "--model", "replacement-model")
+	f.fails("not the requestor", "cancel", withdrawn.ID, "--session-id", second.ID)
+	cancelled := f.json("cancel", withdrawn.ID, "--session-id", requester.ID)
+	if cancelled["status"] != "cancelled" || cancelled["approval_policy"] != "same_host" {
+		t.Fatalf("withdrawal lost status or policy: %+v", cancelled)
+	}
+	stored, afterReviews, err := f.DB.GetRequestWithReviews(withdrawn.ID)
+	if err != nil || stored.Status != db.StatusCancelled || stored.Execution != nil || stored.ResolvedAt == nil ||
+		stored.ApprovalPolicy != db.ApprovalPolicySameHost || stored.Command.Hash != before.Command.Hash ||
+		!reflect.DeepEqual(reviews, afterReviews) {
+		t.Fatalf("withdrawal changed immutable evidence: %+v %+v %v", stored, afterReviews, err)
+	}
+	page, err := f.DB.ReadRequestEvents(context.Background(), f.ProjectDir, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cancellationEvents int
+	for _, event := range page.Events {
+		if event.RequestID == withdrawn.ID && event.State.Status == "cancelled" {
+			cancellationEvents++
+			if event.PreviousStatus == nil || *event.PreviousStatus != "escalated" ||
+				event.State.ApprovalPolicy != db.ApprovalPolicySameHost || event.State.Approvals != 1 ||
+				event.State.ExecutionAssurance != db.AssuranceLegacyUnknown || event.State.ExecutorSessionID != nil ||
+				event.State.ExecutedAt != nil || event.State.CommandHash != before.Command.Hash {
+				t.Fatalf("withdrawal journal lost original review provenance: %+v", event)
+			}
+		}
+	}
+	if cancellationEvents != 1 {
+		t.Fatalf("withdrawal should create one durable event, got %d", cancellationEvents)
+	}
+	for _, args := range queues {
+		queueContains(withdrawn.ID, false, args...)
+	}
+	f.fails("cancelled", "approve", withdrawn.ID, "--session-id", second.ID, "--session-key", second.SessionKey)
+	f.fails("cancelled", "execute", withdrawn.ID, "--session-id", requester.ID)
+	if _, err := os.Stat(filepath.Join(f.ProjectDir, "withdrawn-escalation-marker")); !os.IsNotExist(err) {
+		t.Fatalf("withdrawn command executed: %v", err)
+	}
+	rotated := f.json("session", "resume", "--agent", requester.AgentName,
+		"--session-id", requester.ID, "--session-key", requester.SessionKey, "--model", "replacement-model")
+	if rotated["session_id"] == requester.ID || rotated["model"] != "replacement-model" {
+		t.Fatalf("resolved escalation still strands requester identity: %+v", rotated)
+	}
+}
 
 // TestSessionHeartbeat tests that session heartbeats update last_active_at.
 func TestSessionHeartbeat(t *testing.T) {

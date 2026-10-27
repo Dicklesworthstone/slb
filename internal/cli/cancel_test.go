@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
@@ -177,6 +178,34 @@ func TestCancelCommand_CanCancelApproved(t *testing.T) {
 	}
 	if result["status"] != "cancelled" {
 		t.Errorf("expected status=cancelled, got %v", result["status"])
+	}
+}
+
+func TestCancelCommand_CanCancelEscalated(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetCancelFlags()
+	session := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir))
+	request := testutil.MakeRequest(t, h.DB, session, testutil.WithStatus(db.StatusEscalated), func(request *db.Request) {
+		request.ApprovalPolicy = db.ApprovalPolicySameHost
+	})
+	cmd := newTestCancelCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, cmd, "cancel", request.ID, "-s", session.ID, "-j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("decode cancellation: %v\n%s", err, stdout)
+	}
+	stored, err := h.DB.GetRequest(request.ID)
+	if err != nil || stored.Status != db.StatusCancelled || stored.ResolvedAt == nil || stored.ApprovalPolicy != db.ApprovalPolicySameHost {
+		t.Fatalf("escalated cancellation did not commit its original policy: %+v %v", stored, err)
+	}
+	if result["status"] != "cancelled" || result["request_id"] != request.ID || result["cancelled_at"] != stored.ResolvedAt.Format(time.RFC3339) {
+		t.Fatalf("cancellation output does not describe committed state: %+v", result)
+	}
+	if result["approval_policy"] != "same_host" || result["approval_policy_label"] != db.ApprovalPolicySameHost.Label() || result["review_notice"] != db.ApprovalPolicySameHost.Label() {
+		t.Fatalf("cancellation concealed low-assurance review policy: %+v", result)
 	}
 }
 

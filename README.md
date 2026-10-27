@@ -494,6 +494,36 @@ Installing a hook leaves `general.approval_policy` unchanged. The optional
 `same_host` policy remains a mistake-prevention workflow, with no independently
 authenticated reviewer identity or operating-system security boundary.
 
+### Explicit Policy Files
+
+When your workflow uses a separate configuration file, select the same file for
+installation, the daemon, requests, and reviews:
+
+```bash
+slb -C /path/to/project --config /path/to/review-policy.toml hook install
+slb -C /path/to/project --config /path/to/review-policy.toml daemon start
+slb -C /path/to/project --config /path/to/review-policy.toml request "<command>" --reason "..." --session-id <requester-id>
+slb -C /path/to/project --config /path/to/review-policy.toml approve <request-id> --session-id <reviewer-id> --session-key <key>
+```
+
+The installed registration retains the absolute filename and its owning physical
+project. The hook reloads that file for offline classification and passes it to
+the executor when handing off a reviewed command. Equivalent file aliases may
+connect to the same daemon, but the handoff retains the hook's selected filename
+so later replacement of that file still takes effect. Missing or invalid selected
+files block the action. A daemon started with a different configuration must be
+restarted with the selected file; a hook query cannot change its policy.
+
+The binding applies only to the owning project, including for a global hook.
+A separately initialized nested project uses its own policy. The generated Python
+artifact also retains the binding and uses the native guard to read current
+configuration; it blocks if that guard is unavailable. An artifact generated
+without an explicit file retains its embedded offline snapshot behavior.
+
+Execution still reloads policy and verifies the exact request, signatures,
+quorum and expiry. Opting out of `same_host` after a hook lookup prevents the
+outstanding handoff from executing; it never upgrades the original reviews.
+
 ### Hook Commands
 
 ```bash
@@ -571,28 +601,40 @@ Requests follow a well-defined state machine with strict transition rules.
 
 ### State Diagram
 
+```mermaid
+stateDiagram-v2
+    direction TB
+    PENDING --> APPROVED: Quorum satisfied
+    PENDING --> REJECTED: Rejected
+    PENDING --> CANCELLED: Requester withdraws
+    PENDING --> TIMEOUT: Review deadline
+    TIMEOUT --> ESCALATED: Escalation policy
+    ESCALATED --> APPROVED: Quorum satisfied
+    ESCALATED --> REJECTED: Rejected
+    ESCALATED --> CANCELLED: Requester withdraws
+    APPROVED --> CANCELLED: Requester withdraws
+    APPROVED --> EXECUTING: Verified atomic claim
+    EXECUTING --> EXECUTED: Success
+    EXECUTING --> EXECUTION_FAILED: Failure
+    EXECUTING --> TIMED_OUT: Execution deadline
 ```
-                    ┌─────────────┐
-                    │   PENDING   │
-                    └──────┬──────┘
-           ┌───────────────┼───────────────┐───────────────┐
-           ▼               ▼               ▼               ▼
-     ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
-     │ APPROVED │    │ REJECTED │    │ CANCELLED│    │ TIMEOUT  │
-     └────┬─────┘    └──────────┘    └──────────┘    └────┬─────┘
-          │              (terminal)      (terminal)       │
-          ▼                                               ▼
-     ┌──────────┐                                   ┌──────────┐
-     │EXECUTING │                                   │ESCALATED │
-     └────┬─────┘                                   └────┬─────┘
-          │                                              │
-   ┌──────┴──────┬──────────┐                 ┌─────────┴─────────┐
-   ▼             ▼          ▼                 ▼                   ▼
-┌────────┐  ┌─────────┐  ┌────────┐      ┌──────────┐       ┌──────────┐
-│EXECUTED│  │EXEC_FAIL│  │TIMED_OUT│     │ APPROVED │       │ REJECTED │
-└────────┘  └─────────┘  └────────┘      └──────────┘       └──────────┘
-(terminal)   (terminal)   (terminal)
-```
+
+### Recovering Escalated Requests
+
+`slb pending` and `slb review list` include both pending and escalated requests,
+with an explicit `status` in each row. Their project and review-pool filters
+apply to both states. Escalation keeps the original command binding, approval
+policy, quorum and different-model requirement; another eligible reviewer can
+inspect the request and complete its review.
+
+The requester can withdraw a pending, approved or escalated request using
+`slb cancel <request-id> --session-id <requester-id>`. Cancellation checks ownership
+and current state in one transaction. It cannot overwrite an executing or terminal
+request. Existing signed reviews remain available in history, and the durable
+event journal records the transition with the original policy and review counts.
+Withdrawing an escalated request also resolves that request's block on session
+identity rotation. Escalated rows do not count as pending quota or re-enter pending
+timeout scans merely because they remain visible in reviewer queues.
 
 ### Terminal States
 
@@ -1473,10 +1515,6 @@ slb session list --json
 - Agent rules: `AGENTS.md`
 - Task tracking: `bd ready` (beads)
 - Prioritization: `bv --robot-priority`
-
-## Contributions
-
-> *About Contributions:* Please don't take this the wrong way, but I do not accept outside contributions for any of my projects. I simply don't have the mental bandwidth to review anything, and it's my name on the thing, so I'm responsible for any problems it causes; thus, the risk-reward is highly asymmetric from my perspective. I'd also have to worry about other "stakeholders," which seems unwise for tools I mostly make for myself for free. Feel free to submit issues, and even PRs if you want to illustrate a proposed fix, but know I won't merge them directly. Instead, I'll have Claude or Codex review submissions via `gh` and independently decide whether and how to address them. Bug reports in particular are welcome. Sorry if this offends, but I want to avoid wasted time and hurt feelings. I understand this isn't in sync with the prevailing open-source ethos that seeks community contributions, but it's the only way I can move at this velocity and keep my sanity.
 
 ## License
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,7 +12,246 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/slb/internal/db"
 )
+
+// Use the installed registration and its generated fallback with a real daemon
+// and executor. Only the selected file opts in to same-host review; dropping it
+// at any process boundary must never silently change the effective policy.
+func TestBuiltCLIHookSelectedPolicyIntegration(t *testing.T) {
+	binary := buildIdentityBoundaryCLI(t)
+	f := newSameHostCLI(t, binary, 1, false)
+	project, err := filepath.EvalSymlinks(f.ProjectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.ProjectDir = project
+	home, err := os.MkdirTemp("", "slbh-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	f.home = home
+	const base = `[general]
+require_different_model = false
+enable_dry_run = false
+enable_rollback_capture = false
+approval_policy = %q
+[integrations]
+agent_mail_enabled = false
+[notifications]
+desktop_enabled = false
+`
+	const patterns = `[patterns.dangerous]
+patterns = ['^echo selected-hook-probe$', '^printf']
+min_approvals = 1
+`
+	f.WriteFile(".slb/config.toml", []byte(fmt.Sprintf(base, "independent")), 0600)
+	policyTarget := filepath.Join(f.ProjectDir, "policy source.toml")
+	configPath := filepath.Join(f.ProjectDir, "selected 'policy'.toml")
+	selected := []byte(fmt.Sprintf(base, "same_host") + patterns)
+	writePolicy := func(data []byte) {
+		t.Helper()
+		if err := os.WriteFile(policyTarget, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writePolicy(selected)
+	if err := os.Symlink(policyTarget, configPath); err != nil {
+		t.Fatal(err)
+	}
+	installed := f.json("--config", filepath.Base(configPath), "hook", "install")
+	native, ok := installed["hook_command"].(string)
+	if !ok || !strings.Contains(native, "--config") {
+		t.Fatalf("installed guard lost its explicitly selected policy: %+v", installed)
+	}
+	requester := f.session("Requester", "model-a")
+	reviewer := f.session("Reviewer", "model-b")
+	type hookOutput struct {
+		HookSpecificOutput struct {
+			Decision string         `json:"permissionDecision"`
+			Reason   string         `json:"permissionDecisionReason"`
+			Context  string         `json:"additionalContext"`
+			Updated  map[string]any `json:"updatedInput"`
+		} `json:"hookSpecificOutput"`
+	}
+	runShell := func(command, cwd string, input []byte) (string, string, error) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
+		cmd.Dir = cwd
+		cmd.Env = append(identityCLIEnvironment(f.home), "SLB_SESSION_ID="+requester.ID,
+			"PATH="+filepath.Dir(binary)+string(os.PathListSeparator)+os.Getenv("PATH"))
+		cmd.Stdin = bytes.NewReader(input)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		return stdout.String(), stderr.String(), err
+	}
+	guard := func(invocation, command, cwd, want string) hookOutput {
+		t.Helper()
+		input, err := json.Marshal(map[string]any{"tool_name": "Bash", "cwd": cwd,
+			"tool_input": map[string]any{"command": command, "timeout": 10000}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stdout, stderr, err := runShell(invocation, cwd, input)
+		var result hookOutput
+		if err != nil || json.Unmarshal([]byte(stdout), &result) != nil || result.HookSpecificOutput.Decision != want {
+			t.Fatalf("guard should return %s for %q: %v\nstdout=%s\nstderr=%s", want, command, err, stdout, stderr)
+		}
+		return result
+	}
+	guards := []string{native}
+	if python, err := exec.LookPath("python3"); err == nil {
+		quote := func(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'" }
+		guards = append(guards, quote(python)+" "+quote(installed["hook_script"].(string)))
+	} else {
+		t.Log("python3 unavailable; native installed guard still covered")
+	}
+
+	// An offline invocation must read the selected custom rule. A missing or
+	// malformed selected file cannot restore a weaker embedded/default policy.
+	for _, invocation := range guards {
+		result := guard(invocation, "echo selected-hook-probe", f.ProjectDir, "deny")
+		if !strings.Contains(result.HookSpecificOutput.Reason, "same-host") {
+			t.Fatalf("offline guard lost low-assurance labeling: %+v", result)
+		}
+		writePolicy([]byte("[invalid"))
+		guard(invocation, "git stash", f.ProjectDir, "deny")
+		writePolicy(selected)
+		backup := configPath + ".saved"
+		if err := os.Rename(configPath, backup); err != nil {
+			t.Fatal(err)
+		}
+		guard(invocation, "git stash", f.ProjectDir, "deny")
+		if err := os.Rename(backup, configPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A parent installation must not export its selected policy into a
+	// separately initialized nested project, even when invoked from there.
+	nested := filepath.Join(f.ProjectDir, "nested project")
+	if err := os.Mkdir(nested, 0700); err != nil {
+		t.Fatal(err)
+	}
+	f.json("-C", nested, "init")
+	f.WriteFile("nested project/.slb/config.toml", []byte(fmt.Sprintf(base, "independent")+
+		"[patterns.safe]\npatterns = ['^echo selected-hook-probe$']\n"), 0600)
+	for _, invocation := range guards {
+		guard(invocation, "echo selected-hook-probe", nested, "allow")
+	}
+
+	running := false
+	t.Cleanup(func() {
+		if running {
+			if _, stderr, err := f.run("daemon", "stop"); err != nil {
+				t.Errorf("stopping hook test daemon: %v %s", err, stderr)
+			}
+		}
+	})
+	// Equivalent aliases may select the same file, but execution must keep
+	// the hook's selected filename so a later replacement remains observable.
+	f.json("--config", policyTarget, "daemon", "start")
+	running = true
+	createApproved := func(command string) *db.Request {
+		t.Helper()
+		view := f.json("--config", configPath, "request", command, "--session-id", requester.ID,
+			"--reason", "Verify the installed hook execution handoff", "--expected-effect", "Write an isolated test marker",
+			"--safety", "Only a temporary fixture is affected")
+		id, ok := view["request_id"].(string)
+		if !ok || view["status"] != "pending" {
+			t.Fatalf("test command did not enter peer review: %+v", view)
+		}
+		f.json("--config", configPath, "approve", id, "--session-id", reviewer.ID, "--session-key", reviewer.SessionKey)
+		request, err := f.DB.GetRequest(id)
+		if err != nil || request.Status != db.StatusApproved {
+			t.Fatalf("review did not persist: %+v %v", request, err)
+		}
+		return request
+	}
+	request := createApproved("/bin/sh -c \"printf reviewed >> 'hook marker'\"")
+	_, reviews, err := f.DB.GetRequestWithReviews(request.ID)
+	if err != nil || len(reviews) != 1 || reviews[0].Assurance != db.AssuranceSameHost {
+		t.Fatalf("review evidence is missing: %+v %v", reviews, err)
+	}
+	var handoff string
+	for _, invocation := range guards {
+		result := guard(invocation, request.Command.Raw, f.ProjectDir, "allow")
+		command, ok := result.HookSpecificOutput.Updated["command"].(string)
+		if !ok || !strings.Contains(command, "--config") || !strings.Contains(result.HookSpecificOutput.Context, "same-host") {
+			t.Fatalf("reviewed command lacks a policy-bound execution handoff: %+v", result)
+		}
+		handoff = command
+	}
+	stdout, stderr, err := runShell(handoff, f.ProjectDir, nil)
+	var outcome map[string]any
+	if err != nil || json.Unmarshal([]byte(stdout), &outcome) != nil || outcome["status"] != "executed" || outcome["exit_code"] != float64(0) || outcome["assurance"] != "same_host" {
+		t.Fatalf("exact hook handoff failed: %v\nstdout=%s\nstderr=%s", err, stdout, stderr)
+	}
+	completed, afterReviews, err := f.DB.GetRequestWithReviews(request.ID)
+	if err != nil || completed.Status != db.StatusExecuted || completed.Execution == nil ||
+		completed.Execution.ApprovalPolicy != db.ApprovalPolicySameHost || completed.Execution.Assurance != db.AssuranceSameHost ||
+		!reflect.DeepEqual(reviews, afterReviews) {
+		t.Fatalf("handoff changed stored review/execution assurance: %+v %+v %v", completed, afterReviews, err)
+	}
+	if _, _, err := runShell(handoff, f.ProjectDir, nil); err == nil {
+		t.Fatal("hook handoff was reusable after execution")
+	}
+	marker, err := os.ReadFile(filepath.Join(f.ProjectDir, "hook marker"))
+	if err != nil || string(marker) != "reviewed" {
+		t.Fatalf("reviewed command did not execute exactly once: %q %v", marker, err)
+	}
+
+	// A handoff is still only a candidate: opting out after lookup must stop
+	// the final executor without modifying the signed historical review. The
+	// daemon's target stays same_host; only the hook's selected alias changes.
+	changed := createApproved("/bin/sh -c \"printf changed >> 'policy changed marker'\"")
+	result := guard(native, changed.Command.Raw, f.ProjectDir, "allow")
+	changedHandoff, ok := result.HookSpecificOutput.Updated["command"].(string)
+	if !ok {
+		t.Fatal("second approved command has no handoff")
+	}
+	independentPath := filepath.Join(f.ProjectDir, "independent policy.toml")
+	if err := os.WriteFile(independentPath, []byte(fmt.Sprintf(base, "independent")+patterns), 0600); err != nil {
+		t.Fatal(err)
+	}
+	retarget := func(target string) {
+		t.Helper()
+		next := configPath + ".next"
+		if err := os.Symlink(target, next); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(next, configPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	retarget(independentPath)
+	stdout, stderr, err = runShell(changedHandoff, f.ProjectDir, nil)
+	if err == nil || !strings.Contains(stdout+stderr, "current policy") {
+		t.Fatalf("executor ignored policy change after lookup: %v\n%s\n%s", err, stdout, stderr)
+	}
+	if _, err := os.Stat(filepath.Join(f.ProjectDir, "policy changed marker")); !os.IsNotExist(err) {
+		t.Fatalf("refused handoff ran the command: %v", err)
+	}
+	stored, err := f.DB.GetRequest(changed.ID)
+	if err != nil || stored.Status != db.StatusApproved || stored.Execution != nil || stored.ApprovalPolicy != db.ApprovalPolicySameHost {
+		t.Fatalf("refused handoff claimed or relabeled approval: %+v %v", stored, err)
+	}
+	retarget(policyTarget)
+	f.json("daemon", "stop")
+	running = false
+	f.json("daemon", "start")
+	running = true
+	// The hook asserts its selected file; it cannot silently adopt a daemon
+	// started with another policy, nor reconfigure that daemon per query.
+	for _, invocation := range guards {
+		guard(invocation, "echo selected-hook-probe", f.ProjectDir, "deny")
+	}
+}
 
 // Exercise the installed command itself, not only the shape of its generated
 // configuration. All commands passed to the guard are inspected, never run.

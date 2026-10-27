@@ -16,7 +16,7 @@ var (
 )
 
 func init() {
-	pendingCmd.Flags().BoolVar(&flagPendingAllProjects, "all-projects", false, "list pending requests across all projects")
+	pendingCmd.Flags().BoolVar(&flagPendingAllProjects, "all-projects", false, "list pending and escalated requests across all projects")
 	pendingCmd.Flags().BoolVar(&flagPendingReviewPool, "review-pool", false, "only show requests you can review (not your own)")
 
 	rootCmd.AddCommand(pendingCmd)
@@ -24,11 +24,13 @@ func init() {
 
 var pendingCmd = &cobra.Command{
 	Use:   "pending",
-	Short: "List pending requests awaiting approval",
-	Long: `List all pending command approval requests.
+	Short: "List pending and escalated requests awaiting review",
+	Long: `List command requests that still need review, including escalated requests.
 
-By default, shows pending requests for the current project.
-Use --all-projects to see pending requests across all projects.
+By default, shows pending and escalated requests for the current project.
+Escalation preserves the original review requirements and does not permit execution.
+The requester may cancel an escalated request that is no longer needed.
+Use --all-projects to see reviewable requests across all projects.
 Use --review-pool to filter to requests you can review (excludes your own).
 
 When [general.cross_project_reviews] is true, review_pool is an allowlist of
@@ -49,9 +51,9 @@ the target project's policy explicitly contains your reviewer identity.`,
 		var requests []*db.Request
 
 		if flagPendingAllProjects || flagPendingReviewPool {
-			requests, err = dbConn.ListPendingRequestsAllProjects()
+			requests, err = dbConn.ListReviewableRequests("")
 		} else {
-			requests, err = dbConn.ListPendingRequests(project)
+			requests, err = dbConn.ListReviewableRequests(project)
 		}
 		if err != nil {
 			return fmt.Errorf("listing pending requests: %w", err)
@@ -67,6 +69,7 @@ the target project's policy explicitly contains your reviewer identity.`,
 		type pendingView struct {
 			approvalPolicyView
 			RequestID       string `json:"request_id"`
+			Status          string `json:"status"`
 			Command         string `json:"command"`
 			CommandRedacted string `json:"command_redacted,omitempty"`
 			RiskTier        string `json:"risk_tier"`
@@ -84,6 +87,7 @@ the target project's policy explicitly contains your reviewer identity.`,
 			view := pendingView{
 				approvalPolicyView: policyView(r.ApprovalPolicy),
 				RequestID:          r.ID,
+				Status:             string(r.Status),
 				Command:            r.Command.Raw,
 				RiskTier:           string(r.RiskTier),
 				MinApprovals:       r.MinApprovals,

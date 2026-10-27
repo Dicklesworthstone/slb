@@ -96,6 +96,93 @@ func TestPendingCommand_ListsPendingRequests(t *testing.T) {
 	}
 }
 
+func TestEscalatedRequestsRemainVisibleToReviewers(t *testing.T) {
+	for _, command := range []string{"pending", "review list"} {
+		for _, mode := range []string{"project", "all", "review-pool"} {
+			t.Run(command+"/"+mode, func(t *testing.T) {
+				h := testutil.NewHarness(t)
+				resetPendingFlags()
+				resetReviewFlags()
+				reviewer := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("Reviewer"))
+				author := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("Author"))
+				makeRequest := func(session *db.Session, status db.RequestStatus) *db.Request {
+					return testutil.MakeRequest(t, h.DB, session, testutil.WithStatus(status), testutil.WithMinApprovals(2), func(request *db.Request) {
+						request.ApprovalPolicy = db.ApprovalPolicySameHost
+						request.RequireDifferentModel = true
+					})
+				}
+				pending := makeRequest(author, db.StatusPending)
+				escalated := makeRequest(author, db.StatusEscalated)
+				own := makeRequest(reviewer, db.StatusEscalated)
+				makeRequest(author, db.StatusApproved)
+				foreign := make([]*db.Request, 0, 2)
+				for _, allowed := range []string{"Reviewer", "SomeoneElse"} {
+					project := t.TempDir()
+					if err := os.MkdirAll(filepath.Join(project, ".slb"), 0700); err != nil {
+						t.Fatal(err)
+					}
+					policy := "[general]\ncross_project_reviews = true\nreview_pool = ['" + allowed + "']\n"
+					if err := os.WriteFile(filepath.Join(project, ".slb", "config.toml"), []byte(policy), 0600); err != nil {
+						t.Fatal(err)
+					}
+					session := testutil.MakeSession(t, h.DB, testutil.WithProject(project), testutil.WithAgent("ForeignAuthor"))
+					foreign = append(foreign, makeRequest(session, db.StatusEscalated))
+				}
+				want := map[string]string{pending.ID: string(db.StatusPending), escalated.ID: string(db.StatusEscalated)}
+				args := strings.Fields(command)
+				var cmd *cobra.Command
+				idField := "request_id"
+				if command == "pending" {
+					cmd = newTestPendingCmd(h.DBPath)
+				} else {
+					cmd = newTestReviewCmd(h.DBPath)
+					idField = "id"
+				}
+				flagSessionID = reviewer.ID
+				switch mode {
+				case "review-pool":
+					args = append(args, "--review-pool")
+					want[foreign[0].ID] = string(db.StatusEscalated)
+				case "all":
+					allFlag := "--all"
+					if command == "pending" {
+						allFlag = "--all-projects"
+					}
+					args = append(args, allFlag)
+					want[own.ID] = string(db.StatusEscalated)
+					for _, request := range foreign {
+						want[request.ID] = string(db.StatusEscalated)
+					}
+				default:
+					want[own.ID] = string(db.StatusEscalated)
+				}
+				args = append(args, "-C", h.ProjectDir, "-j")
+				stdout, err := executeCommandCapture(t, cmd, args...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var rows []map[string]any
+				if err := json.Unmarshal([]byte(stdout), &rows); err != nil {
+					t.Fatalf("decode review queue: %v\n%s", err, stdout)
+				}
+				if len(rows) != len(want) {
+					t.Fatalf("reviewable queue lost escalation or scope: got=%s want=%v", stdout, want)
+				}
+				for _, row := range rows {
+					id, _ := row[idField].(string)
+					if want[id] == "" || row["status"] != want[id] || row["approval_policy"] != "same_host" || row["min_approvals"] != float64(2) {
+						t.Fatalf("queue changed status, review policy or quorum: %+v", row)
+					}
+					delete(want, id)
+				}
+				if len(want) != 0 {
+					t.Fatalf("review queue omitted requests: %v", want)
+				}
+			})
+		}
+	}
+}
+
 func TestPendingCommand_EmptyList(t *testing.T) {
 	h := testutil.NewHarness(t)
 	resetPendingFlags()

@@ -29,6 +29,7 @@ func newTestHookCmd(dbPath string) *cobra.Command {
 	}
 
 	root.PersistentFlags().StringVar(&flagDB, "db", dbPath, "database path")
+	root.PersistentFlags().StringVarP(&flagConfig, "config", "c", "", "config file path")
 	root.PersistentFlags().StringVarP(&flagOutput, "output", "o", "text", "output format")
 	root.PersistentFlags().BoolVarP(&flagJSON, "json", "j", false, "json output")
 	root.PersistentFlags().StringVarP(&flagProject, "project", "C", "", "project directory")
@@ -95,6 +96,7 @@ func newTestHookCmd(dbPath string) *cobra.Command {
 
 func resetHookFlags() {
 	flagDB = ""
+	flagConfig = ""
 	flagOutput = "text"
 	flagJSON = false
 	flagProject = ""
@@ -105,6 +107,7 @@ func resetHookFlags() {
 	flagHookOutputDir = ""
 	flagHookLocalOnly = false
 	flagHookSimulateFailure = false
+	flagHookPolicyProject = ""
 }
 
 func TestHookCommand_Help(t *testing.T) {
@@ -1189,11 +1192,11 @@ func TestHookTestCommand_SimulatedFailureUsesFallback(t *testing.T) {
 
 func TestHookCautionPolicyEmbeddedAndLocal(t *testing.T) {
 	engine := core.NewPatternEngine()
-	askScript := generateHookScriptWithPolicy(engine, "ask", db.ApprovalPolicyIndependent)
+	askScript := generateHookScriptWithPolicy(engine, "ask", db.ApprovalPolicyIndependent, "", "")
 	if !strings.Contains(askScript, `HOOK_CAUTION_ACTION = "ask"`) || embeddedHookCautionAction([]byte(askScript)) != "ask" {
 		t.Fatal("generated hook lost explicit CAUTION ask policy")
 	}
-	blockScript := generateHookScriptWithPolicy(engine, "invalid", db.ApprovalPolicyIndependent)
+	blockScript := generateHookScriptWithPolicy(engine, "invalid", db.ApprovalPolicyIndependent, "", "")
 	if embeddedHookCautionAction([]byte(blockScript)) != "block" {
 		t.Fatal("invalid generated CAUTION policy did not fail closed")
 	}
@@ -1323,7 +1326,7 @@ func TestNativeHookGuardExecutionHandoff(t *testing.T) {
 	toolInput := map[string]any{
 		"command": "rm -rf ./build", "timeout": json.Number("1500"), "description": "preserve me",
 	}
-	if err := emitNativeExecutionHandoff(cmd, response, toolInput, "session-1", project); err != nil {
+	if err := emitNativeExecutionHandoff(cmd, response, toolInput, "session-1", project, ""); err != nil {
 		t.Fatal(err)
 	}
 	var output map[string]any
@@ -1349,7 +1352,7 @@ func TestNativeHookGuardExecutionHandoff(t *testing.T) {
 	}
 
 	response.ExecutionHandoff.DatabasePath = filepath.Join(t.TempDir(), "wrong.db")
-	if err := emitNativeExecutionHandoff(&cobra.Command{}, response, toolInput, "session-1", project); err == nil {
+	if err := emitNativeExecutionHandoff(&cobra.Command{}, response, toolInput, "session-1", project, ""); err == nil {
 		t.Fatal("cross-project execution handoff was accepted")
 	}
 }
@@ -1400,7 +1403,7 @@ func TestNativeHookHandoffUsesPhysicalProjectDatabase(t *testing.T) {
 			cmd := &cobra.Command{}
 			var stdout strings.Builder
 			cmd.SetOut(&stdout)
-			err := emitNativeExecutionHandoff(cmd, response, map[string]any{"command": "git reset --hard"}, "session-1", tc.cwd)
+			err := emitNativeExecutionHandoff(cmd, response, map[string]any{"command": "git reset --hard"}, "session-1", tc.cwd, "")
 			if tc.valid {
 				if err != nil {
 					t.Fatal(err)
@@ -1559,8 +1562,226 @@ func TestHookInstallUsesNativeGuard(t *testing.T) {
 	}
 }
 
+func TestHookInstallPersistsSelectedPolicy(t *testing.T) {
+	for _, global := range []bool{false, true} {
+		name := "project"
+		if global {
+			name = "global"
+		}
+		t.Run(name, func(t *testing.T) {
+			h := testutil.NewHarness(t)
+			resetHookFlags()
+			t.Cleanup(resetHookFlags)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			t.Setenv("SLB_PROJECT", "")
+			t.Chdir(h.ProjectDir)
+			relativeConfig := filepath.Join("policy settings", "team's review.toml")
+			selected := h.WriteFile(relativeConfig, []byte("[general]\napproval_policy = 'same_host'\n[patterns.critical]\npatterns = ['^selected-hook-command$']\n"), 0600)
+			physical, err := filepath.EvalSymlinks(h.ProjectDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			base := h.ProjectDir
+			if global {
+				base = home
+			}
+			settingsPath := filepath.Join(base, ".claude", "settings.json")
+			if err := os.MkdirAll(filepath.Dir(settingsPath), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(settingsPath, []byte(`{"env":{"KEEP":"yes"},"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo keep"}]}]}}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			installArgs := []string{"-C", h.ProjectDir, "--config", relativeConfig, "hook", "install", "-j"}
+			statusArgs := []string{"-C", h.ProjectDir, "hook", "status", "-j"}
+			uninstallArgs := []string{"-C", h.ProjectDir, "hook", "uninstall", "-j"}
+			if global {
+				installArgs = append(installArgs, "--global")
+				statusArgs = append(statusArgs, "--global")
+				uninstallArgs = append(uninstallArgs, "--global")
+			}
+			stdout, err := executeCommandCapture(t, newTestHookCmd(h.DBPath), installArgs...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var installed map[string]any
+			if err := json.Unmarshal([]byte(stdout), &installed); err != nil {
+				t.Fatal(err)
+			}
+			if installed["policy_config"] != selected || installed["policy_project"] != physical || installed["approval_policy"] != "same_host" {
+				t.Fatalf("installation lost selected policy provenance: %+v", installed)
+			}
+			command := installed["hook_command"].(string)
+			if !isSLBHookCommand(command, "") {
+				t.Fatalf("pinned native guard is not managed: %s", command)
+			}
+			// Parse with an actual shell without invoking the guard. Paths with
+			// spaces and quotes must survive the installed settings command.
+			if runtime.GOOS != "windows" {
+				parsed, err := exec.Command("sh", "-c", "set -- "+command+"; printf '%s\\n' \"$@\"").Output()
+				if err != nil {
+					t.Fatal(err)
+				}
+				args := strings.Split(strings.TrimSuffix(string(parsed), "\n"), "\n")
+				if len(args) != 7 || args[1] != "hook" || args[2] != "guard" || args[3] != "--config" || args[4] != selected || args[5] != "--policy-project" || args[6] != physical {
+					t.Fatalf("installed shell command changed policy arguments: %#v", args)
+				}
+			}
+			before, err := os.ReadFile(settingsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resetHookFlags()
+			stdout, err = executeCommandCapture(t, newTestHookCmd(h.DBPath), statusArgs...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var status map[string]any
+			if err := json.Unmarshal([]byte(stdout), &status); err != nil {
+				t.Fatal(err)
+			}
+			if status["status"] != "installed" || status["current_approval_policy"] != "same_host" || status["current_policy_config"] != selected || status["policy_config_matches"] != true || status["selected_policy_applies"] != true {
+				t.Fatalf("status did not read the persisted selection: %+v", status)
+			}
+			if flagConfig != "" {
+				t.Fatal("status changed the caller's config flag")
+			}
+			resetHookFlags()
+			if _, err := executeCommandCapture(t, newTestHookCmd(h.DBPath), installArgs...); err != nil {
+				t.Fatal(err)
+			}
+			after, err := os.ReadFile(settingsPath)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("reinstall rewrote pinned settings: %v\n%s", err, after)
+			}
+			resetHookFlags()
+			if _, err := executeCommandCapture(t, newTestHookCmd(h.DBPath), uninstallArgs...); err != nil {
+				t.Fatal(err)
+			}
+			after, err = os.ReadFile(settingsPath)
+			if err != nil || strings.Contains(string(after), "hook guard") || !strings.Contains(string(after), "echo keep") {
+				t.Fatalf("uninstall lost ownership or sibling settings: %v\n%s", err, after)
+			}
+			var remaining struct {
+				Env map[string]string `json:"env"`
+			}
+			if err := json.Unmarshal(after, &remaining); err != nil || remaining.Env["KEEP"] != "yes" {
+				t.Fatalf("uninstall changed unrelated environment settings: %v\n%s", err, after)
+			}
+		})
+	}
+}
+
+func TestHookGenerateSelectedPolicyUsesPhysicalProject(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetHookFlags()
+	t.Cleanup(resetHookFlags)
+	t.Setenv("HOME", t.TempDir())
+	t.Chdir(h.ProjectDir)
+	selected := h.WriteFile("selected review.toml", []byte("[general]\napproval_policy = 'same_host'\n"), 0600)
+	alias := filepath.Join(t.TempDir(), "project alias")
+	if err := os.Symlink(h.ProjectDir, alias); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("directory symlinks require Windows developer mode or privilege: %v", err)
+		}
+		t.Fatal(err)
+	}
+	outputDir := t.TempDir()
+	if _, err := executeCommandCapture(t, newTestHookCmd(h.DBPath), "-C", alias, "--config", "selected review.toml", "hook", "generate", "--output-dir", outputDir, "-j"); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(outputDir, "slb_guard.py")
+	stdout := runGeneratedHookPython(t, script, "import json\nprint(json.dumps([g['HOOK_POLICY_CONFIG'], g['HOOK_POLICY_PROJECT'], g['HOOK_APPROVAL_POLICY']]))")
+	var policy []string
+	if err := json.Unmarshal([]byte(stdout), &policy); err != nil {
+		t.Fatal(err)
+	}
+	physical, err := filepath.EvalSymlinks(h.ProjectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(policy) != 3 || policy[0] != selected || policy[1] != physical || policy[2] != "same_host" {
+		t.Fatalf("generated script lost its selected policy or physical owner: %#v", policy)
+	}
+}
+
+func TestHookGlobalSelectedPolicyStatusStaysScoped(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetHookFlags()
+	t.Cleanup(resetHookFlags)
+	t.Setenv("HOME", t.TempDir())
+	selected := h.WriteFile("selected.toml", []byte("[general]\napproval_policy = 'same_host'\n"), 0600)
+	if _, err := executeCommandCapture(t, newTestHookCmd(h.DBPath), "-C", h.ProjectDir, "--config", selected, "hook", "install", "--global", "-j"); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(h.ProjectDir, "nested")
+	initializeClaudeHookTestProject(t, nested)
+	other := testutil.NewHarness(t)
+	for _, project := range []string{nested, other.ProjectDir} {
+		resetHookFlags()
+		stdout, err := executeCommandCapture(t, newTestHookCmd(filepath.Join(project, ".slb", "state.db")), "-C", project, "hook", "status", "--global", "-j")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var status map[string]any
+		if err := json.Unmarshal([]byte(stdout), &status); err != nil {
+			t.Fatal(err)
+		}
+		if status["selected_policy_applies"] != false || status["current_policy_config"] != "" || status["current_approval_policy"] != "independent" || status["configured_policy_config"] != selected {
+			t.Fatalf("global status imported another project's opt-in policy into %s: %+v", project, status)
+		}
+	}
+}
+
+func TestHookUnavailableSelectedPolicyPreservesInstallation(t *testing.T) {
+	for _, kind := range []string{"missing", "directory", "malformed"} {
+		t.Run(kind, func(t *testing.T) {
+			h := testutil.NewHarness(t)
+			resetHookFlags()
+			t.Cleanup(resetHookFlags)
+			t.Setenv("HOME", t.TempDir())
+			if _, err := executeCommandCapture(t, newTestHookCmd(h.DBPath), "-C", h.ProjectDir, "hook", "install", "-j"); err != nil {
+				t.Fatal(err)
+			}
+			settingsPath := filepath.Join(h.ProjectDir, ".claude", "settings.json")
+			scriptPath := filepath.Join(h.ProjectDir, ".slb", "hooks", "slb_guard.py")
+			settings, err := os.ReadFile(settingsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			script, err := os.ReadFile(scriptPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			selected := filepath.Join(h.ProjectDir, "unavailable.toml")
+			if kind == "directory" {
+				if err := os.Mkdir(selected, 0700); err != nil {
+					t.Fatal(err)
+				}
+			} else if kind == "malformed" {
+				h.WriteFile("unavailable.toml", []byte("[general\n"), 0600)
+			}
+			for _, operation := range [][]string{{"install"}, {"generate", "--output-dir", filepath.Dir(scriptPath)}} {
+				resetHookFlags()
+				args := append([]string{"-C", h.ProjectDir, "--config", selected, "hook"}, operation...)
+				if _, err := executeCommandCapture(t, newTestHookCmd(h.DBPath), args...); err == nil {
+					t.Fatalf("%s accepted %s selected policy", operation[0], kind)
+				}
+				for path, before := range map[string][]byte{settingsPath: settings, scriptPath: script} {
+					after, err := os.ReadFile(path)
+					if err != nil || !bytes.Equal(before, after) {
+						t.Fatalf("%s changed an earlier installation with %s selected config: %s (%v)", operation[0], kind, path, err)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestNativeHookCommandRecognition(t *testing.T) {
-	command, err := nativeHookGuardCommand()
+	command, err := nativeHookGuardCommand("", "")
 	if err != nil {
 		t.Fatal(err)
 	}

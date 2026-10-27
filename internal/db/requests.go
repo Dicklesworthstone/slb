@@ -20,6 +20,9 @@ var ErrRequestNotFound = errors.New("request not found")
 // ErrInvalidTransition is returned when a state transition is invalid.
 var ErrInvalidTransition = errors.New("invalid state transition")
 
+// ErrRequestNotOwner means the supplied session does not own the request.
+var ErrRequestNotOwner = errors.New("cannot cancel request: you are not the requestor (session mismatch)")
+
 // DefaultRequestTimeout is the default timeout for pending requests.
 const DefaultRequestTimeout = 30 * time.Minute
 
@@ -159,6 +162,35 @@ func (db *DB) ListPendingRequests(projectPath string) ([]*Request, error) {
 	return db.ListRequestsByStatus(StatusPending, projectPath)
 }
 
+// ListReviewableRequests returns pending and escalated requests that still
+// accept review. An empty projectPath explicitly selects all projects. Keep
+// this separate from pending-only timer and quota queries: escalation reopens
+// peer/operator review, not automatic approval or a pending capacity slot.
+func (db *DB) ListReviewableRequests(projectPath string) ([]*Request, error) {
+	rows, err := db.Query(`
+		SELECT id, project_path,
+			command_raw, command_argv_json, command_cwd, command_shell, command_hash,
+			command_display_redacted, command_contains_sensitive,
+			risk_tier, requestor_session_id, requestor_agent, requestor_model,
+			justification_reason, justification_expected_effect, justification_goal, justification_safety_argument,
+			dry_run_command, dry_run_output, attachments_json,
+			status, min_approvals, require_different_model,
+			execution_log_path, execution_exit_code, execution_duration_ms,
+			execution_executed_at, execution_executed_by_session_id, execution_executed_by_agent, execution_executed_by_model,
+			rollback_path, rollback_rolled_back_at,
+			created_at, resolved_at, expires_at, approval_expires_at,
+			approval_policy, execution_approval_policy, execution_assurance
+		FROM requests
+		WHERE status IN ('pending', 'escalated') AND (? = '' OR project_path = ?)
+		ORDER BY created_at DESC, id
+	`, projectPath, projectPath)
+	if err != nil {
+		return nil, fmt.Errorf("querying reviewable requests: %w", err)
+	}
+	defer rows.Close()
+	return scanRequests(rows)
+}
+
 // ListPendingRequestsByProjects returns pending requests for a set of projects.
 func (db *DB) ListPendingRequestsByProjects(projectPaths []string) ([]*Request, error) {
 	if len(projectPaths) == 0 {
@@ -277,6 +309,39 @@ func (db *DB) ListAllRequests(projectPath string) ([]*Request, error) {
 	return scanRequests(rows)
 }
 
+// CancelRequest checks ownership and cancels outstanding work under one writer
+// reservation. An executing or terminal request can never be overwritten by a
+// stale CLI snapshot. Existing reviews, bindings and journal history remain.
+// Like local request admission, ownership here is a session-ID workflow check,
+// not independently authenticated authorization against same-UID processes.
+func (db *DB) CancelRequest(id, requestorSessionID string) (*Request, error) {
+	if id == "" || requestorSessionID == "" {
+		return nil, errors.New("request ID and requestor session ID are required")
+	}
+	var cancelled *Request
+	err := db.Transaction(func(tx *sql.Tx) error {
+		request, err := db.GetRequestTx(tx, id)
+		if err != nil {
+			return err
+		}
+		if request.RequestorSessionID != requestorSessionID {
+			return ErrRequestNotOwner
+		}
+		if !canTransition(request.Status, StatusCancelled) {
+			return fmt.Errorf("%w: cannot cancel request: status is %s (must be pending, approved or escalated)", ErrInvalidTransition, request.Status)
+		}
+		if err := db.UpdateRequestStatusTx(tx, id, StatusCancelled, request.Status); err != nil {
+			return err
+		}
+		cancelled, err = db.GetRequestTx(tx, id)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return cancelled, nil
+}
+
 // UpdateRequestStatusTx updates a request's status within a transaction.
 func (db *DB) UpdateRequestStatusTx(tx *sql.Tx, id string, status RequestStatus, currentStatus RequestStatus) error {
 	// Validate transition using state machine
@@ -376,8 +441,8 @@ func canTransition(from, to RequestStatus) bool {
 	case StatusTimeout:
 		return to == StatusEscalated
 	case StatusEscalated:
-		// Human intervention: can approve or reject after escalation
-		return to == StatusApproved || to == StatusRejected
+		// Review remains possible; the requester may withdraw unexecuted work.
+		return to == StatusApproved || to == StatusRejected || to == StatusCancelled
 	default:
 		return false
 	}
