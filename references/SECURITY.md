@@ -202,6 +202,12 @@ parent's policy. Hook approval lookup checks the exact command cwd, requesting
 session and stored project binding against the physical policy root; it does not
 rewrite or upgrade historical review evidence.
 
+The interactive dashboard uses the explicitly selected database for every read
+and write, including asynchronous refresh and review submission. A selected
+store that becomes unavailable is not replaced by the default store. Shared
+database selection does not broaden request/history visibility or the reviewer's
+project authority, and never changes the assurance of stored evidence.
+
 Ordinary approvals and rejections require the reviewer's recorded project path
 to match the request's, even when projects share a database through `--db`.
 Cross-project review uses the explicit `--target-project` delegation workflow;

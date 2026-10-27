@@ -82,8 +82,9 @@ type RemovalRow struct {
 
 // Model is the Bubble Tea model for the pattern removal review panel.
 type Model struct {
-	projectPath string
-	keyMap      RemovalKeyMap
+	projectPath  string
+	databasePath string
+	keyMap       RemovalKeyMap
 
 	// View state
 	ready  bool
@@ -142,15 +143,24 @@ func New(projectPath string) Model {
 	}
 
 	return Model{
-		projectPath: projectPath,
-		keyMap:      DefaultRemovalKeyMap(),
-		filterType:  "", // Show all by default
+		projectPath:  projectPath,
+		databasePath: filepath.Join(projectPath, ".slb", "state.db"),
+		keyMap:       DefaultRemovalKeyMap(),
+		filterType:   "", // Show all by default
 	}
+}
+
+// WithDatabasePath selects the store for both pattern history and actions.
+func (m Model) WithDatabasePath(path string) Model {
+	if path != "" {
+		m.databasePath = path
+	}
+	return m
 }
 
 // Init initializes the model.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(loadDataCmd(m.projectPath, m.filterType), tickCmd())
+	return tea.Batch(loadDataCmd(m.databasePath, m.filterType), tickCmd())
 }
 
 // Update handles messages.
@@ -163,7 +173,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case refreshMsg:
-		return m, tea.Batch(loadDataCmd(m.projectPath, m.filterType), tickCmd())
+		return m, tea.Batch(loadDataCmd(m.databasePath, m.filterType), tickCmd())
 
 	case dataMsg:
 		m.rows = msg.rows
@@ -185,7 +195,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.messageType = "error"
 		}
 		// Refresh data after action
-		return m, loadDataCmd(m.projectPath, m.filterType)
+		return m, loadDataCmd(m.databasePath, m.filterType)
 
 	case tea.KeyMsg:
 		// Clear message on any keypress
@@ -219,7 +229,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(m.rows) > 0 && m.selectedIdx < len(m.rows) {
 				row := m.rows[m.selectedIdx]
 				if row.Status == db.PatternChangeStatusPending {
-					return m, approveCmd(m.projectPath, row.ID)
+					return m, approveCmd(m.databasePath, row.ID)
 				}
 			}
 			return m, nil
@@ -228,7 +238,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(m.rows) > 0 && m.selectedIdx < len(m.rows) {
 				row := m.rows[m.selectedIdx]
 				if row.Status == db.PatternChangeStatusPending {
-					return m, rejectCmd(m.projectPath, row.ID)
+					return m, rejectCmd(m.databasePath, row.ID)
 				}
 			}
 			return m, nil
@@ -236,10 +246,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, m.keyMap.FilterType):
 			m.cycleFilterType()
 			m.selectedIdx = 0
-			return m, loadDataCmd(m.projectPath, m.filterType)
+			return m, loadDataCmd(m.databasePath, m.filterType)
 
 		case key.Matches(msg, m.keyMap.Refresh):
-			return m, loadDataCmd(m.projectPath, m.filterType)
+			return m, loadDataCmd(m.databasePath, m.filterType)
 		}
 	}
 
@@ -480,9 +490,9 @@ func tickCmd() tea.Cmd {
 	})
 }
 
-func loadDataCmd(projectPath, filterType string) tea.Cmd {
+func loadDataCmd(databasePath, filterType string) tea.Cmd {
 	return func() tea.Msg {
-		rows, total, err := loadPatternChanges(projectPath, filterType)
+		rows, total, err := loadPatternChanges(databasePath, filterType)
 		return dataMsg{
 			rows:        rows,
 			totalCount:  total,
@@ -492,9 +502,9 @@ func loadDataCmd(projectPath, filterType string) tea.Cmd {
 	}
 }
 
-func approveCmd(projectPath string, id int64) tea.Cmd {
+func approveCmd(databasePath string, id int64) tea.Cmd {
 	return func() tea.Msg {
-		err := performAction(projectPath, id, "approve")
+		err := performAction(databasePath, id, "approve")
 		return actionMsg{
 			action:  "approve",
 			id:      id,
@@ -504,9 +514,9 @@ func approveCmd(projectPath string, id int64) tea.Cmd {
 	}
 }
 
-func rejectCmd(projectPath string, id int64) tea.Cmd {
+func rejectCmd(databasePath string, id int64) tea.Cmd {
 	return func() tea.Msg {
-		err := performAction(projectPath, id, "reject")
+		err := performAction(databasePath, id, "reject")
 		return actionMsg{
 			action:  "reject",
 			id:      id,
@@ -516,9 +526,8 @@ func rejectCmd(projectPath string, id int64) tea.Cmd {
 	}
 }
 
-func loadPatternChanges(projectPath, filterType string) ([]RemovalRow, int, error) {
-	dbPath := filepath.Join(projectPath, ".slb", "state.db")
-	dbConn, err := db.OpenWithOptions(dbPath, db.OpenOptions{
+func loadPatternChanges(databasePath, filterType string) ([]RemovalRow, int, error) {
+	dbConn, err := db.OpenWithOptions(databasePath, db.OpenOptions{
 		CreateIfNotExists: false,
 		InitSchema:        false,
 		ReadOnly:          true,
@@ -554,9 +563,8 @@ func loadPatternChanges(projectPath, filterType string) ([]RemovalRow, int, erro
 	return rows, len(rows), nil
 }
 
-func performAction(projectPath string, id int64, action string) error {
-	dbPath := filepath.Join(projectPath, ".slb", "state.db")
-	dbConn, err := db.OpenWithOptions(dbPath, db.OpenOptions{
+func performAction(databasePath string, id int64, action string) error {
+	dbConn, err := db.OpenWithOptions(databasePath, db.OpenOptions{
 		CreateIfNotExists: false,
 		InitSchema:        true,
 		ReadOnly:          false,

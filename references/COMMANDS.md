@@ -194,6 +194,7 @@ slb -C /path/to/project --config /path/to/policy.toml daemon start
 slb daemon stop                                # Stop daemon
 slb daemon status                              # Check daemon status
 slb tui                                        # Launch interactive TUI
+slb --db /path/to/review-state.db tui --session-id <id> --session-key <key>
 slb watch --session-id <id> --json             # Stream events (NDJSON)
 slb watch --session-id <id> --auto-approve-caution  # Auto-approve CAUTION tier
 ```
@@ -204,6 +205,20 @@ the directory selected by `-C`. Pass the same
 `--config` file to requester and reviewer commands when using an explicit policy.
 Restart the daemon with that file after changing notification settings; another
 command's `--config` does not change an already running daemon.
+
+The TUI resolves the selected database before terminal startup and retains it
+through navigation, refreshes, reviews and pattern actions. Missing or unreadable
+state is refused without creating a database or falling back to the project
+default. Request/history views, including full-text search, remain scoped to the
+selected project; pattern proposals are scoped to the selected database. Review
+credentials enable the same policy and evidence checks as ordinary CLI reviews.
+
+The default pending-alert worker retries failed desktop and webhook destinations
+independently, with bounded backoff and a shared send budget. Already successful
+destinations are suppressed until daemon restart, and pending alerts stop after
+the request is resolved or escalated. Desktop subprocesses honor daemon
+cancellation and have bounded runtime/output; delivery does not authorize a
+request or change its assurance.
 
 ---
 

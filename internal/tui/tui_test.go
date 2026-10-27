@@ -39,6 +39,32 @@ func TestNewWithOptions(t *testing.T) {
 	}
 }
 
+func TestResolvedDatabaseAndConfigSurviveDirectoryChange(t *testing.T) {
+	database, target, _, opts := interactiveReviewFixture(t, 1, db.ApprovalPolicySameHost)
+	t.Chdir(opts.ProjectPath)
+	opts.DatabasePath = filepath.Join(".slb", "state.db")
+	opts.ConfigPath = filepath.Join(".slb", "config.toml")
+	resolved, err := ResolveOptions(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.DatabasePath != database.Path() || resolved.ConfigPath != filepath.Join(opts.ProjectPath, ".slb", "config.toml") {
+		t.Fatalf("selected filenames were not pinned: %+v", resolved)
+	}
+	t.Chdir(t.TempDir())
+	model := NewWithOptions(resolved)
+	if detail := model.loadRequestDetail(target.ID); detail == nil || detail.Request.ID != target.ID {
+		t.Fatalf("directory change retargeted database: %s", model.navigationError)
+	}
+	resolved.DatabasePath = filepath.Join(t.TempDir(), "missing.db")
+	if err := RunWithOptions(resolved); err == nil || !strings.Contains(err.Error(), "opening selected TUI database") {
+		t.Fatalf("missing database reached terminal startup: %v", err)
+	}
+	if _, err := os.Stat(resolved.DatabasePath); !os.IsNotExist(err) {
+		t.Fatalf("preflight created missing database: %v", err)
+	}
+}
+
 func TestModelInit(t *testing.T) {
 	m := New()
 	cmd := m.Init()

@@ -27,6 +27,14 @@ type CommandResult struct {
 	Duration time.Duration
 }
 
+// ConfigureNoninteractiveCommandCancellation gives CommandContext callers the
+// same ordinary process-group cancellation as command execution on Unix, and
+// direct-child cancellation elsewhere. Call the returned cleanup on failure.
+// This manages process lifetimes; it does not contain deliberate group escapes.
+func ConfigureNoninteractiveCommandCancellation(cmd *exec.Cmd) func() error {
+	return configureCommandCancellation(cmd, false)
+}
+
 // RunCommand executes a command and captures output to both terminal and log file.
 // The command runs in the current shell environment, inheriting all env vars.
 // Once a process starts, its result is returned even on cancellation or I/O error.

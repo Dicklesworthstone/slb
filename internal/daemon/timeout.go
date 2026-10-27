@@ -4,7 +4,6 @@ package daemon
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
@@ -198,42 +197,40 @@ func (h *TimeoutHandler) advance(ctx context.Context, id string, action TimeoutA
 	if h.config.DesktopNotify {
 		switch request.Status {
 		case db.StatusEscalated:
-			h.sendDesktopNotification(request)
+			h.sendDesktopNotification(ctx, request)
 		case db.StatusApproved:
-			h.sendAutoApproveWarning(request)
+			h.sendAutoApproveWarning(ctx, request)
 		}
 	}
 	return nil
 }
 
-func (h *TimeoutHandler) sendDesktopNotification(request *db.Request) {
+func (h *TimeoutHandler) sendDesktopNotification(ctx context.Context, request *db.Request) {
 	title := fmt.Sprintf("SLB: Request Escalated (%s)", request.RiskTier)
 	body := fmt.Sprintf("Request %s timed out.\nCommand: %s\nAgent: %s", truncateID(request.ID, 8),
 		truncateString(core.ApplyRedaction(request.Command.Raw, nil), 50), request.RequestorAgent)
-	if err := notify(title, body); err != nil {
+	if err := notify(ctx, title, body); err != nil {
 		h.logger.Debug("desktop notification failed", "error", err)
 	}
 }
 
-func (h *TimeoutHandler) sendAutoApproveWarning(request *db.Request) {
+func (h *TimeoutHandler) sendAutoApproveWarning(ctx context.Context, request *db.Request) {
 	body := fmt.Sprintf("Request %s passed its CAUTION review delay.\nCommand: %s", truncateID(request.ID, 8),
 		truncateString(core.ApplyRedaction(request.Command.Raw, nil), 50))
-	if err := notify("SLB: Request Auto-Approved (WARNING)", body); err != nil {
+	if err := notify(ctx, "SLB: Request Auto-Approved (WARNING)", body); err != nil {
 		h.logger.Debug("desktop notification failed", "error", err)
 	}
 }
 
 // Notification helpers are bounded so a missing desktop service cannot stall
 // the timer indefinitely. They run only after a committed policy decision.
-func notify(title, body string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+func notify(ctx context.Context, title, body string) error {
 	switch runtime.GOOS {
 	case "darwin":
 		script := fmt.Sprintf(`display notification "%s" with title "%s"`, escapeAppleScript(body), escapeAppleScript(title))
-		return exec.CommandContext(ctx, "osascript", "-e", script).Run()
+		return runNoOutput(ctx, "osascript", "-e", script)
 	case "linux":
-		return exec.CommandContext(ctx, "notify-send", "-u", "critical", title, body).Run()
+		return runNoOutput(ctx, "notify-send", "-u", "critical", title, body)
 	case "windows":
 		script := fmt.Sprintf(`
 			[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
@@ -244,7 +241,7 @@ func notify(title, body string) error {
 			$toast = [Windows.UI.Notifications.ToastNotification]::new($template)
 			[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("SLB").Show($toast)
 		`, escapePowerShellDoubleQuoted(title), escapePowerShellDoubleQuoted(body))
-		return exec.CommandContext(ctx, "powershell", "-Command", script).Run()
+		return runNoOutput(ctx, "powershell", "-Command", script)
 	default:
 		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}

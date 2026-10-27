@@ -3,10 +3,13 @@
 package tui
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/tui/dashboard"
 	"github.com/Dicklesworthstone/slb/internal/tui/history"
 	"github.com/Dicklesworthstone/slb/internal/tui/patterns"
@@ -27,12 +30,61 @@ const (
 // Options configures the TUI behavior.
 type Options struct {
 	ProjectPath     string
+	DatabasePath    string
 	ConfigPath      string
 	Theme           string
 	DisableMouse    bool
 	RefreshInterval int
 	SessionID       string
 	SessionKey      string
+}
+
+func (opts Options) databasePath() string {
+	if opts.DatabasePath != "" {
+		return opts.DatabasePath
+	}
+	return filepath.Join(opts.ProjectPath, ".slb", "state.db")
+}
+
+// ResolveOptions pins selected filenames before asynchronous UI work and checks
+// the database without creating or migrating it. Project identity and policy
+// remain separate from database selection, including for shared stores.
+func ResolveOptions(opts Options) (Options, error) {
+	var err error
+	if opts.ProjectPath == "" {
+		opts.ProjectPath, err = os.Getwd()
+		if err != nil {
+			return opts, fmt.Errorf("resolving TUI project: %w", err)
+		}
+	}
+	opts.ProjectPath, err = filepath.Abs(opts.ProjectPath)
+	if err != nil {
+		return opts, fmt.Errorf("resolving TUI project: %w", err)
+	}
+	if opts.DatabasePath == "" {
+		opts.DatabasePath, err = db.ProjectDatabasePath(opts.ProjectPath)
+		if err != nil {
+			return opts, err
+		}
+	}
+	opts.DatabasePath, err = filepath.Abs(opts.DatabasePath)
+	if err != nil {
+		return opts, fmt.Errorf("resolving TUI database: %w", err)
+	}
+	if opts.ConfigPath != "" {
+		opts.ConfigPath, err = filepath.Abs(opts.ConfigPath)
+		if err != nil {
+			return opts, fmt.Errorf("resolving TUI config: %w", err)
+		}
+	}
+	database, err := db.OpenWithOptions(opts.DatabasePath, db.OpenOptions{ReadOnly: true})
+	if err != nil {
+		return opts, fmt.Errorf("opening selected TUI database %q: %w", opts.DatabasePath, err)
+	}
+	if err := database.Close(); err != nil {
+		return opts, fmt.Errorf("closing TUI database preflight: %w", err)
+	}
+	return opts, nil
 }
 
 // DefaultOptions returns the default TUI options.
@@ -77,20 +129,24 @@ func New() Model {
 
 // NewWithOptions creates a new TUI model with custom options.
 func NewWithOptions(opts Options) Model {
+	if opts.ProjectPath == "" {
+		opts.ProjectPath = DefaultOptions().ProjectPath
+	}
+	opts.DatabasePath = opts.databasePath()
 	// Apply theme if specified
 	if opts.Theme != "" {
 		theme.SetTheme(theme.FlavorName(opts.Theme))
 	}
 
 	// Create dashboard model
-	dash := dashboard.New(opts.ProjectPath)
+	dash := dashboard.New(opts.ProjectPath).WithDatabasePath(opts.DatabasePath)
 
 	return Model{
 		options:   opts,
 		view:      ViewDashboard,
 		dashboard: &dash,
-		history:   history.New(opts.ProjectPath),
-		patterns:  patterns.New(opts.ProjectPath),
+		history:   history.New(opts.ProjectPath).WithDatabasePath(opts.DatabasePath),
+		patterns:  patterns.New(opts.ProjectPath).WithDatabasePath(opts.DatabasePath),
 	}
 }
 
@@ -238,7 +294,7 @@ func (m Model) handleNavigation(nav navigateMsg) (tea.Model, tea.Cmd) {
 
 	switch nav.view {
 	case ViewDashboard:
-		dash := dashboard.New(m.options.ProjectPath)
+		dash := dashboard.New(m.options.ProjectPath).WithDatabasePath(m.options.DatabasePath)
 		m.dashboard = &dash
 		m.setupDashboardCallbacks()
 		m, sizeCmd := m.seedViewSize()
@@ -260,13 +316,13 @@ func (m Model) handleNavigation(nav navigateMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case ViewHistory:
-		m.history = history.New(m.options.ProjectPath)
+		m.history = history.New(m.options.ProjectPath).WithDatabasePath(m.options.DatabasePath)
 		m.setupHistoryCallbacks()
 		m, sizeCmd := m.seedViewSize()
 		return m, tea.Batch(sizeCmd, m.history.Init())
 
 	case ViewPatterns:
-		m.patterns = patterns.New(m.options.ProjectPath)
+		m.patterns = patterns.New(m.options.ProjectPath).WithDatabasePath(m.options.DatabasePath)
 		m.setupPatternsCallbacks()
 		m, sizeCmd := m.seedViewSize()
 		return m, tea.Batch(sizeCmd, m.patterns.Init())
@@ -354,6 +410,11 @@ func Run() error { return RunWithOptions(DefaultOptions()) }
 
 // RunWithOptions starts the TUI with custom options.
 func RunWithOptions(opts Options) error {
+	var err error
+	opts, err = ResolveOptions(opts)
+	if err != nil {
+		return err
+	}
 	if opts.Theme != "" {
 		theme.SetTheme(theme.FlavorName(opts.Theme))
 	}
@@ -363,6 +424,6 @@ func RunWithOptions(opts Options) error {
 		teaOpts = append(teaOpts, tea.WithMouseCellMotion())
 	}
 	p := tea.NewProgram(m, teaOpts...)
-	_, err := p.Run()
+	_, err = p.Run()
 	return err
 }

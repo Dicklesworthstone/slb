@@ -2,6 +2,7 @@ package patterns
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -806,7 +807,7 @@ func TestLoadPatternChanges(t *testing.T) {
 	createTestPatternChange(t, h.db, "rm -rf", db.PatternChangeTypeRemove, db.PatternChangeStatusPending)
 	createTestPatternChange(t, h.db, "sudo", db.PatternChangeTypeSuggest, db.PatternChangeStatusApproved)
 
-	rows, total, err := loadPatternChanges(h.projectPath, "")
+	rows, total, err := loadPatternChanges(h.db.Path(), "")
 	if err != nil {
 		t.Fatalf("loadPatternChanges failed: %v", err)
 	}
@@ -819,6 +820,105 @@ func TestLoadPatternChanges(t *testing.T) {
 	}
 }
 
+func TestPatternReviewUsesSelectedStoreForLoadsAndActions(t *testing.T) {
+	project, selected := newTestHarness(t), newTestHarness(t)
+	defaultApprove := createTestPatternChange(t, project.db, "^default-approve$", db.PatternChangeTypeSuggest, db.PatternChangeStatusPending)
+	defaultReject := createTestPatternChange(t, project.db, "^default-reject$", db.PatternChangeTypeSuggest, db.PatternChangeStatusPending)
+	approve := createTestPatternChange(t, selected.db, "^selected-approve$", db.PatternChangeTypeSuggest, db.PatternChangeStatusPending)
+	reject := createTestPatternChange(t, selected.db, "^selected-reject$", db.PatternChangeTypeSuggest, db.PatternChangeStatusPending)
+	if approve.ID != defaultApprove.ID || reject.ID != defaultReject.ID {
+		t.Fatal("fixture must collide IDs across stores to catch a wrong-store mutation")
+	}
+	m := New(project.projectPath).WithDatabasePath(selected.db.Path())
+	read := func(cmd tea.Cmd) dataMsg {
+		t.Helper()
+		message := cmd()
+		if batch, ok := message.(tea.BatchMsg); ok {
+			message = batch[0]()
+		}
+		data := message.(dataMsg)
+		if data.err != nil || data.totalCount != 2 || len(data.rows) != 2 {
+			t.Fatalf("wrong selected-store pattern history: %+v", data)
+		}
+		for _, row := range data.rows {
+			if !strings.Contains(row.Pattern, "selected") {
+				t.Fatalf("default-store pattern leaked into selected view: %+v", row)
+			}
+		}
+		return data
+	}
+	data := read(m.Init())
+	next, _ := m.Update(data)
+	m = next.(Model)
+	_, refresh := m.Update(refreshMsg{})
+	read(refresh)
+	for _, action := range []struct {
+		id     int64
+		key    rune
+		status string
+	}{{approve.ID, 'a', db.PatternChangeStatusApproved}, {reject.ID, 'r', db.PatternChangeStatusRejected}} {
+		for index, row := range m.rows {
+			if row.ID == action.id {
+				m.selectedIdx = index
+			}
+		}
+		next, command := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{action.key}})
+		m = next.(Model)
+		result := command().(actionMsg)
+		if result.err != nil || !result.success {
+			t.Fatalf("selected-store action failed: %+v", result)
+		}
+		next, reload := m.Update(result)
+		m = next.(Model)
+		data = read(reload)
+		next, _ = m.Update(data)
+		m = next.(Model)
+		stored, err := selected.db.GetPatternChange(action.id)
+		if err != nil || stored.Status != action.status {
+			t.Fatalf("action missed selected store: %+v %v", stored, err)
+		}
+		untouched, err := project.db.GetPatternChange(action.id)
+		if err != nil || untouched.Status != db.PatternChangeStatusPending {
+			t.Fatalf("action mutated the default store: %+v %v", untouched, err)
+		}
+	}
+	rules, err := selected.db.ListCustomPatterns()
+	if err != nil || len(rules) != 1 || rules[0].Pattern != approve.Pattern {
+		t.Fatalf("approval did not apply selected-store policy: %+v %v", rules, err)
+	}
+	if rules, err := project.db.ListCustomPatterns(); err != nil || len(rules) != 0 {
+		t.Fatalf("selected-store actions changed default policy: %+v %v", rules, err)
+	}
+}
+
+func TestPatternReviewMissingSelectedStoreDoesNotFallbackOrCreate(t *testing.T) {
+	project := newTestHarness(t)
+	change := createTestPatternChange(t, project.db, "^default$", db.PatternChangeTypeSuggest, db.PatternChangeStatusPending)
+	missing := filepath.Join(t.TempDir(), "missing.db")
+	m := New(project.projectPath).WithDatabasePath(missing)
+	batch := m.Init()().(tea.BatchMsg)
+	message := batch[0]().(dataMsg)
+	if message.err == nil || len(message.rows) != 0 {
+		t.Fatalf("missing selected pattern store fell back: %+v", message)
+	}
+	// A stale row must not redirect an action to the default database either.
+	m.rows = []RemovalRow{{ID: change.ID, Status: db.PatternChangeStatusPending}}
+	for _, key := range []rune{'a', 'r'} {
+		_, command := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{key}})
+		result := command().(actionMsg)
+		if result.err == nil || result.success {
+			t.Fatalf("missing selected store accepted an action: %+v", result)
+		}
+	}
+	stored, err := project.db.GetPatternChange(change.ID)
+	if err != nil || stored.Status != db.PatternChangeStatusPending {
+		t.Fatalf("missing-store action mutated default policy: %+v %v", stored, err)
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("pattern action created selected database: %v", err)
+	}
+}
+
 func TestLoadPatternChangesWithFilter(t *testing.T) {
 	h := newTestHarness(t)
 
@@ -826,7 +926,7 @@ func TestLoadPatternChangesWithFilter(t *testing.T) {
 	createTestPatternChange(t, h.db, "sudo", db.PatternChangeTypeSuggest, db.PatternChangeStatusApproved)
 
 	// Filter by remove type
-	rows, total, err := loadPatternChanges(h.projectPath, db.PatternChangeTypeRemove)
+	rows, total, err := loadPatternChanges(h.db.Path(), db.PatternChangeTypeRemove)
 	if err != nil {
 		t.Fatalf("loadPatternChanges with filter failed: %v", err)
 	}
@@ -849,7 +949,7 @@ func TestLoadPatternChangesNonexistentDB(t *testing.T) {
 func TestLoadPatternChangesEmptyDB(t *testing.T) {
 	h := newTestHarness(t)
 
-	rows, total, err := loadPatternChanges(h.projectPath, "")
+	rows, total, err := loadPatternChanges(h.db.Path(), "")
 	if err != nil {
 		t.Fatalf("loadPatternChanges on empty DB failed: %v", err)
 	}
@@ -867,7 +967,7 @@ func TestPerformActionApprove(t *testing.T) {
 
 	change := createTestPatternChange(t, h.db, "rm -rf", db.PatternChangeTypeRemove, db.PatternChangeStatusPending)
 
-	err := performAction(h.projectPath, change.ID, "approve")
+	err := performAction(h.db.Path(), change.ID, "approve")
 	if err != nil {
 		t.Fatalf("performAction approve failed: %v", err)
 	}
@@ -887,7 +987,7 @@ func TestPerformActionReject(t *testing.T) {
 
 	change := createTestPatternChange(t, h.db, "sudo", db.PatternChangeTypeSuggest, db.PatternChangeStatusPending)
 
-	err := performAction(h.projectPath, change.ID, "reject")
+	err := performAction(h.db.Path(), change.ID, "reject")
 	if err != nil {
 		t.Fatalf("performAction reject failed: %v", err)
 	}
@@ -907,7 +1007,7 @@ func TestPerformActionUnknown(t *testing.T) {
 
 	change := createTestPatternChange(t, h.db, "test", db.PatternChangeTypeRemove, db.PatternChangeStatusPending)
 
-	err := performAction(h.projectPath, change.ID, "unknown")
+	err := performAction(h.db.Path(), change.ID, "unknown")
 	if err == nil {
 		t.Fatal("expected error for unknown action")
 	}
@@ -928,7 +1028,7 @@ func TestLoadDataCmd(t *testing.T) {
 
 	createTestPatternChange(t, h.db, "test", db.PatternChangeTypeRemove, db.PatternChangeStatusPending)
 
-	cmd := loadDataCmd(h.projectPath, "")
+	cmd := loadDataCmd(h.db.Path(), "")
 	if cmd == nil {
 		t.Fatal("loadDataCmd should return non-nil command")
 	}
@@ -954,7 +1054,7 @@ func TestLoadDataCmdWithFilter(t *testing.T) {
 	createTestPatternChange(t, h.db, "rm -rf", db.PatternChangeTypeRemove, db.PatternChangeStatusPending)
 	createTestPatternChange(t, h.db, "sudo", db.PatternChangeTypeSuggest, db.PatternChangeStatusPending)
 
-	cmd := loadDataCmd(h.projectPath, db.PatternChangeTypeRemove)
+	cmd := loadDataCmd(h.db.Path(), db.PatternChangeTypeRemove)
 	msg := cmd()
 	dm := msg.(dataMsg)
 
@@ -968,7 +1068,7 @@ func TestApproveCmd(t *testing.T) {
 
 	change := createTestPatternChange(t, h.db, "test", db.PatternChangeTypeRemove, db.PatternChangeStatusPending)
 
-	cmd := approveCmd(h.projectPath, change.ID)
+	cmd := approveCmd(h.db.Path(), change.ID)
 	if cmd == nil {
 		t.Fatal("approveCmd should return non-nil command")
 	}
@@ -996,7 +1096,7 @@ func TestRejectCmd(t *testing.T) {
 
 	change := createTestPatternChange(t, h.db, "test", db.PatternChangeTypeSuggest, db.PatternChangeStatusPending)
 
-	cmd := rejectCmd(h.projectPath, change.ID)
+	cmd := rejectCmd(h.db.Path(), change.ID)
 	if cmd == nil {
 		t.Fatal("rejectCmd should return non-nil command")
 	}

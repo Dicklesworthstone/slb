@@ -4,11 +4,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/tui/components"
@@ -370,7 +372,7 @@ func TestLoadData(t *testing.T) {
 	sess := createTestSession(t, h.db, h.projectPath)
 	createTestRequest(t, h.db, sess, "rm -rf /tmp", "critical")
 
-	agents, pending, activity, err := loadData(h.projectPath)
+	agents, pending, activity, err := loadData(h.projectPath, h.db.Path())
 	if err != nil {
 		t.Fatalf("loadData failed: %v", err)
 	}
@@ -387,10 +389,67 @@ func TestLoadData(t *testing.T) {
 	}
 }
 
+func TestDashboardUsesSelectedStoreAndProjectOnRefresh(t *testing.T) {
+	project, selected := newTestHarness(t), newTestHarness(t)
+	defaultSession := createTestSession(t, project.db, project.projectPath)
+	createTestRequest(t, project.db, defaultSession, "default-store-command", "critical")
+	session := createTestSession(t, selected.db, project.projectPath)
+	request := createTestRequest(t, selected.db, session, "selected-store-command", "dangerous")
+	foreign := createTestSession(t, selected.db, selected.projectPath)
+	createTestRequest(t, selected.db, foreign, "foreign-project-command", "critical")
+	m := New(project.projectPath).WithDatabasePath(selected.db.Path())
+	read := func(cmd tea.Cmd) dataMsg {
+		t.Helper()
+		// Execute the immediate load, leaving the periodic timer unscheduled.
+		batch := cmd().(tea.BatchMsg)
+		message := batch[0]().(dataMsg)
+		if message.err != nil {
+			t.Fatal(message.err)
+		}
+		return message
+	}
+	message := read(m.Init())
+	if len(message.agents) != 1 || message.agents[0].SessionID != session.ID || len(message.pending) != 1 || message.pending[0].ID != request.ID || len(message.activity) != 1 {
+		t.Fatalf("selected store or project was ignored: %+v", message)
+	}
+	updated, _ := m.Update(message)
+	m = updated.(Model)
+	createTestRequest(t, selected.db, session, "selected-store-second-command", "caution")
+	_, refresh := m.Update(refreshMsg{})
+	message = read(refresh)
+	if len(message.pending) != 2 || len(message.activity) != 2 || len(message.agents) != 1 {
+		t.Fatalf("refresh switched away from selected store: %+v", message)
+	}
+	m.width = len([]rune(selected.db.Path())) + 40
+	if header := m.renderHeader(); !strings.Contains(header, selected.db.Path()) {
+		t.Fatalf("selected database is not visible: %s", header)
+	}
+	m.width = 50
+	if header := m.renderHeader(); lipgloss.Width(header) > m.width || !strings.Contains(header, "state.db") {
+		t.Fatalf("narrow database label lost its filename or overflowed: %s", header)
+	}
+}
+
+func TestDashboardMissingSelectedStoreDoesNotFallbackOrCreate(t *testing.T) {
+	project := newTestHarness(t)
+	session := createTestSession(t, project.db, project.projectPath)
+	createTestRequest(t, project.db, session, "default-store-command", "critical")
+	missing := filepath.Join(t.TempDir(), "missing.db")
+	m := New(project.projectPath).WithDatabasePath(missing)
+	batch := m.Init()().(tea.BatchMsg)
+	message := batch[0]().(dataMsg)
+	if message.err == nil || len(message.pending) != 0 || len(message.agents) != 0 {
+		t.Fatalf("missing selected store silently fell back: %+v", message)
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("dashboard created selected database: %v", err)
+	}
+}
+
 func TestLoadDataEmptyDB(t *testing.T) {
 	h := newTestHarness(t)
 
-	agents, pending, activity, err := loadData(h.projectPath)
+	agents, pending, activity, err := loadData(h.projectPath, h.db.Path())
 	if err != nil {
 		t.Fatalf("loadData on empty DB failed: %v", err)
 	}
@@ -407,7 +466,7 @@ func TestLoadDataEmptyDB(t *testing.T) {
 }
 
 func TestLoadDataNonexistentDB(t *testing.T) {
-	agents, pending, activity, err := loadData("/nonexistent/path")
+	agents, pending, activity, err := loadData("/nonexistent/path", "/nonexistent/path/state.db")
 	// Should return error but empty data, not panic
 	if err == nil {
 		t.Error("expected error for nonexistent database")
@@ -431,7 +490,7 @@ func TestLoadDataWithMultipleRequests(t *testing.T) {
 		createTestRequest(t, h.db, sess, "test cmd", "caution")
 	}
 
-	_, pending, activity, err := loadData(h.projectPath)
+	_, pending, activity, err := loadData(h.projectPath, h.db.Path())
 	if err != nil {
 		t.Fatalf("loadData failed: %v", err)
 	}
@@ -450,7 +509,7 @@ func TestLoadCmd(t *testing.T) {
 
 	createTestSession(t, h.db, h.projectPath)
 
-	cmd := loadCmd(h.projectPath)
+	cmd := loadCmd(h.projectPath, h.db.Path())
 	if cmd == nil {
 		t.Fatal("loadCmd should return non-nil command")
 	}
@@ -1013,7 +1072,7 @@ func TestLoadDataWithDisplayRedacted(t *testing.T) {
 		t.Fatalf("failed to create request: %v", err)
 	}
 
-	_, pending, _, err := loadData(h.projectPath)
+	_, pending, _, err := loadData(h.projectPath, h.db.Path())
 	if err != nil {
 		t.Fatalf("loadData failed: %v", err)
 	}

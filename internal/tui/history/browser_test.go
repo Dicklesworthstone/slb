@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -856,7 +857,7 @@ func TestLoadHistoryData(t *testing.T) {
 	createTestRequest(t, h.db, sess, "git push --force", db.RiskTierDangerous, db.StatusApproved)
 
 	// Load data
-	rows, total, err := loadHistoryData(h.projectPath, "", Filters{}, 0)
+	rows, total, err := loadHistoryData(h.projectPath, h.db.Path(), "", Filters{}, 0)
 	if err != nil {
 		t.Fatalf("loadHistoryData failed: %v", err)
 	}
@@ -869,6 +870,93 @@ func TestLoadHistoryData(t *testing.T) {
 	}
 }
 
+func TestHistorySelectedStoreScopesSearchBeforePagination(t *testing.T) {
+	project, selected := newTestHarness(t), newTestHarness(t)
+	defaultSession := createTestSession(t, project.db, project.projectPath)
+	createTestRequest(t, project.db, defaultSession, "needle default", db.RiskTierCritical, db.StatusPending)
+	session := createTestSession(t, selected.db, project.projectPath)
+	foreign := createTestSession(t, selected.db, selected.projectPath)
+	for i := 0; i < pageSize+4; i++ {
+		createTestRequest(t, selected.db, session, "needle selected", db.RiskTierCritical, db.StatusPending)
+		for j := 0; j < 5; j++ {
+			createTestRequest(t, selected.db, foreign, "needle foreign", db.RiskTierCritical, db.StatusPending)
+		}
+	}
+	// More than 100 newer foreign matches must not consume the search limit
+	// before project scoping and hide every selected-project result.
+	if _, err := selected.db.Exec(`UPDATE requests SET created_at = ? WHERE project_path = ?`,
+		time.Now().Add(-time.Hour).UTC().Format(time.RFC3339), project.projectPath); err != nil {
+		t.Fatal(err)
+	}
+	m := New(project.projectPath).WithDatabasePath(selected.db.Path())
+	read := func(cmd tea.Cmd, wantRows int) dataMsg {
+		t.Helper()
+		message := cmd()
+		if batch, ok := message.(tea.BatchMsg); ok {
+			message = batch[0]()
+		}
+		data := message.(dataMsg)
+		if data.err != nil || data.totalCount != pageSize+4 || len(data.rows) != wantRows {
+			t.Fatalf("wrong selected-project page: %+v", data)
+		}
+		for _, row := range data.rows {
+			if row.Request.ProjectPath != project.projectPath || row.Command != "needle selected" {
+				t.Fatalf("foreign project or default store leaked into history: %+v", row)
+			}
+		}
+		return data
+	}
+	data := read(m.Init(), pageSize)
+	next, _ := m.Update(data)
+	m = next.(Model)
+	m.searching = true
+	m.searchInput.SetValue("needle")
+	next, search := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	data = read(search, pageSize)
+	next, _ = m.Update(data)
+	m = next.(Model)
+	if m.pageCount != 2 {
+		t.Fatalf("foreign matches changed page count: %d", m.pageCount)
+	}
+	next, page := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = next.(Model)
+	data = read(page, 4)
+	next, _ = m.Update(data)
+	m = next.(Model)
+	_, refresh := m.Update(refreshMsg{})
+	read(refresh, 4)
+	for _, key := range []rune{'t', 's'} {
+		next, filter := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{key}})
+		m = next.(Model)
+		read(filter, pageSize)
+	}
+	m.ready, m.width, m.height = true, 120, 40
+	if view := m.View(); strings.Contains(view, "foreign") || strings.Contains(view, "default") {
+		t.Fatalf("history rendered another project or database: %s", view)
+	}
+	rows, total, err := loadHistoryData(project.projectPath, selected.db.Path(), "foreign", Filters{}, 0)
+	if err != nil || total != 0 || len(rows) != 0 {
+		t.Fatalf("foreign-only search escaped project scope: %+v %d %v", rows, total, err)
+	}
+}
+
+func TestHistoryMissingSelectedStoreDoesNotFallbackOrCreate(t *testing.T) {
+	project := newTestHarness(t)
+	session := createTestSession(t, project.db, project.projectPath)
+	createTestRequest(t, project.db, session, "default history", db.RiskTierCritical, db.StatusPending)
+	missing := filepath.Join(t.TempDir(), "missing.db")
+	m := New(project.projectPath).WithDatabasePath(missing)
+	batch := m.Init()().(tea.BatchMsg)
+	message := batch[0]().(dataMsg)
+	if message.err == nil || message.totalCount != 0 || len(message.rows) != 0 {
+		t.Fatalf("history fell back to the default database: %+v", message)
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("history created selected database: %v", err)
+	}
+}
+
 func TestLoadHistoryDataWithSearch(t *testing.T) {
 	h := newTestHarness(t)
 
@@ -877,7 +965,7 @@ func TestLoadHistoryDataWithSearch(t *testing.T) {
 	createTestRequest(t, h.db, sess, "npm install", db.RiskTierCaution, db.StatusApproved)
 
 	// Search for docker
-	rows, _, err := loadHistoryData(h.projectPath, "docker", Filters{}, 0)
+	rows, _, err := loadHistoryData(h.projectPath, h.db.Path(), "docker", Filters{}, 0)
 	if err != nil {
 		t.Fatalf("loadHistoryData with search failed: %v", err)
 	}
@@ -895,7 +983,7 @@ func TestLoadHistoryDataWithTierFilter(t *testing.T) {
 
 	// Filter by critical tier
 	filters := Filters{TierFilter: string(db.RiskTierCritical)}
-	rows, total, err := loadHistoryData(h.projectPath, "", filters, 0)
+	rows, total, err := loadHistoryData(h.projectPath, h.db.Path(), "", filters, 0)
 	if err != nil {
 		t.Fatalf("loadHistoryData with tier filter failed: %v", err)
 	}
@@ -920,7 +1008,7 @@ func TestLoadHistoryDataWithStatusFilter(t *testing.T) {
 
 	// Filter by approved status
 	filters := Filters{StatusFilter: string(db.StatusApproved)}
-	rows, total, err := loadHistoryData(h.projectPath, "", filters, 0)
+	rows, total, err := loadHistoryData(h.projectPath, h.db.Path(), "", filters, 0)
 	if err != nil {
 		t.Fatalf("loadHistoryData with status filter failed: %v", err)
 	}
@@ -943,7 +1031,7 @@ func TestLoadHistoryDataPagination(t *testing.T) {
 	}
 
 	// First page
-	rows, total, err := loadHistoryData(h.projectPath, "", Filters{}, 0)
+	rows, total, err := loadHistoryData(h.projectPath, h.db.Path(), "", Filters{}, 0)
 	if err != nil {
 		t.Fatalf("loadHistoryData page 0 failed: %v", err)
 	}
@@ -956,7 +1044,7 @@ func TestLoadHistoryDataPagination(t *testing.T) {
 	}
 
 	// Second page
-	rows, _, err = loadHistoryData(h.projectPath, "", Filters{}, 1)
+	rows, _, err = loadHistoryData(h.projectPath, h.db.Path(), "", Filters{}, 1)
 	if err != nil {
 		t.Fatalf("loadHistoryData page 1 failed: %v", err)
 	}
@@ -967,7 +1055,7 @@ func TestLoadHistoryDataPagination(t *testing.T) {
 }
 
 func TestLoadHistoryDataNonexistentDB(t *testing.T) {
-	_, _, err := loadHistoryData("/nonexistent/path", "", Filters{}, 0)
+	_, _, err := loadHistoryData("/nonexistent/path", "/nonexistent/path/state.db", "", Filters{}, 0)
 	if err == nil {
 		t.Error("expected error for nonexistent database")
 	}
@@ -976,7 +1064,7 @@ func TestLoadHistoryDataNonexistentDB(t *testing.T) {
 func TestLoadHistoryDataEmptyDB(t *testing.T) {
 	h := newTestHarness(t)
 
-	rows, total, err := loadHistoryData(h.projectPath, "", Filters{}, 0)
+	rows, total, err := loadHistoryData(h.projectPath, h.db.Path(), "", Filters{}, 0)
 	if err != nil {
 		t.Fatalf("loadHistoryData on empty DB failed: %v", err)
 	}
@@ -995,7 +1083,7 @@ func TestLoadDataCmd(t *testing.T) {
 	sess := createTestSession(t, h.db, h.projectPath)
 	createTestRequest(t, h.db, sess, "test cmd", db.RiskTierCaution, db.StatusPending)
 
-	cmd := loadDataCmd(h.projectPath, "", Filters{}, 0)
+	cmd := loadDataCmd(h.projectPath, h.db.Path(), "", Filters{}, 0)
 	if cmd == nil {
 		t.Fatal("loadDataCmd should return non-nil command")
 	}

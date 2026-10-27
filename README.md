@@ -876,13 +876,26 @@ timeout_action = "escalate"
 
 ### Desktop Notifications
 
-Native notifications on macOS (AppleScript), Linux (notify-send), and Windows (PowerShell):
+Pending-request desktop alerts use macOS AppleScript or Linux `notify-send`:
 
 ```toml
 [notifications]
 desktop_enabled = true
 desktop_delay_seconds = 60    # Wait before first notification
 ```
+
+Desktop and webhook delivery are tracked independently. A failed destination is
+retried with backoff starting at 15 seconds and capped at five minutes, with a
+shared budget of 60 attempted sends per minute. Successful destinations are not
+resent while the daemon remains running, and pending-alert retries stop when the
+request leaves the pending state. This suppression state is in memory, so a
+daemon restart can repeat a still-pending alert.
+
+Desktop helpers have a five-second deadline, bounded output capture and a
+one-second pipe-drain limit. Daemon cancellation interrupts ordinary helper
+process groups instead of waiting indefinitely. Pending desktop alerts are not
+implemented on Windows; timeout alerts retain their separate PowerShell path.
+Notifications remain advisory and never count as approval evidence.
 
 ## Advanced Configuration
 
@@ -1358,7 +1371,24 @@ The interactive terminal UI gives human reviewers an at-a-glance view of pending
 
 ```bash
 slb tui
+
+# Review the same alternate database selected by the requesting agents
+slb --db /path/to/review-state.db tui \
+  --session-id "$REVIEWER_ID" --session-key "$REVIEWER_KEY"
 ```
+
+The dashboard shows its selected database. `--db` applies to the dashboard,
+request details, periodic refresh, history, reviews and pattern actions. Relative
+database and config paths are resolved before the UI starts. A missing or
+unreadable selected database causes an error before terminal startup; the TUI
+does not create it or switch to the default store.
+
+Project selection remains separate: request views and history searches include
+only that project's records, even when the database contains several projects.
+Pattern proposals belong to the selected database. Without reviewer credentials
+the request detail view is read-only; supplying credentials preserves the usual
+policy, quorum, signature and self-review checks. Submitting a review never
+executes the command.
 
 ### Layout
 
@@ -1388,10 +1418,12 @@ slb tui
 | `Tab` | Cycle focus between panels |
 | `↑/↓` | Navigate within panel |
 | `Enter` | View selected request details |
-| `a` | Approve selected request |
-| `r` | Reject selected request |
-| `p` | Open pattern management |
-| `h` | Open history view |
+| `a` / `r` | Open approval / rejection form in request details |
+| `Ctrl+S` | Submit the review form |
+| `Esc` | Cancel a form, or leave request details |
+| `F5` / `Ctrl+R` | Refresh request details outside a form |
+| `m` | Open pattern management |
+| `H` | Open history view |
 | `q` | Quit |
 
 ### Panel Details

@@ -38,7 +38,7 @@ func TestDashboardQueueIncludesEscalationsAndActualOutcomes(t *testing.T) {
 	if _, err := database.Exec(`UPDATE requests SET project_path=? WHERE status=?`, "/foreign", string(db.StatusCancelled)); err != nil {
 		t.Fatal(err)
 	}
-	agents, pending, activity, err := loadData(project)
+	agents, pending, activity, err := loadData(project, database.Path())
 	if err != nil {
 		t.Fatal(err)
 	}

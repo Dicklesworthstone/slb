@@ -91,6 +91,84 @@ func TestInteractiveSameHostReviewPolicyAndEvidence(t *testing.T) {
 	}
 }
 
+func TestInteractiveReviewAndRefreshStayInSelectedDatabase(t *testing.T) {
+	for _, decision := range []db.Decision{db.DecisionApprove, db.DecisionReject} {
+		t.Run(string(decision), func(t *testing.T) {
+			fallback, target, reviewer, opts := interactiveReviewFixture(t, 2, db.ApprovalPolicySameHost)
+			selected, err := db.OpenAndMigrate(filepath.Join(t.TempDir(), "selected.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = selected.Close() })
+			author, err := fallback.GetSession(target.RequestorSessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			peer := *reviewer
+			for _, session := range []*db.Session{author, &peer} {
+				if err := selected.CreateSession(session); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Identical IDs, commands and credentials make a wrong-store write
+			// otherwise valid. Only the selected database may receive this vote.
+			copy := *target
+			copy.Justification.Reason = "Selected database rationale"
+			if err := selected.CreateRequest(&copy); err != nil {
+				t.Fatal(err)
+			}
+			opts.DatabasePath = selected.Path()
+			model := NewWithOptions(opts)
+			next, _ := model.handleNavigation(navigateMsg{view: ViewRequestDetail, requestID: target.ID})
+			model = next.(Model)
+			if model.detail == nil || model.detail.Request.Justification.Reason != copy.Justification.Reason || model.detail.Session == nil {
+				t.Fatalf("selected detail or credential binding was lost: %+v", model.detail)
+			}
+			msg := model.submitReview(target.ID, decision, "Review the selected store")().(request.ReviewSubmittedMsg)
+			if msg.Err != nil || !msg.Recorded || msg.Review.Assurance != db.AssuranceSameHost || !db.VerifyReviewEvidenceSignature(msg.Review, opts.SessionKey) {
+				t.Fatalf("selected review failed or changed its assurance: %+v", msg)
+			}
+			if decision == db.DecisionApprove && (msg.Request.Status != db.StatusPending || msg.Approvals != 1) {
+				t.Fatalf("selected store bypassed quorum: %+v", msg)
+			}
+			next, _ = model.Update(msg)
+			model = refreshInteractiveOnce(t, next.(Model))
+			if len(model.detail.Reviews) != 1 || model.detail.Reviews[0].ID != msg.Review.ID {
+				t.Fatalf("refresh switched databases: %+v", model.detail.Reviews)
+			}
+			for _, view := range []View{ViewDashboard, ViewHistory, ViewPatterns, ViewRequestDetail} {
+				next, _ = model.handleNavigation(navigateMsg{view: view, requestID: target.ID})
+				model = next.(Model)
+				if model.options.DatabasePath != selected.Path() {
+					t.Fatalf("navigation lost selected database: %+v", model.options)
+				}
+			}
+			if model.detail == nil || len(model.detail.Reviews) != 1 {
+				t.Fatal("returning to details lost the committed review")
+			}
+			missing := opts
+			missing.DatabasePath = filepath.Join(t.TempDir(), "missing.db")
+			if _, err := readInteractiveSnapshot(missing, target.ID); err == nil {
+				t.Fatal("missing selected store fell back during detail refresh")
+			}
+			failed := submitInteractiveReview(missing, target.ID, target.Command.Hash, target.ApprovalPolicy, decision, "must not fall back")
+			if failed.Err == nil || failed.Recorded {
+				t.Fatalf("missing selected store fell back during submission: %+v", failed)
+			}
+			if _, err := os.Stat(missing.DatabasePath); !os.IsNotExist(err) {
+				t.Fatalf("TUI created missing selected state: %v", err)
+			}
+			unchanged, err := fallback.GetRequest(target.ID)
+			if err != nil || unchanged.Status != db.StatusPending {
+				t.Fatalf("default store was changed: %+v %v", unchanged, err)
+			}
+			if reviews, err := fallback.ListReviewsForRequest(target.ID); err != nil || len(reviews) != 0 {
+				t.Fatalf("review leaked into default store: %+v %v", reviews, err)
+			}
+		})
+	}
+}
+
 func TestInteractiveReviewUsesExplicitJournalPolicy(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell transport fixture")

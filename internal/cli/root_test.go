@@ -680,6 +680,101 @@ func TestGetDBRefusesUnavailableNestedState(t *testing.T) {
 // TestGetActor_HostnameFallback documents the hostname fallback behavior.
 // Note: The localhost fallback (when os.Hostname() returns "") is a rare
 // system-level condition that's difficult to trigger in unit tests.
+func TestResolveTUIOptionsKeepsSelectedDatabaseAndProject(t *testing.T) {
+	origProject, origDB, origConfig := flagProject, flagDB, flagConfig
+	origSession, origKey, origTheme := flagTuiSessionID, flagTuiSessionKey, flagTuiTheme
+	origRefresh, origMouse := flagTuiRefreshSeconds, flagTuiNoMouse
+	t.Cleanup(func() {
+		flagProject, flagDB, flagConfig = origProject, origDB, origConfig
+		flagTuiSessionID, flagTuiSessionKey, flagTuiTheme = origSession, origKey, origTheme
+		flagTuiRefreshSeconds, flagTuiNoMouse = origRefresh, origMouse
+	})
+	t.Setenv("SLB_PROJECT", "")
+	h := testutil.NewHarness(t)
+	child := filepath.Join(h.ProjectDir, "src")
+	if err := os.Mkdir(child, 0700); err != nil {
+		t.Fatal(err)
+	}
+	selected := filepath.Join(t.TempDir(), "selected store.db")
+	testutil.NewTestDBAtPath(t, selected)
+	relative, err := filepath.Rel(child, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ name, override, want string }{
+		{"discovered default", "", h.DBPath},
+		{"absolute explicit", selected, selected},
+		{"relative explicit", relative, selected},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(child)
+			flagProject, flagDB, flagConfig = "", tc.override, "selected-policy.toml"
+			flagTuiSessionID, flagTuiSessionKey, flagTuiTheme = "reviewer-session", "reviewer-key", "frappe"
+			flagTuiRefreshSeconds, flagTuiNoMouse = 3, true
+			opts, err := resolveTUIOptions()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if opts.ProjectPath != h.ProjectDir || opts.DatabasePath != tc.want || !filepath.IsAbs(opts.DatabasePath) {
+				t.Fatalf("selected database or project lost: %+v; want database=%q project=%q", opts, tc.want, h.ProjectDir)
+			}
+			if opts.ConfigPath != filepath.Join(child, "selected-policy.toml") || opts.SessionID != "reviewer-session" ||
+				opts.SessionKey != "reviewer-key" || opts.Theme != "frappe" || opts.RefreshInterval != 3 || !opts.DisableMouse {
+				t.Fatal("CLI review policy, credentials or display options were not forwarded")
+			}
+			if cwd, err := os.Getwd(); err != nil || cwd != child {
+				t.Fatalf("TUI resolution changed cwd: %q %v", cwd, err)
+			}
+			if _, err := os.Lstat(filepath.Join(child, ".slb")); !os.IsNotExist(err) {
+				t.Fatalf("TUI resolution created descendant state: %v", err)
+			}
+		})
+	}
+}
+
+func TestResolveTUIOptionsRefusesUnavailableSelection(t *testing.T) {
+	origProject, origDB, origConfig, origRefresh := flagProject, flagDB, flagConfig, flagTuiRefreshSeconds
+	t.Cleanup(func() {
+		flagProject, flagDB, flagConfig, flagTuiRefreshSeconds = origProject, origDB, origConfig, origRefresh
+	})
+	t.Setenv("SLB_PROJECT", "")
+	for _, kind := range []string{"missing", "directory", "corrupt", "unreadable"} {
+		t.Run(kind, func(t *testing.T) {
+			h := testutil.NewHarness(t)
+			selected := filepath.Join(t.TempDir(), "selected.db")
+			switch kind {
+			case "directory":
+				if err := os.Mkdir(selected, 0700); err != nil {
+					t.Fatal(err)
+				}
+			case "corrupt":
+				if err := os.WriteFile(selected, []byte("this is not a SQLite database"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "unreadable":
+				testutil.NewTestDBAtPath(t, selected)
+				if err := os.Chmod(selected, 0000); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(selected, 0600) })
+				if file, err := os.Open(selected); err == nil {
+					_ = file.Close()
+					t.Skip("current user bypasses file permissions")
+				}
+			}
+			flagProject, flagDB, flagConfig, flagTuiRefreshSeconds = h.ProjectDir, selected, "", 5
+			if _, err := resolveTUIOptions(); err == nil || !strings.Contains(err.Error(), selected) {
+				t.Fatalf("unavailable explicit selection fell back to valid default state: %v", err)
+			}
+			if kind == "missing" {
+				if _, err := os.Stat(selected); !os.IsNotExist(err) {
+					t.Fatalf("TUI initialized missing state: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestGetActor_HostnameFallbackDocumented(t *testing.T) {
 	// Save original values
 	origActor := flagActor

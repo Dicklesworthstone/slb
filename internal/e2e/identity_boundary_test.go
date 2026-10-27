@@ -1531,6 +1531,196 @@ desktop_enabled = false
 	}
 }
 
+func TestBuiltCLITUISelectedDatabaseIntegration(t *testing.T) {
+	binary := buildIdentityBoundaryCLI(t)
+	t.Run("missing explicit database refuses before terminal startup", func(t *testing.T) {
+		f := newSameHostCLI(t, binary, 1, false)
+		request := f.request(f.session("DefaultOwner", "model-a"))
+		missing := filepath.Join(t.TempDir(), "missing.db")
+		stdout, stderr, err := f.run("--db", missing, "tui", "--no-mouse")
+		if err == nil || !strings.Contains(stderr, missing) || strings.Contains(stdout+stderr, "could not open a new TTY") {
+			t.Fatalf("missing selected database reached the UI or fell back: %v\n%s\n%s", err, stdout, stderr)
+		}
+		if _, err := os.Stat(missing); !os.IsNotExist(err) {
+			t.Fatalf("TUI created a missing selected database: %v", err)
+		}
+		f.assertNotExecuted(request)
+	})
+
+	t.Run("selected review history and pattern actions stay in selected store", func(t *testing.T) {
+		f := newSameHostCLI(t, binary, 1, true)
+		deep := filepath.Join(f.ProjectDir, "src", "deep")
+		if err := os.MkdirAll(deep, 0700); err != nil {
+			t.Fatal(err)
+		}
+		defaultOwner := f.session("DefaultOwner", "model-a")
+		defaultRequest := f.json("request", "touch default-ui-marker", "--session-id", defaultOwner.ID, "--reason", "Default store sentinel")
+		defaultPattern := f.json("patterns", "suggest", "^echo default-ui-policy$", "--tier", "dangerous", "--reason", "Default store sentinel")
+		selected := filepath.Join(t.TempDir(), "selected store.db")
+		owner := f.json("--db", selected, "session", "start", "--agent", "SelectedOwner", "--program", "e2e", "--model", "model-a")
+		peer := f.json("--db", selected, "session", "start", "--agent", "SelectedPeer", "--program", "e2e", "--model", "model-b")
+		created := f.json("--db", selected, "request", "touch selected-ui-marker", "--session-id", owner["session_id"].(string),
+			"--reason", "Create one harmless marker after selected-store review", "--expected-effect", "Create selected-ui-marker only")
+		id := created["request_id"].(string)
+		proposal := f.json("--db", selected, "patterns", "suggest", "^echo selected-ui-policy$", "--tier", "dangerous", "--reason", "Selected store proposal")
+		relative, err := filepath.Rel(deep, selected)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transcript := runIdentityCLITerminal(t, f, deep, []string{
+			"--db", relative, "tui", "--no-mouse", "--refresh-interval", "1",
+			"--session-id", peer["session_id"].(string), "--session-key", peer["session_key"].(string),
+		}, [][2]string{
+			{"selected-ui-marker", "\r"},
+			{id, "a"},
+			{"Approve Request", "Inspected the exact command and expected marker\x13"},
+			{"Review recorded: approve.", "b"},
+			{"No pending requests", "H"},
+			{"selected-ui-marker", "b"},
+			{"No pending requests", "m"},
+			{"selected-ui-policy", "a"},
+			{fmt.Sprintf("Pattern change #%d approved", int(proposal["id"].(float64))), "b"},
+			{"No pending requests", "q"},
+		})
+		for _, unwanted := range []string{"default-ui-marker", "default-ui-policy", "DefaultOwner"} {
+			if strings.Contains(transcript, unwanted) {
+				t.Fatalf("selected TUI displayed default-store data %q", unwanted)
+			}
+		}
+		if !strings.Contains(transcript, "not independently authenticated authorization") {
+			t.Fatal("terminal review omitted the same-host assurance notice")
+		}
+		selectedDB, err := db.OpenWithOptions(selected, db.OpenOptions{ReadOnly: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer selectedDB.Close()
+		request, reviews, err := selectedDB.GetRequestWithReviews(id)
+		if err != nil || request.Status != db.StatusApproved || len(reviews) != 1 || request.Execution != nil ||
+			reviews[0].ReviewerSessionID != peer["session_id"] || reviews[0].Assurance != db.AssuranceSameHost ||
+			reviews[0].CommandHash != request.Command.Hash || reviews[0].SignatureVersion != 2 {
+			t.Fatalf("interactive review did not persist bound same-host evidence in the selected store: %+v %+v %v", request, reviews, err)
+		}
+		for _, name := range []string{"selected-ui-marker", "default-ui-marker"} {
+			if _, err := os.Stat(filepath.Join(f.ProjectDir, name)); !os.IsNotExist(err) {
+				t.Fatalf("review executed command %s: %v", name, err)
+			}
+		}
+		selectedChange, err := selectedDB.GetPatternChange(int64(proposal["id"].(float64)))
+		if err != nil || selectedChange.Status != db.PatternChangeStatusApproved {
+			t.Fatalf("pattern action missed selected store: %+v %v", selectedChange, err)
+		}
+		unchanged, defaultReviews, err := f.DB.GetRequestWithReviews(defaultRequest["request_id"].(string))
+		if err != nil || unchanged.Status != db.StatusPending || unchanged.Execution != nil || len(defaultReviews) != 0 {
+			t.Fatalf("selected TUI changed default request: %+v %+v %v", unchanged, defaultReviews, err)
+		}
+		defaultChange, err := f.DB.GetPatternChange(int64(defaultPattern["id"].(float64)))
+		if err != nil || defaultChange.Status != db.PatternChangeStatusPending {
+			t.Fatalf("selected TUI changed default pattern proposal: %+v %v", defaultChange, err)
+		}
+		page, err := selectedDB.ReadRequestEvents(context.Background(), request.ProjectPath, "", 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reviewEvents := 0
+		for _, event := range page.Events {
+			if event.RequestID == id && event.Review != nil {
+				reviewEvents++
+				if event.Review.Assurance != db.AssuranceSameHost || event.State.ApprovalPolicy != db.ApprovalPolicySameHost {
+					t.Fatalf("interactive review audit lost its assurance: %+v", event)
+				}
+			}
+		}
+		if reviewEvents != 1 {
+			t.Fatalf("expected one selected-store review event, got %d", reviewEvents)
+		}
+		result := f.json("--db", selected, "execute", id, "--session-id", owner["session_id"].(string))
+		if result["status"] != "executed" || result["assurance"] != "same_host" {
+			t.Fatalf("requester could not execute the TUI-reviewed command: %+v", result)
+		}
+		if _, err := os.Stat(filepath.Join(f.ProjectDir, "selected-ui-marker")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Lstat(filepath.Join(deep, ".slb")); !os.IsNotExist(err) {
+			t.Fatalf("terminal invocation created a shadow project: %v", err)
+		}
+		// Without --db, the same descendant must still show its owning project's store.
+		defaultView := runIdentityCLITerminal(t, f, deep, []string{"tui", "--no-mouse"}, [][2]string{{"default-ui-marker", "q"}})
+		if strings.Contains(defaultView, "selected-ui-marker") {
+			t.Fatal("default TUI unexpectedly switched to the alternate database")
+		}
+	})
+}
+
+// Python's standard-library PTY drives the actual production terminal program.
+// Wait for rendered state before each key sequence; no arbitrary sleeps or
+// replacement UI runner can hide a dropped CLI database option.
+func runIdentityCLITerminal(t *testing.T, f *sameHostCLI, cwd string, args []string, steps [][2]string) string {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("production terminal fixture requires Linux PTY support")
+	}
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("production terminal fixture requires Python 3 standard library")
+	}
+	const driver = `import errno, fcntl, json, os, pty, select, struct, subprocess, sys, termios, time
+plan = json.load(sys.stdin)
+master, slave = pty.openpty()
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 52, 200, 0, 0))
+child = subprocess.Popen(plan['args'], stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+os.close(slave)
+output = bytearray()
+cursor = 0
+def read_output():
+    if not select.select([master], [], [], 0.1)[0]:
+        return
+    try:
+        output.extend(os.read(master, 65536))
+    except OSError as exc:
+        if exc.errno != errno.EIO:
+            raise
+try:
+    for expected, keys in plan['steps']:
+        deadline = time.monotonic() + 8
+        while expected.encode() not in output[cursor:]:
+            read_output()
+            if child.poll() is not None or time.monotonic() > deadline:
+                raise RuntimeError('terminal did not display ' + repr(expected))
+        cursor = len(output)
+        os.write(master, keys.encode())
+    deadline = time.monotonic() + 5
+    while child.poll() is None and time.monotonic() < deadline:
+        read_output()
+    if child.poll() != 0:
+        raise RuntimeError('terminal did not exit successfully: ' + str(child.poll()))
+    sys.stdout.write(output.decode(errors='replace'))
+except Exception as exc:
+    sys.stderr.write(str(exc) + '\n' + output[-12000:].decode(errors='replace'))
+    sys.exit(1)
+finally:
+    if child.poll() is None:
+        child.kill()
+        child.wait()
+    os.close(master)
+`
+	plan, err := json.Marshal(map[string]any{"args": append([]string{f.binary}, args...), "steps": steps})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, python, "-c", driver)
+	command.Dir = cwd
+	command.Env = append(identityCLIEnvironment(f.home), "TERM=xterm-256color", "NO_COLOR=1")
+	command.Stdin = bytes.NewReader(plan)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("production TUI interaction failed: %v\n%s", err, output)
+	}
+	return string(output)
+}
+
 func (f *sameHostCLI) assertExecuted(id string) {
 	f.T.Helper()
 	if _, err := os.Stat(filepath.Join(f.ProjectDir, "reviewed-marker")); err != nil {

@@ -569,6 +569,19 @@ func (db *DB) CountRecentRequestsBySession(sessionID string, windowSeconds int) 
 
 // SearchRequests performs a full-text search on requests.
 func (db *DB) SearchRequests(query string) ([]*Request, error) {
+	return db.searchRequests(query, "")
+}
+
+// SearchRequestsForProject scopes matches before applying the result limit so
+// newer matches from other projects cannot hide this project's history.
+func (db *DB) SearchRequestsForProject(query, project string) ([]*Request, error) {
+	if project == "" {
+		return nil, errors.New("project path is required for scoped request search")
+	}
+	return db.searchRequests(query, project)
+}
+
+func (db *DB) searchRequests(query, project string) ([]*Request, error) {
 	rows, err := db.Query(`
 		SELECT r.id, r.project_path,
 			r.command_raw, r.command_argv_json, r.command_cwd, r.command_shell, r.command_hash,
@@ -584,10 +597,10 @@ func (db *DB) SearchRequests(query string) ([]*Request, error) {
 			r.approval_policy, r.execution_approval_policy, r.execution_assurance
 		FROM requests r
 		JOIN requests_fts fts ON r.rowid = fts.rowid
-		WHERE requests_fts MATCH ?
+		WHERE requests_fts MATCH ? AND (? = '' OR r.project_path = ?)
 		ORDER BY r.created_at DESC
 		LIMIT 100
-	`, query)
+	`, query, project, project)
 	if err != nil {
 		return nil, fmt.Errorf("searching requests: %w", err)
 	}

@@ -48,22 +48,23 @@ type dataMsg struct {
 
 // Model is the main dashboard Bubble Tea model.
 type Model struct {
-	projectPath string
-	ready       bool
-	width       int
-	height      int
-	focus       focusPanel
-	agents      []components.AgentInfo
-	pending     []requestRow
-	activity    []string
-	agentSel    int
-	agentOff    int
-	pendingSel  int
-	pendingOff  int
-	activitySel int
-	activityOff int
-	lastErr     error
-	lastRefresh time.Time
+	projectPath  string
+	databasePath string
+	ready        bool
+	width        int
+	height       int
+	focus        focusPanel
+	agents       []components.AgentInfo
+	pending      []requestRow
+	activity     []string
+	agentSel     int
+	agentOff     int
+	pendingSel   int
+	pendingOff   int
+	activitySel  int
+	activityOff  int
+	lastErr      error
+	lastRefresh  time.Time
 
 	OnPatterns func()
 	OnHistory  func()
@@ -75,11 +76,19 @@ func New(projectPath string) Model {
 			projectPath = pwd
 		}
 	}
-	return Model{projectPath: projectPath, focus: focusPending}
+	return Model{projectPath: projectPath, databasePath: filepath.Join(projectPath, ".slb", "state.db"), focus: focusPending}
+}
+
+// WithDatabasePath selects the store while retaining this view's project scope.
+func (m Model) WithDatabasePath(path string) Model {
+	if path != "" {
+		m.databasePath = path
+	}
+	return m
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(loadCmd(m.projectPath), tickCmd())
+	return tea.Batch(loadCmd(m.projectPath, m.databasePath), tickCmd())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -88,7 +97,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height, m.ready = msg.Width, msg.Height, true
 		return m, nil
 	case refreshMsg:
-		return m, tea.Batch(loadCmd(m.projectPath), tickCmd())
+		return m, tea.Batch(loadCmd(m.projectPath, m.databasePath), tickCmd())
 	case dataMsg:
 		m.lastErr = msg.err
 		if msg.err != nil {
@@ -164,10 +173,21 @@ func (m Model) View() string {
 
 func (m Model) renderHeader() string {
 	th := theme.Current
-	title := lipgloss.NewStyle().Foreground(th.Mauve).Bold(true).Render("SLB Dashboard")
-	status := lipgloss.NewStyle().Foreground(th.Subtext).Render("Project database • polling")
+	innerWidth := maxInt(0, m.width-2)
+	title := lipgloss.NewStyle().Foreground(th.Mauve).Bold(true).Render(truncateRunes("SLB Dashboard", innerWidth))
+	statusWidth := maxInt(0, innerWidth-lipgloss.Width(title)-1)
+	statusText := "DB: " + m.databasePath
+	if lipgloss.Width(statusText) > statusWidth {
+		// Keep the filename visible when a long absolute path cannot fit.
+		path := []rune(m.databasePath)
+		for len(path) > 0 && lipgloss.Width("DB: …"+string(path)) > statusWidth {
+			path = path[1:]
+		}
+		statusText = truncateRunes("DB: …"+string(path), statusWidth)
+	}
+	status := lipgloss.NewStyle().Foreground(th.Subtext).Render(statusText)
 	row := lipgloss.JoinHorizontal(lipgloss.Top, title,
-		lipgloss.NewStyle().Width(maxInt(0, m.width-lipgloss.Width(title)-lipgloss.Width(status))).Render(""), status)
+		lipgloss.NewStyle().Width(maxInt(0, innerWidth-lipgloss.Width(title)-lipgloss.Width(status))).Render(""), status)
 	return lipgloss.NewStyle().Background(th.Mantle).Foreground(th.Text).Padding(0, 1).Width(maxInt(0, m.width)).Render(row)
 }
 
@@ -294,15 +314,15 @@ func tickCmd() tea.Cmd {
 	return tea.Tick(refreshInterval, func(time.Time) tea.Msg { return refreshMsg{} })
 }
 
-func loadCmd(projectPath string) tea.Cmd {
+func loadCmd(projectPath, databasePath string) tea.Cmd {
 	return func() tea.Msg {
-		agents, pending, activity, err := loadData(projectPath)
+		agents, pending, activity, err := loadData(projectPath, databasePath)
 		return dataMsg{agents: agents, pending: pending, activity: activity, err: err, refreshedAt: time.Now().UTC()}
 	}
 }
 
-func loadData(projectPath string) ([]components.AgentInfo, []requestRow, []string, error) {
-	database, err := db.OpenWithOptions(filepath.Join(projectPath, ".slb", "state.db"), db.OpenOptions{ReadOnly: true})
+func loadData(projectPath, databasePath string) ([]components.AgentInfo, []requestRow, []string, error) {
+	database, err := db.OpenWithOptions(databasePath, db.OpenOptions{ReadOnly: true})
 	if err != nil {
 		return nil, nil, nil, err
 	}

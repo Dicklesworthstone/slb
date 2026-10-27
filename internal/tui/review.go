@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
@@ -51,7 +50,7 @@ func submitInteractiveReview(opts Options, id, commandHash string, approvalPolic
 	if commandHash == "" {
 		return fail(errors.New("reload the request before reviewing: displayed command hash is missing"))
 	}
-	database, err := db.OpenWithOptions(filepath.Join(opts.ProjectPath, ".slb", "state.db"), db.OpenOptions{})
+	database, err := db.OpenWithOptions(opts.databasePath(), db.OpenOptions{})
 	if err != nil {
 		return fail(fmt.Errorf("opening review database: %w", err))
 	}

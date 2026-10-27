@@ -487,6 +487,26 @@ func TestSearchRequests(t *testing.T) {
 	}
 }
 
+func TestSearchRequestsForProjectRequiresAndPreservesScope(t *testing.T) {
+	database := setupTestDB(t)
+	defer database.Close()
+	_, request := createTestRequest(t, database)
+	results, err := database.SearchRequestsForProject("clean", request.ProjectPath)
+	if err != nil || len(results) != 1 || results[0].ID != request.ID {
+		t.Fatalf("scoped search lost matching history: %+v %v", results, err)
+	}
+	results, err = database.SearchRequestsForProject("clean", "/another/project")
+	if err != nil || len(results) != 0 {
+		t.Fatalf("scoped search returned another project: %+v %v", results, err)
+	}
+	if _, err := database.SearchRequestsForProject("clean", ""); err == nil {
+		t.Fatal("empty project silently requested a global search")
+	}
+	if _, err := database.SearchRequestsForProject(`"`, request.ProjectPath); err == nil {
+		t.Fatal("invalid search silently returned partial history")
+	}
+}
+
 func TestGetRequestWithReviews(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()

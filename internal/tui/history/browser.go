@@ -106,8 +106,9 @@ type HistoryRow struct {
 
 // Model is the Bubble Tea model for the history browser.
 type Model struct {
-	projectPath string
-	keyMap      BrowserKeyMap
+	projectPath  string
+	databasePath string
+	keyMap       BrowserKeyMap
 
 	// View state
 	ready  bool
@@ -167,17 +168,26 @@ func New(projectPath string) Model {
 	ti.Width = 40
 
 	return Model{
-		projectPath: projectPath,
-		keyMap:      DefaultBrowserKeyMap(),
-		searchInput: ti,
-		filters:     NewFilters(),
-		page:        0,
+		projectPath:  projectPath,
+		databasePath: filepath.Join(projectPath, ".slb", "state.db"),
+		keyMap:       DefaultBrowserKeyMap(),
+		searchInput:  ti,
+		filters:      NewFilters(),
+		page:         0,
 	}
+}
+
+// WithDatabasePath selects the store while retaining this view's project scope.
+func (m Model) WithDatabasePath(path string) Model {
+	if path != "" {
+		m.databasePath = path
+	}
+	return m
 }
 
 // Init initializes the model.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(loadDataCmd(m.projectPath, m.searchQuery, m.filters, m.page), tickCmd())
+	return tea.Batch(loadDataCmd(m.projectPath, m.databasePath, m.searchQuery, m.filters, m.page), tickCmd())
 }
 
 // Update handles messages.
@@ -193,7 +203,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case refreshMsg:
-		return m, tea.Batch(loadDataCmd(m.projectPath, m.searchQuery, m.filters, m.page), tickCmd())
+		return m, tea.Batch(loadDataCmd(m.projectPath, m.databasePath, m.searchQuery, m.filters, m.page), tickCmd())
 
 	case dataMsg:
 		m.rows = msg.rows
@@ -219,7 +229,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.searching = false
 				m.page = 0
 				m.selectedIdx = 0
-				return m, loadDataCmd(m.projectPath, m.searchQuery, m.filters, m.page)
+				return m, loadDataCmd(m.projectPath, m.databasePath, m.searchQuery, m.filters, m.page)
 			case "esc":
 				m.searching = false
 				m.searchInput.SetValue(m.searchQuery)
@@ -245,7 +255,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.searchInput.SetValue("")
 				m.page = 0
 				m.selectedIdx = 0
-				return m, loadDataCmd(m.projectPath, m.searchQuery, m.filters, m.page)
+				return m, loadDataCmd(m.projectPath, m.databasePath, m.searchQuery, m.filters, m.page)
 			}
 			if m.OnBack != nil {
 				m.OnBack()
@@ -271,7 +281,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.page < m.pageCount-1 {
 				m.page++
 				m.selectedIdx = 0
-				return m, loadDataCmd(m.projectPath, m.searchQuery, m.filters, m.page)
+				return m, loadDataCmd(m.projectPath, m.databasePath, m.searchQuery, m.filters, m.page)
 			}
 			return m, nil
 
@@ -279,7 +289,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.page > 0 {
 				m.page--
 				m.selectedIdx = 0
-				return m, loadDataCmd(m.projectPath, m.searchQuery, m.filters, m.page)
+				return m, loadDataCmd(m.projectPath, m.databasePath, m.searchQuery, m.filters, m.page)
 			}
 			return m, nil
 
@@ -295,13 +305,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.filters.CycleTier()
 			m.page = 0
 			m.selectedIdx = 0
-			return m, loadDataCmd(m.projectPath, m.searchQuery, m.filters, m.page)
+			return m, loadDataCmd(m.projectPath, m.databasePath, m.searchQuery, m.filters, m.page)
 
 		case key.Matches(msg, m.keyMap.FilterStatus):
 			m.filters.CycleStatus()
 			m.page = 0
 			m.selectedIdx = 0
-			return m, loadDataCmd(m.projectPath, m.searchQuery, m.filters, m.page)
+			return m, loadDataCmd(m.projectPath, m.databasePath, m.searchQuery, m.filters, m.page)
 		}
 	}
 
@@ -495,9 +505,9 @@ func tickCmd() tea.Cmd {
 	})
 }
 
-func loadDataCmd(projectPath, query string, filters Filters, page int) tea.Cmd {
+func loadDataCmd(projectPath, databasePath, query string, filters Filters, page int) tea.Cmd {
 	return func() tea.Msg {
-		rows, total, err := loadHistoryData(projectPath, query, filters, page)
+		rows, total, err := loadHistoryData(projectPath, databasePath, query, filters, page)
 		return dataMsg{
 			rows:        rows,
 			totalCount:  total,
@@ -507,9 +517,8 @@ func loadDataCmd(projectPath, query string, filters Filters, page int) tea.Cmd {
 	}
 }
 
-func loadHistoryData(projectPath, query string, filters Filters, page int) ([]HistoryRow, int, error) {
-	dbPath := filepath.Join(projectPath, ".slb", "state.db")
-	dbConn, err := db.OpenWithOptions(dbPath, db.OpenOptions{
+func loadHistoryData(projectPath, databasePath, query string, filters Filters, page int) ([]HistoryRow, int, error) {
+	dbConn, err := db.OpenWithOptions(databasePath, db.OpenOptions{
 		CreateIfNotExists: false,
 		InitSchema:        false,
 		ReadOnly:          true,
@@ -522,7 +531,7 @@ func loadHistoryData(projectPath, query string, filters Filters, page int) ([]Hi
 	// Build search query
 	var requests []*db.Request
 	if query != "" {
-		requests, err = dbConn.SearchRequests(query)
+		requests, err = dbConn.SearchRequestsForProject(query, projectPath)
 	} else {
 		requests, err = dbConn.ListAllRequests(projectPath)
 	}
@@ -533,6 +542,11 @@ func loadHistoryData(projectPath, query string, filters Filters, page int) ([]Hi
 	// Apply filters
 	filtered := make([]*db.Request, 0, len(requests))
 	for _, r := range requests {
+		// Retain the view's project scope before filters and pagination even
+		// if a future loader returns broader results from this shared store.
+		if r.ProjectPath != projectPath {
+			continue
+		}
 		if filters.TierFilter != "" && string(r.RiskTier) != filters.TierFilter {
 			continue
 		}

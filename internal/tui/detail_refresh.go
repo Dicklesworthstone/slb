@@ -3,7 +3,6 @@ package tui
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
@@ -79,7 +78,7 @@ func (m Model) finishDetailRefresh(msg detailRefreshResult) (tea.Model, tea.Cmd)
 func readInteractiveSnapshot(opts Options, id string) (*db.RequestReviewSnapshot, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	database, err := db.OpenWithOptions(filepath.Join(opts.ProjectPath, ".slb", "state.db"), db.OpenOptions{ReadOnly: true})
+	database, err := db.OpenWithOptions(opts.databasePath(), db.OpenOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}

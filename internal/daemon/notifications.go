@@ -12,16 +12,25 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
+	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/charmbracelet/log"
 )
 
 // WebhookTimeout is the maximum time to wait for a webhook request.
 const WebhookTimeout = 10 * time.Second
+
+const (
+	pendingAlertPassTimeout  = 15 * time.Second
+	pendingAlertRetryBase    = 15 * time.Second
+	pendingAlertRetryMaximum = 5 * time.Minute
+	pendingAlertAttemptLimit = 60
+	desktopNotificationLimit = 5 * time.Second
+	desktopNotificationBytes = 4096
+)
 
 // WebhookEvent represents the type of webhook event.
 type WebhookEvent string
@@ -56,13 +65,26 @@ type WebhookNotifier interface {
 }
 
 type DesktopNotifier interface {
-	Notify(title, message string) error
+	// Notify must honor cancellation and return only after its work stops.
+	Notify(ctx context.Context, title, message string) error
 }
 
-type DesktopNotifierFunc func(title, message string) error
+type DesktopNotifierFunc func(context.Context, string, string) error
 
-func (f DesktopNotifierFunc) Notify(title, message string) error {
-	return f(title, message)
+func (f DesktopNotifierFunc) Notify(ctx context.Context, title, message string) error {
+	return f(ctx, title, message)
+}
+
+type pendingAlertKey struct {
+	requestID   string
+	destination string
+	event       WebhookEvent
+}
+
+type pendingAlertDelivery struct {
+	sent     bool
+	failures int
+	retryAt  time.Time
 }
 
 type NotificationManager struct {
@@ -73,8 +95,13 @@ type NotificationManager struct {
 	webhook     WebhookNotifier
 	now         func() time.Time
 
-	mu       sync.Mutex
-	notified map[string]time.Time
+	// Serialize scans and delivery without making a cancelled caller wait for
+	// another pass. State is bounded by current pending requests and one minute
+	// of attempted sends; it never changes request or review records.
+	gate       chan struct{}
+	deliveries map[pendingAlertKey]pendingAlertDelivery
+	attempts   []time.Time
+	next       int
 }
 
 // DefaultWebhookNotifier is the default implementation of WebhookNotifier.
@@ -147,7 +174,8 @@ func NewNotificationManager(projectPath string, cfg config.NotificationsConfig, 
 		notifier:    notifier,
 		webhook:     webhook,
 		now:         time.Now,
-		notified:    make(map[string]time.Time),
+		gate:        make(chan struct{}, 1),
+		deliveries:  make(map[pendingAlertKey]pendingAlertDelivery),
 	}
 }
 
@@ -194,6 +222,17 @@ func (m *NotificationManager) Check(ctx context.Context) error {
 	if strings.TrimSpace(m.projectPath) == "" {
 		return nil
 	}
+	select {
+	case m.gate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-m.gate }()
+	ctx, cancel := context.WithTimeout(ctx, pendingAlertPassTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	dbPath := filepath.Join(m.projectPath, ".slb", "state.db")
 	dbConn, err := db.OpenWithOptions(dbPath, db.OpenOptions{
@@ -215,86 +254,99 @@ func (m *NotificationManager) Check(ctx context.Context) error {
 		return nil
 	}
 
+	var jobs []pendingAlertKey
+	needed := make(map[pendingAlertKey]bool)
 	for _, req := range pending {
-		if req == nil {
+		if req == nil || now.Sub(req.CreatedAt) < delay {
 			continue
 		}
-
-		// Only notify for CRITICAL and DANGEROUS tiers
-		if req.RiskTier != db.RiskTierCritical && req.RiskTier != db.RiskTierDangerous {
+		event := WebhookEventDangerousPending
+		if req.RiskTier == db.RiskTierCritical {
+			event = WebhookEventCriticalPending
+		} else if req.RiskTier != db.RiskTierDangerous {
 			continue
 		}
-
-		// Check if enough time has passed since creation
-		if now.Sub(req.CreatedAt) < delay {
+		for _, destination := range []string{"desktop", "webhook"} {
+			if destination == "desktop" && (!hasDesktop || req.RiskTier != db.RiskTierCritical) || destination == "webhook" && !hasWebhook {
+				continue
+			}
+			key := pendingAlertKey{requestID: req.ID, destination: destination, event: event}
+			jobs = append(jobs, key)
+			needed[key] = true
+		}
+	}
+	for key := range m.deliveries {
+		if !needed[key] {
+			delete(m.deliveries, key)
+		}
+	}
+	if len(jobs) == 0 {
+		return nil
+	}
+	start := m.next % len(jobs)
+	for offset := range jobs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		index := (start + offset) % len(jobs)
+		key := jobs[index]
+		delivery := m.deliveries[key]
+		now = m.now().UTC()
+		if delivery.sent || now.Before(delivery.retryAt) {
 			continue
 		}
-
-		// Determine notification key based on tier
-		var notifyKey string
-		var webhookEvent WebhookEvent
-		switch req.RiskTier {
-		case db.RiskTierCritical:
-			notifyKey = "critical_pending:" + req.ID
-			webhookEvent = WebhookEventCriticalPending
-		case db.RiskTierDangerous:
-			notifyKey = "dangerous_pending:" + req.ID
-			webhookEvent = WebhookEventDangerousPending
-		default:
-			continue
-		}
-
-		// Skip if already notified
-		if !m.markOnce(notifyKey, now) {
-			continue
-		}
-
-		cmd := req.Command.DisplayRedacted
-		if cmd == "" {
-			cmd = req.Command.Raw
-		}
-		cmd = strings.TrimSpace(cmd)
-		if len(cmd) > 140 {
-			cmd = cmd[:140] + "…"
-		}
-
-		// Send desktop notification (CRITICAL only)
-		if hasDesktop && req.RiskTier == db.RiskTierCritical {
-			title := "SLB: CRITICAL request pending"
-			message := fmt.Sprintf("%s\nRequestor: %s\nID: %s", cmd, req.RequestorAgent, shortID(req.ID))
-			message += "\n" + req.ApprovalPolicy.Label()
-
-			if err := m.notifier.Notify(title, message); err != nil {
-				m.logger.Warn("desktop notification failed", "error", err)
+		attempts := m.attempts[:0]
+		for _, at := range m.attempts {
+			if at.After(now.Add(-time.Minute)) {
+				attempts = append(attempts, at)
 			}
 		}
-
-		// Send webhook notification
-		if hasWebhook {
-			payload := WebhookPayload{
-				Event:          webhookEvent,
-				RequestID:      req.ID,
-				Command:        cmd,
-				Tier:           string(req.RiskTier),
-				Requestor:      req.RequestorAgent,
-				Timestamp:      now.Format(time.RFC3339),
-				Project:        m.projectPath,
-				ApprovalPolicy: req.ApprovalPolicy.Normalized(), ReviewNotice: req.ApprovalPolicy.Label(),
+		m.attempts = attempts
+		if len(m.attempts) >= pendingAlertAttemptLimit {
+			m.next = index
+			break
+		}
+		// Re-read before EACH destination. A decision committed while the
+		// other destination was slow must end pending-alert retries.
+		req, err := dbConn.GetRequest(key.requestID)
+		if err != nil {
+			continue
+		}
+		if req.Status != db.StatusPending || req.ProjectPath != m.projectPath ||
+			key.event == WebhookEventCriticalPending && req.RiskTier != db.RiskTierCritical ||
+			key.event == WebhookEventDangerousPending && req.RiskTier != db.RiskTierDangerous {
+			delete(m.deliveries, key)
+			continue
+		}
+		m.next = (index + 1) % len(jobs)
+		m.attempts = append(m.attempts, now)
+		delivery.failures = min(delivery.failures+1, 6)
+		delivery.retryAt = now.Add(min(pendingAlertRetryMaximum, pendingAlertRetryBase*time.Duration(1<<uint(delivery.failures-1))))
+		m.deliveries[key] = delivery
+		attempt, stop := context.WithTimeout(ctx, WebhookTimeout)
+		if key.destination == "desktop" {
+			command := req.Command.DisplayRedacted
+			if command == "" {
+				command = req.Command.Raw
 			}
-
-			// Use a timeout context for webhook calls
-			webhookCtx, cancel := context.WithTimeout(ctx, WebhookTimeout)
-			if err := m.webhook.Send(webhookCtx, m.cfg.WebhookURL, payload); err != nil {
-				m.logger.Warn("webhook notification failed",
-					"error", err,
-					"request_id", req.ID,
-					"event", webhookEvent)
-			} else {
-				m.logger.Debug("webhook notification sent",
-					"request_id", req.ID,
-					"event", webhookEvent)
+			command = strings.TrimSpace(command)
+			if len(command) > 140 {
+				command = command[:140] + "…"
 			}
-			cancel()
+			message := fmt.Sprintf("%s\nRequestor: %s\nID: %s\n%s", command, req.RequestorAgent, shortID(req.ID), req.ApprovalPolicy.Label())
+			err = m.notifier.Notify(attempt, "SLB: CRITICAL request pending", message)
+			if err != nil && ctx.Err() == nil {
+				m.logger.Warn("desktop notification failed; retry scheduled", "error", err, "request_id", req.ID)
+			}
+		} else {
+			err = m.SendWebhook(attempt, key.event, req)
+		}
+		stop()
+		if err == nil {
+			m.deliveries[key] = pendingAlertDelivery{sent: true}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 	}
 
@@ -344,16 +396,6 @@ func (m *NotificationManager) SendWebhook(ctx context.Context, event WebhookEven
 	return nil
 }
 
-func (m *NotificationManager) markOnce(key string, at time.Time) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, ok := m.notified[key]; ok {
-		return false
-	}
-	m.notified[key] = at
-	return true
-}
-
 func shortID(id string) string {
 	if len(id) <= 8 {
 		return id
@@ -362,7 +404,7 @@ func shortID(id string) string {
 }
 
 // SendDesktopNotification sends a best-effort desktop notification on the current platform.
-func SendDesktopNotification(title, message string) error {
+func SendDesktopNotification(ctx context.Context, title, message string) error {
 	title = strings.TrimSpace(title)
 	message = strings.TrimSpace(message)
 	if title == "" {
@@ -382,12 +424,12 @@ func SendDesktopNotification(title, message string) error {
 			escapeAppleScript(message),
 			escapeAppleScript(title),
 		)
-		return runNoOutput("osascript", "-e", script)
+		return runNoOutput(ctx, "osascript", "-e", script)
 	case "linux":
 		if _, err := exec.LookPath("notify-send"); err != nil {
 			return fmt.Errorf("notify-send not found")
 		}
-		return runNoOutput("notify-send", title, message)
+		return runNoOutput(ctx, "notify-send", title, message)
 	case "windows":
 		// Graceful fallback: don't hard-fail the daemon on unsupported notification setups.
 		return errors.New("desktop notifications not implemented on windows")
@@ -396,14 +438,47 @@ func SendDesktopNotification(title, message string) error {
 	}
 }
 
-func runNoOutput(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
+func runNoOutput(parent context.Context, name string, args ...string) error {
+	ctx, cancel := context.WithTimeout(parent, desktopNotificationLimit)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Env = os.Environ()
-	out, err := cmd.CombinedOutput()
+	output := &notificationOutput{}
+	cmd.Stdout, cmd.Stderr = output, output
+	cmd.WaitDelay = time.Second
+	stopGroup := core.ConfigureNoninteractiveCommandCancellation(cmd)
+	err := cmd.Run()
 	if err != nil {
-		return fmt.Errorf("%s failed: %w (%s)", name, err, strings.TrimSpace(string(out)))
+		if stopGroup != nil {
+			if stopErr := stopGroup(); stopErr != nil && !errors.Is(stopErr, os.ErrProcessDone) {
+				err = errors.Join(err, stopErr)
+			}
+		}
+		if ctx.Err() != nil {
+			err = errors.Join(err, ctx.Err())
+		}
+		return fmt.Errorf("%s failed: %w (%s)", name, err, strings.TrimSpace(output.String()))
 	}
 	return nil
+}
+
+type notificationOutput struct {
+	buffer    bytes.Buffer
+	truncated bool
+}
+
+func (o *notificationOutput) Write(data []byte) (int, error) {
+	n := min(len(data), desktopNotificationBytes-o.buffer.Len())
+	_, _ = o.buffer.Write(data[:n])
+	o.truncated = o.truncated || n < len(data)
+	return len(data), nil
+}
+
+func (o *notificationOutput) String() string {
+	if o.truncated {
+		return o.buffer.String() + " [output truncated]"
+	}
+	return o.buffer.String()
 }
 
 func escapeAppleScript(s string) string {

@@ -608,12 +608,12 @@ func TestSendDesktopNotification_LinuxUsesNotifySendWhenPresent(t *testing.T) {
 		t.Fatalf("write notify-send: %v", err)
 	}
 
-	if err := SendDesktopNotification("Title", "Message"); err != nil {
+	if err := SendDesktopNotification(context.Background(), "Title", "Message"); err != nil {
 		t.Fatalf("SendDesktopNotification: %v", err)
 	}
 
 	// Also cover timeout notify() linux path (adds -u critical).
-	if err := notify("T2", "B2"); err != nil {
+	if err := notify(context.Background(), "T2", "B2"); err != nil {
 		t.Fatalf("timeout notify: %v", err)
 	}
 
@@ -627,7 +627,7 @@ func TestSendDesktopNotification_LinuxUsesNotifySendWhenPresent(t *testing.T) {
 }
 
 func TestSendDesktopNotification_RequiresMessage(t *testing.T) {
-	if err := SendDesktopNotification("Title", ""); err == nil {
+	if err := SendDesktopNotification(context.Background(), "Title", ""); err == nil {
 		t.Fatalf("expected error for empty message")
 	}
 }
@@ -643,12 +643,44 @@ func TestRunNoOutput_ErrorIncludesCommand(t *testing.T) {
 		t.Fatalf("write fail script: %v", err)
 	}
 
-	err := runNoOutput(fail)
+	err := runNoOutput(context.Background(), fail)
 	if err == nil {
 		t.Fatalf("expected error")
 	}
 	if !strings.Contains(err.Error(), "failed") {
 		t.Fatalf("expected error to mention failure, got: %v", err)
+	}
+}
+
+func TestRunNoOutputBoundsHelperOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture")
+	}
+	helper := filepath.Join(t.TempDir(), "noisy-helper")
+	script := "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 1000 ]; do printf '0123456789' >&2; i=$((i+1)); done\nexit 42\n"
+	if err := os.WriteFile(helper, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	err := runNoOutput(context.Background(), helper)
+	if err == nil || !strings.Contains(err.Error(), "output truncated") || len(err.Error()) > 4600 {
+		t.Fatalf("helper output was not explicitly bounded: %v", err)
+	}
+}
+
+func TestRunNoOutputBoundsInheritedPipesAfterParentExit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix process groups")
+	}
+	helper := filepath.Join(t.TempDir(), "pipe-holder")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nsleep 10 &\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	started := time.Now()
+	err := runNoOutput(ctx, helper)
+	if !errors.Is(err, exec.ErrWaitDelay) || time.Since(started) > 3*time.Second {
+		t.Fatalf("background helper kept inherited output pipes open: %v", err)
 	}
 }
 
@@ -993,8 +1025,8 @@ func TestTimeoutHandler_DesktopNotificationHelpers(t *testing.T) {
 		Command:        db.CommandSpec{Raw: "rm -rf /tmp/x"},
 	}
 
-	h.sendDesktopNotification(req)
-	h.sendAutoApproveWarning(req)
+	h.sendDesktopNotification(context.Background(), req)
+	h.sendAutoApproveWarning(context.Background(), req)
 }
 
 func TestExtractRemoteIP_ParsesTCPAddrAndHostPort(t *testing.T) {

@@ -30,7 +30,10 @@ var tuiCmd = &cobra.Command{
 	Short: "Launch the interactive TUI dashboard",
 	Long: `Launch the SLB Bubble Tea dashboard.
 
-The dashboard and open request details refresh from the project database.
+The dashboard and open request details refresh from the selected database.
+--db applies to every view, refresh, review and pattern action. The selected
+database must already exist; opening failures are reported before the UI starts.
+Project identity still scopes requests and determines the review policy.
 Providing --session-id and --session-key enables interactive approval/rejection.
 Reviews obey the request project's policy and --config override. A recorded
 vote is not full approval until the configured quorum is met. No command is
@@ -50,21 +53,9 @@ Key bindings:
 
 Theme options: mocha (default), macchiato, frappe, latte`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		project, err := projectPath()
+		opts, err := resolveTUIOptions()
 		if err != nil {
-			return fmt.Errorf("resolving project: %w", err)
-		}
-		if flagTuiRefreshSeconds <= 0 {
-			return fmt.Errorf("--refresh-interval must be positive")
-		}
-		opts := tui.Options{
-			ProjectPath:     project,
-			ConfigPath:      flagConfig,
-			Theme:           flagTuiTheme,
-			DisableMouse:    flagTuiNoMouse,
-			RefreshInterval: flagTuiRefreshSeconds,
-			SessionID:       flagTuiSessionID,
-			SessionKey:      flagTuiSessionKey,
+			return err
 		}
 
 		if err := tui.RunWithOptions(opts); err != nil {
@@ -72,4 +63,24 @@ Theme options: mocha (default), macchiato, frappe, latte`,
 		}
 		return nil
 	},
+}
+
+func resolveTUIOptions() (tui.Options, error) {
+	project, err := projectPath()
+	if err != nil {
+		return tui.Options{}, fmt.Errorf("resolving project: %w", err)
+	}
+	database, err := GetDB()
+	if err != nil {
+		return tui.Options{}, err
+	}
+	if flagTuiRefreshSeconds <= 0 {
+		return tui.Options{}, fmt.Errorf("--refresh-interval must be positive")
+	}
+	return tui.ResolveOptions(tui.Options{
+		ProjectPath: project, DatabasePath: database, ConfigPath: flagConfig,
+		Theme: flagTuiTheme, DisableMouse: flagTuiNoMouse,
+		RefreshInterval: flagTuiRefreshSeconds,
+		SessionID:       flagTuiSessionID, SessionKey: flagTuiSessionKey,
+	})
 }
