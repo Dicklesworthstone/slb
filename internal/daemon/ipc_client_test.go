@@ -300,6 +300,9 @@ func TestToRequestStreamEvent_ApprovalFields(t *testing.T) {
 	if result.ApprovedBy != "ReviewerAgent" {
 		t.Errorf("expected approved_by 'ReviewerAgent', got %q", result.ApprovedBy)
 	}
+	if result.ApprovalPolicy != "" || result.ExecutionAssurance != "" || result.ReviewNotice != "" {
+		t.Fatalf("historical event without evidence was assigned an assurance: %+v", result)
+	}
 }
 
 func TestToRequestStreamEvent_RejectionFields(t *testing.T) {

@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/core"
+	"github.com/Dicklesworthstone/slb/internal/daemon"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 	"github.com/spf13/cobra"
@@ -194,4 +196,77 @@ func TestWatchRejectsInvalidPollingIntervals(t *testing.T) {
 			t.Fatal("polling panicked or accepted an invalid interval")
 		}
 	}
+}
+
+func TestWatchPollingPreservesSameHostEvidenceAfterPolicyChange(t *testing.T) {
+	database, original := watchPolicyFixture(t)
+	flagWatchAutoApproveCaution = false
+	configPath := filepath.Join(original.ProjectPath, ".slb", "config.toml")
+	if err := os.WriteFile(configPath, []byte("[general]\napproval_policy = 'same_host'\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	request := &db.Request{
+		ProjectPath: original.ProjectPath, RequestorSessionID: original.RequestorSessionID,
+		RequestorAgent: original.RequestorAgent, RequestorModel: original.RequestorModel,
+		ApprovalPolicy: db.ApprovalPolicySameHost,
+		Command:        db.CommandSpec{Raw: "echo reviewed", Argv: []string{"echo", "reviewed"}, Cwd: original.ProjectPath},
+		RiskTier:       db.RiskTierDangerous, MinApprovals: 1,
+		Justification: db.Justification{Reason: "observe a same-host review without starting a process"},
+	}
+	if err := database.CreateRequest(request); err != nil {
+		t.Fatal(err)
+	}
+	peer := &db.Session{AgentName: "watch-peer", Model: "peer-model", Program: "test", ProjectPath: request.ProjectPath}
+	if err := database.CreateSession(peer); err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]db.RequestStatus)
+	var output bytes.Buffer
+	observe := func(eventType string, assurance db.ReviewAssurance) {
+		t.Helper()
+		output.Reset()
+		if err := pollRequests(context.Background(), database, json.NewEncoder(&output), seen); err != nil {
+			t.Fatal(err)
+		}
+		decoder := json.NewDecoder(&output)
+		for {
+			var event daemon.RequestStreamEvent
+			if err := decoder.Decode(&event); err != nil {
+				t.Fatalf("watch did not emit %s for %s: %v", eventType, request.ID, err)
+			}
+			if event.RequestID != request.ID {
+				continue
+			}
+			if event.Event != eventType || event.ApprovalPolicy != db.ApprovalPolicySameHost ||
+				!strings.Contains(event.ReviewNotice, "not independently authenticated authorization") ||
+				event.ExecutionAssurance != assurance {
+				t.Fatalf("watch lost or promoted persisted evidence: %+v", event)
+			}
+			return
+		}
+	}
+	observe("request_pending", "")
+	decision, err := database.ApplyReview(&db.Review{RequestID: request.ID, ReviewerSessionID: peer.ID, Decision: db.DecisionApprove},
+		peer.SessionKey, db.ReviewPolicy{ApprovalPolicy: db.ApprovalPolicySameHost})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observe("request_approved", "")
+	now := time.Now().UTC()
+	execution := &db.Execution{ExecutedAt: &now, ExecutedBySessionID: peer.ID, ExecutedByAgent: peer.AgentName,
+		ExecutedByModel: peer.Model, LogPath: filepath.Join(request.ProjectPath, ".slb", "watch-execution.log")}
+	if err := database.ClaimRequestExecutionAuthenticated(decision.Request, execution, peer.SessionKey, core.ExecutionPolicyGuard("")); err != nil {
+		t.Fatal(err)
+	}
+	// A later configuration edit cannot relabel an already-started execution.
+	// Its completion must remain reportable without granting a fresh permit.
+	if err := os.WriteFile(configPath, []byte("[general]\napproval_policy = 'independent'\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	exit := 0
+	execution.ExitCode = &exit
+	if err := database.CompleteRequestExecutionAuthenticated(request.ID, db.StatusExecuted, execution, peer.SessionKey); err != nil {
+		t.Fatal(err)
+	}
+	observe("request_executed", db.AssuranceSameHost)
 }

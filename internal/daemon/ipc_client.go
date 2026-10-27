@@ -14,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
 const defaultIPCOperationTimeout = 5 * time.Second
@@ -473,19 +475,24 @@ func (c *IPCClient) readEvents(ctx context.Context, connection ipcClientConnecti
 	}
 }
 
-// RequestStreamEvent is a structured event for the watch command output.
+// RequestStreamEvent is a display observation for the watch command output,
+// never an execution permit. Policy names describe requirements; only an
+// explicitly recorded assurance describes the evidence used for execution.
 type RequestStreamEvent struct {
-	Event      string `json:"event"`
-	RequestID  string `json:"request_id,omitempty"`
-	RiskTier   string `json:"risk_tier,omitempty"`
-	Command    string `json:"command,omitempty"`
-	Requestor  string `json:"requestor,omitempty"`
-	ApprovedBy string `json:"approved_by,omitempty"`
-	RejectedBy string `json:"rejected_by,omitempty"`
-	Reason     string `json:"reason,omitempty"`
-	ExitCode   *int   `json:"exit_code,omitempty"`
-	CreatedAt  string `json:"created_at,omitempty"`
-	ExecutedAt string `json:"executed_at,omitempty"`
+	Event              string             `json:"event"`
+	RequestID          string             `json:"request_id,omitempty"`
+	RiskTier           string             `json:"risk_tier,omitempty"`
+	Command            string             `json:"command,omitempty"`
+	Requestor          string             `json:"requestor,omitempty"`
+	ApprovedBy         string             `json:"approved_by,omitempty"`
+	RejectedBy         string             `json:"rejected_by,omitempty"`
+	Reason             string             `json:"reason,omitempty"`
+	ExitCode           *int               `json:"exit_code,omitempty"`
+	CreatedAt          string             `json:"created_at,omitempty"`
+	ExecutedAt         string             `json:"executed_at,omitempty"`
+	ApprovalPolicy     db.ApprovalPolicy  `json:"approval_policy,omitempty"`
+	ReviewNotice       string             `json:"review_notice,omitempty"`
+	ExecutionAssurance db.ReviewAssurance `json:"execution_assurance,omitempty"`
 }
 
 // ToRequestStreamEvent converts a daemon Event to a RequestStreamEvent.
@@ -512,6 +519,24 @@ func ToRequestStreamEvent(e Event) *RequestStreamEvent {
 		}
 		if v, ok := payload["reason"].(string); ok {
 			we.Reason = v
+		}
+		// Direct in-process events use the named database types; events
+		// decoded from the IPC wire carry strings. Preserve both without
+		// interpreting a missing category as independent authorization.
+		switch policy := payload["approval_policy"].(type) {
+		case db.ApprovalPolicy:
+			we.ApprovalPolicy = policy
+		case string:
+			we.ApprovalPolicy = db.ApprovalPolicy(policy)
+		}
+		if we.ApprovalPolicy != "" {
+			we.ReviewNotice = we.ApprovalPolicy.Label()
+		}
+		switch assurance := payload["execution_assurance"].(type) {
+		case db.ReviewAssurance:
+			we.ExecutionAssurance = assurance
+		case string:
+			we.ExecutionAssurance = db.ReviewAssurance(assurance)
 		}
 		if v, ok := payload["exit_code"].(float64); ok {
 			code := int(v)

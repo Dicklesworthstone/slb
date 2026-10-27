@@ -48,6 +48,10 @@ If the daemon is running, events are received in real-time via IPC subscription.
 If the daemon is not running, the command falls back to polling the database.
 If a daemon subscription is lost, a watch_degraded event precedes a fresh
 pending snapshot from polling. Consumers should deduplicate by request ID.
+Request events preserve approval_policy and review_notice in both modes.
+Execution events include the recorded execution_assurance when available.
+Same-host review is low assurance, not independently authenticated authorization.
+Events describe observed state; execution must still pass slb execute's checks.
 
 Event types:
   request_pending   - New request awaiting approval
@@ -313,12 +317,14 @@ func processPolledRequest(ctx context.Context, req *db.Request, enc *json.Encode
 	case PollActionEmitNew:
 		// New request - build and emit pending event
 		event := daemon.RequestStreamEvent{
-			Event:     result.EventType,
-			RequestID: req.ID,
-			RiskTier:  string(req.RiskTier),
-			Command:   req.Command.DisplayRedacted,
-			Requestor: req.RequestorAgent,
-			CreatedAt: req.CreatedAt.Format(time.RFC3339),
+			Event:          result.EventType,
+			RequestID:      req.ID,
+			RiskTier:       string(req.RiskTier),
+			Command:        req.Command.DisplayRedacted,
+			Requestor:      req.RequestorAgent,
+			CreatedAt:      req.CreatedAt.Format(time.RFC3339),
+			ApprovalPolicy: req.ApprovalPolicy.Normalized(),
+			ReviewNotice:   req.ApprovalPolicy.Label(),
 		}
 		if req.Command.DisplayRedacted == "" {
 			event.Command = req.Command.Raw
@@ -330,8 +336,16 @@ func processPolledRequest(ctx context.Context, req *db.Request, enc *json.Encode
 	case PollActionEmitStatusChange:
 		// Status changed - emit status change event
 		event := daemon.RequestStreamEvent{
-			Event:     result.EventType,
-			RequestID: req.ID,
+			Event:          result.EventType,
+			RequestID:      req.ID,
+			ApprovalPolicy: req.ApprovalPolicy.Normalized(),
+			ReviewNotice:   req.ApprovalPolicy.Label(),
+		}
+		if req.Execution != nil {
+			event.ExecutionAssurance = req.Execution.Assurance
+			if event.ExecutionAssurance == "" {
+				event.ExecutionAssurance = db.AssuranceLegacyUnknown
+			}
 		}
 		if err := enc.Encode(event); err != nil {
 			return fmt.Errorf("encoding event: %w", err)

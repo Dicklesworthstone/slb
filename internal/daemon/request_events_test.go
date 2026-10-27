@@ -59,6 +59,41 @@ func TestRequestStateLateSubscribeAndUpdates(t *testing.T) {
 	}
 }
 
+func TestRequestStateWatchPreservesSameHostEvidence(t *testing.T) {
+	server, addr := deliveryServer(t)
+	pending := stateFixture(db.StatusPending)
+	pending.Requests[0].ApprovalPolicy = db.ApprovalPolicySameHost
+	server.publishRequestState(pending)
+	conn := deliveryDial(t, addr)
+	reader := deliverySubscribe(t, conn)
+
+	for _, status := range []db.RequestStatus{db.StatusPending, db.StatusApproved, db.StatusExecuted} {
+		if status != db.StatusPending {
+			next := stateFixture(status)
+			next.Requests[0].ApprovalPolicy = db.ApprovalPolicySameHost
+			next.Requests[0].Approvals = 1
+			if status == db.StatusExecuted {
+				next.Requests[0].ExecutionAssurance = db.AssuranceSameHost
+			}
+			server.publishRequestState(next)
+		}
+		// Exercise the same wire decoding and projection as slb watch:
+		// preserving labels only in the server payload is insufficient.
+		stream := ToRequestStreamEvent(stateReadEvent(t, reader))
+		if stream.Event != "request_"+string(status) || stream.ApprovalPolicy != db.ApprovalPolicySameHost ||
+			!strings.Contains(stream.ReviewNotice, "not independently authenticated authorization") {
+			t.Fatalf("watch lost same-host policy for %s: %+v", status, stream)
+		}
+		want := db.ReviewAssurance("")
+		if status == db.StatusExecuted {
+			want = db.AssuranceSameHost
+		}
+		if stream.ExecutionAssurance != want {
+			t.Fatalf("watch lost or manufactured execution evidence for %s: %+v", status, stream)
+		}
+	}
+}
+
 func TestRequestStateSnapshotHandoffHasNoGap(t *testing.T) {
 	server, addr := deliveryServer(t)
 	for i := 0; i < 30; i++ {
