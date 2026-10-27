@@ -2,6 +2,7 @@ package db
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -78,6 +79,7 @@ func TestSameHostReviewRequiresDistinctKnownModels(t *testing.T) {
 				if delegated {
 					policy.DelegatedReviewer = &DelegatedReviewerIdentity{SourceProjectPath: t.TempDir(), SourceSessionID: reviewer.ID,
 						AgentName: reviewer.AgentName, Model: tc.reviewer}
+					policy.DelegatedSourceCheck = func(*sql.Tx) error { return nil }
 				}
 				outcome, err := applyFixtureReview(database, request, reviewer, DecisionApprove, policy)
 				if tc.allowed {
@@ -186,7 +188,8 @@ func TestSameHostDelegatedLegacyProvenanceRemainsValid(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := database.ApplyReview(&Review{RequestID: current.ID, ReviewerSessionID: identity.SourceSessionID, Decision: DecisionApprove},
-		sourceKey, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost, DelegatedReviewer: identity})
+		sourceKey, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost, DelegatedReviewer: identity,
+			DelegatedSourceCheck: func(*sql.Tx) error { return nil }})
 	if err != nil || result == nil || result.Request.Status != StatusApproved || result.Review.ReviewerSessionID == legacy.ID {
 		t.Fatalf("fresh delegation reused or invalidated a historical provenance ID: %+v %v", result, err)
 	}
@@ -255,6 +258,7 @@ func TestIndependentIdentityFailsClosed(t *testing.T) {
 			}
 			if attack.delegated {
 				policy.DelegatedReviewer = &DelegatedReviewerIdentity{SourceProjectPath: "/other", SourceSessionID: reviewer.ID, AgentName: attack.agent, Model: attack.model}
+				policy.DelegatedSourceCheck = func(*sql.Tx) error { return nil }
 			}
 			review := &Review{RequestID: request.ID, ReviewerSessionID: reviewer.ID,
 				ReviewerAgent: attack.agent, ReviewerModel: attack.model, Decision: DecisionApprove}
@@ -546,6 +550,78 @@ func TestSameHostReviewAllowsRejectionAfterOptOut(t *testing.T) {
 	}
 	if out.Review.ApprovalPolicy != ApprovalPolicySameHost || out.Review.Assurance != AssuranceSameHost {
 		t.Fatalf("rejection lost its original same-host policy and assurance: %+v", out.Review)
+	}
+}
+
+func TestDelegatedReviewRequiresCurrentSourceCheck(t *testing.T) {
+	for _, decision := range []Decision{DecisionApprove, DecisionReject} {
+		for _, checkPresent := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/check=%t", decision, checkPresent), func(t *testing.T) {
+				database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+				reviewer := sessions[1]
+				policy := ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost,
+					DelegatedReviewer: &DelegatedReviewerIdentity{SourceProjectPath: t.TempDir(),
+						SourceSessionID: reviewer.ID, AgentName: reviewer.AgentName, Model: reviewer.Model}}
+				called := false
+				want := ErrReviewDelegationMismatch
+				if checkPresent {
+					want = errors.New("source credential revoked")
+					policy.DelegatedSourceCheck = func(tx *sql.Tx) error {
+						called = true
+						// The checker can read the target's reserved snapshot without
+						// opening another connection or taking another writer lock.
+						current, err := database.GetRequestTx(tx, request.ID)
+						if err != nil || current.Status != StatusPending {
+							return fmt.Errorf("wrong target transaction: %+v %v", current, err)
+						}
+						return want
+					}
+				}
+				review := &Review{RequestID: request.ID, ReviewerSessionID: reviewer.ID, Decision: decision}
+				outcome, err := database.ApplyReview(review, reviewer.SessionKey, policy)
+				if outcome != nil || !errors.Is(err, want) || called != checkPresent {
+					t.Fatalf("delegated source check was not enforced: outcome=%+v err=%v called=%t", outcome, err, called)
+				}
+				if review.ID != "" || review.Signature != "" {
+					t.Fatal("source denial changed the caller's review")
+				}
+				stored, reviews, err := database.GetRequestWithReviews(request.ID)
+				if err != nil || stored.Status != StatusPending || stored.ApprovalExpiresAt != nil || len(reviews) != 0 {
+					t.Fatalf("missing or denied source check changed the request: %+v %+v %v", stored, reviews, err)
+				}
+				var provenance int
+				if err := database.QueryRow(`SELECT COUNT(*) FROM sessions WHERE program = 'cross-project-review'`).Scan(&provenance); err != nil || provenance != 0 {
+					t.Fatalf("missing or denied source check minted provenance: count=%d err=%v", provenance, err)
+				}
+			})
+		}
+	}
+}
+
+func TestDelegatedReviewChecksExpiryAfterSourceAuthentication(t *testing.T) {
+	database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+	reviewer := sessions[1]
+	expires := time.Now().UTC().Add(200 * time.Millisecond)
+	if _, err := database.Exec(`UPDATE requests SET expires_at = ? WHERE id = ?`, expires.Format(time.RFC3339Nano), request.ID); err != nil {
+		t.Fatal(err)
+	}
+	policy := ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost,
+		DelegatedReviewer: &DelegatedReviewerIdentity{SourceProjectPath: t.TempDir(),
+			SourceSessionID: reviewer.ID, AgentName: reviewer.AgentName, Model: reviewer.Model},
+		DelegatedSourceCheck: func(*sql.Tx) error {
+			// A contended source read can complete after the request expires.
+			// Successful source authentication must not waive that deadline.
+			time.Sleep(time.Until(expires) + 10*time.Millisecond)
+			return nil
+		},
+	}
+	result, err := applyFixtureReview(database, request, reviewer, DecisionApprove, policy)
+	if result != nil || !errors.Is(err, ErrReviewExpired) {
+		t.Fatalf("source authentication delayed past expiry but created approval: %+v %v", result, err)
+	}
+	stored, reviews, err := database.GetRequestWithReviews(request.ID)
+	if err != nil || stored.Status != StatusPending || stored.ApprovalExpiresAt != nil || len(reviews) != 0 {
+		t.Fatalf("expired source check left approval evidence: %+v %+v %v", stored, reviews, err)
 	}
 }
 

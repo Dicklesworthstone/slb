@@ -58,6 +58,13 @@ type ReviewPolicy struct {
 	ExpectedProjectPath    string
 	ExpectedApprovalPolicy ApprovalPolicy
 	DelegatedReviewer      *DelegatedReviewerIdentity
+	// DelegatedSourceCheck is required for delegated reviews. It rechecks
+	// the source credential, activity and identity after the target writer
+	// reservation, before provenance or a vote is written. It applies to
+	// approvals and rejections. A source sharing this DB handle must read
+	// through tx; separate source DBs remain separate read snapshots.
+	// The callback must not mutate either store or open another writer.
+	DelegatedSourceCheck func(*sql.Tx) error
 	// PolicyCheck reloads current project policy after the writer reservation
 	// is acquired. It applies to approvals only: opting out must not prevent
 	// rejection of an outstanding request. The callback must not mutate the
@@ -137,6 +144,17 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 				return fmt.Errorf("checking current review policy: %w", err)
 			}
 		}
+		delegated := policy.DelegatedReviewer
+		if delegated != nil {
+			if accepted.ReviewerSessionID != delegated.SourceSessionID {
+				return ErrReviewDelegationMismatch
+			}
+			if err := policy.DelegatedSourceCheck(tx); err != nil {
+				return fmt.Errorf("checking current delegated reviewer: %w", err)
+			}
+		}
+		// Source reads can wait too. Check expiry and timestamp the vote only
+		// after every current-identity and policy observation has completed.
 		now := time.Now().UTC()
 		if request.Status != StatusPending && request.Status != StatusEscalated {
 			return fmt.Errorf("%w: status is %s", ErrReviewNotPending, request.Status)
@@ -154,11 +172,7 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 
 		var agent, model, storedDigest string
 		var ended sql.NullString
-		delegated := policy.DelegatedReviewer
 		if delegated != nil {
-			if accepted.ReviewerSessionID != delegated.SourceSessionID {
-				return ErrReviewDelegationMismatch
-			}
 			accepted.ReviewerSessionID, agent, model, storedDigest, err =
 				db.ensureDelegatedReviewerTx(tx, request.ProjectPath, sessionKey, delegated, now)
 			if err != nil {
@@ -405,6 +419,9 @@ func (p ReviewPolicy) validate() error {
 		d := p.DelegatedReviewer
 		if d.SourceProjectPath == "" || d.SourceSessionID == "" || d.AgentName == "" {
 			return ErrReviewDelegationMismatch
+		}
+		if p.DelegatedSourceCheck == nil {
+			return fmt.Errorf("%w: current source-session check is required", ErrReviewDelegationMismatch)
 		}
 	}
 	return nil

@@ -1,8 +1,11 @@
 package core
 
 import (
+	"database/sql"
 	"errors"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -1651,5 +1654,211 @@ func TestSubmitCrossProjectReviewRejectsEndedSourceSession(t *testing.T) {
 	})
 	if !errors.Is(err, ErrSessionInactive) {
 		t.Fatalf("ended source session authorized delegated review: %v", err)
+	}
+}
+
+func TestCrossProjectReviewReauthenticatesAfterTargetWriterWait(t *testing.T) {
+	for _, decision := range []db.Decision{db.DecisionApprove, db.DecisionReject} {
+		for _, change := range []string{"ended", "replaced", "key rotated", "agent changed", "model changed", "project changed"} {
+			t.Run(string(decision)+"/"+change, func(t *testing.T) {
+				sourceProject, targetProject := t.TempDir(), t.TempDir()
+				source, err := db.Open(filepath.Join(sourceProject, "source.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = source.Close() })
+				target, err := db.Open(filepath.Join(targetProject, "target.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = target.Close() })
+				reviewer, request, service := delegatedReviewFixture(t, source, target, sourceProject, targetProject)
+				var originalEvents int
+				if err := target.QueryRow(`SELECT COUNT(*) FROM request_events WHERE request_id = ?`, request.ID).Scan(&originalEvents); err != nil {
+					t.Fatal(err)
+				}
+				contender, err := db.OpenWithOptions(target.Path(), db.OpenOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = contender.Close() })
+				service.db = contender
+				writer, err := target.Begin()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = writer.Rollback() }()
+				initialRead := make(chan struct{})
+				result := make(chan error, 1)
+				opts := ReviewOptions{SessionID: reviewer.ID, SessionKey: reviewer.SessionKey,
+					RequestID: request.ID, Decision: decision}
+				go func() {
+					// This is the same private path as the public DB adapter. The
+					// latch observes a completed initial read, not elapsed time.
+					_, err := service.submitCrossProjectReview(sourceProject, opts, func(tx *sql.Tx) (*db.Session, error) {
+						session, err := source.AuthenticateSession(opts.SessionID, opts.SessionKey)
+						if tx == nil {
+							close(initialRead)
+						}
+						return session, err
+					})
+					result <- err
+				}()
+				select {
+				case <-initialRead:
+				case <-time.After(5 * time.Second):
+					t.Fatal("delegated review did not read the initial source identity")
+				}
+				want := db.ErrReviewDelegationMismatch
+				switch change {
+				case "ended":
+					err = source.EndSession(reviewer.ID)
+					want = ErrSessionInactive
+				case "replaced":
+					_, err = source.ReplaceSession(reviewer, reviewer.SessionKey, "codex-cli", "replacement-model")
+					want = ErrSessionInactive
+				case "key rotated":
+					digest, ok := db.SessionKeyDigest(strings.Repeat("a", 64))
+					if !ok {
+						t.Fatal("invalid replacement key fixture")
+					}
+					_, err = source.Exec(`UPDATE sessions SET session_key_digest = ? WHERE id = ?`, digest, reviewer.ID)
+					want = ErrSessionKeyMismatch
+				case "agent changed":
+					_, err = source.Exec(`UPDATE sessions SET agent_name = 'ChangedReviewer' WHERE id = ?`, reviewer.ID)
+				case "model changed":
+					_, err = source.Exec(`UPDATE sessions SET model = 'changed-model' WHERE id = ?`, reviewer.ID)
+				case "project changed":
+					_, err = source.Exec(`UPDATE sessions SET project_path = ? WHERE id = ?`, t.TempDir(), reviewer.ID)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := writer.Commit(); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case err := <-result:
+					if !errors.Is(err, want) {
+						t.Fatalf("queued delegated review used stale source identity: got %v, want %v", err, want)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("delegated review did not finish after the target writer released")
+				}
+				stored, reviews, err := target.GetRequestWithReviews(request.ID)
+				if err != nil || stored.Status != db.StatusPending || stored.ApprovalExpiresAt != nil || len(reviews) != 0 {
+					t.Fatalf("source revocation left review authority: request=%+v reviews=%+v err=%v", stored, reviews, err)
+				}
+				var provenance int
+				if err := target.QueryRow(`SELECT COUNT(*) FROM sessions WHERE program = 'cross-project-review'`).Scan(&provenance); err != nil || provenance != 0 {
+					t.Fatalf("source revocation left delegated provenance: count=%d err=%v", provenance, err)
+				}
+				var events int
+				if err := target.QueryRow(`SELECT COUNT(*) FROM request_events WHERE request_id = ?`, request.ID).Scan(&events); err != nil || events != originalEvents {
+					t.Fatalf("source revocation changed the request journal: before=%d after=%d err=%v", originalEvents, events, err)
+				}
+			})
+		}
+	}
+}
+
+func delegatedReviewFixture(t *testing.T, source, target *db.DB, sourceProject, targetProject string) (*db.Session, *db.Request, *ReviewService) {
+	t.Helper()
+	writeExecutionPolicy(t, targetProject, "[general]\napproval_policy = 'same_host'\ncross_project_reviews = true\nreview_pool = ['Reviewer']\n[integrations]\nagent_mail_enabled = false\n")
+	reviewer := &db.Session{AgentName: "Reviewer", Program: "codex-cli", Model: "model-b", ProjectPath: sourceProject}
+	if err := source.CreateSession(reviewer); err != nil {
+		t.Fatal(err)
+	}
+	requester := &db.Session{AgentName: "Requester", Program: "claude-code", Model: "model-a", ProjectPath: targetProject}
+	if err := target.CreateSession(requester); err != nil {
+		t.Fatal(err)
+	}
+	request := &db.Request{ProjectPath: targetProject, RequestorSessionID: requester.ID,
+		RequestorAgent: requester.AgentName, RequestorModel: requester.Model,
+		Command:  db.CommandSpec{Raw: "touch reviewed-command", Cwd: targetProject, Shell: true},
+		RiskTier: db.RiskTierDangerous, Status: db.StatusPending, MinApprovals: 1,
+		RequireDifferentModel: true, ApprovalPolicy: db.ApprovalPolicySameHost,
+		Justification: db.Justification{Reason: "test current source identity at delegated review commit"}}
+	if err := target.CreateRequest(request); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultReviewConfig()
+	cfg.ApprovalPolicy, cfg.CrossProjectReviews, cfg.ReviewPool = db.ApprovalPolicySameHost, true, []string{"Reviewer"}
+	return reviewer, request, NewReviewService(target, cfg)
+}
+
+func TestCrossProjectReviewSharedStoresPreserveCompletedEvidence(t *testing.T) {
+	for _, decision := range []db.Decision{db.DecisionApprove, db.DecisionReject} {
+		for _, store := range []string{"same memory handle", "same file handle", "separate shared-file handles", "separate stores"} {
+			t.Run(string(decision)+"/"+store, func(t *testing.T) {
+				sourceProject, targetProject := t.TempDir(), t.TempDir()
+				path := filepath.Join(targetProject, "target.db")
+				if store == "same memory handle" {
+					path = ":memory:"
+				}
+				target, err := db.Open(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = target.Close() })
+				source := target
+				if store == "separate shared-file handles" {
+					source, err = db.OpenWithOptions(path, db.OpenOptions{})
+				} else if store == "separate stores" {
+					source, err = db.Open(filepath.Join(sourceProject, "source.db"))
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if source != target {
+					t.Cleanup(func() { _ = source.Close() })
+				}
+				reviewer, request, service := delegatedReviewFixture(t, source, target, sourceProject, targetProject)
+				result, err := service.SubmitCrossProjectReview(source, sourceProject, ReviewOptions{
+					SessionID: reviewer.ID, SessionKey: reviewer.SessionKey, RequestID: request.ID, Decision: decision,
+				})
+				want := db.StatusApproved
+				if decision == db.DecisionReject {
+					want = db.StatusRejected
+				}
+				if err != nil || result == nil || result.NewRequestStatus != want {
+					t.Fatalf("valid delegated review failed: %+v %v", result, err)
+				}
+				before, err := target.GetReview(result.Review.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				provenance, err := target.GetSession(before.ReviewerSessionID)
+				if err != nil || provenance.EndedAt == nil || provenance.ProjectPath != targetProject ||
+					before.ApprovalPolicy != db.ApprovalPolicySameHost || before.Assurance != db.AssuranceSameHost {
+					t.Fatalf("delegation lost ended, target-scoped same-host provenance: %+v %+v %v", before, provenance, err)
+				}
+				// Admission must use the current source identity, but a completed
+				// review retains its immutable snapshot after the source changes.
+				if err := source.EndSession(reviewer.ID); err != nil {
+					t.Fatal(err)
+				}
+				digest, ok := db.SessionKeyDigest(strings.Repeat("b", 64))
+				if !ok {
+					t.Fatal("invalid replacement key fixture")
+				}
+				if _, err := source.Exec(`UPDATE sessions SET session_key_digest = ?, model = 'later-model' WHERE id = ?`, digest, reviewer.ID); err != nil {
+					t.Fatal(err)
+				}
+				after, err := target.GetReview(before.ID)
+				if err != nil || !reflect.DeepEqual(before, after) {
+					t.Fatalf("source changes rewrote signed review evidence: before=%+v after=%+v err=%v", before, after, err)
+				}
+				storedProvenance, err := target.GetSession(provenance.ID)
+				if err != nil || !reflect.DeepEqual(provenance, storedProvenance) {
+					t.Fatalf("source changes rewrote completed provenance: before=%+v after=%+v err=%v", provenance, storedProvenance, err)
+				}
+				if decision == db.DecisionApprove {
+					if _, err := target.VerifyRequestApproval(request.ID); err != nil {
+						t.Fatalf("source changes invalidated an immutable completed review: %v", err)
+					}
+				}
+			})
+		}
 	}
 }

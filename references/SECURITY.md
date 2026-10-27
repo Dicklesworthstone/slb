@@ -215,6 +215,16 @@ the target opts in with `general.cross_project_reviews` and restricts reviewer
 agent names with `general.review_pool`. Delegation records ended, target-scoped
 reviewer provenance rather than creating another active local reviewer session.
 
+Before recording either a delegated approval or rejection, SLB reauthenticates
+the source session after acquiring the target database's writer reservation.
+A source session ended, replaced, rekeyed or changed while the review waited
+cannot supply a new vote from its earlier identity snapshot. The source key,
+active session, project, agent, model and program must still match. An identical
+source/target database handle reads through that transaction; separate databases
+remain separate observations, not an atomic cross-database identity boundary.
+Completed delegated reviews keep their original provenance after later source
+changes and still face the target's execution-time policy and evidence checks.
+
 The target's current opt-in and reviewer pool are checked when committing a
 delegated approval and again before execution. Disabling cross-project review
 or removing a reviewer from the pool blocks outstanding delegated approvals

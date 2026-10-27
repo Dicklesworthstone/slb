@@ -2,6 +2,7 @@
 package core
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -134,7 +135,7 @@ func (rs *ReviewService) SetNotifier(n integrations.RequestNotifier) {
 // Session authentication, request eligibility, the review, and its resulting
 // status/approval deadline are checked and committed under one DB write lock.
 func (rs *ReviewService) SubmitReview(opts ReviewOptions) (*ReviewResult, error) {
-	return rs.submitReview(opts, nil)
+	return rs.submitReview(opts, nil, nil)
 }
 
 // SubmitCrossProjectReview authenticates the reviewer against the source
@@ -142,18 +143,35 @@ func (rs *ReviewService) SubmitReview(opts ReviewOptions) (*ReviewResult, error)
 // then commits a delegated review to the target. The delegated provenance row
 // is ended at commit and therefore never expands target-project reviewer capacity.
 func (rs *ReviewService) SubmitCrossProjectReview(sourceDB *db.DB, sourceProject string, opts ReviewOptions) (*ReviewResult, error) {
-	if sourceDB == nil || !rs.config.CrossProjectReviews {
+	if sourceDB == nil {
+		return nil, ErrCrossProjectReviewDenied
+	}
+	return rs.submitCrossProjectReview(sourceProject, opts, func(tx *sql.Tx) (*db.Session, error) {
+		if tx != nil && sourceDB == rs.db {
+			return sourceDB.AuthenticateSessionTx(tx, opts.SessionID, opts.SessionKey)
+		}
+		return sourceDB.AuthenticateSession(opts.SessionID, opts.SessionKey)
+	})
+}
+
+// The source reader uses the target transaction when both roles share a DB
+// handle. Separate source stores remain independent read snapshots.
+func (rs *ReviewService) submitCrossProjectReview(sourceProject string, opts ReviewOptions, authenticate func(*sql.Tx) (*db.Session, error)) (*ReviewResult, error) {
+	if authenticate == nil || !rs.config.CrossProjectReviews {
 		return nil, ErrCrossProjectReviewDenied
 	}
 	if opts.SessionKey == "" {
 		return nil, ErrSessionKeyMismatch
 	}
-	session, err := sourceDB.AuthenticateSession(opts.SessionID, opts.SessionKey)
+	session, err := authenticate(nil)
 	if errors.Is(err, db.ErrSessionKeyMismatch) {
 		return nil, ErrSessionKeyMismatch
 	}
 	if err != nil {
 		return nil, err
+	}
+	if session == nil {
+		return nil, db.ErrReviewDelegationMismatch
 	}
 	if !session.IsActive() {
 		return nil, ErrSessionInactive
@@ -176,15 +194,40 @@ func (rs *ReviewService) SubmitCrossProjectReview(sourceDB *db.DB, sourceProject
 	if !allowed {
 		return nil, ErrCrossProjectReviewDenied
 	}
-	return rs.submitReview(opts, &db.DelegatedReviewerIdentity{
+	snapshot := *session
+	identity := &db.DelegatedReviewerIdentity{
 		SourceProjectPath: filepath.Clean(sourceAbs),
-		SourceSessionID:   session.ID,
-		AgentName:         session.AgentName,
-		Model:             session.Model,
+		SourceSessionID:   snapshot.ID,
+		AgentName:         snapshot.AgentName,
+		Model:             snapshot.Model,
+	}
+	return rs.submitReview(opts, identity, func(tx *sql.Tx) error {
+		// The target writer may have waited while the source session ended,
+		// changed identity or lost its key. Recheck before minting provenance
+		// for either kind of vote. Separate stores are not one transaction:
+		// this is a fresh source observation, not cross-database isolation.
+		current, err := authenticate(tx)
+		if errors.Is(err, db.ErrSessionKeyMismatch) {
+			return ErrSessionKeyMismatch
+		}
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return db.ErrReviewDelegationMismatch
+		}
+		if !current.IsActive() {
+			return ErrSessionInactive
+		}
+		if current.ID != snapshot.ID || current.ProjectPath != snapshot.ProjectPath ||
+			current.AgentName != snapshot.AgentName || current.Model != snapshot.Model || current.Program != snapshot.Program {
+			return db.ErrReviewDelegationMismatch
+		}
+		return nil
 	})
 }
 
-func (rs *ReviewService) submitReview(opts ReviewOptions, delegated *db.DelegatedReviewerIdentity) (*ReviewResult, error) {
+func (rs *ReviewService) submitReview(opts ReviewOptions, delegated *db.DelegatedReviewerIdentity, checkSource func(*sql.Tx) error) (*ReviewResult, error) {
 	if opts.SessionID == "" {
 		return nil, errors.New("session_id is required")
 	}
@@ -207,6 +250,7 @@ func (rs *ReviewService) submitReview(opts ReviewOptions, delegated *db.Delegate
 		ApprovalTTL:             rs.config.ApprovalTTL,
 		CriticalApprovalTTL:     rs.config.CriticalApprovalTTL,
 		DelegatedReviewer:       delegated,
+		DelegatedSourceCheck:    checkSource,
 	})
 	if errors.Is(err, db.ErrReviewSessionInactive) {
 		return nil, ErrSessionInactive

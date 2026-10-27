@@ -75,8 +75,23 @@ func SessionKeyMatches(storedDigest, supplied string) bool {
 // returned session carries supplied as SessionKey; nothing else in the
 // database can reproduce it.
 func (db *DB) AuthenticateSession(id, supplied string) (*Session, error) {
-	session, digest, err := scanSessionWithDigest(db.QueryRow(`SELECT `+sessionColumns+`, session_key_digest
-		FROM sessions WHERE id = ?`, id))
+	return authenticateSessionRow(db.QueryRow(`SELECT `+sessionColumns+`, session_key_digest
+		FROM sessions WHERE id = ?`, id), supplied)
+}
+
+// AuthenticateSessionTx checks the current credential through an existing
+// transaction. Shared-store review must not open another pooled connection
+// while its target transaction owns the writer reservation.
+func (db *DB) AuthenticateSessionTx(tx *sql.Tx, id, supplied string) (*Session, error) {
+	if tx == nil {
+		return nil, errors.New("session authentication requires a transaction")
+	}
+	return authenticateSessionRow(tx.QueryRow(`SELECT `+sessionColumns+`, session_key_digest
+		FROM sessions WHERE id = ?`, id), supplied)
+}
+
+func authenticateSessionRow(row *sql.Row, supplied string) (*Session, error) {
+	session, digest, err := scanSessionWithDigest(row)
 	if err != nil {
 		return nil, err
 	}
