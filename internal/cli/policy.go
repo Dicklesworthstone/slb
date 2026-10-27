@@ -37,6 +37,12 @@ func loadCustomPatternsIntoDefaultEngine() (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	return loadCustomPatternsForProject(project, GetDB(), flagDB != "")
+}
+
+// loadCustomPatternsForProject also lets scoped integrations load the selected
+// project's policy without changing process-wide flags or the working directory.
+func loadCustomPatternsForProject(project, path string, requireDatabase bool) (int, error) {
 	cfg, err := config.Load(config.LoadOptions{ProjectDir: project, ConfigPath: flagConfig})
 	if err != nil {
 		return 0, fmt.Errorf("loading command policy config: %w", err)
@@ -48,9 +54,8 @@ func loadCustomPatternsIntoDefaultEngine() (int, error) {
 			return 0, fmt.Errorf("explicit policy config is not a regular file")
 		}
 	}
-	path := GetDB()
 	info, err := os.Stat(path)
-	if os.IsNotExist(err) && flagDB == "" {
+	if os.IsNotExist(err) && !requireDatabase {
 		return core.GetDefaultEngine().ReplacePolicy(cfg, nil, flagConfig)
 	}
 	if err != nil {

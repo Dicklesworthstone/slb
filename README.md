@@ -320,11 +320,20 @@ slb run "rm -rf ./build" --reason "Clean build before fresh compile"
 All DANGEROUS and CRITICAL commands must go through slb review.
 ```
 
-Generate Claude Code hooks:
+Install the Claude Code hook for the selected project:
 
 ```bash
-slb integrations claude-hooks > ~/.claude/hooks.json
+slb init                    # Once per project, before project hook installation
+slb hook install
+slb hook status
+
+# Or install for all projects in your user settings:
+slb hook install --global
 ```
+
+The `slb integrations claude-hooks --install` entry point uses the same installer.
+Use `slb integrations claude-hooks --preview` to print a current `PreToolUse`
+settings fragment without changing files. See [hook installation and scopes](#claude-code-hook-integration).
 
 ### Cursor Rules
 
@@ -423,37 +432,85 @@ To integrate with Claude Code, `slb` provides a PreToolUse hook that intercepts 
 ### Quick Setup
 
 ```bash
-# Install hook (generates script and updates Claude Code settings)
+# Initialize the project's policy and state database first
+slb init
+
+# Install in the current project's .claude/settings.json
 slb hook install
 
-# Check installation status
+# Check that same project installation
 slb hook status
 
 # Test classification without executing
 slb hook test "rm -rf ./build"
+
+# Select a different project, or install for all projects
+slb -C /path/to/project init
+slb -C /path/to/project hook install
+slb hook install --global
 ```
+
+### Installation Scope
+
+`install`, `status`, and `uninstall` operate on the selected project by default.
+The project comes from `-C` / `--project`, then `SLB_PROJECT`, then the current
+working directory. Add `--global` to operate on your user installation instead.
+
+Project installation requires a readable, initialized
+`<project>/.slb/state.db`. Initialize a new project with `slb init` first; restore
+or repair missing or unreadable state in an existing project before installing.
+The installer checks this prerequisite before changing settings or creating a
+fallback script. A global registration can be installed without initializing a
+project; its native guard still applies the current policy checks for each tool call.
+
+| Scope | Claude Code registration | Standalone fallback script |
+|-------|--------------------------|----------------------------|
+| Project (default) | `<project>/.claude/settings.json` | `<project>/.slb/hooks/slb_guard.py` |
+| Global (`--global`) | `~/.claude/settings.json` | `~/.slb/hooks/slb_guard.py` |
+
+SLB updates its own `PreToolUse` hook and preserves other settings, other hook
+events, and neighboring hooks in the same `Bash` entry. Reinstalling an unchanged
+registration leaves the settings file unchanged. `--force` or `--merge=false`
+resets only SLB's own hook options. Uninstalling removes the selected registration
+and keeps the script file; it does not edit the other scope.
+
+Earlier versions of `slb hook install` always wrote user settings. Inspect that
+existing installation with `slb hook status --global`; use
+`slb hook uninstall --global` if you choose to remove it. Project status reports
+the project registration, even when a global registration is also present.
+
+Generated registrations include `onFailure: "block"`. Claude Code **v2.1.295 or
+later** supports this setting to block an action when its hook cannot start,
+fails, or times out. See the [Claude Code hook failure documentation](https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails).
 
 ### How It Works
 
-1. **Hook Script**: A Python script at `~/.slb/hooks/slb_guard.py` intercepts Bash tool calls
-2. **Pattern Matching**: Commands are classified using embedded patterns (same as the daemon)
-3. **Daemon Communication**: For approval checks, the hook connects to the SLB daemon via Unix socket
-4. **Fail-Closed**: If SLB is unavailable, dangerous commands are blocked by default
+1. **Native guard**: Claude Code invokes the installed `slb hook guard` command with the Bash tool input. The generated Python script is available separately as a standalone fallback.
+2. **Current policy**: The guard uses the command's working directory to load project policy and find the project daemon.
+3. **Review and execution**: A reviewed command is handed to SLB's execution path, which rechecks its command binding, policy, review evidence, and expiration before claiming execution.
+4. **Offline behavior**: When the daemon is unavailable, the native guard classifies locally and blocks commands that require review.
+
+Installing a hook leaves `general.approval_policy` unchanged. The optional
+`same_host` policy remains a mistake-prevention workflow, with no independently
+authenticated reviewer identity or operating-system security boundary.
 
 ### Hook Commands
 
 ```bash
-slb hook generate                 # Generate hook script only
-slb hook install [--global]       # Install to Claude Code settings
-slb hook uninstall                # Remove hook from settings
-slb hook status                   # Show installation status
-slb hook test "<command>"         # Test command classification
+slb hook generate                         # Generate standalone fallback script
+slb hook install [--global]               # Install in the selected scope
+slb hook uninstall [--global]             # Remove only that registration
+slb hook status [--global]                # Inspect that scope's installation
+slb hook test "<command>"                 # Test classification without executing
+slb integrations claude-hooks --preview   # Print a PreToolUse settings fragment
+slb integrations claude-hooks --install [--global]  # Same scoped installer
 ```
 
-The hook returns one of three actions to Claude Code:
-- `allow` - Command proceeds without intervention
-- `ask` - User is prompted (CAUTION tier)
-- `block` - Command is blocked with message to use `slb request`
+The guard returns Claude Code's `PreToolUse` permission decision:
+
+- `allow`: The tool call may proceed, subject to Claude Code's other permissions.
+- `ask`: Claude Code requests a decision, for example under a configured CAUTION policy.
+- `deny`: The tool call is blocked with guidance for requesting SLB review.
 
 ## Pattern Matching Engine
 

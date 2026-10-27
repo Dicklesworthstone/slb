@@ -81,59 +81,53 @@ var cursorRulesCmd = &cobra.Command{
 
 var claudeHooksCmd = &cobra.Command{
 	Use:   "claude-hooks",
-	Short: "Generate Claude Code hooks.json for SLB integration",
+	Short: "Preview or install the native SLB guard in Claude Code settings",
 	Long: `Generate or install Claude Code hooks that intercept dangerous commands.
 
-When installed, Claude Code will check commands with 'slb patterns test' before execution
-and prompt for slb approval when the command requires review.`,
+The preview is a settings.json fragment containing a Bash PreToolUse command
+hook. The installed hook uses the same native guard and settings-preserving
+installer as 'slb hook install'. Existing unrelated settings and hooks are kept.
+
+Installation defaults to the selected project's .claude/settings.json.
+Use --global for ~/.claude/settings.json. --merge=false resets only SLB's own
+hook entry; it never replaces the settings file or other tools' hooks.
+
+Claude Code 2.1.295 or later is required for onFailure: block, which prevents a
+missing or failed guard from silently allowing the tool call.`,
+	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		install, _ := cmd.Flags().GetBool("install")
 		preview, _ := cmd.Flags().GetBool("preview")
 		merge, _ := cmd.Flags().GetBool("merge")
+		global, _ := cmd.Flags().GetBool("global")
+		if install && preview {
+			return fmt.Errorf("--install and --preview cannot be used together")
+		}
 
 		// Default behavior: preview if neither explicitly chosen.
 		if !install && !preview {
 			preview = true
 		}
 
-		projectDir := flagProject
-		if projectDir == "" {
-			if env := os.Getenv("SLB_PROJECT"); env != "" {
-				projectDir = env
-			} else {
-				wd, err := os.Getwd()
-				if err != nil {
-					return err
-				}
-				projectDir = wd
-			}
-		}
-
 		if preview {
-			hooks := integrations.DefaultClaudeHooks()
+			guardCommand, err := nativeHookGuardCommand()
+			if err != nil {
+				return fmt.Errorf("resolving native hook command: %w", err)
+			}
+			hooks := integrations.DefaultClaudeHooks(guardCommand)
 			data, err := integrations.MarshalClaudeHooks(hooks)
 			if err != nil {
 				return fmt.Errorf("marshaling hooks: %w", err)
 			}
-			fmt.Println(string(data))
-			return nil
+			_, err = fmt.Fprintln(cmd.OutOrStdout(), string(data))
+			return err
 		}
 
 		if !install {
 			return nil
 		}
 
-		path, merged, err := integrations.InstallClaudeHooks(projectDir, merge)
-		if err != nil {
-			return fmt.Errorf("installing hooks: %w", err)
-		}
-
-		if merged {
-			fmt.Fprintf(os.Stderr, "Merged SLB hooks into %s\n", path)
-		} else {
-			fmt.Fprintf(os.Stderr, "Wrote %s\n", path)
-		}
-		return nil
+		return installClaudeHook(cmd, global, !merge)
 	},
 }
 
@@ -147,7 +141,8 @@ func init() {
 	cursorRulesCmd.Flags().Bool("replace", false, "Replace existing slb section")
 
 	integrationsCmd.AddCommand(claudeHooksCmd)
-	claudeHooksCmd.Flags().Bool("install", false, "Write to .claude/hooks.json in the project directory")
+	claudeHooksCmd.Flags().Bool("install", false, "Install the native guard in the selected Claude Code settings.json")
 	claudeHooksCmd.Flags().Bool("preview", false, "Print what would be written (default)")
-	claudeHooksCmd.Flags().Bool("merge", true, "Merge with existing hooks.json (default true)")
+	claudeHooksCmd.Flags().Bool("merge", true, "Keep SLB hook options; false resets only SLB's hook (other settings are preserved)")
+	claudeHooksCmd.Flags().Bool("global", false, "Install in user settings for all projects")
 }

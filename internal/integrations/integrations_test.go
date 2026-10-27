@@ -62,7 +62,8 @@ func TestApplyCursorRules(t *testing.T) {
 }
 
 func TestMarshalClaudeHooks_ValidJSON(t *testing.T) {
-	data, err := MarshalClaudeHooks(DefaultClaudeHooks())
+	command := `'/opt/agent tools/slb' hook guard`
+	data, err := MarshalClaudeHooks(DefaultClaudeHooks(command))
 	if err != nil {
 		t.Fatalf("MarshalClaudeHooks: %v", err)
 	}
@@ -76,121 +77,24 @@ func TestMarshalClaudeHooks_ValidJSON(t *testing.T) {
 	if !ok || hooks == nil {
 		t.Fatalf("expected hooks object: %#v", root)
 	}
-	if _, ok := hooks["pre_bash"]; !ok {
-		t.Fatalf("expected pre_bash hook: %#v", hooks)
+	if len(hooks) != 1 {
+		t.Fatalf("expected only the supported hook event: %#v", hooks)
 	}
-}
-
-func TestInstallClaudeHooks(t *testing.T) {
-	project := t.TempDir()
-
-	path, merged, err := InstallClaudeHooks(project, false)
-	if err != nil {
-		t.Fatalf("InstallClaudeHooks(no-merge): %v", err)
+	entries, ok := hooks["PreToolUse"].([]any)
+	if !ok || len(entries) != 1 {
+		t.Fatalf("expected one PreToolUse matcher: %#v", hooks)
 	}
-	if merged {
-		t.Fatalf("expected merged=false when merge disabled")
+	entry, ok := entries[0].(map[string]any)
+	if !ok || entry["matcher"] != "Bash" {
+		t.Fatalf("guard must inspect Bash tool calls: %#v", entries)
 	}
-	if path != filepath.Join(project, ".claude", "hooks.json") {
-		t.Fatalf("unexpected path: %s", path)
+	commands, ok := entry["hooks"].([]any)
+	if !ok || len(commands) != 1 {
+		t.Fatalf("expected one synchronous command hook: %#v", entry)
 	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("expected hooks.json to exist: %v", err)
-	}
-
-	// Merge case: preserve unrelated hooks.
-	existing := map[string]any{
-		"hooks": map[string]any{
-			"other": map[string]any{"command": "echo hi"},
-		},
-	}
-	existingData, _ := json.Marshal(existing)
-	if err := os.WriteFile(path, append(existingData, '\n'), 0644); err != nil {
-		t.Fatalf("write existing hooks.json: %v", err)
-	}
-
-	path2, merged, err := InstallClaudeHooks(project, true)
-	if err != nil {
-		t.Fatalf("InstallClaudeHooks(merge): %v", err)
-	}
-	if !merged {
-		t.Fatalf("expected merged=true when merge enabled and file exists")
-	}
-	if path2 != path {
-		t.Fatalf("expected same path, got %s", path2)
-	}
-
-	mergedData, err := os.ReadFile(path2)
-	if err != nil {
-		t.Fatalf("read merged hooks.json: %v", err)
-	}
-
-	var root map[string]any
-	if err := json.Unmarshal(mergedData, &root); err != nil {
-		t.Fatalf("json.Unmarshal merged: %v", err)
-	}
-	hooks, ok := root["hooks"].(map[string]any)
-	if !ok || hooks == nil {
-		t.Fatalf("expected hooks object: %#v", root)
-	}
-	if _, ok := hooks["other"]; !ok {
-		t.Fatalf("expected other hook preserved: %#v", hooks)
-	}
-	if _, ok := hooks["pre_bash"]; !ok {
-		t.Fatalf("expected pre_bash installed: %#v", hooks)
-	}
-}
-
-func TestInstallClaudeHooks_MergeWhenMissingFile(t *testing.T) {
-	project := t.TempDir()
-
-	path, merged, err := InstallClaudeHooks(project, true)
-	if err != nil {
-		t.Fatalf("InstallClaudeHooks(merge, missing): %v", err)
-	}
-	if merged {
-		t.Fatalf("expected merged=false when file was missing")
-	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("expected hooks.json to exist: %v", err)
-	}
-}
-
-func TestInstallClaudeHooks_MergeWhenHooksKeyMissing(t *testing.T) {
-	project := t.TempDir()
-	path := filepath.Join(project, ".claude", "hooks.json")
-	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
-		t.Fatalf("mkdir .claude: %v", err)
-	}
-	if err := os.WriteFile(path, []byte("{\"other_top_level\": true}\n"), 0644); err != nil {
-		t.Fatalf("write hooks.json: %v", err)
-	}
-
-	_, merged, err := InstallClaudeHooks(project, true)
-	if err != nil {
-		t.Fatalf("InstallClaudeHooks(merge, no hooks key): %v", err)
-	}
-	if !merged {
-		t.Fatalf("expected merged=true when file exists")
-	}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read hooks.json: %v", err)
-	}
-	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
-		t.Fatalf("unmarshal merged: %v", err)
-	}
-	if root["other_top_level"] != true {
-		t.Fatalf("expected other_top_level preserved: %#v", root)
-	}
-	hooks, ok := root["hooks"].(map[string]any)
-	if !ok || hooks == nil {
-		t.Fatalf("expected hooks object: %#v", root)
-	}
-	if _, ok := hooks["pre_bash"]; !ok {
-		t.Fatalf("expected pre_bash installed: %#v", hooks)
+	hook, ok := commands[0].(map[string]any)
+	if !ok || len(hook) != 3 || hook["type"] != "command" || hook["command"] != command || hook["onFailure"] != "block" {
+		t.Fatalf("guard must receive stdin and fail closed with the exact quoted executable: %#v", commands)
 	}
 }
 

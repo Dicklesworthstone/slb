@@ -127,9 +127,10 @@ func TestHookInstallUpgradesOnlySLBHookInSharedEntry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Byte-for-byte: only SLB's own command changed. Sibling hooks, the other
-	// entry, key order, number spelling and '&'/'<'/'>' are all untouched.
-	want := sharedBashEntrySettings(jsonString(t, guard))
+	// Byte-for-byte: only SLB's own command and failure policy changed. Sibling
+	// hooks, the other entry, key order, number spelling and '&'/'<'/'>' remain.
+	want := sharedBashEntrySettings(jsonString(t, guard) + `,
+            "onFailure": "block"`)
 	if string(got) != want {
 		t.Fatalf("settings changed beyond the SLB hook command.\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
@@ -138,7 +139,7 @@ func TestHookInstallUpgradesOnlySLBHookInSharedEntry(t *testing.T) {
 	}
 
 	// Second install is a no-op: nothing is rewritten.
-	result = runHookCLI(t, h.DBPath, "install")
+	result = runHookCLI(t, h.DBPath, "install", "--global")
 	if result["already_existed"] != true || result["upgraded"] != false || result["settings_changed"] != false {
 		t.Fatalf("second install was not idempotent: %+v", result)
 	}
@@ -148,7 +149,7 @@ func TestHookInstallUpgradesOnlySLBHookInSharedEntry(t *testing.T) {
 	}
 
 	// Uninstall removes only the SLB hook object from the shared entry.
-	result = runHookCLI(t, h.DBPath, "uninstall")
+	result = runHookCLI(t, h.DBPath, "uninstall", "--global")
 	if result["status"] != "uninstalled" || result["removed"] != true {
 		t.Fatalf("uninstall did not report removal: %+v", result)
 	}
@@ -156,7 +157,8 @@ func TestHookInstallUpgradesOnlySLBHookInSharedEntry(t *testing.T) {
 	wantUninstalled := strings.Replace(want, `,
           {
             "type": "command",
-            "command": `+jsonString(t, guard)+`
+            "command": `+jsonString(t, guard)+`,
+            "onFailure": "block"
           }`, "", 1)
 	if wantUninstalled == want {
 		t.Fatal("test bug: expected-uninstall text was not derived")
@@ -166,7 +168,7 @@ func TestHookInstallUpgradesOnlySLBHookInSharedEntry(t *testing.T) {
 	}
 
 	// A second uninstall finds nothing and leaves the file alone.
-	result = runHookCLI(t, h.DBPath, "uninstall")
+	result = runHookCLI(t, h.DBPath, "uninstall", "--global")
 	if result["removed"] != false {
 		t.Fatalf("second uninstall claimed a removal: %+v", result)
 	}
@@ -202,7 +204,7 @@ func TestHookInstallAppendsToExistingBashEntry(t *testing.T) {
 		]
 	}
 }`)
-	result := runHookCLI(t, h.DBPath, "install")
+	result := runHookCLI(t, h.DBPath, "install", "--global")
 	if result["upgraded"] != false || result["already_existed"] != false || result["sibling_hooks_preserved"] != float64(1) {
 		t.Fatalf("unexpected fresh install result: %+v", result)
 	}
@@ -259,7 +261,7 @@ func TestHookUninstallDropsEntryOnlyWhenSLBWasItsLastHook(t *testing.T) {
   }
 }
 `)
-	result := runHookCLI(t, h.DBPath, "uninstall")
+	result := runHookCLI(t, h.DBPath, "uninstall", "--global")
 	if result["removed"] != true {
 		t.Fatalf("legacy SLB hook not removed: %+v", result)
 	}
@@ -293,7 +295,7 @@ func TestHookInstallCollapsesDuplicateSLBHooksAndKeepsSiblings(t *testing.T) {
   {"matcher": "Bash", "hooks": [{"type": "command", "command": "/opt/other-slb/slb hook guard", "timeout": 5}, {"type": "command", "command": "keep-me"}]},
   {"matcher": "Bash", "hooks": [{"type": "command", "command": `+jsonString(t, legacy)+`}]}
 ]}}`)
-	result := runHookCLI(t, h.DBPath, "install")
+	result := runHookCLI(t, h.DBPath, "install", "--global")
 	if result["duplicate_slb_hooks_removed"] != float64(1) || result["upgraded"] != true {
 		t.Fatalf("duplicates not collapsed: %+v", result)
 	}
@@ -319,7 +321,7 @@ func TestHookInstallCollapsesDuplicateSLBHooksAndKeepsSiblings(t *testing.T) {
 
 	// --force resets SLB's own hook object only.
 	resetHookFlags()
-	if _, err := executeCommandCapture(t, newTestHookCmd(h.DBPath), "hook", "install", "--force", "-j"); err != nil {
+	if _, err := executeCommandCapture(t, newTestHookCmd(h.DBPath), "hook", "install", "--global", "--force", "-j"); err != nil {
 		t.Fatal(err)
 	}
 	data, _ = os.ReadFile(settingsPath)
@@ -328,12 +330,75 @@ func TestHookInstallCollapsesDuplicateSLBHooksAndKeepsSiblings(t *testing.T) {
 	}
 }
 
+func TestHookInstallNormalizesBlockingGuardOptions(t *testing.T) {
+	const guardCommand = "/opt/slb/slb hook guard"
+	settings, err := decodeSettingsJSON([]byte(`{
+  "hooks": {
+    "PreToolUse": [{
+      "matcher": "Bash",
+      "hooks": [
+        {"type":"command","command":"/opt/slb/slb hook guard","onFailure":"continue","async":true,"asyncRewake":true,"timeout":45},
+        {"type":"command","command":"notify-other-tool","onFailure":"continue","async":true,"asyncRewake":true}
+      ]
+    }]
+  }
+}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := &claudeSettingsFile{root: settings}
+	_, entries, _, err := file.preToolUse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hooks := entries[0].(*settingsObject).values["hooks"].([]any)
+	siblingBefore, err := encodeSettingsJSON(hooks[1].(*settingsObject), "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	isSLB := func(command string) bool { return command == guardCommand }
+	change, err := installSLBHook(file, guardCommand, isSLB, false)
+	if err != nil || !change.changed || !change.found {
+		t.Fatalf("unsafe existing registration was not repaired: %+v, %v", change, err)
+	}
+	managed := hooks[0].(*settingsObject)
+	if managed.values["onFailure"] != "block" || managed.values["async"] != false || managed.values["asyncRewake"] != false {
+		t.Fatalf("installed guard could run asynchronously or fail open: %#v", managed.values)
+	}
+	if managed.values["timeout"] != json.Number("45") {
+		t.Fatalf("unrelated managed options were lost: %#v", managed.values)
+	}
+	siblingAfter, err := encodeSettingsJSON(hooks[1].(*settingsObject), "  ")
+	if err != nil || !bytes.Equal(siblingBefore, siblingAfter) {
+		t.Fatalf("normalization altered another tool's hook: %v\nbefore: %s\nafter: %s", err, siblingBefore, siblingAfter)
+	}
+	if again, err := installSLBHook(file, guardCommand, isSLB, false); err != nil || again.changed {
+		t.Fatalf("normalized guard was not idempotent: %+v, %v", again, err)
+	}
+	if _, err := installSLBHook(file, guardCommand, isSLB, true); err != nil {
+		t.Fatal(err)
+	}
+	_, entries, _, err = file.preToolUse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hooks = entries[0].(*settingsObject).values["hooks"].([]any)
+	managed = hooks[0].(*settingsObject)
+	if len(managed.values) != 3 || managed.values["type"] != "command" || managed.values["command"] != guardCommand || managed.values["onFailure"] != "block" {
+		t.Fatalf("force reset did not restore the exact blocking guard: %#v", managed.values)
+	}
+	siblingAfter, err = encodeSettingsJSON(hooks[1].(*settingsObject), "  ")
+	if err != nil || !bytes.Equal(siblingBefore, siblingAfter) {
+		t.Fatalf("force reset altered another tool's hook: %v\nbefore: %s\nafter: %s", err, siblingBefore, siblingAfter)
+	}
+}
+
 func TestHookInstallRefusesMalformedHooksSection(t *testing.T) {
 	h := testutil.NewHarness(t)
 	original := `{"hooks": ["not", "an", "object"]}`
 	_, settingsPath := setupHookHome(t, original)
 	resetHookFlags()
-	_, err := executeCommandCapture(t, newTestHookCmd(h.DBPath), "hook", "install", "-j")
+	_, err := executeCommandCapture(t, newTestHookCmd(h.DBPath), "hook", "install", "--global", "-j")
 	if err == nil || !strings.Contains(err.Error(), "refusing to rewrite") {
 		t.Fatalf("expected refusal for a non-object hooks section, got %v", err)
 	}
@@ -354,7 +419,7 @@ func TestHookInstallWritesThroughSettingsSymlink(t *testing.T) {
 	if err := os.Symlink(target, settingsPath); err != nil {
 		t.Fatal(err)
 	}
-	runHookCLI(t, h.DBPath, "install")
+	runHookCLI(t, h.DBPath, "install", "--global")
 	info, err := os.Lstat(settingsPath)
 	if err != nil || info.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("settings symlink was replaced: %v %v", info, err)
@@ -379,7 +444,7 @@ func TestHookInstallWritesThroughDanglingSettingsSymlink(t *testing.T) {
 	if err := os.Symlink(filepath.Join("..", "dotfiles", "claude-settings.json"), settingsPath); err != nil {
 		t.Fatal(err)
 	}
-	runHookCLI(t, h.DBPath, "install")
+	runHookCLI(t, h.DBPath, "install", "--global")
 	info, err := os.Lstat(settingsPath)
 	if err != nil || info.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("dangling settings symlink was replaced: %v %v", info, err)

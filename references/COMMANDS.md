@@ -154,15 +154,39 @@ slb watch --session-id <id> --auto-approve-caution  # Auto-approve CAUTION tier
 ## Claude Code Hook
 
 ```bash
-slb hook install                               # Install PreToolUse hook
-slb hook status                                # Check installation
-slb hook test "<command>"                      # Test classification
-slb hook uninstall                             # Remove hook
+slb init                                       # Initialize project policy first
+slb hook install                               # Install project PreToolUse hook
+slb -C /path/to/project init                    # Initialize a different project
+slb -C /path/to/project hook install            # Select the project explicitly
+slb hook install --global                      # Install in user settings
+slb hook status [--global]                      # Inspect the selected scope
+slb hook test "<command>"                      # Test classification, no execution
+slb hook uninstall [--global]                   # Remove only that registration
+slb hook install --force                       # Reset only SLB's hook options
 
 # Generate IDE integrations
-slb integrations claude-hooks > ~/.claude/hooks.json
+slb integrations claude-hooks --preview         # Current PreToolUse settings fragment
+slb integrations claude-hooks --install [--global]  # Same scoped hook installer
 slb integrations cursor-rules > .cursorrules
 ```
+
+The default scope is the project selected by `-C` / `--project`, `SLB_PROJECT`,
+or the current directory, in that order. Its registration is
+`<project>/.claude/settings.json`; `--global` selects `~/.claude/settings.json`.
+The standalone fallback script lives under that scope's `.slb/hooks/` directory.
+Status reports the selected scope only. Existing user installations from older
+SLB versions can be inspected or removed with `--global`.
+
+Project installation requires a readable initialized `<project>/.slb/state.db`;
+run `slb init` in a new project first. A failed prerequisite check changes no
+settings or hook artifacts. Global installation does not require project initialization.
+
+Both installation entry points preserve unrelated settings and neighboring
+hooks. `--force` and `--merge=false` reset only SLB's own hook object; uninstall
+keeps the script and the other scope's registration. Preview changes no files.
+The native registration uses `onFailure: "block"`, which requires Claude Code
+v2.1.295 or later for hook startup failures and timeouts to block the action.
+See [Claude Code's hook failure behavior](https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails).
 
 ---
 

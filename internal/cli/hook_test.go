@@ -63,12 +63,14 @@ func newTestHookCmd(dbPath string) *cobra.Command {
 		Short: "Remove hook from Claude Code settings",
 		RunE:  hookUninstallCmd.RunE,
 	}
+	uninstallCmd.Flags().BoolVarP(&flagHookGlobal, "global", "g", false, "uninstall globally")
 
 	statusCmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show hook installation status",
 		RunE:  hookStatusCmd.RunE,
 	}
+	statusCmd.Flags().BoolVarP(&flagHookGlobal, "global", "g", false, "inspect global settings")
 
 	healthCmd := &cobra.Command{
 		Use:   "health",
@@ -334,7 +336,7 @@ func TestHookStatusCommand_NotInstalled(t *testing.T) {
 	defer os.Unsetenv("HOME")
 
 	cmd := newTestHookCmd(h.DBPath)
-	stdout, err := executeCommandCapture(t, cmd, "hook", "status", "-j")
+	stdout, err := executeCommandCapture(t, cmd, "hook", "status", "--global", "-j")
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -376,7 +378,7 @@ func TestHookStatusCommand_PartialInstall(t *testing.T) {
 	// Check status
 	resetHookFlags()
 	statusCmd := newTestHookCmd(h.DBPath)
-	stdout, err := executeCommandCapture(t, statusCmd, "hook", "status", "-j")
+	stdout, err := executeCommandCapture(t, statusCmd, "hook", "status", "--global", "-j")
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -409,7 +411,7 @@ func TestHookStatusCommand_FullyInstalled(t *testing.T) {
 
 	// Install hook
 	installCmd := newTestHookCmd(h.DBPath)
-	_, err := executeCommandCapture(t, installCmd, "hook", "install", "-j")
+	_, err := executeCommandCapture(t, installCmd, "hook", "install", "--global", "-j")
 	if err != nil {
 		t.Fatalf("failed to install hook: %v", err)
 	}
@@ -417,7 +419,7 @@ func TestHookStatusCommand_FullyInstalled(t *testing.T) {
 	// Check status
 	resetHookFlags()
 	statusCmd := newTestHookCmd(h.DBPath)
-	stdout, err := executeCommandCapture(t, statusCmd, "hook", "status", "-j")
+	stdout, err := executeCommandCapture(t, statusCmd, "hook", "status", "--global", "-j")
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -448,7 +450,7 @@ func TestHookInstallCommand_CreatesSettingsFile(t *testing.T) {
 	defer os.Unsetenv("HOME")
 
 	cmd := newTestHookCmd(h.DBPath)
-	stdout, err := executeCommandCapture(t, cmd, "hook", "install", "-j")
+	stdout, err := executeCommandCapture(t, cmd, "hook", "install", "--global", "-j")
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -522,7 +524,7 @@ func TestHookInstallCommand_PreservesExistingHooks(t *testing.T) {
 
 	// Install SLB hook
 	cmd := newTestHookCmd(h.DBPath)
-	_, err := executeCommandCapture(t, cmd, "hook", "install", "-j")
+	_, err := executeCommandCapture(t, cmd, "hook", "install", "--global", "-j")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -552,7 +554,7 @@ func TestHookUninstallCommand_RemovesHook(t *testing.T) {
 
 	// First install
 	installCmd := newTestHookCmd(h.DBPath)
-	_, err := executeCommandCapture(t, installCmd, "hook", "install", "-j")
+	_, err := executeCommandCapture(t, installCmd, "hook", "install", "--global", "-j")
 	if err != nil {
 		t.Fatalf("failed to install: %v", err)
 	}
@@ -560,7 +562,7 @@ func TestHookUninstallCommand_RemovesHook(t *testing.T) {
 	// Then uninstall
 	resetHookFlags()
 	uninstallCmd := newTestHookCmd(h.DBPath)
-	stdout, err := executeCommandCapture(t, uninstallCmd, "hook", "uninstall", "-j")
+	stdout, err := executeCommandCapture(t, uninstallCmd, "hook", "uninstall", "--global", "-j")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -622,7 +624,7 @@ func TestHookUninstallCommand_NotInstalled(t *testing.T) {
 	defer os.Unsetenv("HOME")
 
 	cmd := newTestHookCmd(h.DBPath)
-	stdout, err := executeCommandCapture(t, cmd, "hook", "uninstall", "-j")
+	stdout, err := executeCommandCapture(t, cmd, "hook", "uninstall", "--global", "-j")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -647,14 +649,14 @@ func TestHookInstallCommand_Idempotent(t *testing.T) {
 
 	// Install twice
 	cmd1 := newTestHookCmd(h.DBPath)
-	_, err := executeCommandCapture(t, cmd1, "hook", "install", "-j")
+	_, err := executeCommandCapture(t, cmd1, "hook", "install", "--global", "-j")
 	if err != nil {
 		t.Fatalf("first install error: %v", err)
 	}
 
 	resetHookFlags()
 	cmd2 := newTestHookCmd(h.DBPath)
-	stdout, err := executeCommandCapture(t, cmd2, "hook", "install", "-j")
+	stdout, err := executeCommandCapture(t, cmd2, "hook", "install", "--global", "-j")
 	if err != nil {
 		t.Fatalf("second install error: %v", err)
 	}
@@ -1087,7 +1089,7 @@ func TestHookStatusCommand_DetectsStalePatternSnapshot(t *testing.T) {
 	t.Setenv("USERPROFILE", home)
 
 	installCmd := newTestHookCmd(h.DBPath)
-	if _, err := executeCommandCapture(t, installCmd, "hook", "install", "-j"); err != nil {
+	if _, err := executeCommandCapture(t, installCmd, "hook", "install", "--global", "-j"); err != nil {
 		t.Fatalf("install hook: %v", err)
 	}
 
@@ -1114,7 +1116,7 @@ func TestHookStatusCommand_DetectsStalePatternSnapshot(t *testing.T) {
 
 	resetHookFlags()
 	statusCmd := newTestHookCmd(h.DBPath)
-	stdout, err := executeCommandCapture(t, statusCmd, "hook", "status", "-j")
+	stdout, err := executeCommandCapture(t, statusCmd, "hook", "status", "--global", "-j")
 	if err != nil {
 		t.Fatalf("hook status: %v", err)
 	}
@@ -1209,12 +1211,12 @@ func TestHookStatusCommand_DetectsChangedApprovalPolicy(t *testing.T) {
 	h := testutil.NewHarness(t)
 	resetHookFlags()
 	t.Cleanup(resetHookFlags)
-	if _, err := executeCommandCapture(t, newTestHookCmd(h.DBPath), "-C", h.ProjectDir, "hook", "install", "-j"); err != nil {
+	if _, err := executeCommandCapture(t, newTestHookCmd(h.DBPath), "-C", h.ProjectDir, "hook", "install", "--global", "-j"); err != nil {
 		t.Fatal(err)
 	}
 	h.WriteFile(".slb/config.toml", []byte("[general]\napproval_policy = 'same_host'\n"), 0600)
 	resetHookFlags()
-	stdout, err := executeCommandCapture(t, newTestHookCmd(h.DBPath), "-C", h.ProjectDir, "hook", "status", "-j")
+	stdout, err := executeCommandCapture(t, newTestHookCmd(h.DBPath), "-C", h.ProjectDir, "hook", "status", "--global", "-j")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1526,7 +1528,7 @@ func TestHookInstallUsesNativeGuard(t *testing.T) {
 	t.Setenv("HOME", home)
 
 	cmd := newTestHookCmd(h.DBPath)
-	stdout, err := executeCommandCapture(t, cmd, "hook", "install", "-j")
+	stdout, err := executeCommandCapture(t, cmd, "hook", "install", "--global", "-j")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1608,7 +1610,7 @@ func TestHookInstallAutoUpgradesLegacyPythonGuard(t *testing.T) {
 	}
 
 	cmd := newTestHookCmd(h.DBPath)
-	stdout, err := executeCommandCapture(t, cmd, "hook", "install", "-j")
+	stdout, err := executeCommandCapture(t, cmd, "hook", "install", "--global", "-j")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1629,7 +1631,7 @@ func TestHookInstallAutoUpgradesLegacyPythonGuard(t *testing.T) {
 
 	resetHookFlags()
 	second := newTestHookCmd(h.DBPath)
-	stdout, err = executeCommandCapture(t, second, "hook", "install", "-j")
+	stdout, err = executeCommandCapture(t, second, "hook", "install", "--global", "-j")
 	if err != nil {
 		t.Fatal(err)
 	}

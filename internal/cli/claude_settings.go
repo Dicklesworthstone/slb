@@ -450,7 +450,8 @@ type slbHookInstallResult struct {
 // editing only SLB's own hook object:
 //   - an existing SLB hook (native or legacy Python) in an entry that covers
 //     Bash has its command updated in place; sibling hooks and any other keys
-//     on the hook object (e.g. "timeout") are kept unless force is set;
+//     on the hook object (e.g. "timeout") are kept unless force is set, except
+//     that SLB always runs synchronously with onFailure: block;
 //   - extra SLB hooks elsewhere are removed so there is exactly one guard;
 //   - otherwise the hook is appended to the first "Bash" entry, or a new
 //     "Bash" entry is appended when there is none.
@@ -487,6 +488,7 @@ func installSLBHook(f *claudeSettingsFile, guardCommand string, isSLB func(strin
 			canonical := newSettingsObject()
 			canonical.set("type", "command")
 			canonical.set("command", guardCommand)
+			canonical.set("onFailure", "block")
 			rawList, _ := location.entry.get("hooks")
 			list := rawList.([]any)
 			if !encodedEqual(list[location.hookIndex], canonical) {
@@ -501,6 +503,18 @@ func installSLBHook(f *claudeSettingsFile, guardCommand string, isSLB func(strin
 			if location.command != guardCommand {
 				location.hook.set("command", guardCommand)
 				result.changed = true
+			}
+			if location.hook.values["onFailure"] != "block" {
+				location.hook.set("onFailure", "block")
+				result.changed = true
+			}
+			// Claude Code ignores onFailure for background hooks. A guard must
+			// finish before the tool runs, even when upgrading a customized entry.
+			for _, key := range []string{"async", "asyncRewake"} {
+				if value, present := location.hook.get(key); present && value != false {
+					location.hook.set(key, false)
+					result.changed = true
+				}
 			}
 		}
 	}
@@ -519,6 +533,7 @@ func installSLBHook(f *claudeSettingsFile, guardCommand string, isSLB func(strin
 		hook := newSettingsObject()
 		hook.set("type", "command")
 		hook.set("command", guardCommand)
+		hook.set("onFailure", "block")
 		appended := false
 		for _, rawEntry := range entries {
 			entry, ok := rawEntry.(*settingsObject)

@@ -30,6 +30,8 @@ func init() {
 	hookInstallCmd.Flags().BoolVarP(&flagHookGlobal, "global", "g", false, "install globally for all projects")
 	hookInstallCmd.Flags().BoolVar(&flagHookMerge, "merge", true, "preserve existing hooks (default)")
 	hookInstallCmd.Flags().BoolVarP(&flagHookForce, "force", "f", false, "reset SLB's own hook entry to its canonical form (other hooks are never touched)")
+	hookStatusCmd.Flags().BoolVarP(&flagHookGlobal, "global", "g", false, "inspect user-level settings for all projects")
+	hookUninstallCmd.Flags().BoolVarP(&flagHookGlobal, "global", "g", false, "remove the hook from user-level settings for all projects")
 
 	// hook generate flags.
 	// Named --output-dir (not --output): the persistent --output/-o is the
@@ -88,10 +90,11 @@ var hookInstallCmd = &cobra.Command{
 	Long: `Generate the hook script and configure Claude Code to use it.
 
 This command:
-1. Generates the standalone fallback script at ~/.slb/hooks/slb_guard.py
+1. Generates the standalone fallback script at .slb/hooks/slb_guard.py
 2. Configures Claude Code to call the native 'slb hook guard' entrypoint
 
-Only SLB's own hook object in ~/.claude/settings.json is edited. An existing
+Only SLB's own hook object in the selected project's .claude/settings.json is
+edited (selection: --project/-C, SLB_PROJECT, then the working directory). An existing
 SLB registration (native or legacy Python) is updated in place; otherwise the
 guard is appended to the existing "Bash" PreToolUse entry, or a new one is
 added. Other hooks - including ones sharing the "Bash" entry - other entries,
@@ -99,7 +102,11 @@ key order and indentation are preserved, and the file is not rewritten when
 nothing changes. --force resets SLB's own hook object (e.g. drops a custom
 "timeout") but still leaves every other hook alone.
 
-Use --global to install for all projects (user-level settings).`,
+SLB always runs synchronously with onFailure: block. Claude Code 2.1.295 or later
+is required to block tool calls if the guard cannot start, fails, or times out.
+Initialize a project with 'slb init' before installing its hook. The project
+database must remain available so the native guard can load its complete policy.
+Use --global to select ~/.claude/settings.json and ~/.slb/hooks/slb_guard.py.`,
 	RunE: runHookInstall,
 }
 
@@ -110,7 +117,10 @@ var hookUninstallCmd = &cobra.Command{
 
 This removes only SLB's own hook objects from settings.json; sibling hooks in
 the same matcher entry are kept. It does not delete the hook script file. Use
-this if you want to temporarily disable SLB hook integration.`,
+this if you want to temporarily disable SLB hook integration.
+
+The selected project's settings are used by default (--project/-C, SLB_PROJECT,
+then the working directory). Use --global for user-level settings.`,
 	RunE: runHookUninstall,
 }
 
@@ -201,35 +211,103 @@ func runHookGenerate(cmd *cobra.Command, args []string) error {
 }
 
 func runHookInstall(cmd *cobra.Command, args []string) error {
-	// Generate the hook script (without output)
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("failed to get home directory: %w", err)
-	}
+	return installClaudeHook(cmd, flagHookGlobal, flagHookForce || !flagHookMerge)
+}
 
-	outputDir := filepath.Join(home, ".slb", "hooks")
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory %s: %w", outputDir, err)
+type claudeHookPaths struct {
+	scope          string
+	project        string
+	settingsPath   string
+	hookScriptPath string
+	databasePath   string
+}
+
+func resolveClaudeHookPaths(global bool) (claudeHookPaths, error) {
+	var paths claudeHookPaths
+	project := flagProject
+	if project == "" {
+		project = os.Getenv("SLB_PROJECT")
+	}
+	if project == "" {
+		project = "."
+	}
+	project, err := filepath.Abs(project)
+	if err != nil {
+		return paths, fmt.Errorf("resolving hook project directory: %w", err)
+	}
+	if info, err := os.Stat(project); err != nil {
+		return paths, fmt.Errorf("reading hook project directory: %w", err)
+	} else if !info.IsDir() {
+		return paths, fmt.Errorf("hook project %q is not a directory", project)
+	}
+	paths.project = project
+	paths.databasePath = flagDB
+	if paths.databasePath == "" {
+		paths.databasePath = filepath.Join(project, ".slb", "state.db")
+	}
+	base := project
+	paths.scope = "project"
+	if global {
+		base, err = os.UserHomeDir()
+		if err != nil {
+			return paths, fmt.Errorf("failed to get home directory: %w", err)
+		}
+		paths.scope = "global"
+	}
+	paths.settingsPath = filepath.Join(base, ".claude", "settings.json")
+	paths.hookScriptPath = filepath.Join(base, ".slb", "hooks", "slb_guard.py")
+	return paths, nil
+}
+
+// installClaudeHook is shared by both documented installation entry points.
+// It edits exactly one selected settings file through the lossless editor.
+func installClaudeHook(cmd *cobra.Command, global, force bool) error {
+	paths, err := resolveClaudeHookPaths(global)
+	if err != nil {
+		return err
+	}
+	settings, err := loadClaudeSettings(paths.settingsPath)
+	if err != nil {
+		return err
+	}
+	if !global {
+		// Creating .slb/hooks without a database would make the project appear
+		// initialized while its policy is unavailable. The guard correctly
+		// denies all commands in that state; never install a broken setup or
+		// silently recreate a database whose custom policy may have been lost.
+		projectDB := filepath.Join(paths.project, ".slb", "state.db")
+		info, err := os.Stat(projectDB)
+		if os.IsNotExist(err) {
+			return fmt.Errorf("project policy database %q is unavailable: run slb init in a new project, or restore the existing project database before installing its hook", projectDB)
+		}
+		if err != nil {
+			return fmt.Errorf("reading project policy database: %w", err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("project policy database %q is not a regular file", projectDB)
+		}
+		if flagDB != "" {
+			explicit, err := os.Stat(flagDB)
+			if err != nil || !os.SameFile(info, explicit) {
+				return fmt.Errorf("project hook must use %q; --db cannot select a different policy database", projectDB)
+			}
+		}
+		paths.databasePath = projectDB
 	}
 
 	// Install must embed the complete current policy, just like generate.
-	if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
+	if _, err := loadCustomPatternsForProject(paths.project, paths.databasePath, !global || flagDB != ""); err != nil {
 		return err
 	}
 
 	engine := core.GetDefaultEngine()
-	cautionAction, approvalPolicy, err := hookPolicySettings()
+	cautionAction, approvalPolicy, err := hookPolicySettingsForProject(paths.project)
 	if err != nil {
 		return err
 	}
 	hookScript := generateHookScriptWithPolicy(engine, cautionAction, approvalPolicy)
 
-	hookScriptPath := filepath.Join(outputDir, "slb_guard.py")
-	if err := os.WriteFile(hookScriptPath, []byte(hookScript), 0755); err != nil {
-		return fmt.Errorf("failed to write hook script: %w", err)
-	}
-
-	// The installed hot path is native. Keep writing the Python guard above as
+	// The installed hot path is native. Keep writing the Python guard as
 	// an explicit standalone fallback/debugging artifact, but do not pay a
 	// Python startup/import penalty on every Bash tool call.
 	guardCommand, err := nativeHookGuardCommand()
@@ -237,19 +315,22 @@ func runHookInstall(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolving native hook command: %w", err)
 	}
 
-	settingsPath := filepath.Join(home, ".claude", "settings.json")
-	settings, err := loadClaudeSettings(settingsPath)
-	if err != nil {
-		return err
-	}
 	// Legacy Python registrations and native registrations pointing at an
 	// older/moved executable are the same managed hook: upgrade them in place.
 	// Only SLB's own hook object is edited; sibling hooks sharing its matcher
 	// entry, other entries and all other settings are preserved (GitHub #18).
-	isSLB := func(command string) bool { return isSLBHookCommand(command, hookScriptPath) }
-	change, err := installSLBHook(settings, guardCommand, isSLB, flagHookForce)
+	isSLB := func(command string) bool { return isSLBHookCommand(command, paths.hookScriptPath) }
+	change, err := installSLBHook(settings, guardCommand, isSLB, force)
 	if err != nil {
-		return fmt.Errorf("updating %s: %w", settingsPath, err)
+		return fmt.Errorf("updating %s: %w", paths.settingsPath, err)
+	}
+	// Validate the existing settings and complete policy before writing either
+	// artifact, so invalid input leaves an earlier installation untouched.
+	if err := os.MkdirAll(filepath.Dir(paths.hookScriptPath), 0755); err != nil {
+		return fmt.Errorf("failed to create hook directory: %w", err)
+	}
+	if err := os.WriteFile(paths.hookScriptPath, []byte(hookScript), 0755); err != nil {
+		return fmt.Errorf("failed to write hook script: %w", err)
 	}
 	if change.changed {
 		if err := settings.save(); err != nil {
@@ -259,11 +340,13 @@ func runHookInstall(cmd *cobra.Command, args []string) error {
 
 	result := map[string]any{
 		"status":                  "installed",
-		"settings_path":           settingsPath,
+		"scope":                   paths.scope,
+		"settings_path":           paths.settingsPath,
 		"settings_changed":        change.changed,
-		"hook_script":             hookScriptPath,
+		"hook_script":             paths.hookScriptPath,
 		"hook_command":            guardCommand,
 		"native_guard":            true,
+		"on_failure":              "block",
 		"upgraded":                change.upgraded,
 		"already_existed":         change.found && !change.upgraded,
 		"matcher":                 change.entryMatcher,
@@ -282,12 +365,12 @@ func runHookInstall(cmd *cobra.Command, args []string) error {
 }
 
 func runHookUninstall(cmd *cobra.Command, args []string) error {
-	home, err := os.UserHomeDir()
+	paths, err := resolveClaudeHookPaths(flagHookGlobal)
 	if err != nil {
-		return fmt.Errorf("failed to get home directory: %w", err)
+		return err
 	}
 
-	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	settingsPath := paths.settingsPath
 	settings, err := loadClaudeSettings(settingsPath)
 	if err != nil {
 		return err
@@ -295,25 +378,28 @@ func runHookUninstall(cmd *cobra.Command, args []string) error {
 	out := output.New(output.Format(GetOutput()))
 	if !settings.exists {
 		return out.Write(map[string]any{
-			"status":  "not_installed",
-			"message": "Claude Code settings.json not found",
+			"status":        "not_installed",
+			"scope":         paths.scope,
+			"settings_path": settingsPath,
+			"message":       "Claude Code settings.json not found",
 		})
 	}
 
 	// Remove only SLB's own hook objects. Sibling hooks in the same matcher
 	// entry stay; an entry is dropped only if SLB's hook was its last one.
-	hookScriptPath := filepath.Join(home, ".slb", "hooks", "slb_guard.py")
 	removed, err := uninstallSLBHook(settings, func(command string) bool {
-		return isSLBHookCommand(command, hookScriptPath)
+		return isSLBHookCommand(command, paths.hookScriptPath)
 	})
 	if err != nil {
 		return fmt.Errorf("updating %s: %w", settingsPath, err)
 	}
 	if removed == 0 {
 		return out.Write(map[string]any{
-			"status":  "not_installed",
-			"removed": false,
-			"message": "No SLB PreToolUse hook configured",
+			"status":        "not_installed",
+			"scope":         paths.scope,
+			"settings_path": settingsPath,
+			"removed":       false,
+			"message":       "No SLB PreToolUse hook configured",
 		})
 	}
 	if err := settings.save(); err != nil {
@@ -321,6 +407,7 @@ func runHookUninstall(cmd *cobra.Command, args []string) error {
 	}
 	return out.Write(map[string]any{
 		"status":        "uninstalled",
+		"scope":         paths.scope,
 		"removed":       true,
 		"removed_count": removed,
 		"settings_path": settingsPath,
@@ -328,28 +415,30 @@ func runHookUninstall(cmd *cobra.Command, args []string) error {
 }
 
 func runHookStatus(cmd *cobra.Command, args []string) error {
-	home, err := os.UserHomeDir()
+	paths, err := resolveClaudeHookPaths(flagHookGlobal)
 	if err != nil {
-		return fmt.Errorf("failed to get home directory: %w", err)
+		return err
 	}
 
-	hookScriptPath := filepath.Join(home, ".slb", "hooks", "slb_guard.py")
-	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	hookScriptPath := paths.hookScriptPath
+	settingsPath := paths.settingsPath
 
 	// Compare the current persisted policy with the installed guard.
-	if _, err := loadCustomPatternsIntoDefaultEngine(); err != nil {
+	if _, err := loadCustomPatternsForProject(paths.project, paths.databasePath, flagDB != ""); err != nil {
 		return err
 	}
 	currentHash := core.GetDefaultEngine().ComputeHash()
-	currentCautionAction, currentPolicy, err := hookPolicySettings()
+	currentCautionAction, currentPolicy, err := hookPolicySettingsForProject(paths.project)
 	if err != nil {
 		return err
 	}
 	status := map[string]any{
+		"scope":                         paths.scope,
 		"hook_script_exists":            false,
 		"hook_script_path":              hookScriptPath,
 		"settings_configured":           false,
 		"settings_path":                 settingsPath,
+		"failure_policy_configured":     false,
 		"current_pattern_hash":          currentHash,
 		"installed_pattern_hash":        "",
 		"pattern_hash_matches":          false,
@@ -399,16 +488,21 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 			status["settings_configured"] = true
 			status["configured_command"] = location.command
 			status["native_guard"] = strings.Contains(location.command, "hook guard")
+			status["configured_on_failure"] = location.hook.values["onFailure"]
+			synchronous := true
+			for _, key := range []string{"async", "asyncRewake"} {
+				if value, present := location.hook.get(key); present && value != false {
+					synchronous = false
+				}
+			}
+			status["failure_policy_configured"] = location.hook.values["type"] == "command" &&
+				synchronous && location.hook.values["onFailure"] == "block"
 			break
 		}
 	}
 
-	project, projectErr := projectPath()
-	if projectErr != nil {
-		status["daemon_error"] = projectErr.Error()
-	} else if cwd, absErr := filepath.Abs(project); absErr != nil {
-		status["daemon_error"] = absErr.Error()
-	} else {
+	{
+		cwd := paths.project
 		healthCtx, cancel := context.WithTimeout(cmd.Context(), hookQueryTimeout(cwd))
 		client := daemon.NewIPCClient(daemon.SocketPathForCWD(cwd))
 		health, healthErr := client.HookHealth(healthCtx, cwd)
@@ -444,7 +538,7 @@ func runHookStatus(cmd *cobra.Command, args []string) error {
 	switch {
 	case scriptOK && settingsOK && !fresh:
 		status["status"] = "stale"
-	case scriptOK && settingsOK && !daemonHealthy:
+	case scriptOK && settingsOK && (!daemonHealthy || status["failure_policy_configured"] != true):
 		status["status"] = "degraded"
 	case scriptOK && settingsOK:
 		status["status"] = "installed"
@@ -695,6 +789,10 @@ func hookPolicySettings() (string, db.ApprovalPolicy, error) {
 	if err != nil {
 		return "", "", err
 	}
+	return hookPolicySettingsForProject(project)
+}
+
+func hookPolicySettingsForProject(project string) (string, db.ApprovalPolicy, error) {
 	cfg, err := config.Load(config.LoadOptions{ProjectDir: project, ConfigPath: flagConfig})
 	if err != nil {
 		return "", "", fmt.Errorf("loading hook policy: %w", err)
