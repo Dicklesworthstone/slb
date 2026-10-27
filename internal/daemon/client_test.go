@@ -843,11 +843,17 @@ func TestRunDaemon_StartsTCPListenerFromConfigAndValidatesAuth(t *testing.T) {
 	addr := ln.Addr().String()
 	_ = ln.Close()
 
-	// The daemon scopes authentication to its physical project path, and
-	// /tmp is a symlink on macOS.
+	// The daemon runs on the physical project path, while a session keeps
+	// the path it was started from. Record the session under an alias so
+	// authentication has to match the two spellings (macOS /tmp is itself
+	// an alias, so resolve the project first).
 	project, err := filepath.EvalSymlinks(shortSocketDir(t))
 	if err != nil {
 		t.Fatal(err)
+	}
+	alias := filepath.Join(shortSocketDir(t), "alias")
+	if err := os.Symlink(project, alias); err != nil {
+		t.Fatalf("symlink project alias: %v", err)
 	}
 	slbDir := filepath.Join(project, ".slb")
 	if err := os.MkdirAll(slbDir, 0755); err != nil {
@@ -880,11 +886,24 @@ func TestRunDaemon_StartsTCPListenerFromConfigAndValidatesAuth(t *testing.T) {
 		AgentName:   "Agent",
 		Program:     "test",
 		Model:       "test",
-		ProjectPath: project,
+		ProjectPath: alias,
 		SessionKey:  tcpTestKey,
 	}
 	if err := dbConn.CreateSession(session); err != nil {
 		t.Fatalf("CreateSession: %v", err)
+	}
+	// An active session recorded for a different project must not
+	// authenticate to this daemon.
+	otherKey := strings.Repeat("ef", 32)
+	if err := dbConn.CreateSession(&db.Session{
+		ID:          "sess-other",
+		AgentName:   "Other",
+		Program:     "test",
+		Model:       "test",
+		ProjectPath: shortSocketDir(t),
+		SessionKey:  otherKey,
+	}); err != nil {
+		t.Fatalf("CreateSession (other project): %v", err)
 	}
 
 	// Run daemon inside the temp project directory so it loads the project config.
@@ -925,12 +944,13 @@ func TestRunDaemon_StartsTCPListenerFromConfigAndValidatesAuth(t *testing.T) {
 	if pingErr != nil {
 		t.Fatalf("TCP ping with the session key failed: %v", pingErr)
 	}
-	// Neither a wrong key nor the digest stored in the database authenticates.
+	// Neither a wrong key, the digest stored in the database, nor another
+	// project's session key authenticates.
 	var digest string
 	if err := dbConn.QueryRow(`SELECT session_key_digest FROM sessions WHERE id = ?`, session.ID).Scan(&digest); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{strings.Repeat("cd", 32), digest} {
+	for _, key := range []string{strings.Repeat("cd", 32), digest, otherKey} {
 		if err := ping(key); err == nil {
 			t.Fatalf("TCP ping authenticated with %q", key)
 		}

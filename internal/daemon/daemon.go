@@ -321,7 +321,7 @@ func RunDaemon(ctx context.Context, opts ServerOptions) error {
 				if err := ctx.Err(); err != nil {
 					return false, err
 				}
-				return database.ActiveSessionKeyMatches(projectPath, sessionKey)
+				return database.ActiveSessionKeyMatches(recordedInProject(projectPath), sessionKey)
 			},
 		}, logger)
 		if err != nil {
@@ -497,6 +497,24 @@ func parsePID(data []byte) (int, error) {
 		return 0, errors.New("pid must be > 0")
 	}
 	return pid, nil
+}
+
+// recordedInProject reports whether a session's recorded project path names
+// the daemon's project. Sessions keep the literal path they were started
+// from, which can be a symlink alias (macOS /tmp is one), while the daemon
+// runs on the physical project root. Relative or unresolvable paths never
+// match.
+func recordedInProject(root string) func(string) bool {
+	return func(recorded string) bool {
+		if recorded == root {
+			return true
+		}
+		if !filepath.IsAbs(recorded) {
+			return false
+		}
+		physical, err := filepath.EvalSymlinks(recorded)
+		return err == nil && physical == root
+	}
 }
 
 // loadDaemonCustomPatterns mirrors the CLI's legacy custom-pattern loader.
