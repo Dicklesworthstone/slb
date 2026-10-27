@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -876,5 +877,138 @@ func TestSameHostReviewIntegrationDistinctSessionsAndRejection(t *testing.T) {
 	if err != nil || out.Request.Status != StatusRejected || out.Review.Assurance != AssuranceSameHost ||
 		out.Review.ApprovalPolicy != ApprovalPolicySameHost || !VerifyReviewEvidenceSignature(out.Review, sessions[2].SessionKey) {
 		t.Fatalf("rejection lost its evidence category: %+v %v", out, err)
+	}
+}
+
+func TestSameHostSessionReplacementPreservesReviewEvidence(t *testing.T) {
+	database, request, sessions := reviewDecisionFixture(t, 2, ApprovalPolicySameHost)
+	if _, err := database.Exec(`UPDATE requests SET require_different_model = 1 WHERE id = ?`, request.ID); err != nil {
+		t.Fatal(err)
+	}
+	policy := ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost}
+	first, err := applyFixtureReview(database, request, sessions[1], DecisionApprove, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := database.GetReview(first.Review.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := database.ReplaceSession(sessions[1], sessions[1].SessionKey, sessions[1].Program, "replacement-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := applyFixtureReview(database, request, replacement, DecisionApprove, policy); result != nil || !errors.Is(err, ErrReviewExists) {
+		t.Fatalf("replacement identity supplied a second vote from the same agent: %v", err)
+	}
+	second, err := applyFixtureReview(database, request, sessions[2], DecisionApprove, policy)
+	if err != nil || second.Request.Status != StatusApproved {
+		t.Fatalf("historical review could no longer complete quorum: %v", err)
+	}
+	request = second.Request
+	after, err := database.GetReview(first.Review.ID)
+	if err != nil || !reflect.DeepEqual(before, after) || !VerifyReviewEvidenceSignature(after, sessions[1].SessionKey) ||
+		VerifyReviewEvidenceSignature(after, replacement.SessionKey) {
+		t.Fatalf("rotation altered or relabeled existing review evidence: %v", err)
+	}
+	if _, err := database.VerifyRequestApproval(request.ID); err != nil {
+		t.Fatalf("ended review identity invalidated signed quorum: %v", err)
+	}
+	// A replacement is still the same agent for self-review. The ended identity
+	// is retained only for historical verification, never for a new review.
+	own := *request
+	own.ID, own.Status = "replacement-own-request", StatusPending
+	own.RequestorSessionID, own.RequestorAgent, own.RequestorModel = replacement.ID, replacement.AgentName, replacement.Model
+	own.ApprovalExpiresAt = nil
+	if err := database.CreateRequest(&own); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := applyFixtureReview(database, &own, replacement, DecisionApprove, policy); result != nil || !errors.Is(err, ErrSelfReview) {
+		t.Fatalf("replacement bypassed self-review restriction: %v", err)
+	}
+	if result, err := applyFixtureReview(database, &own, sessions[1], DecisionApprove, policy); result != nil || !errors.Is(err, ErrReviewSessionInactive) {
+		t.Fatalf("ended historical identity submitted a new vote: %v", err)
+	}
+	// Ordinary reviewed execution permits an eligible current project session;
+	// it does not rewrite the original requester's signed identity.
+	now := time.Now().UTC()
+	execution := &Execution{ExecutedAt: &now, ExecutedBySessionID: replacement.ID,
+		ExecutedByAgent: replacement.AgentName, ExecutedByModel: replacement.Model, LogPath: "replacement-execution.log"}
+	if err := database.ClaimRequestExecutionAuthenticated(request, execution, replacement.SessionKey); err != nil {
+		t.Fatalf("eligible replacement could not execute historical approval: %v", err)
+	}
+	code, duration := 0, int64(1)
+	execution.ExitCode, execution.DurationMs = &code, &duration
+	if err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, execution, replacement.SessionKey); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := database.GetRequest(request.ID)
+	if err != nil || stored.Status != StatusExecuted || stored.RequestorSessionID != sessions[0].ID ||
+		stored.RequestorModel != sessions[0].Model || stored.Execution.Assurance != AssuranceSameHost || stored.Execution.ApprovalPolicy != ApprovalPolicySameHost {
+		t.Fatalf("replacement execution changed requester binding or assurance: %v", err)
+	}
+}
+
+func TestSameHostSessionReplacementAllowsOwnedExecutionCompletion(t *testing.T) {
+	database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+	outcome, err := applyFixtureReview(database, request, sessions[1], DecisionApprove, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request = outcome.Request
+	now := time.Now().UTC()
+	execution := &Execution{ExecutedAt: &now, ExecutedBySessionID: sessions[0].ID,
+		ExecutedByAgent: sessions[0].AgentName, ExecutedByModel: sessions[0].Model, LogPath: "original-owned-execution.log"}
+	if err := database.ClaimRequestExecutionAuthenticated(request, execution, sessions[0].SessionKey); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := database.ReplaceSession(sessions[0], sessions[0].SessionKey, sessions[0].Program, "replacement-model")
+	if err != nil {
+		t.Fatalf("already-claimed work blocked identity replacement: %v", err)
+	}
+	code, duration := 0, int64(1)
+	execution.ExitCode, execution.DurationMs = &code, &duration
+	otherClaim := *execution
+	otherClaim.ExecutedBySessionID, otherClaim.ExecutedByModel = replacement.ID, replacement.Model
+	if err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, &otherClaim, replacement.SessionKey); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("replacement took over an existing execution claim: %v", err)
+	}
+	if err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, execution, sessions[0].SessionKey); err != nil {
+		t.Fatalf("original executor could not finish after identity replacement: %v", err)
+	}
+	stored, err := database.GetRequest(request.ID)
+	if err != nil || stored.Status != StatusExecuted || stored.RequestorSessionID != sessions[0].ID ||
+		stored.Execution.ExecutedBySessionID != sessions[0].ID || stored.Execution.ExecutedByModel != sessions[0].Model ||
+		stored.Execution.Assurance != AssuranceSameHost {
+		t.Fatalf("completion rebound historical request or execution identity: %v", err)
+	}
+}
+
+func TestSessionReplacementPreservesHistoricalV1Evidence(t *testing.T) {
+	database, request, sessions := reviewDecisionFixture(t, 1)
+	var reviewID string
+	t.Run("create historical evidence under simulated authority", func(t *testing.T) {
+		SimulateIndependentIdentityForTest(t)
+		outcome, err := applyFixtureReview(database, request, sessions[1], DecisionApprove, ReviewPolicy{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request, reviewID = outcome.Request, outcome.Review.ID
+	})
+	before, err := database.GetReview(reviewID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ReplaceSession(sessions[1], sessions[1].SessionKey, sessions[1].Program, "replacement-model"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := database.GetReview(reviewID)
+	if err != nil || !reflect.DeepEqual(before, after) || after.SignatureVersion != 1 ||
+		after.ApprovalPolicy != ApprovalPolicyIndependent || after.Assurance != AssuranceLegacyLocal ||
+		!VerifyReviewEvidenceSignature(after, sessions[1].SessionKey) {
+		t.Fatalf("replacement lost historical v1 verification or promoted its assurance: %v", err)
+	}
+	if _, err := database.VerifyRequestApproval(request.ID); !errors.Is(err, ErrIndependentIdentityUnavailable) {
+		t.Fatalf("historical identity replacement authorized default local evidence: %v", err)
 	}
 }

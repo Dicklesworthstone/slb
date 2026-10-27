@@ -19,10 +19,29 @@
 slb session start --agent <name> --program <prog> --model <model>
 slb session end --session-id <id>
 slb session resume --agent <name> --session-id <id> --session-key <key>  # Resume after crash
+slb session resume --agent <name> --session-id <id> --session-key <key> --model <new-model>
+slb session resume --agent <name> --session-id <id> --session-key <key> --program <new-prog> --force
 slb session list                               # Show active sessions
-slb session heartbeat --session-id <id>        # Keep session alive
+slb session heartbeat --session-id <id>        # Refresh activity timestamp
 slb session gc --threshold 2h                  # Clean stale sessions
 ```
+
+An active session resumes with the same ID/key when program and model are omitted
+or unchanged. A changed model or permitted program change atomically ends the old
+session and returns a fresh ID/key; omitted fields keep their current values.
+Changing an established program requires `--force`. Always adopt the returned
+credentials. The old identity and signing-key digest are retained so existing
+reviews keep their original model, signature, and policy.
+
+Rotation refuses sessions that own `pending`, `approved`, or `escalated` requests.
+Finish that work with the original session or cancel eligible requests first;
+`--force` does not transfer ownership or bypass this check. Commands already
+executing can complete under the original identity. Rotating does not allow an
+agent to add another quorum vote or self-review.
+
+`session gc` rechecks each candidate's activity against its cutoff before ending
+it, so a refreshed session is skipped. Historical session and review records are
+retained.
 
 ---
 

@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // ErrActiveSessionExists is returned when creating a session that would duplicate
@@ -18,6 +20,14 @@ var ErrActiveSessionExists = errors.New("active session already exists for this 
 
 // ErrSessionNotFound is returned when a session is not found.
 var ErrSessionNotFound = errors.New("session not found")
+
+// ErrSessionChanged means a recovery operation no longer owns its original
+// active session snapshot. It must not return a replacement session's key.
+var ErrSessionChanged = errors.New("session changed or is no longer active")
+
+// ErrSessionHasLiveRequests prevents identity replacement from stranding
+// pending timers or native Git approvals bound to the original requester.
+var ErrSessionHasLiveRequests = errors.New("session has outstanding requests")
 
 // sessionColumns are the session fields every read returns. The key's digest
 // is read only by the queries that authenticate a supplied key.
@@ -28,11 +38,22 @@ const sessionColumns = "id, agent_name, program, model, project_path, started_at
 // s.SessionKey is the one copy of the key, for the caller to hand to the agent.
 // Returns ErrActiveSessionExists if an active session already exists for the agent+project.
 func (db *DB) CreateSession(s *Session) error {
+	digest, err := prepareSession(s)
+	if err != nil {
+		return err
+	}
+	return insertSession(db, s, digest)
+}
+
+func prepareSession(s *Session) (string, error) {
+	if s == nil {
+		return "", fmt.Errorf("session is required")
+	}
 	if s.AgentName == "" {
-		return fmt.Errorf("agent_name is required")
+		return "", fmt.Errorf("agent_name is required")
 	}
 	if s.ProjectPath == "" {
-		return fmt.Errorf("project_path is required")
+		return "", fmt.Errorf("project_path is required")
 	}
 
 	// Generate UUID if not set
@@ -44,13 +65,13 @@ func (db *DB) CreateSession(s *Session) error {
 	if s.SessionKey == "" {
 		key := make([]byte, sessionKeyBytes)
 		if _, err := rand.Read(key); err != nil {
-			return fmt.Errorf("generating session key: %w", err)
+			return "", fmt.Errorf("generating session key: %w", err)
 		}
 		s.SessionKey = hex.EncodeToString(key)
 	}
 	digest, ok := SessionKeyDigest(s.SessionKey)
 	if !ok {
-		return ErrMalformedSessionKey
+		return "", ErrMalformedSessionKey
 	}
 
 	// Set timestamps
@@ -58,10 +79,15 @@ func (db *DB) CreateSession(s *Session) error {
 	s.StartedAt = now
 	s.LastActiveAt = now
 	s.EndedAt = nil
+	return digest, nil
+}
 
+func insertSession(writer interface {
+	Exec(string, ...any) (sql.Result, error)
+}, s *Session, digest string) error {
 	// Insert into database. session_key stays empty: older binaries read it
 	// as the key, and an empty key never authenticates there.
-	_, err := db.Exec(`
+	_, err := writer.Exec(`
 		INSERT INTO sessions (id, agent_name, program, model, project_path, session_key, session_key_digest, started_at, last_active_at, ended_at)
 		VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, NULL)
 	`, s.ID, s.AgentName, s.Program, s.Model, s.ProjectPath, digest, s.StartedAt.Format(time.RFC3339), s.LastActiveAt.Format(time.RFC3339))
@@ -75,6 +101,79 @@ func (db *DB) CreateSession(s *Session) error {
 	}
 
 	return nil
+}
+
+// ReplaceSession atomically ends an authenticated active identity and creates
+// its replacement. The original identity and key digest remain unchanged for
+// historical review verification and completion of already-claimed work.
+// program and model are the complete replacement values; callers preserve any
+// omitted options before invoking this method. No key is returned on failure.
+func (db *DB) ReplaceSession(expected *Session, sessionKey, program, model string) (*Session, error) {
+	if expected == nil || expected.ID == "" {
+		return nil, fmt.Errorf("original session snapshot is required")
+	}
+	replacement := &Session{
+		AgentName: expected.AgentName, ProjectPath: expected.ProjectPath,
+		Program: program, Model: model,
+	}
+	digest, err := prepareSession(replacement)
+	if err != nil {
+		return nil, err
+	}
+	err = db.Transaction(func(tx *sql.Tx) error {
+		// DB write transactions reserve the writer before this read. Session
+		// admission, review and execution therefore cannot appear between the
+		// live-work check and replacement, and concurrent replacements queue.
+		current, currentDigest, err := scanSessionWithDigest(tx.QueryRow(`SELECT `+sessionColumns+`, session_key_digest
+			FROM sessions WHERE id = ?`, expected.ID))
+		if err != nil {
+			return err
+		}
+		if !SessionKeyMatches(currentDigest, sessionKey) {
+			return ErrSessionKeyMismatch
+		}
+		if !current.IsActive() || current.AgentName != expected.AgentName || current.ProjectPath != expected.ProjectPath ||
+			current.Program != expected.Program || current.Model != expected.Model {
+			return ErrSessionChanged
+		}
+		// Requester identity is part of signed evidence and cannot be rebound.
+		// Pending automatic approval and native Git tokens need that original
+		// session. An already-started execution can still finish with its old
+		// key, so executing and terminal requests do not prevent replacement.
+		var requestID, status string
+		err = tx.QueryRow(`SELECT id, status FROM requests
+			WHERE requestor_session_id = ? AND status IN ('pending', 'approved', 'escalated')
+			ORDER BY created_at, id LIMIT 1`, current.ID).Scan(&requestID, &status)
+		if err == nil {
+			return fmt.Errorf("%w: request %s is %s; resolve it before changing program or model; the original session is unchanged",
+				ErrSessionHasLiveRequests, requestID, status)
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("checking session requests: %w", err)
+		}
+		// Timestamp the actual replacement after waiting for the writer, not
+		// the earlier credential generation or an intervening heartbeat.
+		replacement.StartedAt = time.Now().UTC()
+		replacement.LastActiveAt = replacement.StartedAt
+		result, err := tx.Exec(`UPDATE sessions SET ended_at = ?
+			WHERE id = ? AND session_key_digest = ? AND ended_at IS NULL`,
+			replacement.StartedAt.UTC().Format(time.RFC3339), current.ID, currentDigest)
+		if err != nil {
+			return fmt.Errorf("ending replaced session: %w", err)
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("checking session replacement: %w", err)
+		}
+		if count != 1 {
+			return ErrSessionChanged
+		}
+		return insertSession(tx, replacement, digest)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return replacement, nil
 }
 
 // UpdateSessionModel updates the model for an active session.
@@ -193,6 +292,30 @@ func (db *DB) EndSession(id string) error {
 	return nil
 }
 
+// EndStaleSession ends only a still-stale session in the selected project.
+// A heartbeat or resume after candidate selection wins over cleanup. False
+// reports a refreshed, missing, already-ended or different-project session.
+func (db *DB) EndStaleSession(id, project string, cutoff time.Time) (bool, error) {
+	if id == "" || project == "" || cutoff.IsZero() {
+		return false, fmt.Errorf("session ID, project and stale cutoff are required")
+	}
+	// Heartbeat and resume persist whole seconds. Round the cutoff down so a
+	// refresh within its fractional second cannot still appear stale.
+	cutoff = cutoff.UTC().Truncate(time.Second)
+	result, err := db.Exec(`UPDATE sessions SET ended_at = ?
+		WHERE id = ? AND project_path = ? AND ended_at IS NULL
+			AND julianday(last_active_at) < julianday(?)`,
+		time.Now().UTC().Format(time.RFC3339), id, project, cutoff.Format(time.RFC3339))
+	if err != nil {
+		return false, fmt.Errorf("ending stale session: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("checking stale session cleanup: %w", err)
+	}
+	return count == 1, nil
+}
+
 // GetSessionRateLimitResetAt returns the stored per-minute rate limit reset timestamp (if any)
 // for an active session.
 func (db *DB) GetSessionRateLimitResetAt(id string) (*time.Time, error) {
@@ -258,6 +381,24 @@ func (db *DB) FindStaleSessions(threshold time.Duration) ([]*Session, error) {
 	}
 	defer rows.Close()
 
+	return scanSessions(rows)
+}
+
+// FindStaleProjectSessions uses the same fixed cutoff as conditional cleanup.
+func (db *DB) FindStaleProjectSessions(project string, cutoff time.Time) ([]*Session, error) {
+	if project == "" || cutoff.IsZero() {
+		return nil, fmt.Errorf("project and stale cutoff are required")
+	}
+	// Match conditional cleanup's conservative whole-second boundary.
+	cutoff = cutoff.UTC().Truncate(time.Second)
+	rows, err := db.Query(`SELECT `+sessionColumns+` FROM sessions
+		WHERE project_path = ? AND ended_at IS NULL
+			AND julianday(last_active_at) < julianday(?)
+		ORDER BY last_active_at, id`, project, cutoff.Format(time.RFC3339))
+	if err != nil {
+		return nil, fmt.Errorf("finding stale project sessions: %w", err)
+	}
+	defer rows.Close()
 	return scanSessions(rows)
 }
 
@@ -400,51 +541,19 @@ func scanSessions(rows *sql.Rows) ([]*Session, error) {
 	return sessions, nil
 }
 
-// isUniqueConstraintError checks if the error is a unique constraint violation.
-// Note: We explicitly exclude FOREIGN KEY errors which also contain "constraint failed".
+// isUniqueConstraintError recognizes only SQLite's specific uniqueness codes.
+// Other constraints, including RAISE(ABORT) triggers, are storage failures whose
+// original error must survive rather than masquerading as an existing session
+// or review. errors.As also handles callers that wrap the driver error.
 func isUniqueConstraintError(err error) bool {
-	if err == nil {
+	var sqliteError *sqlite.Error
+	if !errors.As(err, &sqliteError) {
 		return false
 	}
-	errStr := err.Error()
-	// Exclude FOREIGN KEY errors - they also contain "constraint failed" but are not unique violations
-	if containsIgnoreCase(errStr, "FOREIGN KEY") {
+	switch sqliteError.Code() {
+	case sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY, sqlite3.SQLITE_CONSTRAINT_ROWID:
+		return true
+	default:
 		return false
 	}
-	// modernc.org/sqlite returns errors containing this message
-	return containsIgnoreCase(errStr, "UNIQUE constraint failed") ||
-		containsIgnoreCase(errStr, "constraint failed")
-}
-
-// containsIgnoreCase checks if s contains substr (case-insensitive).
-func containsIgnoreCase(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || findIgnoreCase(s, substr))
-}
-
-func findIgnoreCase(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if equalIgnoreCase(s[i:i+len(substr)], substr) {
-			return true
-		}
-	}
-	return false
-}
-
-func equalIgnoreCase(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := 0; i < len(a); i++ {
-		ca, cb := a[i], b[i]
-		if ca >= 'A' && ca <= 'Z' {
-			ca += 'a' - 'A'
-		}
-		if cb >= 'A' && cb <= 'Z' {
-			cb += 'a' - 'A'
-		}
-		if ca != cb {
-			return false
-		}
-	}
-	return true
 }

@@ -465,14 +465,17 @@ func TestBuiltCLISameHostReviewIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("changed reviewer model invalidates an outstanding review", func(t *testing.T) {
+	t.Run("rewritten historical reviewer identity invalidates its review", func(t *testing.T) {
 		f := newSameHostCLI(t, binary, 1, true)
 		requester := f.session("Requester", "model-a")
 		reviewer := f.session("Reviewer", "model-b")
 		request := f.request(requester)
 		f.approve(request, reviewer)
-		f.json("session", "resume", "--agent", reviewer.AgentName, "--session-id", reviewer.ID,
-			"--session-key", reviewer.SessionKey, "--model", "changed-model")
+		// A database writer can tamper with historical identity labels. Normal
+		// resume preserves this row by rotating to a separate session instead.
+		if _, err := f.DB.Exec(`UPDATE sessions SET model = ? WHERE id = ?`, "changed-model", reviewer.ID); err != nil {
+			t.Fatal(err)
+		}
 		f.fails("reviewer identity is missing or changed", "execute", request.ID, "--session-id", requester.ID)
 		f.assertNotExecuted(request)
 	})

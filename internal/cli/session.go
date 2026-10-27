@@ -34,7 +34,7 @@ func init() {
 	sessionCmd.PersistentFlags().StringVarP(&flagSessionModel, "model", "m", "", "agent model (e.g., gpt-5.1-codex)")
 
 	sessionResumeCmd.Flags().BoolVar(&flagResumeCreateIfMissing, "create-if-missing", true, "create a new session if none active")
-	sessionResumeCmd.Flags().BoolVar(&flagResumeForce, "force", false, "end mismatched active session and create a new one")
+	sessionResumeCmd.Flags().BoolVar(&flagResumeForce, "force", false, "rotate the authenticated session identity when its program changes")
 	sessionResumeCmd.Flags().StringVar(&flagSessionKey, "session-key", "", "original session key (required to resume an existing session)")
 
 	sessionGcCmd.Flags().BoolVar(&flagSessionGCDryRun, "dry-run", false, "show what would be cleaned up without ending sessions")
@@ -128,6 +128,23 @@ var sessionEndCmd = &cobra.Command{
 var sessionResumeCmd = &cobra.Command{
 	Use:   "resume",
 	Short: "Resume an existing active session or start a new one",
+	Long: `Resume an active session using its original session ID and key.
+
+Omitted or unchanged --program and --model values keep the existing identity.
+Changing --model creates a fresh session_id and session_key. Changing an existing
+program requires --force and also creates a fresh identity. The previous session
+ends while its original model, program, and review evidence are retained.
+
+Always adopt the returned session_id and session_key after a successful resume;
+save both before submitting requests or reviews with the resumed session.
+An original key is still required with --force. Names, programs, and models are
+not recovery credentials, and a lost key cannot be retrieved from the database.
+
+Identity changes are refused while the old session owns pending, approved, or
+escalated requests. Resolve that work first, or cancel requests whose state allows
+cancellation. Existing requests and reviews are never transferred to a new identity.
+
+If no active session exists, --create-if-missing starts one by default.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if flagSessionAgent == "" {
 			return fmt.Errorf("--agent is required")

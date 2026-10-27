@@ -57,13 +57,19 @@ type ResumeOptions struct {
 // ResumeSession resumes an existing active session (agent_name + project_path) or creates a new one.
 //
 // Behavior:
-// - If an active session exists and Program is specified, it must match (unless ForceEndMismatch is true).
-// - Existing sessions require proof of possession of their original ID and key before any mutation.
-// - On successful resume, updates the session heartbeat (last_active_at) and returns the authenticated session.
-// - If no active session exists:
+//   - If an active session exists and Program is specified, it must match (unless ForceEndMismatch is true).
+//   - Existing sessions require proof of possession of their original ID and key before any mutation.
+//   - Unchanged identities keep their ID/key and refresh their heartbeat.
+//   - A changed model or permitted program change atomically creates a new ID/key,
+//     preserving the old identity for completed reviews. Outstanding requester
+//     work must be resolved first. Omitted program/model values are preserved.
+//   - If no active session exists:
 //   - CreateIfMissing=true → creates a new session and returns it
 //   - CreateIfMissing=false → returns db.ErrSessionNotFound
 func ResumeSession(dbConn *db.DB, opts ResumeOptions) (*db.Session, error) {
+	if dbConn == nil {
+		return nil, fmt.Errorf("dbConn is required")
+	}
 	if opts.AgentName == "" {
 		return nil, fmt.Errorf("agent_name is required")
 	}
@@ -114,36 +120,29 @@ func ResumeSession(dbConn *db.DB, opts ResumeOptions) (*db.Session, error) {
 			return nil, fmt.Errorf("%w: active=%q requested=%q", ErrSessionProgramMismatch, sess.Program, opts.Program)
 		}
 
-		// Force: end the old session and create a new one.
-		result, err := dbConn.Exec(`UPDATE sessions SET ended_at = ? WHERE id = ? AND session_key_digest = ? AND ended_at IS NULL`,
-			time.Now().UTC().Format(time.RFC3339), sess.ID, digest)
-		if err != nil {
-			return nil, err
-		}
-		if count, err := result.RowsAffected(); err != nil || count != 1 {
-			return nil, ErrSessionAuthentication
-		}
-		newSess := &db.Session{
-			AgentName:   opts.AgentName,
-			Program:     opts.Program,
-			Model:       opts.Model,
-			ProjectPath: opts.ProjectPath,
-		}
-		if err := dbConn.CreateSession(newSess); err != nil {
-			return nil, err
-		}
-		return newSess, nil
 	}
 
+	program, model := sess.Program, sess.Model
+	if opts.Program != "" {
+		program = opts.Program
+	}
 	if opts.Model != "" {
-		sess.Model = opts.Model
+		model = opts.Model
+	}
+	if program != sess.Program || model != sess.Model {
+		replacement, err := dbConn.ReplaceSession(sess, opts.SessionKey, program, model)
+		if errors.Is(err, db.ErrSessionChanged) || errors.Is(err, db.ErrSessionKeyMismatch) || errors.Is(err, db.ErrSessionNotFound) {
+			return nil, ErrSessionAuthentication
+		}
+		return replacement, err
 	}
 	// Fence mutations against credential rotation/session termination after
 	// the initial read. Never reread and return a replacement credential.
 	sess.LastActiveAt = time.Now().UTC().Truncate(time.Second)
-	result, err := dbConn.Exec(`UPDATE sessions SET model = ?, last_active_at = ?
-		WHERE id = ? AND session_key_digest = ? AND ended_at IS NULL`,
-		sess.Model, sess.LastActiveAt.Format(time.RFC3339), sess.ID, digest)
+	result, err := dbConn.Exec(`UPDATE sessions SET last_active_at = ?
+		WHERE id = ? AND session_key_digest = ? AND ended_at IS NULL
+			AND agent_name = ? AND project_path = ? AND COALESCE(program, '') = ? AND COALESCE(model, '') = ?`,
+		sess.LastActiveAt.Format(time.RFC3339), sess.ID, digest, sess.AgentName, sess.ProjectPath, sess.Program, sess.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -169,18 +168,15 @@ func GarbageCollectStaleSessions(dbConn *db.DB, opts SessionGCOptions) (*Session
 	res := &SessionGCResult{
 		ProjectPath: opts.ProjectPath,
 		Threshold:   opts.Threshold,
-		Cutoff:      now.Add(-opts.Threshold),
+		Cutoff:      now.Add(-opts.Threshold).Truncate(time.Second),
 	}
 
-	stale, err := dbConn.FindStaleSessions(opts.Threshold)
+	stale, err := dbConn.FindStaleProjectSessions(opts.ProjectPath, res.Cutoff)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, s := range stale {
-		if s.ProjectPath != opts.ProjectPath {
-			continue
-		}
 		res.Sessions = append(res.Sessions, SessionSummary{
 			ID:           s.ID,
 			AgentName:    s.AgentName,
@@ -197,12 +193,13 @@ func GarbageCollectStaleSessions(dbConn *db.DB, opts SessionGCOptions) (*Session
 	}
 
 	for _, s := range res.Sessions {
-		if err := dbConn.EndSession(s.ID); err != nil {
-			if errors.Is(err, db.ErrSessionNotFound) {
-				res.SkippedIDs = append(res.SkippedIDs, s.ID)
-				continue
-			}
+		ended, err := dbConn.EndStaleSession(s.ID, opts.ProjectPath, res.Cutoff)
+		if err != nil {
 			return nil, err
+		}
+		if !ended {
+			res.SkippedIDs = append(res.SkippedIDs, s.ID)
+			continue
 		}
 		res.EndedIDs = append(res.EndedIDs, s.ID)
 	}

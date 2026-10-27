@@ -57,6 +57,9 @@ func policyExecutionFixture(t *testing.T) (*db.DB, *db.Request, *db.Session) {
 func writeExecutionPolicy(t *testing.T, project, text string) string {
 	t.Helper()
 	path := filepath.Join(project, ".slb", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(path, []byte(text), 0600); err != nil {
 		t.Fatal(err)
 	}

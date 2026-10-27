@@ -2,6 +2,7 @@ package core
 
 import (
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -443,5 +444,173 @@ func TestGarbageCollectStaleSessions_NoStaleSessions(t *testing.T) {
 	}
 	if len(res.EndedIDs) != 0 {
 		t.Fatalf("expected no ended sessions, got %d", len(res.EndedIDs))
+	}
+}
+
+func TestResumeSessionIdentityChangesRotate(t *testing.T) {
+	for _, test := range []struct {
+		name, storedProgram, program, model, wantProgram, wantModel string
+		force, rotated                                              bool
+	}{
+		{name: "omitted metadata", storedProgram: "original-program", wantProgram: "original-program", wantModel: "original-model"},
+		{name: "unchanged metadata", storedProgram: "original-program", program: "original-program", model: "original-model", wantProgram: "original-program", wantModel: "original-model"},
+		{name: "model change", storedProgram: "original-program", model: "new-model", wantProgram: "original-program", wantModel: "new-model", rotated: true},
+		{name: "forced program change", storedProgram: "original-program", program: "new-program", wantProgram: "new-program", wantModel: "original-model", force: true, rotated: true},
+		{name: "fill missing program", program: "new-program", wantProgram: "new-program", wantModel: "original-model", rotated: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database, err := db.Open(":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = database.Close() })
+			original := &db.Session{AgentName: "resume-agent", ProjectPath: "/test/resume", Program: test.storedProgram, Model: "original-model"}
+			if err := database.CreateSession(original); err != nil {
+				t.Fatal(err)
+			}
+			oldHeartbeat := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+			if _, err := database.Exec(`UPDATE sessions SET last_active_at = ? WHERE id = ?`, oldHeartbeat.Format(time.RFC3339), original.ID); err != nil {
+				t.Fatal(err)
+			}
+			resumed, err := ResumeSession(database, ResumeOptions{
+				AgentName: original.AgentName, ProjectPath: original.ProjectPath,
+				SessionID: original.ID, SessionKey: original.SessionKey, Program: test.program, Model: test.model,
+				ForceEndMismatch: test.force, CreateIfMissing: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resumed.Program != test.wantProgram || resumed.Model != test.wantModel ||
+				resumed.AgentName != original.AgentName || resumed.ProjectPath != original.ProjectPath || !resumed.LastActiveAt.After(oldHeartbeat) {
+				t.Fatal("resume lost requested or omitted identity metadata")
+			}
+			stored, err := database.GetSession(original.ID)
+			if err != nil || stored.Program != original.Program || stored.Model != original.Model {
+				t.Fatalf("resume changed historical identity: %v", err)
+			}
+			if test.rotated {
+				if resumed.ID == original.ID || resumed.SessionKey == original.SessionKey || stored.EndedAt == nil || !stored.LastActiveAt.Equal(oldHeartbeat) {
+					t.Fatal("identity change failed to rotate credentials while preserving history")
+				}
+			} else if resumed.ID != original.ID || resumed.SessionKey != original.SessionKey || stored.EndedAt != nil || !stored.LastActiveAt.After(oldHeartbeat) {
+				t.Fatal("unchanged resume did not retain credentials and renew heartbeat")
+			}
+		})
+	}
+}
+
+func TestResumeSessionOutstandingWorkBlocksOnlyIdentityChanges(t *testing.T) {
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	original := &db.Session{AgentName: "busy-agent", ProjectPath: "/test/resume", Program: "original-program", Model: "original-model"}
+	if err := database.CreateSession(original); err != nil {
+		t.Fatal(err)
+	}
+	request := &db.Request{ProjectPath: original.ProjectPath, RequestorSessionID: original.ID,
+		RequestorAgent: original.AgentName, RequestorModel: original.Model,
+		Command: db.CommandSpec{Raw: "echo live-work", Cwd: original.ProjectPath}, RiskTier: db.RiskTierDangerous,
+		Status: db.StatusPending, MinApprovals: 1, Justification: db.Justification{Reason: "live work"}}
+	if err := database.CreateRequest(request); err != nil {
+		t.Fatal(err)
+	}
+	base := ResumeOptions{AgentName: original.AgentName, ProjectPath: original.ProjectPath,
+		SessionID: original.ID, SessionKey: original.SessionKey, CreateIfMissing: true}
+	for _, changeProgram := range []bool{false, true} {
+		opts := base
+		if changeProgram {
+			opts.Program, opts.ForceEndMismatch = "new-program", true
+		} else {
+			opts.Model = "new-model"
+		}
+		if resumed, err := ResumeSession(database, opts); resumed != nil || !errors.Is(err, db.ErrSessionHasLiveRequests) {
+			t.Fatalf("identity change stranded requester work: %v", err)
+		}
+	}
+	resumed, err := ResumeSession(database, base)
+	if err != nil || resumed.ID != original.ID || resumed.SessionKey != original.SessionKey || resumed.Model != original.Model || resumed.Program != original.Program {
+		t.Fatalf("unchanged busy session could not resume: %v", err)
+	}
+}
+
+func TestResumeSessionConcurrentRotationHasOneWinner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.db")
+	database, err := db.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	other, err := db.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	original := &db.Session{AgentName: "concurrent-agent", ProjectPath: "/test/resume", Program: "program", Model: "original-model"}
+	if err := database.CreateSession(original); err != nil {
+		t.Fatal(err)
+	}
+	opts := ResumeOptions{AgentName: original.AgentName, ProjectPath: original.ProjectPath,
+		SessionID: original.ID, SessionKey: original.SessionKey, Model: "new-model", CreateIfMissing: true}
+	type outcome struct {
+		session *db.Session
+		err     error
+	}
+	start, results := make(chan struct{}), make(chan outcome, 2)
+	for _, connection := range []*db.DB{database, other} {
+		go func(connection *db.DB) {
+			<-start
+			session, err := ResumeSession(connection, opts)
+			results <- outcome{session, err}
+		}(connection)
+	}
+	close(start)
+	winners := 0
+	for range 2 {
+		got := <-results
+		if got.err == nil {
+			winners++
+			if got.session == nil || got.session.ID == original.ID || got.session.SessionKey == original.SessionKey {
+				t.Fatal("winner did not receive its replacement identity")
+			}
+		} else if got.session != nil || !errors.Is(got.err, ErrSessionAuthentication) {
+			t.Fatalf("loser received another session or an unexpected error: %v", got.err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("got %d successful replacements, want 1", winners)
+	}
+}
+
+func TestGarbageCollectionSkipsSessionResumedAfterSelection(t *testing.T) {
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	original := &db.Session{AgentName: "resumed-agent", ProjectPath: "/test/resume", Model: "model"}
+	if err := database.CreateSession(original); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`UPDATE sessions SET last_active_at = ? WHERE id = ?`, time.Now().UTC().Add(-2*time.Hour).Format(time.RFC3339), original.ID); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := GarbageCollectStaleSessions(database, SessionGCOptions{ProjectPath: original.ProjectPath, Threshold: time.Hour + 250*time.Millisecond, DryRun: true})
+	if err != nil || len(candidates.Sessions) != 1 {
+		t.Fatalf("missing stale candidate: %v", err)
+	}
+	if candidates.Cutoff.Location() != time.UTC || candidates.Cutoff.Nanosecond() != 0 {
+		t.Fatal("reported GC cutoff does not match the whole-second cleanup boundary")
+	}
+	if _, err := ResumeSession(database, ResumeOptions{AgentName: original.AgentName, ProjectPath: original.ProjectPath, SessionID: original.ID, SessionKey: original.SessionKey}); err != nil {
+		t.Fatal(err)
+	}
+	if ended, err := database.EndStaleSession(original.ID, original.ProjectPath, candidates.Cutoff); err != nil || ended {
+		t.Fatalf("conditional cleanup ended resumed session: %v", err)
+	}
+	stored, err := database.GetSession(original.ID)
+	if err != nil || !stored.IsActive() {
+		t.Fatalf("resumed session became unusable: %v", err)
 	}
 }

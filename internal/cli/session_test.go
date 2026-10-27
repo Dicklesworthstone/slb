@@ -371,6 +371,114 @@ func TestSessionResume_ReturnsExistingSession(t *testing.T) {
 	if result["session_id"] != existing.ID {
 		t.Errorf("expected session_id=%s, got %v", existing.ID, result["session_id"])
 	}
+	if result["session_key"] != existing.SessionKey || result["program"] != existing.Program || result["model"] != existing.Model {
+		t.Fatal("unchanged metadata did not preserve the authenticated identity")
+	}
+
+	// Omitting metadata must preserve the original program/model, including
+	// with --force; a resume must not erase identity labels or rotate by itself.
+	resetSessionFlags()
+	cmd = newTestSessionCmd(h.DBPath)
+	stdout, err = executeCommandCapture(t, cmd, "session", "resume",
+		"-a", existing.AgentName, "--session-id", existing.ID,
+		"--session-key", existing.SessionKey, "--force", "-C", h.ProjectDir, "-j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result["session_id"] != existing.ID || result["session_key"] != existing.SessionKey ||
+		result["program"] != existing.Program || result["model"] != existing.Model {
+		t.Fatal("omitted metadata changed the authenticated identity")
+	}
+}
+
+func TestSessionResumeIdentityChangeReturnsFreshCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		name, program, model string
+		args                 []string
+	}{
+		{"model change", "original-program", "new-model", []string{"--model", "new-model"}},
+		{"forced program change", "new-program", "original-model", []string{"--program", "new-program", "--force"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := testutil.NewHarness(t)
+			resetSessionFlags()
+			t.Cleanup(resetSessionFlags)
+			existing := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir),
+				testutil.WithAgent("ChangingAgent"), testutil.WithProgram("original-program"), testutil.WithModel("original-model"))
+			args := []string{"session", "resume", "-a", existing.AgentName,
+				"--session-id", existing.ID, "--session-key", existing.SessionKey, "-C", h.ProjectDir, "-j"}
+			stdout, err := executeCommandCapture(t, newTestSessionCmd(h.DBPath), append(args, tc.args...)...)
+			if err != nil {
+				t.Fatalf("resume identity change: %v", err)
+			}
+			var result struct {
+				ID      string `json:"session_id"`
+				Key     string `json:"session_key"`
+				Agent   string `json:"agent_name"`
+				Program string `json:"program"`
+				Model   string `json:"model"`
+				Project string `json:"project_path"`
+			}
+			if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+				t.Fatalf("resume JSON: %v", err)
+			}
+			if result.ID == "" || result.ID == existing.ID || result.Key == "" || result.Key == existing.SessionKey {
+				t.Fatal("identity change did not return fresh credentials")
+			}
+			if result.Program != tc.program || result.Model != tc.model || result.Agent != existing.AgentName || result.Project != existing.ProjectPath {
+				t.Fatal("returned identity lost changed or omitted metadata")
+			}
+			authenticated, err := h.DB.AuthenticateSession(result.ID, result.Key)
+			if err != nil || !authenticated.IsActive() {
+				t.Fatalf("returned credentials are not usable: %v", err)
+			}
+			original, err := h.DB.GetSession(existing.ID)
+			if err != nil || original.EndedAt == nil || original.Program != existing.Program || original.Model != existing.Model {
+				t.Fatalf("rotation rewrote the historical identity: %v", err)
+			}
+			active, err := h.DB.GetActiveSession(existing.AgentName, h.ProjectDir)
+			if err != nil || active.ID != result.ID {
+				t.Fatalf("returned identity is not the active session: %v", err)
+			}
+		})
+	}
+}
+
+func TestSessionResumeIdentityChangeRefusesOutstandingRequests(t *testing.T) {
+	for _, status := range []db.RequestStatus{db.StatusPending, db.StatusApproved, db.StatusEscalated} {
+		t.Run(string(status), func(t *testing.T) {
+			h := testutil.NewHarness(t)
+			resetSessionFlags()
+			t.Cleanup(resetSessionFlags)
+			existing := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir),
+				testutil.WithAgent("BusyAgent"), testutil.WithProgram("original-program"), testutil.WithModel("original-model"))
+			request := testutil.MakeRequest(t, h.DB, existing, testutil.WithStatus(status))
+			stdout, err := executeCommandCapture(t, newTestSessionCmd(h.DBPath), "session", "resume",
+				"-a", existing.AgentName, "--session-id", existing.ID, "--session-key", existing.SessionKey,
+				"--model", "new-model", "--force", "-C", h.ProjectDir, "-j")
+			if !errors.Is(err, db.ErrSessionHasLiveRequests) || stdout != "" {
+				t.Fatalf("live-work refusal returned credentials or wrong error: %v", err)
+			}
+			if !strings.Contains(err.Error(), request.ID) || !strings.Contains(err.Error(), string(status)) {
+				t.Fatalf("refusal did not identify the work to resolve: %v", err)
+			}
+			original, err := h.DB.AuthenticateSession(existing.ID, existing.SessionKey)
+			if err != nil || !original.IsActive() || original.Model != existing.Model || original.Program != existing.Program {
+				t.Fatalf("refusal changed the original session: %v", err)
+			}
+			stored, err := h.DB.GetRequest(request.ID)
+			if err != nil || stored.RequestorSessionID != existing.ID || stored.RequestorModel != existing.Model || stored.Status != status {
+				t.Fatalf("refusal transferred or changed existing work: %v", err)
+			}
+			var sessions int
+			if err := h.DB.QueryRow(`SELECT COUNT(*) FROM sessions`).Scan(&sessions); err != nil || sessions != 1 {
+				t.Fatalf("refusal created a replacement identity: count=%d err=%v", sessions, err)
+			}
+		})
+	}
 }
 
 func TestSessionResumeRejectsKeyRecovery(t *testing.T) {

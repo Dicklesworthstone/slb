@@ -850,7 +850,7 @@ mode they prevent workflow mistakes, not malicious actions by the same OS user:
 
 - **Command binding**: SHA-256 hash computed at request time, verified at execution
 - **Review signatures**: HMAC-SHA256 keyed with the digest of the reviewer's session key. Same-host evidence uses a separate signature format that binds the decision to the exact command and review policy. Relabeling the policy or replacing the command invalidates that evidence. A holder of the signing material, including a process that can read the database, can still forge local reviews; a signature does not establish an independent principal.
-- **Session keys**: Generated per session and shown once, by `slb session start` (or by `slb session resume` when it creates a session). SQLite stores only a SHA-256 digest of each key, and supplied keys are compared with it in constant time, so a copy or backup of `state.db` does not contain a key slb will accept. Upgrading converts existing keys in place and then rebuilds the file, so no old copy of a key is left in it; agents keep using the keys they hold. Hashing protects copies of the database. It does not separate agents that run as the same OS user: such a process can read another agent's key from its environment, files or terminal, write the database, or run commands directly. See [the identity boundary](references/SECURITY.md#reviewer-identity-security-boundary-issue-30).
+- **Session keys**: Generated per session and shown once, by `slb session start` (or by `slb session resume` when it creates or rotates a session). SQLite stores only a SHA-256 digest of each key, and supplied keys are compared with it in constant time, so a copy or backup of `state.db` does not contain a key slb will accept. Upgrading converts existing keys in place and then rebuilds the file, so no old copy of a key is left in it; agents keep using the keys they hold. Hashing protects copies of the database. It does not separate agents that run as the same OS user: such a process can read another agent's key from its environment, files or terminal, write the database, or run commands directly. See [the identity boundary](references/SECURITY.md#reviewer-identity-security-boundary-issue-30).
 - **Session recovery**: Resuming an existing session requires its original `--session-id` and `--session-key`, including with `--force`. Names, programs, and models are not recovery credentials. slb cannot return a lost key, because it does not have it; start a new session instead.
 
 ### Fail-Closed Behavior
@@ -1031,8 +1031,11 @@ slb session start --agent "GreenLake" --program "claude-code" --model "opus"
 # Resume after a crash: present the original session ID and key
 slb session resume --agent "GreenLake" --session-id <id> --session-key <key>
 
-# Force resume (ends a session started by another program; still needs the key)
-slb session resume --agent "GreenLake" --program "codex-cli" --session-id <id> --session-key <key> --force
+# Change model: returns a NEW session ID and key
+slb session resume --agent "GreenLake" --session-id <current-id> --session-key <current-key> --model "codex"
+
+# Change program: also rotates identity; an omitted model keeps its current value
+slb session resume --agent "GreenLake" --session-id <current-id> --session-key <current-key> --program "codex-cli" --force
 
 # Heartbeat (update last_active for GC)
 slb session heartbeat --session-id <id>
@@ -1040,6 +1043,27 @@ slb session heartbeat --session-id <id>
 # End session gracefully
 slb session end --session-id <id>
 ```
+
+Resuming an active session with omitted or unchanged program/model metadata
+keeps its ID and key and refreshes its activity timestamp. Changing its model,
+or making a permitted program change, atomically ends the old session and creates
+a replacement with a fresh ID and key. Omitted metadata keeps its existing value.
+Changing an established program requires `--force`; the original session ID and
+key are still required. **Always use the ID and key returned by resume for
+subsequent work.**
+
+Identity rotation is refused while the session owns a `pending`, `approved`, or
+`escalated` request. Finish that work with the original session, or cancel requests
+that can be cancelled, before changing its program or model. The refused rotation
+leaves the original session unchanged, and requests are never transferred to the
+replacement identity. A command that has already claimed execution can finish
+under its original session.
+
+The old session's identity and signing-key digest remain available for historical
+review verification. Earlier reviews retain their original agent, model,
+signature, and approval policy; the normal expiration and execution checks still
+apply. A new session ID does not give the same agent another quorum vote or
+permission to review its own request.
 
 ### Session Garbage Collection
 
@@ -1055,6 +1079,11 @@ slb session gc --threshold 2h --force
 # Interactive cleanup (prompts for each)
 slb session gc --threshold 1h
 ```
+
+Cleanup rechecks that each candidate is still active and older than the same
+cutoff when it ends the session. A heartbeat or successful resume that makes a
+candidate current causes cleanup to skip it. Ended sessions retain their
+historical identity records and review evidence; cleanup does not delete them.
 
 ### Rate Limit Reset
 
