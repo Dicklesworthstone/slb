@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -116,20 +117,87 @@ func TestNotaryRPC_ClaimAndCompleteOverUnix(t *testing.T) {
 		t.Fatal("wrong receipt accepted")
 	}
 	report.ExecutionReceipt = claimed.ExecutionReceipt
+	claimedRequest, err := database.GetRequest(p.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := database.ReadRequestEvents(ctx, claimedRequest.ProjectPath, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Lose the connection after sending a complete report, without reading
+	// its reply. Reconnecting must recover the committed result, never issue
+	// another claim or rewrite the original completion timestamp.
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.Encode(RPCRequest{Method: "complete_execute", Params: encoded, ID: 19}); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var stored *db.Request
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		stored, err = database.GetRequest(p.RequestID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.Status != db.StatusExecuting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("completion did not commit after reply was lost")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if stored.Status != db.StatusExecuted || stored.ResolvedAt == nil || stored.Execution == nil || stored.Execution.ExitCode == nil || *stored.Execution.ExitCode != 0 {
+		t.Fatalf("completion not durable after reply loss: %+v", stored)
+	}
+	committed, err := database.ReadRequestEvents(ctx, stored.ProjectPath, before.Cursor, 100)
+	if err != nil || len(committed.Events) != 1 || committed.Events[0].State.Status != string(db.StatusExecuted) {
+		t.Fatalf("completion did not publish exactly one durable outcome: %+v %v", committed, err)
+	}
+	conn, err = net.DialTimeout("unix", path, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	encoder, decoder = json.NewEncoder(conn), json.NewDecoder(conn)
 	completed := call("complete_execute", report)
 	if completed.Error != nil {
-		t.Fatalf("complete RPC: %+v", completed.Error)
+		t.Fatalf("completion could not recover its lost reply: %+v", completed.Error)
 	}
 	result, ok := completed.Result.(map[string]any)
-	if !ok || result["recorded"] != true {
-		t.Fatalf("completion not acknowledged: %+v", completed)
+	if !ok || result["recorded"] != true || result["request_id"] != stored.ID ||
+		result["status"] != string(stored.Status) || result["resolved_at"] != stored.ResolvedAt.Format(time.RFC3339) ||
+		result["exit_code"] != float64(0) || result["duration_ms"] != nil ||
+		result["approval_policy"] != string(stored.Execution.ApprovalPolicy) || result["assurance"] != string(stored.Execution.Assurance) {
+		t.Fatalf("completion retry did not return the original receipt: %+v", completed)
 	}
-	stored, err := database.GetRequest(p.RequestID)
-	if err != nil || stored.Status != db.StatusExecuted || stored.Execution.ExitCode == nil || *stored.Execution.ExitCode != 0 {
-		t.Fatalf("completion not durable: %+v %v", stored, err)
+	for _, permitField := range []string{"allowed", "command", "command_spec", "command_hash", "execution_receipt"} {
+		if _, present := result[permitField]; present {
+			t.Fatalf("completion recovery returned an execution permit field: %s", permitField)
+		}
 	}
-	if duplicate := call("complete_execute", report); duplicate.Error == nil {
-		t.Fatal("completion replay accepted")
+	if duplicate := call("complete_execute", report); duplicate.Error != nil || !reflect.DeepEqual(duplicate.Result, result) {
+		t.Fatalf("exact completion retry changed its receipt: %+v", duplicate)
+	}
+	report.Status = db.StatusExecutionFailed
+	if conflicting := call("complete_execute", report); conflicting.Error == nil {
+		t.Fatal("conflicting completion rewrote a terminal outcome")
+	}
+	unchanged, err := database.GetRequest(p.RequestID)
+	if err != nil || !reflect.DeepEqual(stored, unchanged) {
+		t.Fatalf("completion retries changed durable evidence: %+v %v", unchanged, err)
+	}
+	if events, err := database.ReadRequestEvents(ctx, stored.ProjectPath, committed.Cursor, 100); err != nil || len(events.Events) != 0 {
+		t.Fatalf("completion retries appended audit events: %+v %v", events, err)
 	}
 }
 

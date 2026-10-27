@@ -95,7 +95,7 @@ func TestDetailRejectRequiresReasonAndSubmissionCallback(t *testing.T) {
 }
 
 func TestDetailReviewEligibility(t *testing.T) {
-	for _, name := range []string{"active", "escalated", "expired", "ended", "same-agent", "duplicate-agent", "different-model", "busy", "read-only"} {
+	for _, name := range []string{"active", "escalated", "expired", "ended", "same-agent", "duplicate-agent", "different-model", "missing-reviewer-model", "missing-requester-model", "equivalent-model", "optional-unknown-model", "busy", "read-only"} {
 		t.Run(name, func(t *testing.T) {
 			m := submissionDetail()
 			approve, reject := true, true
@@ -120,6 +120,20 @@ func TestDetailReviewEligibility(t *testing.T) {
 				m.Request.RequireDifferentModel = true
 				m.Session.Model = m.Request.RequestorModel
 				approve = false
+			case "missing-reviewer-model":
+				m.Request.RequireDifferentModel = true
+				m.Session.Model = "\t\u00a0 "
+				approve = false
+			case "missing-requester-model":
+				m.Request.RequireDifferentModel = true
+				m.Request.RequestorModel = ""
+				approve = false
+			case "equivalent-model":
+				m.Request.RequireDifferentModel = true
+				m.Session.Model = " MODEL-A "
+				approve = false
+			case "optional-unknown-model":
+				m.Session.Model, m.Request.RequestorModel = "", ""
 			case "busy":
 				m.ReviewPending = true
 				approve, reject = false, false

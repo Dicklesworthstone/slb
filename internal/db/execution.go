@@ -151,40 +151,51 @@ func authenticateExecutionTx(tx *sql.Tx, project, sessionID, supplied string, re
 // write. The unique log path fences stale executors, even when sessions match.
 // A NULL exit code denotes failure before a process produced an exit status.
 func (db *DB) CompleteRequestExecution(id string, status RequestStatus, execution *Execution) error {
-	return db.completeRequestExecution(id, status, execution, nil)
+	_, err := db.completeRequestExecution(id, status, execution, nil)
+	return err
 }
 
 // CompleteRequestExecutionAuthenticated records an RPC outcome for exactly the
 // owned claim. Ended sessions may report an already-started execution, but key
 // rotation revokes that authority. Completion never grants a fresh execution.
-func (db *DB) CompleteRequestExecutionAuthenticated(id string, status RequestStatus, execution *Execution, sessionKey string) error {
+// An identical retry recovers the original committed result after reply loss;
+// it does not rewrite the outcome, its timestamps, or the audit journal.
+func (db *DB) CompleteRequestExecutionAuthenticated(id string, status RequestStatus, execution *Execution, sessionKey string) (*Request, error) {
 	return db.completeRequestExecution(id, status, execution, &sessionKey)
 }
 
-func (db *DB) completeRequestExecution(id string, status RequestStatus, execution *Execution, sessionKey *string) error {
+func (db *DB) completeRequestExecution(id string, status RequestStatus, execution *Execution, sessionKey *string) (*Request, error) {
 	if status != StatusExecuted && status != StatusExecutionFailed && status != StatusTimedOut {
-		return fmt.Errorf("%w: invalid execution outcome %s", ErrInvalidTransition, status)
+		return nil, fmt.Errorf("%w: invalid execution outcome %s", ErrInvalidTransition, status)
 	}
 	if execution == nil || execution.ExecutedBySessionID == "" || execution.LogPath == "" {
-		return fmt.Errorf("execution identity and log path are required")
+		return nil, fmt.Errorf("execution identity and log path are required")
 	}
 	if status == StatusExecuted && (execution.ExitCode == nil || *execution.ExitCode != 0) {
-		return fmt.Errorf("a successful execution requires exit code zero")
+		return nil, fmt.Errorf("a successful execution requires exit code zero")
 	}
 	if execution.DurationMs != nil && *execution.DurationMs < 0 {
-		return fmt.Errorf("execution duration must not be negative")
+		return nil, fmt.Errorf("execution duration must not be negative")
 	}
-	return db.Transaction(func(tx *sql.Tx) error {
+	var completed *Request
+	err := db.Transaction(func(tx *sql.Tx) error {
 		if sessionKey != nil {
-			if _, err := tx.Exec(`UPDATE requests SET id = id WHERE id = ?`, id); err != nil {
-				return fmt.Errorf("locking execution outcome: %w", err)
-			}
+			// Writable DB transactions begin with BEGIN IMMEDIATE. Authenticate
+			// and compare under that reservation without even a no-op UPDATE:
+			// terminal immutability triggers must not fire for a read-only retry.
 			current, err := db.GetRequestTx(tx, id)
 			if err != nil {
 				return err
 			}
 			if err := authenticateExecutionTx(tx, current.ProjectPath, execution.ExecutedBySessionID, *sessionKey, false); err != nil {
 				return err
+			}
+			if current.Status != StatusExecuting {
+				if !matchesCompletedExecution(current, status, execution) {
+					return fmt.Errorf("%w: completion differs from the recorded execution", ErrInvalidTransition)
+				}
+				completed = current
+				return nil
 			}
 		}
 		result, err := tx.Exec(`
@@ -204,6 +215,46 @@ func (db *DB) completeRequestExecution(id string, status RequestStatus, executio
 		if count != 1 {
 			return fmt.Errorf("%w: execution claim is no longer owned by this executor", ErrInvalidTransition)
 		}
+		if sessionKey != nil {
+			// Read the canonical persisted timestamps and claim assurance while
+			// this transaction still owns the outcome. Never reconstruct a
+			// successful receipt from the caller's report or a later read.
+			completed, err = db.GetRequestTx(tx, id)
+			return err
+		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return completed, nil
+}
+
+func matchesCompletedExecution(request *Request, status RequestStatus, report *Execution) bool {
+	stored := request.Execution
+	if request.Status != status || request.ResolvedAt == nil || stored == nil ||
+		stored.ExecutedBySessionID != report.ExecutedBySessionID || stored.LogPath != report.LogPath ||
+		!sameCompletionValue(stored.ExitCode, report.ExitCode) || !sameCompletionValue(stored.DurationMs, report.DurationMs) {
+		return false
+	}
+	// RPC reports carry the claim fence and outcome only. Local callers may
+	// also assert immutable claim metadata; if supplied, it must agree with
+	// the original record and cannot upgrade its evidence classification.
+	if (report.ApprovalPolicy != "" && report.ApprovalPolicy.Normalized() != stored.ApprovalPolicy.Normalized()) ||
+		(report.Assurance != "" && report.Assurance != stored.Assurance) ||
+		(report.ExecutedByAgent != "" && report.ExecutedByAgent != stored.ExecutedByAgent) ||
+		(report.ExecutedByModel != "" && report.ExecutedByModel != stored.ExecutedByModel) {
+		return false
+	}
+	// Claims persist timestamps at whole-second precision. Compare the same
+	// representation when a caller retained its original subsecond timestamp.
+	return report.ExecutedAt == nil || (stored.ExecutedAt != nil &&
+		report.ExecutedAt.UTC().Format(time.RFC3339) == stored.ExecutedAt.UTC().Format(time.RFC3339))
+}
+
+func sameCompletionValue[T comparable](stored, reported *T) bool {
+	if stored == nil || reported == nil {
+		return stored == reported
+	}
+	return *stored == *reported
 }

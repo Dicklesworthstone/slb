@@ -359,6 +359,40 @@ func TestPendingDifferentModelTimeoutDatabaseGuard(t *testing.T) {
 	}
 }
 
+func TestPendingModelTimeoutIgnoresUnknownAndEquivalentModels(t *testing.T) {
+	for _, tc := range []struct {
+		name, requester, reviewer string
+		want                      db.RequestStatus
+	}{
+		{"missing reviewer", "model-a", "", db.StatusEscalated},
+		{"missing requester", "", "model-b", db.StatusEscalated},
+		{"blank reviewer", "model-a", "\t\u00a0 ", db.StatusEscalated},
+		{"equivalent labels", " Model-A ", "model-a", db.StatusEscalated},
+		{"different labels", " Model-A ", "model-b", db.StatusPending},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database, request := pendingFixture(t)
+			pendingSQL(t, database, `UPDATE requests SET risk_tier = 'dangerous', min_approvals = 1,
+				require_different_model = 1, requestor_model = ?, expires_at = ? WHERE id = ?`,
+				tc.requester, time.Now().UTC().Add(time.Hour).Format(time.RFC3339), request.ID)
+			pendingSQL(t, database, `UPDATE sessions SET model = ? WHERE id = ?`, tc.requester, request.RequestorSessionID)
+			pendingConfig(t, request, "[general]\ndifferent_model_timeout = 30\n")
+			reviewer := &db.Session{AgentName: "reviewer", Model: tc.reviewer, ProjectPath: request.ProjectPath}
+			if err := database.CreateSession(reviewer); err != nil {
+				t.Fatal(err)
+			}
+			result, err := AdvancePendingRequest(context.Background(), database, request.ID, PendingOptions{})
+			if err != nil || result.Request.Status != tc.want || result.Changed != (tc.want == db.StatusEscalated) {
+				t.Fatalf("model metadata misrepresented available reviewers: result=%+v err=%v want=%s", result, err, tc.want)
+			}
+			stored, reviews, err := database.GetRequestWithReviews(request.ID)
+			if err != nil || len(reviews) != 0 || stored.ApprovalExpiresAt != nil || !stored.RequireDifferentModel || stored.RequestorModel != tc.requester {
+				t.Fatalf("model timeout changed review requirements or evidence: request=%+v reviews=%+v err=%v", stored, reviews, err)
+			}
+		})
+	}
+}
+
 func TestPendingExpiredDifferentModelRequestEscalates(t *testing.T) {
 	for _, expiredOnly := range []bool{false, true} {
 		t.Run(fmt.Sprintf("expired_only=%t", expiredOnly), func(t *testing.T) {

@@ -540,15 +540,15 @@ func (s *IPCServer) handleCompleteExecute(req RPCRequest) *RPCResponse {
 	// Preserve the committed execution category in the completion receipt.
 	// Configuration may have changed since the claim; completion reports that
 	// historical execution and cannot grant another authorization.
-	request, err := s.verifier.db.GetRequest(params.RequestID)
+	request, err := s.verifier.MarkExecutionComplete(params)
 	if err != nil {
 		return &RPCResponse{Error: &Error{Code: ErrCodeInternal, Message: err.Error()}, ID: req.ID}
 	}
-	if err := s.verifier.MarkExecutionComplete(params); err != nil {
-		return &RPCResponse{Error: &Error{Code: ErrCodeInternal, Message: err.Error()}, ID: req.ID}
-	}
-	result := map[string]any{"recorded": true, "request_id": params.RequestID, "status": params.Status}
+	result := map[string]any{"recorded": true, "request_id": request.ID, "status": request.Status,
+		"resolved_at": request.ResolvedAt.Format(time.RFC3339)}
 	if request.Execution != nil {
+		result["exit_code"] = request.Execution.ExitCode
+		result["duration_ms"] = request.Execution.DurationMs
 		result["approval_policy"] = request.Execution.ApprovalPolicy.Normalized()
 		result["review_notice"] = request.Execution.ApprovalPolicy.Label()
 		result["assurance"] = request.Execution.Assurance

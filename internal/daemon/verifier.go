@@ -205,9 +205,11 @@ func validNotaryReceipt(receipt string) bool {
 // MarkExecutionComplete authenticates against the current key and fences the
 // report with the receipt returned by the committed claim. Ended sessions may
 // finish already-started work; rotated keys and stale receipts are rejected.
-func (v *Verifier) MarkExecutionComplete(p CompleteExecuteParams) error {
+// Exact completion retries return the original durable result without issuing
+// another execution permit or altering any terminal evidence.
+func (v *Verifier) MarkExecutionComplete(p CompleteExecuteParams) (*db.Request, error) {
 	if err := p.validate(); err != nil {
-		return err
+		return nil, err
 	}
 	return v.db.CompleteRequestExecutionAuthenticated(p.RequestID, p.Status, &db.Execution{
 		ExecutedBySessionID: p.SessionID, LogPath: p.ExecutionReceipt,

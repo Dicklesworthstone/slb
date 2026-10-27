@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -220,7 +221,7 @@ func TestAuthenticatedCompletionFencesAndPreservesIdentity(t *testing.T) {
 			n := 7
 			candidate.ExitCode = &n
 		}
-		if err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, &candidate, key); err == nil {
+		if _, err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, &candidate, key); err == nil {
 			t.Errorf("accepted %s", kind)
 		}
 	}
@@ -228,7 +229,7 @@ func TestAuthenticatedCompletionFencesAndPreservesIdentity(t *testing.T) {
 	if _, err := database.Exec(`UPDATE sessions SET ended_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339), session.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, execution, session.SessionKey); err != nil {
+	if _, err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, execution, session.SessionKey); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := database.GetRequest(request.ID)
@@ -238,8 +239,8 @@ func TestAuthenticatedCompletionFencesAndPreservesIdentity(t *testing.T) {
 	if stored.Status != StatusExecuted || stored.Execution.ExecutedByAgent != execution.ExecutedByAgent || stored.Execution.ExecutedAt == nil || !stored.Execution.ExecutedAt.Equal(execution.ExecutedAt.Truncate(time.Second)) || *stored.Execution.DurationMs != duration {
 		t.Fatalf("outcome lost original identity: %+v", stored.Execution)
 	}
-	if err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, execution, session.SessionKey); !errors.Is(err, ErrInvalidTransition) {
-		t.Fatalf("replayed completion: %v", err)
+	if recovered, err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, execution, session.SessionKey); err != nil || !reflect.DeepEqual(stored, recovered) {
+		t.Fatalf("exact completion retry did not recover original identity: %+v %v", recovered, err)
 	}
 }
 
@@ -248,13 +249,14 @@ func TestAuthenticatedCompletionIsAtomic(t *testing.T) {
 	if err := database.ClaimRequestExecutionAuthenticated(request, execution, session.SessionKey); err != nil {
 		t.Fatal(err)
 	}
+	before := journalPage(t, database, request.ProjectPath, "", 100)
 	if _, err := database.Exec(`CREATE TRIGGER deny_outcome BEFORE UPDATE OF execution_exit_code ON requests BEGIN SELECT RAISE(ABORT,'outcome failure'); END`); err != nil {
 		t.Fatal(err)
 	}
 	code := 7
 	execution.ExitCode = &code
-	if err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecutionFailed, execution, session.SessionKey); err == nil {
-		t.Fatal("accepted failed persistence")
+	if completed, err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecutionFailed, execution, session.SessionKey); err == nil || completed != nil {
+		t.Fatalf("acknowledged failed persistence: %+v %v", completed, err)
 	}
 	stored, err := database.GetRequest(request.ID)
 	if err != nil {
@@ -262,5 +264,249 @@ func TestAuthenticatedCompletionIsAtomic(t *testing.T) {
 	}
 	if stored.Status != StatusExecuting || stored.Execution.ExitCode != nil || stored.ResolvedAt != nil {
 		t.Fatal("outcome partially committed")
+	}
+	if after := journalPage(t, database, request.ProjectPath, "", 100); !reflect.DeepEqual(before, after) {
+		t.Fatalf("failed completion published an audit event: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestAuthenticatedCompletionRetryPreservesOutcome(t *testing.T) {
+	for _, status := range []RequestStatus{StatusExecuted, StatusExecutionFailed, StatusTimedOut} {
+		t.Run(string(status), func(t *testing.T) {
+			database, request, execution, session := authenticatedClaimFixture(t)
+			if err := database.ClaimRequestExecutionAuthenticated(request, execution, session.SessionKey); err != nil {
+				t.Fatal(err)
+			}
+			code, duration := 0, int64(1200)
+			if status == StatusExecuted {
+				execution.ExitCode = &code
+			}
+			execution.DurationMs = &duration
+			first, err := database.CompleteRequestExecutionAuthenticated(request.ID, status, execution, session.SessionKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			original, err := database.GetRequest(request.ID)
+			if err != nil || !reflect.DeepEqual(first, original) {
+				t.Fatalf("first completion did not return its persisted outcome: %+v %v", first, err)
+			}
+			before := journalPage(t, database, request.ProjectPath, "", 100)
+			// The first reply can be lost after its transaction committed. An
+			// identical authenticated report recovers that result, never a new
+			// authorization or a second outcome timestamp.
+			if recovered, err := database.CompleteRequestExecutionAuthenticated(request.ID, status, execution, session.SessionKey); err != nil || !reflect.DeepEqual(original, recovered) {
+				t.Fatalf("exact completion retry could not recover a committed result: %+v %v", recovered, err)
+			}
+			if _, err := database.Exec(`CREATE TRIGGER immutable_terminal_request BEFORE UPDATE ON requests
+				WHEN OLD.status IN ('executed', 'execution_failed', 'timed_out')
+				BEGIN SELECT RAISE(ABORT, 'terminal requests cannot be rewritten'); END`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.CompleteRequestExecutionAuthenticated(request.ID, status, execution, session.SessionKey); err != nil {
+				t.Fatalf("retry attempted to rewrite terminal evidence: %v", err)
+			}
+			if execution.ExitCode == nil {
+				// An unavailable child result is not a reported exit code zero.
+				changed := *execution
+				changed.ExitCode = &code
+				if completed, err := database.CompleteRequestExecutionAuthenticated(request.ID, status, &changed, session.SessionKey); err == nil || completed != nil {
+					t.Fatalf("retry replaced an unknown exit with zero: %+v %v", completed, err)
+				}
+			}
+			after, err := database.GetRequest(request.ID)
+			if err != nil || !reflect.DeepEqual(original, after) {
+				t.Fatalf("retry changed the original outcome: before=%+v after=%+v err=%v", original, after, err)
+			}
+			if events := journalPage(t, database, request.ProjectPath, "", 100); !reflect.DeepEqual(before, events) {
+				t.Fatalf("retry appended or changed an audit event: before=%+v after=%+v", before, events)
+			}
+		})
+	}
+}
+
+func TestAuthenticatedCompletionRetryRejectsChangedReport(t *testing.T) {
+	database, request, execution, session := authenticatedClaimFixture(t)
+	if err := database.ClaimRequestExecutionAuthenticated(request, execution, session.SessionKey); err != nil {
+		t.Fatal(err)
+	}
+	code, duration := 7, int64(1200)
+	execution.ExitCode, execution.DurationMs = &code, &duration
+	original, err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecutionFailed, execution, session.SessionKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := &Session{AgentName: "other", ProjectPath: request.ProjectPath, Model: "two", Program: "test"}
+	foreign := &Session{AgentName: "foreign", ProjectPath: t.TempDir(), Model: "three", Program: "test"}
+	for _, candidate := range []*Session{other, foreign} {
+		if err := database.CreateSession(candidate); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := journalPage(t, database, request.ProjectPath, "", 100)
+	for _, kind := range []string{
+		"status", "exit code", "missing exit code", "duration", "missing duration",
+		"claim fence", "other session", "other project", "wrong key", "empty key",
+		"claim timestamp", "agent", "model", "assurance", "approval policy",
+	} {
+		t.Run(kind, func(t *testing.T) {
+			report := *execution
+			status, key := StatusExecutionFailed, session.SessionKey
+			switch kind {
+			case "status":
+				status = StatusTimedOut
+			case "exit code":
+				changed := 0
+				report.ExitCode = &changed
+			case "missing exit code":
+				report.ExitCode = nil
+			case "duration":
+				changed := duration + 1
+				report.DurationMs = &changed
+			case "missing duration":
+				report.DurationMs = nil
+			case "claim fence":
+				report.LogPath += "-different"
+			case "other session":
+				report.ExecutedBySessionID, key = other.ID, other.SessionKey
+			case "other project":
+				report.ExecutedBySessionID, key = foreign.ID, foreign.SessionKey
+			case "wrong key":
+				key = strings.Repeat("00", 32)
+			case "empty key":
+				key = ""
+			case "claim timestamp":
+				changed := execution.ExecutedAt.Add(time.Second)
+				report.ExecutedAt = &changed
+			case "agent":
+				report.ExecutedByAgent += "-different"
+			case "model":
+				report.ExecutedByModel += "-different"
+			case "assurance":
+				report.Assurance = AssuranceIndependent
+			case "approval policy":
+				report.ApprovalPolicy = ApprovalPolicySameHost
+			}
+			if completed, err := database.CompleteRequestExecutionAuthenticated(request.ID, status, &report, key); err == nil || completed != nil {
+				t.Fatalf("changed report was treated as an exact retry: %+v %v", completed, err)
+			}
+		})
+	}
+	// The unauthenticated local API remains a one-shot state transition.
+	if err := database.CompleteRequestExecution(request.ID, StatusExecutionFailed, execution); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("local completion unexpectedly became replayable: %v", err)
+	}
+	stored, err := database.GetRequest(request.ID)
+	if err != nil || !reflect.DeepEqual(original, stored) {
+		t.Fatalf("conflicting report altered the original receipt: %+v %v", stored, err)
+	}
+	if after := journalPage(t, database, request.ProjectPath, "", 100); !reflect.DeepEqual(before, after) {
+		t.Fatalf("conflicting report changed the audit journal: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestAuthenticatedCompletionRetryRechecksKeyAfterWriterWait(t *testing.T) {
+	database, request, execution, session := authenticatedClaimFixture(t)
+	if err := database.ClaimRequestExecutionAuthenticated(request, execution, session.SessionKey); err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	execution.ExitCode = &zero
+	original, err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, execution, session.SessionKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := journalPage(t, database, request.ProjectPath, "", 100)
+	other, err := Open(database.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	started, outcome := make(chan struct{}), make(chan error, 1)
+	err = database.Transaction(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`UPDATE sessions SET session_key_digest=? WHERE id=?`, strings.Repeat("19", 32), session.ID); err != nil {
+			return err
+		}
+		go func() {
+			close(started)
+			completed, err := other.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, execution, session.SessionKey)
+			if completed != nil {
+				outcome <- fmt.Errorf("revoked retry returned a receipt: %+v", completed)
+				return
+			}
+			outcome <- err
+		}()
+		<-started
+		select {
+		case err := <-outcome:
+			return fmt.Errorf("retry completed while writer was reserved: %v", err)
+		case <-time.After(25 * time.Millisecond):
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-outcome:
+		if !errors.Is(err, ErrExecutionAuthentication) {
+			t.Fatalf("stale key recovered completion after lock wait: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("retry did not finish after writer released")
+	}
+	stored, err := database.GetRequest(request.ID)
+	if err != nil || !reflect.DeepEqual(original, stored) {
+		t.Fatalf("revoked retry altered the original receipt: %+v %v", stored, err)
+	}
+	if after := journalPage(t, database, request.ProjectPath, "", 100); !reflect.DeepEqual(before, after) {
+		t.Fatalf("revoked retry changed the audit journal: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestAuthenticatedCompletionConcurrentRetryReturnsOneOutcome(t *testing.T) {
+	database, request, execution, session := authenticatedClaimFixture(t)
+	if err := database.ClaimRequestExecutionAuthenticated(request, execution, session.SessionKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`CREATE TRIGGER immutable_terminal_request BEFORE UPDATE ON requests
+		WHEN OLD.status IN ('executed', 'execution_failed', 'timed_out')
+		BEGIN SELECT RAISE(ABORT, 'terminal requests cannot be rewritten'); END`); err != nil {
+		t.Fatal(err)
+	}
+	before := journalPage(t, database, request.ProjectPath, "", 100)
+	other, err := Open(database.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	zero, duration := 0, int64(23)
+	execution.ExitCode, execution.DurationMs = &zero, &duration
+	type result struct {
+		request *Request
+		err     error
+	}
+	start := make(chan struct{})
+	outcomes := make(chan result, 2)
+	for _, connection := range []*DB{database, other} {
+		go func(connection *DB) {
+			<-start
+			completed, err := connection.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, execution, session.SessionKey)
+			outcomes <- result{completed, err}
+		}(connection)
+	}
+	close(start)
+	for i := 0; i < 2; i++ {
+		outcome := <-outcomes
+		if outcome.err != nil {
+			t.Fatalf("identical concurrent report failed: %v", outcome.err)
+		}
+		stored, err := database.GetRequest(request.ID)
+		if err != nil || !reflect.DeepEqual(stored, outcome.request) {
+			t.Fatalf("concurrent report returned another result: %+v %v", outcome.request, err)
+		}
+	}
+	after := journalPage(t, database, request.ProjectPath, before.Cursor, 100)
+	if len(after.Events) != 1 || after.Events[0].State.Status != string(StatusExecuted) {
+		t.Fatalf("concurrent completions did not publish exactly one outcome: %+v", after.Events)
 	}
 }

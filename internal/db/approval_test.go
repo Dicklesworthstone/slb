@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -128,6 +129,66 @@ func TestExecutionRechecksDifferentModelEvidence(t *testing.T) {
 	}
 	if _, err := database.VerifyRequestApproval(request.ID); !errors.Is(err, ErrInvalidApprovalProof) || !strings.Contains(err.Error(), "different model") {
 		t.Fatalf("accepted same-model-only proof: %v", err)
+	}
+}
+
+func TestSameHostExecutionRechecksKnownModelDiversity(t *testing.T) {
+	for _, tc := range []struct{ name, requester, reviewer string }{
+		{"missing reviewer", "model-a", ""},
+		{"missing requester", "", "model-b"},
+		{"blank reviewer", "model-a", "\t\u00a0 "},
+		{"equivalent labels", " Model-A ", "model-a"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+			request.RequestorModel, request.RequireDifferentModel = tc.requester, true
+			if _, err := database.Exec(`UPDATE requests SET requestor_model = ?, require_different_model = 1 WHERE id = ?`,
+				tc.requester, request.ID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.Exec(`UPDATE sessions SET model = ? WHERE id = ?`, tc.reviewer, sessions[1].ID); err != nil {
+				t.Fatal(err)
+			}
+			// Recreate fully valid signatures an older binary could issue for
+			// missing/equivalent model labels. Refusal must be about diversity,
+			// not a broken signature or an artificially mutated request binding.
+			vote := &Review{RequestID: request.ID, ReviewerSessionID: sessions[1].ID,
+				ReviewerAgent: sessions[1].AgentName, ReviewerModel: tc.reviewer, Decision: DecisionApprove,
+				ApprovalPolicy: ApprovalPolicySameHost, Assurance: AssuranceSameHost, SignatureVersion: 2,
+				CommandHash: request.Command.Hash, RequestBinding: reviewRequestBinding(request),
+				SignatureTimestamp: time.Now().UTC().Truncate(time.Second)}
+			digest, _ := SessionKeyDigest(sessions[1].SessionKey)
+			vote.Signature = signReviewEvidenceWithDigest(digest, vote)
+			if err := database.CreateReview(vote); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.Exec(`UPDATE requests SET status = 'approved', approval_expires_at = ? WHERE id = ?`,
+				time.Now().UTC().Add(time.Hour).Format(time.RFC3339), request.ID); err != nil {
+				t.Fatal(err)
+			}
+			request, err := database.GetRequest(request.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := database.GetReview(vote.ID)
+			if err != nil || !VerifyReviewEvidenceSignature(before, sessions[1].SessionKey) {
+				t.Fatalf("historical fixture signature is invalid: %v", err)
+			}
+			if _, err := database.VerifyRequestApproval(request.ID); !errors.Is(err, ErrInvalidApprovalProof) || !strings.Contains(err.Error(), "different model") {
+				t.Fatalf("historical labels satisfied advisory diversity check: %v", err)
+			}
+			now := time.Now().UTC()
+			execution := &Execution{ExecutedAt: &now, ExecutedBySessionID: sessions[0].ID,
+				ExecutedByAgent: sessions[0].AgentName, ExecutedByModel: sessions[0].Model, LogPath: "diversity-claim.log"}
+			if err := database.ClaimRequestExecution(request, execution); !errors.Is(err, ErrInvalidApprovalProof) || !strings.Contains(err.Error(), "different model") {
+				t.Fatalf("historical labels satisfied atomic execution diversity check: %v", err)
+			}
+			assertNoExecutionClaim(t, database, request.ID)
+			after, err := database.GetReview(vote.ID)
+			if err != nil || !reflect.DeepEqual(before, after) {
+				t.Fatalf("refusal rewrote historical review evidence: %+v %v", after, err)
+			}
+		})
 	}
 }
 

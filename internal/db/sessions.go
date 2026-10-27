@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -403,41 +404,36 @@ func (db *DB) FindStaleProjectSessions(project string, cutoff time.Time) ([]*Ses
 }
 
 // ListActiveSessionsWithDifferentModel returns active sessions in a project
-// that have a different model than the specified one.
+// whose nonblank model labels differ from the specified nonblank label.
 func (db *DB) ListActiveSessionsWithDifferentModel(projectPath, excludeModel string) ([]*Session, error) {
-	rows, err := db.Query(`
-		SELECT `+sessionColumns+`
-		FROM sessions
-		WHERE project_path = ? AND ended_at IS NULL AND model != ?
-		ORDER BY last_active_at DESC
-	`, projectPath, excludeModel)
+	sessions, err := db.ListActiveSessions(projectPath)
 	if err != nil {
 		return nil, fmt.Errorf("querying sessions with different model: %w", err)
 	}
-	defer rows.Close()
-
-	return scanSessions(rows)
+	var different []*Session
+	for _, session := range sessions {
+		if ModelsDiffer(excludeModel, session.Model) {
+			different = append(different, session)
+		}
+	}
+	return different, nil
 }
 
-// HasActiveSessionWithDifferentModel checks if there's any active session
-// in the project with a different model.
+// HasActiveSessionWithDifferentModel checks for an active session in the
+// project with a distinct nonblank model label.
 func (db *DB) HasActiveSessionWithDifferentModel(projectPath, excludeModel string) (bool, error) {
-	var count int
-	err := db.QueryRow(`
-		SELECT COUNT(*) FROM sessions
-		WHERE project_path = ? AND ended_at IS NULL AND model != ?
-	`, projectPath, excludeModel).Scan(&count)
+	sessions, err := db.ListActiveSessionsWithDifferentModel(projectPath, excludeModel)
 	if err != nil {
 		return false, fmt.Errorf("checking different model sessions: %w", err)
 	}
-	return count > 0, nil
+	return len(sessions) > 0, nil
 }
 
 // DifferentModelStatus provides information about available different-model reviewers.
 type DifferentModelStatus struct {
-	// HasDifferentModel indicates if any active session has a different model.
+	// HasDifferentModel indicates whether an active session has a distinct nonblank model label.
 	HasDifferentModel bool `json:"has_different_model"`
-	// AvailableModels lists the distinct models of active sessions.
+	// AvailableModels lists distinct nonblank model labels from active sessions.
 	AvailableModels []string `json:"available_models"`
 	// SameModelSessions lists sessions with the same model as the requestor.
 	SameModelSessions []*Session `json:"-"`
@@ -458,16 +454,19 @@ func (db *DB) GetDifferentModelStatus(projectPath, requestorModel string) (*Diff
 	modelSet := make(map[string]bool)
 
 	for _, s := range sessions {
+		if strings.TrimSpace(s.Model) == "" {
+			continue // Unknown models are neither same-model nor different-model evidence.
+		}
 		if !modelSet[s.Model] {
 			modelSet[s.Model] = true
 			status.AvailableModels = append(status.AvailableModels, s.Model)
 		}
 
-		if s.Model == requestorModel {
-			status.SameModelSessions = append(status.SameModelSessions, s)
-		} else {
+		if ModelsDiffer(requestorModel, s.Model) {
 			status.DifferentModelSessions = append(status.DifferentModelSessions, s)
 			status.HasDifferentModel = true
+		} else if strings.TrimSpace(requestorModel) != "" {
+			status.SameModelSessions = append(status.SameModelSessions, s)
 		}
 	}
 

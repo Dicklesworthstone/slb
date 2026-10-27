@@ -523,7 +523,7 @@ func (m *DetailModel) renderFooter() string {
 
 // Eligibility is only a UI hint. ApplyReview revalidates under a write lock.
 func (m *DetailModel) canApprove() bool {
-	return m.canReject() && (!m.Request.RequireDifferentModel || m.Session.Model != m.Request.RequestorModel)
+	return m.canReject() && (!m.Request.RequireDifferentModel || db.ModelsDiffer(m.Request.RequestorModel, m.Session.Model))
 }
 
 func (m *DetailModel) canReject() bool {

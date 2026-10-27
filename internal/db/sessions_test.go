@@ -563,6 +563,44 @@ func TestDifferentModelSessionQueries(t *testing.T) {
 	}
 }
 
+func TestDifferentModelQueriesRequireKnownDistinctLabels(t *testing.T) {
+	for _, tc := range []struct {
+		name, requester, reviewer string
+		wantDifferent             bool
+	}{
+		{"missing reviewer", "model-a", "", false},
+		{"missing requester", "", "model-b", false},
+		{"blank reviewer", "model-a", "\t\u00a0 ", false},
+		{"equivalent labels", " Model-A ", "model-a", false},
+		{"different labels", " Model-A ", "model-b", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database := setupTestDB(t)
+			defer database.Close()
+			session := &Session{AgentName: "reviewer", Model: tc.reviewer, ProjectPath: "/project"}
+			if err := database.CreateSession(session); err != nil {
+				t.Fatal(err)
+			}
+			list, err := database.ListActiveSessionsWithDifferentModel(session.ProjectPath, tc.requester)
+			if err != nil || (len(list) == 1) != tc.wantDifferent {
+				t.Fatalf("different-model list=%+v err=%v wantDifferent=%v", list, err, tc.wantDifferent)
+			}
+			has, err := database.HasActiveSessionWithDifferentModel(session.ProjectPath, tc.requester)
+			if err != nil || has != tc.wantDifferent {
+				t.Fatalf("different-model availability=%v err=%v want=%v", has, err, tc.wantDifferent)
+			}
+			status, err := database.GetDifferentModelStatus(session.ProjectPath, tc.requester)
+			if err != nil || status.HasDifferentModel != tc.wantDifferent || (len(status.DifferentModelSessions) == 1) != tc.wantDifferent {
+				t.Fatalf("different-model status=%+v err=%v wantDifferent=%v", status, err, tc.wantDifferent)
+			}
+			stored, err := database.GetSession(session.ID)
+			if err != nil || stored.Model != tc.reviewer {
+				t.Fatalf("availability queries changed the model label: %+v %v", stored, err)
+			}
+		})
+	}
+}
+
 func TestIsUniqueConstraintError_Nil(t *testing.T) {
 	if isUniqueConstraintError(nil) {
 		t.Fatalf("expected nil error to be non-unique")

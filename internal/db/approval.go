@@ -163,11 +163,12 @@ func verifyReviewEvidenceTx(tx *sql.Tx, request *Request, now time.Time) (review
 		}
 		seenAgents[agent] = true
 		if decision == string(DecisionApprove) {
-			if request.ApprovalPolicy == ApprovalPolicySameHost && request.RequireDifferentModel && model == request.RequestorModel {
+			differentModel := ModelsDiffer(request.RequestorModel, model)
+			if request.ApprovalPolicy == ApprovalPolicySameHost && request.RequireDifferentModel && !differentModel {
 				return deny("different model approval is required")
 			}
 			proof.approvals++
-			proof.differentModel = proof.differentModel || model != request.RequestorModel
+			proof.differentModel = proof.differentModel || differentModel
 		} else {
 			proof.rejections++
 		}

@@ -48,6 +48,68 @@ func applyFixtureReview(database *DB, request *Request, session *Session, decisi
 	return database.ApplyReview(&Review{RequestID: request.ID, ReviewerSessionID: session.ID, Decision: decision}, session.SessionKey, policy)
 }
 
+func TestSameHostReviewRequiresDistinctKnownModels(t *testing.T) {
+	for _, tc := range []struct {
+		name, requester, reviewer string
+		required, allowed         bool
+	}{
+		{"missing reviewer", "model-a", "", true, false},
+		{"missing requester", "", "model-b", true, false},
+		{"blank reviewer", "model-a", "\t\u00a0 ", true, false},
+		{"blank requester", " \n", "model-b", true, false},
+		{"case and whitespace only", " Model-A ", "model-a", true, false},
+		{"same label", "model-a", "model-a", true, false},
+		{"different labels", " Model-A ", "model-b", true, true},
+		{"optional omitted labels", "", "", false, true},
+	} {
+		for _, delegated := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/delegated=%v", tc.name, delegated), func(t *testing.T) {
+				database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+				request.RequestorModel, request.RequireDifferentModel = tc.requester, tc.required
+				if _, err := database.Exec(`UPDATE requests SET requestor_model = ?, require_different_model = ? WHERE id = ?`,
+					tc.requester, tc.required, request.ID); err != nil {
+					t.Fatal(err)
+				}
+				reviewer := sessions[1]
+				if _, err := database.Exec(`UPDATE sessions SET model = ? WHERE id = ?`, tc.reviewer, reviewer.ID); err != nil {
+					t.Fatal(err)
+				}
+				policy := ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost}
+				if delegated {
+					policy.DelegatedReviewer = &DelegatedReviewerIdentity{SourceProjectPath: t.TempDir(), SourceSessionID: reviewer.ID,
+						AgentName: reviewer.AgentName, Model: tc.reviewer}
+				}
+				outcome, err := applyFixtureReview(database, request, reviewer, DecisionApprove, policy)
+				if tc.allowed {
+					if err != nil || outcome == nil || outcome.Request.Status != StatusApproved {
+						t.Fatalf("eligible review failed: %+v %v", outcome, err)
+					}
+					if outcome.Review.ReviewerModel != tc.reviewer || outcome.Request.RequestorModel != tc.requester {
+						t.Fatal("model comparison rewrote the original signed labels")
+					}
+					if _, err := database.VerifyRequestApproval(request.ID); err != nil {
+						t.Fatalf("eligible evidence failed execution verification: %v", err)
+					}
+					return
+				}
+				if outcome != nil || !errors.Is(err, ErrReviewDifferentModel) {
+					t.Fatalf("unknown or equivalent model labels satisfied diversity: outcome=%+v err=%v", outcome, err)
+				}
+				stored, votes, err := database.GetRequestWithReviews(request.ID)
+				if err != nil || stored.Status != StatusPending || stored.ApprovalExpiresAt != nil || len(votes) != 0 {
+					t.Fatalf("refused review changed evidence: request=%+v votes=%+v err=%v", stored, votes, err)
+				}
+				// Missing or equivalent labels must never prevent a reviewer from
+				// recording a rejection, including through delegated review.
+				outcome, err = applyFixtureReview(database, request, reviewer, DecisionReject, policy)
+				if err != nil || outcome == nil || outcome.Request.Status != StatusRejected || outcome.Rejections != 1 {
+					t.Fatalf("model restriction prevented rejection: %+v %v", outcome, err)
+				}
+			})
+		}
+	}
+}
+
 func TestSameHostReviewRejectsNonstandardDelegationProvenance(t *testing.T) {
 	for _, fixture := range []struct{ name, id, program string }{
 		{"marker without reserved ID", "ordinary-session", "cross-project-review"},
@@ -702,7 +764,7 @@ func TestSameHostReviewIntegrationOptIn(t *testing.T) {
 	code := 0
 	execution.ExitCode = &code
 	execution.ApprovalPolicy, execution.Assurance = ApprovalPolicyIndependent, AssuranceIndependent
-	if err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, execution, sessions[0].SessionKey); err != nil {
+	if _, err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, execution, sessions[0].SessionKey); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := database.GetRequest(request.ID)
@@ -1017,7 +1079,7 @@ func TestSameHostSessionReplacementPreservesReviewEvidence(t *testing.T) {
 	}
 	code, duration := 0, int64(1)
 	execution.ExitCode, execution.DurationMs = &code, &duration
-	if err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, execution, replacement.SessionKey); err != nil {
+	if _, err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, execution, replacement.SessionKey); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := database.GetRequest(request.ID)
@@ -1048,10 +1110,10 @@ func TestSameHostSessionReplacementAllowsOwnedExecutionCompletion(t *testing.T) 
 	execution.ExitCode, execution.DurationMs = &code, &duration
 	otherClaim := *execution
 	otherClaim.ExecutedBySessionID, otherClaim.ExecutedByModel = replacement.ID, replacement.Model
-	if err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, &otherClaim, replacement.SessionKey); !errors.Is(err, ErrInvalidTransition) {
+	if _, err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, &otherClaim, replacement.SessionKey); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("replacement took over an existing execution claim: %v", err)
 	}
-	if err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, execution, sessions[0].SessionKey); err != nil {
+	if _, err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, execution, sessions[0].SessionKey); err != nil {
 		t.Fatalf("original executor could not finish after identity replacement: %v", err)
 	}
 	stored, err := database.GetRequest(request.ID)

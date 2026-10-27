@@ -203,7 +203,11 @@ func (f *sameHostCLI) fails(want string, args ...string) {
 
 func (f *sameHostCLI) session(agent, model string) *db.Session {
 	f.T.Helper()
-	result := f.json("session", "start", "--agent", agent, "--program", "e2e", "--model", model)
+	args := []string{"session", "start", "--agent", agent, "--program", "e2e"}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	result := f.json(args...)
 	id, idOK := result["session_id"].(string)
 	key, keyOK := result["session_key"].(string)
 	if !idOK || !keyOK || id == "" || key == "" {
@@ -248,6 +252,66 @@ func (f *sameHostCLI) assertNotExecuted(request *db.Request) {
 	if err != nil || stored.Execution != nil ||
 		(stored.Status != db.StatusPending && stored.Status != db.StatusApproved && stored.Status != db.StatusRejected) {
 		f.T.Fatalf("refusal changed execution state: %+v, %v", stored, err)
+	}
+}
+
+func TestBuiltCLISameHostDifferentModelLabels(t *testing.T) {
+	binary := buildIdentityBoundaryCLI(t)
+	for _, tc := range []struct{ name, requester, reviewer string }{
+		{"reviewer omitted model", "model-a", ""},
+		{"requester omitted model", "", "model-b"},
+		{"reviewer blank model", "model-a", "\t\u00a0 "},
+		{"case and whitespace only", " Model-A ", "model-a"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSameHostCLI(t, binary, 1, true)
+			requester := f.session("Requester", tc.requester)
+			reviewer := f.session("Reviewer", tc.reviewer)
+			request := f.request(requester)
+			f.fails("different model", "approve", request.ID, "--session-id", reviewer.ID, "--session-key", reviewer.SessionKey)
+			stored, votes, err := f.DB.GetRequestWithReviews(request.ID)
+			if err != nil || stored.Status != db.StatusPending || stored.ApprovalExpiresAt != nil || len(votes) != 0 {
+				t.Fatalf("ineligible labels granted review evidence: request=%+v votes=%+v err=%v", stored, votes, err)
+			}
+			f.fails("not approved", "execute", request.ID, "--session-id", requester.ID)
+			f.assertNotExecuted(request)
+			// The same credentials still permit a negative review. Missing
+			// model metadata must not suppress a reviewer's safety objection.
+			f.json("reject", request.ID, "--session-id", reviewer.ID, "--session-key", reviewer.SessionKey,
+				"--reason", "Cannot establish the required different model label")
+			stored, votes, err = f.DB.GetRequestWithReviews(request.ID)
+			if err != nil || stored.Status != db.StatusRejected || len(votes) != 1 || votes[0].Decision != db.DecisionReject {
+				t.Fatalf("model restriction prevented rejection: request=%+v votes=%+v err=%v", stored, votes, err)
+			}
+			f.assertNotExecuted(request)
+		})
+	}
+	for _, tc := range []struct {
+		name, requester, reviewer string
+		required                  bool
+	}{
+		{"known distinct labels", " Model-A ", " Model-B ", true},
+		{"omitted models when optional", "", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSameHostCLI(t, binary, 1, tc.required)
+			requester := f.session("Requester", tc.requester)
+			reviewer := f.session("Reviewer", tc.reviewer)
+			request := f.request(requester)
+			f.approve(request, reviewer)
+			result := f.json("execute", request.ID, "--session-id", requester.ID)
+			if result["status"] != "executed" || result["assurance"] != "same_host" {
+				t.Fatalf("eligible same-host workflow did not execute: %+v", result)
+			}
+			if _, err := os.Stat(filepath.Join(f.ProjectDir, "reviewed-marker")); err != nil {
+				t.Fatalf("reviewed command did not execute: %v", err)
+			}
+			stored, votes, err := f.DB.GetRequestWithReviews(request.ID)
+			if err != nil || len(votes) != 1 || stored.RequestorModel != tc.requester || votes[0].ReviewerModel != tc.reviewer ||
+				!db.VerifyReviewEvidenceSignature(votes[0], reviewer.SessionKey) {
+				t.Fatalf("comparison changed original signed labels: request=%+v votes=%+v err=%v", stored, votes, err)
+			}
+		})
 	}
 }
 

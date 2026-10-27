@@ -283,7 +283,7 @@ func TestWatchPollingPreservesSameHostEvidenceAfterPolicyChange(t *testing.T) {
 	}
 	exit := 0
 	execution.ExitCode = &exit
-	if err := database.CompleteRequestExecutionAuthenticated(request.ID, db.StatusExecuted, execution, peer.SessionKey); err != nil {
+	if _, err := database.CompleteRequestExecutionAuthenticated(request.ID, db.StatusExecuted, execution, peer.SessionKey); err != nil {
 		t.Fatal(err)
 	}
 	observe("request_executed", db.AssuranceSameHost)

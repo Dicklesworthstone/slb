@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -219,6 +220,13 @@ func TestVerifierSameHostClaimLabelsAndCurrentPolicy(t *testing.T) {
 			stored, err := database.GetRequest(request.ID)
 			if err != nil || stored.Status != db.StatusExecuted || stored.Execution == nil || stored.Execution.Assurance != db.AssuranceSameHost || stored.Execution.ApprovalPolicy != db.ApprovalPolicySameHost || stored.Rollback != nil {
 				t.Fatalf("completed execution lost captured evidence category: %+v %v", stored, err)
+			}
+			if stored.ResolvedAt == nil || receipt["resolved_at"] != stored.ResolvedAt.Format(time.RFC3339) {
+				t.Fatalf("completion did not return its persisted timestamp: %+v", receipt)
+			}
+			recovered := (&IPCServer{verifier: v}).handleCompleteExecute(RPCRequest{Params: completion, ID: 32})
+			if recovered.Error != nil || !reflect.DeepEqual(completed.Result, recovered.Result) {
+				t.Fatalf("completion retry after opt-out reinterpreted historical evidence: %+v", recovered)
 			}
 		})
 	}
@@ -465,7 +473,7 @@ func TestVerifier_CompletionOutcomes(t *testing.T) {
 			if status != db.StatusExecuted {
 				report.ExitCode = nil
 			}
-			if err := v.MarkExecutionComplete(report); err != nil {
+			if _, err := v.MarkExecutionComplete(report); err != nil {
 				t.Fatal(err)
 			}
 			stored, err := database.GetRequest(p.RequestID)
@@ -477,8 +485,10 @@ func TestVerifier_CompletionOutcomes(t *testing.T) {
 				stored.Execution.DurationMs == nil || *stored.Execution.DurationMs != 23 {
 				t.Fatalf("incorrect outcome: %+v", stored)
 			}
-			if err := v.MarkExecutionComplete(report); err == nil {
-				t.Fatal("completion replay accepted")
+			// Recovering a lost completion reply is safe; it returns the same
+			// terminal record and never reissues the execution claim.
+			if recovered, err := v.MarkExecutionComplete(report); err != nil || !reflect.DeepEqual(stored, recovered) {
+				t.Fatalf("completion retry did not recover the original result: %+v %v", recovered, err)
 			}
 			if next, err := v.VerifyAndMarkExecuting(p); err != nil || next.Allowed {
 				t.Fatalf("terminal claim reissued: %+v %v", next, err)
@@ -517,7 +527,7 @@ func TestVerifier_CompletionOwnershipAndValidation(t *testing.T) {
 				duration := int64(-1)
 				report.DurationMs = &duration
 			}
-			if err := v.MarkExecutionComplete(report); err == nil {
+			if _, err := v.MarkExecutionComplete(report); err == nil {
 				t.Fatalf("accepted %s", mode)
 			}
 			stored, err := database.GetRequest(p.RequestID)
@@ -533,7 +543,7 @@ func TestVerifier_EndedSessionCanComplete(t *testing.T) {
 	database, v, p := notaryFixture(t)
 	claim := requireNotaryClaim(t, v, p)
 	notarySQL(t, database, "UPDATE sessions SET ended_at = ? WHERE id = ?", time.Now().UTC().Format(time.RFC3339), p.SessionID)
-	if err := v.MarkExecutionComplete(completionFor(p, claim)); err != nil {
+	if _, err := v.MarkExecutionComplete(completionFor(p, claim)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -558,7 +568,7 @@ func TestVerifier_DatabaseFailuresNeverAuthorize(t *testing.T) {
 				if err == nil || result != nil {
 					t.Fatalf("failed claim granted permission: %+v %v", result, err)
 				}
-			} else if err := v.MarkExecutionComplete(completionFor(p, claim)); err == nil {
+			} else if _, err := v.MarkExecutionComplete(completionFor(p, claim)); err == nil {
 				t.Fatal("failed completion reported success")
 			}
 			stored, err := database.GetRequest(p.RequestID)

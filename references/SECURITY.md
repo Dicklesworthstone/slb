@@ -91,6 +91,13 @@ session and a different agent name, provide its session key, meet quorum,
 provide a different model label when required, and review before expiry.
 `trusted_self_approve` never permits self-review in this mode.
 
+When different-model review is required, both requester and reviewer must supply
+nonblank model labels. Surrounding whitespace and letter case do not make the
+same label different. Submission, reviewer availability and execution-time
+verification use this comparison; the original labels remain in signed evidence.
+Missing historical labels cannot satisfy the requirement, and these labels still
+do not authenticate which model actually performed the review.
+
 Same-host review catches mistakes only. Any process sharing the OS user can
 enable this option, change its claimed agent/model, read signing material,
 write the database, replace SLB or its hook, or execute the command directly.
@@ -136,6 +143,14 @@ are not evidence that an independent person or model approved the action.
   assurance captured in the execution receipt. The standalone Python hook
   reports its generated policy snapshot or the daemon's live policy explicitly;
   neither hook response is execution authorization.
+- An authenticated completion report can be retried after a lost reply. The
+  current session key, owning session, claim receipt and exact terminal outcome
+  must still match, including missing versus zero exit codes and durations. An
+  identical retry returns the original committed result, timestamp, policy and
+  assurance without updating the terminal record or adding another audit event.
+  It returns no permission to execute again. A later configuration change cannot
+  relabel that historical claim; conflicting reports remain errors. This receipt
+  recovery does not reconcile an executor that disappeared before reporting.
 - Hooks installed with `--config` retain the selected absolute filename and its
   owning physical project. The daemon must acknowledge the same selected file;
   the query cannot replace the daemon's policy. Offline native classification

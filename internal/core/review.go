@@ -432,7 +432,7 @@ type DifferentModelEscalationStatus struct {
 	RequestorModel string `json:"requestor_model"`
 	// DifferentModelAvailable indicates if any different-model session is active.
 	DifferentModelAvailable bool `json:"different_model_available"`
-	// AvailableModels lists the models of all active sessions.
+	// AvailableModels lists nonblank model labels from active sessions.
 	AvailableModels []string `json:"available_models"`
 	// SameModelAgents lists agents using the same model as the requestor.
 	SameModelAgents []string `json:"same_model_agents"`
@@ -498,11 +498,11 @@ func (rs *ReviewService) CheckDifferentModelEscalation(requestID string) (*Diffe
 		status.TimeoutExpired = true
 		status.ShouldEscalate = true
 		status.EscalationReason = fmt.Sprintf(
-			"No reviewer with different model available after %v timeout. "+
-				"Request requires different model (requestor: %s), but all %d active sessions use same model.",
+			"No reviewer with a distinct, nonblank model label is available after %v timeout. "+
+				"Requester label: %q; available labels: %q. Supply explicit distinct model labels for different-model review.",
 			rs.config.DifferentModelTimeout,
 			request.RequestorModel,
-			len(modelStatus.SameModelSessions),
+			modelStatus.AvailableModels,
 		)
 	}
 

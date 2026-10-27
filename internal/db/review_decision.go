@@ -210,7 +210,7 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 				return fmt.Errorf("trusted self-approve requires %v delay", policy.TrustedSelfApproveDelay)
 			}
 		}
-		if accepted.Decision == DecisionApprove && request.RequireDifferentModel && model == request.RequestorModel {
+		if accepted.Decision == DecisionApprove && request.RequireDifferentModel && !ModelsDiffer(request.RequestorModel, model) {
 			return ErrReviewDifferentModel
 		}
 		duplicate, err := db.HasReviewerAlreadyReviewedTx(tx, request.ID, accepted.ReviewerSessionID)

@@ -3,6 +3,7 @@ package db
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -34,6 +35,15 @@ type Session struct {
 // IsActive returns true if the session is still active.
 func (s *Session) IsActive() bool {
 	return s.EndedAt == nil
+}
+
+// ModelsDiffer compares nonblank model labels for the review workflow. Labels
+// are unverified coordination metadata, not authenticated model identities.
+// Missing labels cannot establish diversity, and case or surrounding whitespace
+// does not make the same label different. Stored and signed labels stay intact.
+func ModelsDiffer(requester, reviewer string) bool {
+	requester, reviewer = strings.TrimSpace(requester), strings.TrimSpace(reviewer)
+	return requester != "" && reviewer != "" && !strings.EqualFold(requester, reviewer)
 }
 
 // CommandSpec represents the command to be executed.

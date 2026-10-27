@@ -114,19 +114,11 @@ func (db *DB) ResolvePendingRequest(ctx context.Context, id string, decide Pendi
 			now.Sub(request.CreatedAt) < decision.DifferentModelTimeout {
 			return nil, fmt.Errorf("%w: request is not eligible for different-model escalation", ErrInvalidTransition)
 		}
-		var available int
-		if err := tx.QueryRowContext(ctx, `
-			SELECT COUNT(*) FROM sessions s
-			WHERE s.project_path = ? AND s.ended_at IS NULL
-			  AND COALESCE(s.model, '') != ? AND s.agent_name != ?
-			  AND NOT EXISTS (
-				SELECT 1 FROM reviews v
-				WHERE v.request_id = ? AND v.reviewer_agent = s.agent_name
-			  )
-		`, request.ProjectPath, request.RequestorModel, request.RequestorAgent, request.ID).Scan(&available); err != nil {
+		available, err := hasDifferentModelReviewerTx(ctx, tx, request)
+		if err != nil {
 			return nil, fmt.Errorf("checking different-model reviewer availability: %w", err)
 		}
-		if available > 0 {
+		if available {
 			return result, nil
 		}
 	default:
@@ -152,4 +144,29 @@ func (db *DB) ResolvePendingRequest(ctx context.Context, id string, decide Pendi
 	request.ApprovalExpiresAt = approvalExpiresAt
 	result.Changed = true
 	return result, nil
+}
+
+func hasDifferentModelReviewerTx(ctx context.Context, tx *sql.Tx, request *Request) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT COALESCE(s.model, '') FROM sessions s
+		WHERE s.project_path = ? AND s.ended_at IS NULL AND s.agent_name != ?
+		  AND NOT EXISTS (
+			SELECT 1 FROM reviews v
+			WHERE v.request_id = ? AND v.reviewer_agent = s.agent_name
+		  )
+	`, request.ProjectPath, request.RequestorAgent, request.ID)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var model string
+		if err := rows.Scan(&model); err != nil {
+			return false, err
+		}
+		if ModelsDiffer(request.RequestorModel, model) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
