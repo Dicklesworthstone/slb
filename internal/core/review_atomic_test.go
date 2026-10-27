@@ -3,7 +3,10 @@ package core
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -368,4 +371,162 @@ func TestSameHostDelegatedApprovalStillExpires(t *testing.T) {
 	}
 	assertPolicyUnclaimed(t, database, request.ID)
 	assertDelegatedSourceUnchanged(t, database, foreign)
+}
+
+func TestSameHostDelegatedReviewSupportsMultipleTargetsInSharedDatabase(t *testing.T) {
+	database, first, firstAuthor, foreign, service := sameHostDelegatedReviewFixture(t, 1)
+	secondProject := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(secondProject, ".slb"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := os.ReadFile(filepath.Join(first.ProjectPath, ".slb", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeExecutionPolicy(t, secondProject, string(policy))
+	secondAuthor := &db.Session{AgentName: "second-project-author", Model: firstAuthor.Model, ProjectPath: secondProject}
+	if err := database.CreateSession(secondAuthor); err != nil {
+		t.Fatal(err)
+	}
+	second := *first
+	second.ID, second.ProjectPath = "", secondProject
+	second.RequestorSessionID, second.RequestorAgent, second.RequestorModel = secondAuthor.ID, secondAuthor.AgentName, secondAuthor.Model
+	second.Command.Cwd, second.Command.Hash = secondProject, ""
+	if err := database.CreateRequest(&second); err != nil {
+		t.Fatal(err)
+	}
+	provenanceIDs := make(map[string]bool)
+	for _, request := range []*db.Request{first, &second} {
+		result, err := service.SubmitCrossProjectReview(database, foreign.ProjectPath, ReviewOptions{
+			RequestID: request.ID, SessionID: foreign.ID, SessionKey: foreign.SessionKey, Decision: db.DecisionApprove,
+		})
+		if err != nil || result == nil || result.NewRequestStatus != db.StatusApproved || result.Review.Assurance != db.AssuranceSameHost {
+			t.Fatalf("authorized target %s could not receive delegated review: %+v %v", request.ProjectPath, result, err)
+		}
+		provenance, err := database.GetSession(result.Review.ReviewerSessionID)
+		if err != nil || provenance.IsActive() || provenance.ProjectPath != request.ProjectPath || provenanceIDs[provenance.ID] {
+			t.Fatalf("targets did not receive distinct ended provenance: %+v %v", provenance, err)
+		}
+		provenanceIDs[provenance.ID] = true
+	}
+	// Reviewing the second target must leave the first target's signed proof
+	// usable. Both execute under their own freshly loaded target policy.
+	for i, request := range []*db.Request{first, &second} {
+		approved, err := database.VerifyRequestApproval(request.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		author := []*db.Session{firstAuthor, secondAuthor}[i]
+		execution := policyExecutionIdentity(author)
+		if err := database.ClaimRequestExecutionAuthenticated(approved, execution, author.SessionKey, ExecutionPolicyGuard("")); err != nil {
+			t.Fatalf("target could not claim its own reviewed execution: %v", err)
+		}
+		if execution.Assurance != db.AssuranceSameHost {
+			t.Fatalf("delegation changed execution assurance: %s", execution.Assurance)
+		}
+	}
+	assertDelegatedSourceUnchanged(t, database, foreign)
+}
+
+func TestSameHostDelegatedReviewPreservesSnapshotsAcrossSourceChanges(t *testing.T) {
+	for _, change := range []string{"model", "credential"} {
+		t.Run(change, func(t *testing.T) {
+			database, first, author, foreign, service := sameHostDelegatedReviewFixture(t, 2)
+			oldSourceID, oldKey := foreign.ID, foreign.SessionKey
+			review := ReviewOptions{RequestID: first.ID, SessionID: foreign.ID, SessionKey: oldKey, Decision: db.DecisionApprove}
+			result, err := service.SubmitCrossProjectReview(database, foreign.ProjectPath, review)
+			if err != nil || result.RequestStatusChanged {
+				t.Fatalf("initial vote did not remain below quorum: %+v %v", result, err)
+			}
+			oldReview, err := database.GetReview(result.Review.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldProvenance, err := database.GetSession(oldReview.ReviewerSessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if change == "model" {
+				foreign, err = ResumeSession(database, ResumeOptions{
+					SessionID: foreign.ID, SessionKey: oldKey, AgentName: foreign.AgentName,
+					ProjectPath: foreign.ProjectPath, Model: "resumed-model",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if foreign.ID == oldSourceID || foreign.SessionKey == oldKey {
+					t.Fatal("model change did not return a replacement source identity and credential")
+				}
+				oldSource, err := database.GetSession(oldSourceID)
+				if err != nil || oldSource.IsActive() || oldSource.Model != oldProvenance.Model {
+					t.Fatalf("model replacement changed or retained the active historical source: %+v %v", oldSource, err)
+				}
+				if _, err := service.SubmitCrossProjectReview(database, foreign.ProjectPath, review); !errors.Is(err, ErrSessionInactive) {
+					t.Fatalf("ended source identity admitted a fresh delegated review: %v", err)
+				}
+			} else {
+				// There is no CLI key-rotation command. Model a credential
+				// replacement at the authoritative source, then authenticate it
+				// through the same public cross-project submission path.
+				foreign.SessionKey = strings.Repeat("ab", 32)
+				digest, ok := db.SessionKeyDigest(foreign.SessionKey)
+				if !ok {
+					t.Fatal("invalid replacement test credential")
+				}
+				if _, err := database.Exec(`UPDATE sessions SET session_key_digest = ? WHERE id = ?`, digest, foreign.ID); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := service.SubmitCrossProjectReview(database, foreign.ProjectPath, review); !errors.Is(err, ErrSessionKeyMismatch) {
+					t.Fatalf("replaced source credential still admitted a fresh review: %v", err)
+				}
+			}
+			review.SessionID, review.SessionKey = foreign.ID, foreign.SessionKey
+			if _, err := service.SubmitCrossProjectReview(database, foreign.ProjectPath, review); !errors.Is(err, ErrAlreadyReviewed) {
+				t.Fatalf("a new provenance snapshot gained a second vote from one agent: %v", err)
+			}
+			if approvals, rejections, err := database.CountReviewsByDecision(first.ID); err != nil || approvals != 1 || rejections != 0 {
+				t.Fatalf("source change altered quorum: %d/%d %v", approvals, rejections, err)
+			}
+			second := *first
+			second.ID, second.MinApprovals = "", 1
+			if err := database.CreateRequest(&second); err != nil {
+				t.Fatal(err)
+			}
+			review.RequestID = second.ID
+			result, err = service.SubmitCrossProjectReview(database, foreign.ProjectPath, review)
+			if err != nil || result == nil || result.NewRequestStatus != db.StatusApproved ||
+				result.Review.ReviewerSessionID == oldProvenance.ID || result.Review.ReviewerModel != foreign.Model {
+				t.Fatalf("current source identity could not create a fresh snapshot: %+v %v", result, err)
+			}
+
+			// Existing delegation already treats completed votes as immutable
+			// snapshots. Model/key changes must neither rewrite their identity
+			// nor retroactively revoke their signatures through row reuse.
+			storedReview, err := database.GetReview(oldReview.ID)
+			if err != nil || !reflect.DeepEqual(storedReview, oldReview) {
+				t.Fatalf("source change rewrote the old signed vote: %+v %v", storedReview, err)
+			}
+			storedProvenance, err := database.GetSession(oldProvenance.ID)
+			if err != nil || !reflect.DeepEqual(storedProvenance, oldProvenance) {
+				t.Fatalf("source change rewrote old provenance: %+v %v", storedProvenance, err)
+			}
+			peer := &db.Session{AgentName: "additional-local-reviewer", Model: "third-model", ProjectPath: first.ProjectPath}
+			if err := database.CreateSession(peer); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.SubmitReview(ReviewOptions{RequestID: first.ID, SessionID: peer.ID, SessionKey: peer.SessionKey, Decision: db.DecisionApprove}); err != nil {
+				t.Fatalf("unchanged old vote could not contribute to valid quorum: %v", err)
+			}
+			for _, request := range []*db.Request{first, &second} {
+				approved, err := database.VerifyRequestApproval(request.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := database.ClaimRequestExecutionAuthenticated(approved, policyExecutionIdentity(author), author.SessionKey, ExecutionPolicyGuard("")); err != nil {
+					t.Fatalf("valid snapshot could not claim execution: %v", err)
+				}
+			}
+			assertDelegatedSourceUnchanged(t, database, foreign)
+		})
+	}
 }

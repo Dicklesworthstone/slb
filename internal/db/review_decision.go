@@ -299,13 +299,24 @@ func (db *DB) ensureDelegatedReviewerTx(tx *sql.Tx, targetProject, sessionKey st
 		identity.AgentName == "" || targetProject == "" || identity.SourceProjectPath == targetProject {
 		return "", "", "", "", ErrReviewDelegationMismatch
 	}
-	sum := sha256.Sum256([]byte(identity.SourceProjectPath + "\x00" + identity.SourceSessionID))
-	id = "xpr-" + hex.EncodeToString(sum[:16])
 	delegationKey := deriveDelegatedReviewKey(sessionKey, targetProject, identity.SourceProjectPath, identity.SourceSessionID)
 	delegationDigest, ok := SessionKeyDigest(delegationKey)
 	if !ok {
 		return "", "", "", "", ErrReviewDelegationMismatch
 	}
+	// Provenance is an immutable snapshot, not the live source session. Scope
+	// its ID to both projects and every identity/signing field so one source
+	// can review multiple targets in a shared DB or resume with a new model
+	// or credential. Never rewrite older rows: their IDs and fields support
+	// already-signed reviews. This preserves the existing snapshot lifetime;
+	// changing the source does not revoke its completed delegated reviews.
+	binding := []byte("slb-cross-project-review-session-v2\x00")
+	for _, field := range []string{targetProject, identity.SourceProjectPath, identity.SourceSessionID,
+		identity.AgentName, identity.Model, delegationDigest} {
+		binding = fmt.Appendf(binding, "%d:%s", len(field), field)
+	}
+	sum := sha256.Sum256(binding)
+	id = "xpr-" + hex.EncodeToString(sum[:16])
 	timestamp := now.UTC().Format(time.RFC3339Nano)
 	_, err = tx.Exec(`
 		INSERT OR IGNORE INTO sessions (

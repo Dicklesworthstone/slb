@@ -1,6 +1,7 @@
 package db
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -68,6 +69,83 @@ func TestSameHostReviewRejectsNonstandardDelegationProvenance(t *testing.T) {
 				t.Fatalf("failed provenance validation persisted a vote: %d/%d %v", approvals, rejections, err)
 			}
 		})
+	}
+}
+
+func TestSameHostDelegatedLegacyProvenanceRemainsValid(t *testing.T) {
+	database, original, _ := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+	identity := &DelegatedReviewerIdentity{SourceProjectPath: t.TempDir(), SourceSessionID: "legacy-source",
+		AgentName: "legacy-reviewer", Model: "legacy-model"}
+	sourceKey := strings.Repeat("bc", 32)
+	// Recreate the historical source-only ID and its signed vote. New
+	// delegations must not rename or update this row to accommodate a target
+	// or source identity change: the review signature binds its original ID.
+	sum := sha256.Sum256([]byte(identity.SourceProjectPath + "\x00" + identity.SourceSessionID))
+	legacy := &Session{ID: fmt.Sprintf("xpr-%x", sum[:16]), AgentName: identity.AgentName, Model: identity.Model,
+		Program: "cross-project-review", ProjectPath: original.ProjectPath,
+		SessionKey: deriveDelegatedReviewKey(sourceKey, original.ProjectPath, identity.SourceProjectPath, identity.SourceSessionID)}
+	if err := database.CreateSession(legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.EndSession(legacy.ID); err != nil {
+		t.Fatal(err)
+	}
+	digest, ok := SessionKeyDigest(legacy.SessionKey)
+	if !ok {
+		t.Fatal("invalid historical delegation credential")
+	}
+	oldVote := &Review{RequestID: original.ID, ReviewerSessionID: legacy.ID, ReviewerAgent: identity.AgentName,
+		ReviewerModel: identity.Model, Decision: DecisionApprove, ApprovalPolicy: ApprovalPolicySameHost, Assurance: AssuranceSameHost,
+		CommandHash: original.Command.Hash, RequestBinding: reviewRequestBinding(original), SignatureVersion: 2,
+		SignatureTimestamp: time.Now().UTC().Truncate(time.Second)}
+	oldVote.Signature = signReviewEvidenceWithDigest(digest, oldVote)
+	if err := database.CreateReview(oldVote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`UPDATE requests SET status = 'approved', approval_expires_at = ? WHERE id = ?`,
+		time.Now().UTC().Add(time.Hour).Format(time.RFC3339), original.ID); err != nil {
+		t.Fatal(err)
+	}
+	oldProof, err := database.VerifyRequestApproval(original.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldVote, err = database.GetReview(oldVote.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSession, err := database.GetSession(legacy.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := *original
+	current.ID = ""
+	if err := database.CreateRequest(&current); err != nil {
+		t.Fatal(err)
+	}
+	result, err := database.ApplyReview(&Review{RequestID: current.ID, ReviewerSessionID: identity.SourceSessionID, Decision: DecisionApprove},
+		sourceKey, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost, DelegatedReviewer: identity})
+	if err != nil || result == nil || result.Request.Status != StatusApproved || result.Review.ReviewerSessionID == legacy.ID {
+		t.Fatalf("fresh delegation reused or invalidated a historical provenance ID: %+v %v", result, err)
+	}
+	if _, err := database.VerifyRequestApproval(current.ID); err != nil {
+		t.Fatal(err)
+	}
+	stillValid, err := database.VerifyRequestApproval(original.ID)
+	if err != nil || !stillValid.ApprovalExpiresAt.Equal(*oldProof.ApprovalExpiresAt) {
+		t.Fatalf("new provenance changed historical authorization or expiration: %+v %v", stillValid, err)
+	}
+	storedVote, err := database.GetReview(oldVote.ID)
+	if err != nil || !reflect.DeepEqual(storedVote, oldVote) {
+		t.Fatalf("historical signed vote was modified: %+v %v", storedVote, err)
+	}
+	storedSession, err := database.GetSession(legacy.ID)
+	if err != nil || !reflect.DeepEqual(storedSession, oldSession) {
+		t.Fatalf("historical provenance was modified: %+v %v", storedSession, err)
+	}
+	var active int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM sessions WHERE agent_name = ? AND ended_at IS NULL`, identity.AgentName).Scan(&active); err != nil || active != 0 {
+		t.Fatalf("provenance became active reviewer capacity: %d %v", active, err)
 	}
 }
 
