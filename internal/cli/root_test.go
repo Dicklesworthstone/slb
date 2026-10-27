@@ -341,6 +341,44 @@ func TestGetDB(t *testing.T) {
 	})
 }
 
+func TestEnterProjectDir_RelativeFlagResolvesOnce(t *testing.T) {
+	origDB := flagDB
+	origProject := flagProject
+	defer func() {
+		flagDB = origDB
+		flagProject = origProject
+	}()
+
+	parent := t.TempDir()
+	project := filepath.Join(parent, "sub")
+	if err := os.Mkdir(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(parent)
+	flagDB = ""
+	flagProject = "sub"
+
+	if err := enterProjectDir(); err != nil {
+		t.Fatalf("enterProjectDir: %v", err)
+	}
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	physicalProject, _ := filepath.EvalSymlinks(project)
+	physicalWd, _ := filepath.EvalSymlinks(wd)
+	if physicalWd != physicalProject {
+		t.Fatalf("cwd = %s, want %s", wd, project)
+	}
+	if got, err := projectPath(); err != nil || got != project {
+		t.Fatalf("projectPath() = %q, %v; want %q", got, err, project)
+	}
+	if got, want := GetDB(), filepath.Join(project, ".slb", "state.db"); got != want {
+		t.Fatalf("GetDB() = %s, want %s", got, want)
+	}
+}
+
 func TestGetActor(t *testing.T) {
 	// Save original values
 	origActor := flagActor

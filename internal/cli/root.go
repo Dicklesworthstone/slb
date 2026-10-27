@@ -62,13 +62,7 @@ Commands are classified by risk level:
 	// their OWN command after printing, so cobra does not reprint — no double
 	// message. SilenceUsage stays true so a failure is one line, not a usage dump.
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		if flagProject == "" {
-			return nil
-		}
-		if err := os.Chdir(flagProject); err != nil {
-			return fmt.Errorf("changing directory to %s: %w", flagProject, err)
-		}
-		return nil
+		return enterProjectDir()
 	},
 	Run: func(cmd *cobra.Command, args []string) {
 		// When no subcommand given, show quick reference card
@@ -157,6 +151,25 @@ func GetOutput() string {
 // GetStats returns whether to show token savings statistics.
 func GetStats() bool {
 	return flagStats
+}
+
+// enterProjectDir changes into -C/--project and keeps the flag absolute.
+// projectPath and GetDB read flagProject after the change, so a relative
+// value would resolve a second time from inside the project: -C sub opened
+// sub/sub/.slb/state.db and recorded "sub" as the session's project.
+func enterProjectDir() error {
+	if flagProject == "" {
+		return nil
+	}
+	abs, err := filepath.Abs(flagProject)
+	if err != nil {
+		return fmt.Errorf("resolving project directory %s: %w", flagProject, err)
+	}
+	if err := os.Chdir(abs); err != nil {
+		return fmt.Errorf("changing directory to %s: %w", flagProject, err)
+	}
+	flagProject = abs
+	return nil
 }
 
 // GetDB returns the database path.
