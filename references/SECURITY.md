@@ -140,6 +140,23 @@ are not evidence that an independent person or model approved the action.
 These checks prevent accidental evidence reuse through normal SLB operations.
 They do not make mutable local storage tamper-proof against the same OS user.
 
+### Project scope and delegated review
+
+Ordinary approvals and rejections require the reviewer's recorded project path
+to match the request's, even when projects share a database through `--db`.
+Cross-project review uses the explicit `--target-project` delegation workflow;
+the target opts in with `general.cross_project_reviews` and restricts reviewer
+agent names with `general.review_pool`. Delegation records ended, target-scoped
+reviewer provenance rather than creating another active local reviewer session.
+
+The target's current opt-in and reviewer pool are checked when committing a
+delegated approval and again before execution. Disabling cross-project review
+or removing a reviewer from the pool blocks outstanding delegated approvals
+under the current policy. Restoring permission can allow still-valid, unexpired
+evidence again; it never raises that evidence's assurance. Changing a provenance
+record's program label or making its reserved delegation session active cannot
+turn delegated evidence into local approval.
+
 ## Table of Contents
 - [Reviewer Identity Security Boundary](#reviewer-identity-security-boundary-issue-30)
 - [Optional Same-Host Peer Review](#optional-same-host-peer-review-issue-31)
@@ -194,6 +211,15 @@ For execution of a reviewed request, these checks must pass:
 - **Approval expired** → Submit a new request for review
 - **Hash mismatch** → Reject execution
 - **Policy or assurance mismatch** → Reject review/execution; submit a new request under the intended policy
+
+The installed native Claude guard loads current project policy and uses the
+shell normalizer when the daemon is unavailable. The standalone generated Python
+guard instead contains a policy snapshot. It only automatically allows SAFE
+matches for literal simple commands: a safe prefix cannot cover shell operators,
+expansion, redirection, quoting, or an execution wrapper's hidden payload. Known
+risks retain their policy checks; forms the snapshot cannot classify require an
+explicit decision. Confirmation is not a reviewed approval. Use the native guard
+for full shell analysis and the reviewed execution handoff.
 
 ---
 

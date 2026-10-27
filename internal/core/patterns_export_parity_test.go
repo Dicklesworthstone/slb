@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -134,6 +135,93 @@ for line in sys.stdin.read().split("\n"):
 	}
 	if len(got) != len(commands) {
 		t.Errorf("python classified %d commands, want %d", len(got), len(commands))
+	}
+}
+
+func TestExportClaudeHook_SafeRulesCannotAuthorizeShellEvaluation(t *testing.T) {
+	python := findPython3(t)
+	engine := NewPatternEngine()
+	if err := engine.AddPattern(RiskTier(RiskSafe), `^`, "broad custom allowlist", "test"); err != nil {
+		t.Fatal(err)
+	}
+	commands := []struct {
+		command string
+		safe    bool
+	}{
+		{"git stash", true},
+		{"echo literal-argument", true},
+		{"/opt/bin/local-command --flag=value", true},
+		{"npm cache clean; rm -rf /srv", false},
+		{"git stash\nrm -rf /srv", false},
+		{"rm ${TARGET}.log", false},
+		{"echo $(rm -rf /srv)", false},
+		{"echo `rm -rf /srv`", false},
+		{"echo > important.txt", false},
+		{"echo 'unterminated", false},
+		{"env -i rm -rf /srv", false},
+		{"/usr/bin/env rm -rf /srv", false},
+		{"PROFILE=production rm -rf /srv", false},
+		{"exec rm -rf /srv", false},
+		{"timeout 5 rm -rf /srv", false},
+		{"bash -c reboot", false},
+		{"/bin/sh -s", false},
+		{"python3.13 -", false},
+		{"node -", false},
+		{"eval rm -rf /srv", false},
+		{"source cleanup.sh", false},
+		{". cleanup.sh", false},
+		{"alias cleanup=rm", false},
+		{"hash -p /bin/rm cleanup", false},
+		{"xargs kubectl delete pod", false},
+		{"stdbuf -oL xargs rm -rf /srv", false},
+	}
+	inputs := make([]string, len(commands))
+	for i, tc := range commands {
+		inputs[i] = tc.command
+	}
+	input, err := json.Marshal(inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	program := engine.ExportClaudeHook() + `
+import json, sys
+print(json.dumps([{'tier': classify(command)[0], 'needs_approval': needs_approval(command),
+                   'blocked': is_blocked(command)[0]} for command in json.load(sys.stdin)]))
+`
+	cmd := exec.Command(python, "-c", program)
+	cmd.Stdin = strings.NewReader(string(input))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("exported classifier failed: %v\n%s", err, out)
+	}
+	var results []struct {
+		Tier          string `json:"tier"`
+		NeedsApproval bool   `json:"needs_approval"`
+		Blocked       bool   `json:"blocked"`
+	}
+	if err := json.Unmarshal(out, &results); err != nil || len(results) != len(commands) {
+		t.Fatalf("invalid classification results: %s, %v", out, err)
+	}
+	for i, tc := range commands {
+		got := results[i]
+		if (got.Tier == "safe") != tc.safe || got.NeedsApproval == tc.safe || got.Blocked == tc.safe {
+			t.Errorf("%q: %+v, want safe=%v with consistent approval helpers", tc.command, got, tc.safe)
+		}
+	}
+}
+
+func TestExportClaudeHook_UnknownNeedsExplicitDecision(t *testing.T) {
+	python := findPython3(t)
+	program := NewPatternEngine().ExportClaudeHook() + `
+command = 'unrecognized-tool argument'
+print(classify(command)[0], needs_approval(command), is_blocked(command)[0])
+`
+	out, err := exec.Command(python, "-c", program).CombinedOutput()
+	if err != nil {
+		t.Fatalf("exported classifier failed: %v\n%s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "unknown True True" {
+		t.Fatalf("unrecognized command silently authorized: %q", got)
 	}
 }
 

@@ -851,6 +851,74 @@ func runGeneratedHookPython(t *testing.T, scriptPath, expr string, args ...strin
 	return strings.TrimSpace(stdout.String())
 }
 
+func TestGeneratedHookOfflineSafePrefixCannotHideExecution(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 is required to exercise the generated hook")
+	}
+	project := t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".slb"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(daemon.SocketPathForCWD(project)); !os.IsNotExist(err) {
+		t.Fatalf("offline fixture unexpectedly has a daemon socket: %v", err)
+	}
+	home := t.TempDir()
+	scriptPath := filepath.Join(t.TempDir(), "slb_guard.py")
+	if err := os.WriteFile(scriptPath, []byte(generateHookScript(core.NewPatternEngine())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(project, "must-not-execute")
+	for _, tc := range []struct {
+		name    string
+		command string
+		allow   bool
+	}{
+		{"simple stash", "git stash", true},
+		{"simple npm", "npm cache clean --force", true},
+		{"simple pod", "kubectl delete pod fixture", true},
+		{"simple logs", "rm -f first.log second.log", true},
+		{"semicolon", "npm cache clean; touch " + marker, false},
+		{"critical tail", "kubectl delete pod fixture; rm -rf /srv", false},
+		{"conditional", "npm cache clean && touch " + marker, false},
+		{"newline", "npm cache clean\ntouch " + marker, false},
+		{"pipe", "npm cache clean | touch " + marker, false},
+		{"substitution", "kubectl delete pod $(touch " + marker + ")", false},
+		{"backticks", "kubectl delete pod `touch " + marker + "`", false},
+		{"redirection", "npm cache clean > " + marker, false},
+		{"process substitution", "kubectl delete pod <(touch " + marker + ")", false},
+		{"variable expansion", "rm ${TARGET}.log", false},
+		{"glob expansion", "rm *.log", false},
+		{"malformed quote", "npm cache clean '", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input, err := json.Marshal(map[string]any{
+				"tool_name": "Bash", "cwd": project,
+				"tool_input": map[string]any{"command": tc.command},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command(python, scriptPath)
+			command.Dir = project
+			command.Env = append(os.Environ(), "HOME="+home, "USERPROFILE="+home, "SLB_SESSION_ID=")
+			command.Stdin = bytes.NewReader(input)
+			var stdout, stderr bytes.Buffer
+			command.Stdout, command.Stderr = &stdout, &stderr
+			if err := command.Run(); err != nil {
+				t.Fatalf("generated hook failed: %v\n%s", err, stderr.String())
+			}
+			permission := hookPermission(t, stdout.String())
+			if (permission == "allow") != tc.allow {
+				t.Errorf("offline hook permission for %q = %q, want allow=%v: %s", tc.command, permission, tc.allow, stdout.String())
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("hook executed command text while classifying: %v", err)
+			}
+		})
+	}
+}
+
 // The generated script must walk up from CWD looking for .slb/
 // when computing the daemon socket path (#3). Anchored hashing of
 // the immediate CWD diverges from the daemon's hash whenever the

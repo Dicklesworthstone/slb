@@ -494,7 +494,8 @@ func (e *PatternEngine) ExportJSON() (string, error) {
 	return string(data), err
 }
 
-// ExportClaudeHook retains offline regex classification. The daemon remains
+// ExportClaudeHook retains conservative offline regex classification. Only
+// literal simple commands can use its safe rules; the native classifier remains
 // authoritative for normalization, project policy and single-use approvals.
 func (e *PatternEngine) ExportClaudeHook() string {
 	e.mu.RLock()
@@ -532,10 +533,53 @@ func (e *PatternEngine) ExportClaudeHook() string {
 		sb.WriteString(fmt.Sprintf("    '%s': %d,\n", tier.name, e.requiredApprovalsLocked(RiskTier(tier.name), -1)))
 	}
 	sb.WriteString("}\n\n")
+	// Reuse the native analyzer's execution-command vocabulary without trying
+	// to duplicate its shell parser in Python. A custom safe regex matching a
+	// wrapper, interpreter or evaluator cannot prove its payload is safe.
+	normalizationCommands := map[string]bool{
+		".": true, "alias": true, "eval": true, "hash": true, "source": true, "python": true,
+		"if": true, "then": true, "else": true, "elif": true, "fi": true,
+		"for": true, "in": true, "do": true, "done": true, "case": true, "esac": true,
+		"while": true, "until": true, "select": true, "function": true, "coproc": true,
+	}
+	for name := range executionWrappers {
+		normalizationCommands[name] = true
+	}
+	for name := range stdinShells {
+		normalizationCommands[name] = true
+	}
+	for name := range stdinInterpreters {
+		normalizationCommands[name] = true
+	}
+	names := make([]string, 0, len(normalizationCommands))
+	for name := range normalizationCommands {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	encodedNames, _ := json.Marshal(names)
+	sb.WriteString("NORMALIZATION_COMMANDS = frozenset(" + string(encodedNames) + ")\n\n")
 	sb.WriteString(`# Python's re backtracks, so a rule that is linear in Go can take seconds on a
 # long command here. Longer commands are not scanned; they need the strictest
 # approval instead of being allowed unclassified.
 MAX_CLASSIFIED_LENGTH = 16384
+
+
+def _literal_simple_command(command: str) -> bool:
+    """Recognize a narrow literal argv form, without parsing shell syntax."""
+    # Quotes, escapes, operators, redirections, expansions, globs, comments and
+    # non-ASCII/control characters all require native analysis or confirmation.
+    # A SAFE regex prefix must never hide another command or an expanded target.
+    if re.fullmatch(r'[A-Za-z0-9_./:@%+=, \t-]+', command) is None:
+        return False
+    words = command.split()
+    executable = words[0].rsplit('/', 1)[-1].lower()
+    if '=' in words[0] or executable in NORMALIZATION_COMMANDS:
+        return False
+    if executable.startswith(('python2', 'python3')):
+        return False
+    # The native analyzer also inspects xargs behind an unrecognized wrapper;
+    # its appended arguments are unavailable to this exported policy snapshot.
+    return not any(word.rsplit('/', 1)[-1].lower() == 'xargs' for word in words)
 
 
 def classify(command: str) -> Tuple[str, int]:
@@ -543,8 +587,11 @@ def classify(command: str) -> Tuple[str, int]:
     command = command.strip()
     if len(command) > MAX_CLASSIFIED_LENGTH:
         return ('critical', MIN_APPROVALS['critical'])
+    literal = _literal_simple_command(command)
     for tier, patterns in (('safe', SAFE_PATTERNS), ('critical', CRITICAL_PATTERNS),
                            ('dangerous', DANGEROUS_PATTERNS), ('caution', CAUTION_PATTERNS)):
+        if tier == 'safe' and not literal:
+            continue
         for pattern in patterns:
             if pattern.search(command):
                 return (tier, MIN_APPROVALS[tier])
@@ -552,15 +599,15 @@ def classify(command: str) -> Tuple[str, int]:
 
 
 def needs_approval(command: str) -> bool:
-    """Return True if the command needs SLB approval."""
+    """Return True when approval or explicit confirmation is needed."""
     tier, _ = classify(command)
-    return tier in ('dangerous', 'critical', 'caution')
+    return tier != 'safe'
 
 
 def is_blocked(command: str) -> Tuple[bool, Optional[str]]:
-    """Check whether the command should be blocked pending approval."""
+    """Check whether automatic execution must wait for review/confirmation."""
     tier, approvals = classify(command)
-    if tier == 'safe' or tier == 'unknown':
+    if tier == 'safe':
         return (False, None)
     if tier == 'critical':
         return (True, f"CRITICAL: Requires {approvals} approvals. Use 'slb request' to submit.")
@@ -568,7 +615,7 @@ def is_blocked(command: str) -> Tuple[bool, Optional[str]]:
         return (True, f"DANGEROUS: Requires {approvals} approval. Use 'slb request' to submit.")
     if tier == 'caution':
         return (True, "CAUTION: Command logged for review. Use 'slb request' to submit.")
-    return (False, None)
+    return (True, "OFFLINE: Native SLB analysis or explicit confirmation required; local rules cannot allow this command.")
 `)
 	return sb.String()
 }
