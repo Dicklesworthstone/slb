@@ -37,7 +37,7 @@ func TestExecuteBackgroundWorkerProcess(t *testing.T) {
 	os.Exit(0)
 }
 
-func backgroundExecutionFixture(t *testing.T, script string) (*db.DB, background.Job) {
+func backgroundExecutionFixture(t *testing.T, script string, policies ...db.ApprovalPolicy) (*db.DB, background.Job) {
 	t.Helper()
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("detached POSIX execution test")
@@ -45,13 +45,18 @@ func backgroundExecutionFixture(t *testing.T, script string) (*db.DB, background
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("SHELL", "/bin/sh")
 	t.Setenv("SLB_TEST_EXECUTE_BACKGROUND_WORKER", "1")
+	policy := db.ApprovalPolicyIndependent
+	if len(policies) > 0 {
+		policy = policies[0]
+	}
 	project := t.TempDir()
 	conn, err := db.OpenAndMigrate(filepath.Join(project, ".slb", "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	if err := os.WriteFile(filepath.Join(project, ".slb", "config.toml"), []byte("[integrations]\nagent_mail_enabled = false\n[general]\nenable_rollback_capture = false\n"), 0600); err != nil {
+	configuration := fmt.Sprintf("[integrations]\nagent_mail_enabled = false\n[general]\napproval_policy = %q\nenable_rollback_capture = false\n", policy)
+	if err := os.WriteFile(filepath.Join(project, ".slb", "config.toml"), []byte(configuration), 0600); err != nil {
 		t.Fatal(err)
 	}
 	requester := &db.Session{AgentName: "BackgroundRequester", Program: "test", Model: "model-a", ProjectPath: project}
@@ -66,13 +71,23 @@ func backgroundExecutionFixture(t *testing.T, script string) (*db.DB, background
 	}
 	expires := time.Now().UTC().Add(5 * time.Minute)
 	request := &db.Request{ProjectPath: project, Command: db.CommandSpec{Raw: script, Cwd: project, Shell: true},
+		ApprovalPolicy:     policy,
 		RequestorSessionID: requester.ID, RequestorAgent: requester.AgentName, RequestorModel: requester.Model,
 		Status: db.StatusApproved, RiskTier: db.RiskTierCritical, MinApprovals: 2, ApprovalExpiresAt: &expires,
 		Justification: db.Justification{Reason: "background execution regression in a temporary project"}}
+	if policy == db.ApprovalPolicySameHost {
+		request.Status, request.ApprovalExpiresAt = db.StatusPending, nil
+	}
 	if err := conn.CreateRequest(request); err != nil {
 		t.Fatal(err)
 	}
 	for _, reviewer := range reviewers {
+		if policy == db.ApprovalPolicySameHost {
+			if _, err := conn.ApplyReview(&db.Review{RequestID: request.ID, ReviewerSessionID: reviewer.ID, Decision: db.DecisionApprove}, reviewer.SessionKey, db.ReviewPolicy{ApprovalPolicy: policy}); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
 		now := time.Now().UTC()
 		review := &db.Review{RequestID: request.ID, ReviewerSessionID: reviewer.ID, ReviewerAgent: reviewer.AgentName, ReviewerModel: reviewer.Model,
 			Decision: db.DecisionApprove, SignatureTimestamp: now, Signature: db.ComputeReviewSignature(reviewer.SessionKey, request.ID, db.DecisionApprove, now)}
@@ -81,7 +96,30 @@ func backgroundExecutionFixture(t *testing.T, script string) (*db.DB, background
 		}
 	}
 	return conn, background.Job{Version: background.Version, RequestID: request.ID, SessionID: requester.ID, CommandHash: request.Command.Hash,
-		Database: conn.Path(), Project: project, LogDir: filepath.Join(project, ".slb", "logs"), TimeoutSeconds: 10}
+		ApprovalPolicy: policy,
+		Database:       conn.Path(), Project: project, LogDir: filepath.Join(project, ".slb", "logs"), TimeoutSeconds: 10}
+}
+
+func TestExecuteBackgroundSameHostCarriesAssurance(t *testing.T) {
+	conn, job := backgroundExecutionFixture(t, "printf 'same-host-background\\n'", db.ApprovalPolicySameHost)
+	receipt, err := launchTestBackground(t, job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.ApprovalPolicy != db.ApprovalPolicySameHost || receipt.Assurance != db.AssuranceSameHost ||
+		!strings.Contains(receipt.ApprovalPolicyLabel, "not independently authenticated") {
+		t.Fatalf("startup receipt lost low-assurance classification: %+v", receipt)
+	}
+	request := waitBackgroundOutcome(t, conn, job.RequestID)
+	if request.Status != db.StatusExecuted || request.Execution == nil || request.Execution.Assurance != db.AssuranceSameHost ||
+		request.Execution.ApprovalPolicy != db.ApprovalPolicySameHost {
+		t.Fatalf("detached outcome lost low-assurance classification: %+v", request)
+	}
+	log, err := os.ReadFile(receipt.LogPath)
+	if err != nil || !strings.Contains(string(log), `"approval_policy":"same_host"`) ||
+		!strings.Contains(string(log), `"assurance":"same_host"`) {
+		t.Fatalf("execution log lost low-assurance classification: %s %v", log, err)
+	}
 }
 
 func launchTestBackground(t *testing.T, job background.Job) (*background.Receipt, error) {

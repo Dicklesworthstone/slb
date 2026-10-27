@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -93,9 +94,18 @@ func TestSessionKeyDigestMigration(t *testing.T) {
 			Command:  CommandSpec{Raw: "echo " + id, Argv: []string{"echo", id}, Cwd: project},
 			RiskTier: RiskTierDangerous, Status: StatusPending, MinApprovals: 1,
 			Justification: Justification{Reason: "key migration test"}}
-		if err := legacy.CreateRequest(r); err != nil {
+		// Use the original schema's wire format, not today's request writer:
+		// this fixture must continue to represent a real pre-policy database.
+		r.Command.Hash = ComputeCommandHash(r.Command)
+		argv, err := json.Marshal(r.Command.Argv)
+		if err != nil {
 			t.Fatal(err)
 		}
+		journalExec(t, legacy, `INSERT INTO requests(id, project_path, command_raw, command_argv_json,
+			command_cwd, command_hash, risk_tier, requestor_session_id, requestor_agent, requestor_model,
+			justification_reason, status, min_approvals, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			r.ID, r.ProjectPath, r.Command.Raw, string(argv), r.Command.Cwd, r.Command.Hash, string(r.RiskTier),
+			r.RequestorSessionID, r.RequestorAgent, r.RequestorModel, r.Justification.Reason, string(r.Status), r.MinApprovals, now.Format(time.RFC3339))
 		journalExec(t, legacy, `UPDATE requests SET status = 'approved', approval_expires_at = ? WHERE id = ?`, expiry.Format(time.RFC3339), id)
 		return r
 	}
@@ -104,11 +114,10 @@ func TestSessionKeyDigestMigration(t *testing.T) {
 		{signed.ID, "reviewer", keys["reviewer"]},
 		{forged.ID, "forger", keys["reviewer"]}, // signed with someone else's key
 	} {
-		if err := legacy.CreateReview(&Review{RequestID: vote.request, ReviewerSessionID: vote.reviewer,
-			ReviewerAgent: vote.reviewer, ReviewerModel: vote.reviewer + "-model", Decision: DecisionApprove,
-			SignatureTimestamp: now, Signature: legacyTestSignature(vote.signingKey, vote.request, DecisionApprove, now)}); err != nil {
-			t.Fatal(err)
-		}
+		journalExec(t, legacy, `INSERT INTO reviews(id, request_id, reviewer_session_id, reviewer_agent,
+			reviewer_model, decision, signature, signature_timestamp, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			"review-"+vote.request, vote.request, vote.reviewer, vote.reviewer, vote.reviewer+"-model", string(DecisionApprove),
+			legacyTestSignature(vote.signingKey, vote.request, DecisionApprove, now), now.Format(time.RFC3339), now.Format(time.RFC3339))
 	}
 	if !databaseFilesContain(t, path, keys["reviewer"]) {
 		t.Fatal("fixture did not write a plaintext key; the file scans below would prove nothing")
@@ -164,6 +173,17 @@ func TestSessionKeyDigestMigration(t *testing.T) {
 	}
 	if _, err := database.VerifyRequestApproval(forged.ID); !errors.Is(err, ErrInvalidApprovalProof) {
 		t.Errorf("forged historical approval accepted after upgrade: %v", err)
+	}
+	// Migration keeps the old security requirement and old local evidence
+	// category. Enabling the new workflow cannot convert historical votes.
+	stored, votes, err := database.GetRequestWithReviews(signed.ID)
+	if err != nil || stored.ApprovalPolicy != ApprovalPolicyIndependent || len(votes) != 1 ||
+		votes[0].ApprovalPolicy != ApprovalPolicyIndependent || votes[0].Assurance != AssuranceLegacyLocal || votes[0].SignatureVersion != 1 {
+		t.Fatalf("migration relabeled historical evidence: %+v %+v %v", stored, votes, err)
+	}
+	journalExec(t, database, `UPDATE requests SET approval_policy = 'same_host' WHERE id = ?`, signed.ID)
+	if _, err := database.VerifyRequestApproval(signed.ID); !errors.Is(err, ErrInvalidApprovalProof) {
+		t.Errorf("historical local vote silently converted to same-host review: %v", err)
 	}
 	if err := database.ApplyMigrations(t.Context()); err != nil {
 		t.Fatalf("second migration run: %v", err)

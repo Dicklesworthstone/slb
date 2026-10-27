@@ -28,10 +28,12 @@ type HookQueryParams struct {
 // never permission to execute the raw command directly. Queries do not consume
 // approval; the executor claims it exactly once immediately before execution.
 type HookExecutionHandoff struct {
-	RequestID    string `json:"request_id"`
-	CommandHash  string `json:"command_hash"`
-	SessionID    string `json:"session_id"`
-	DatabasePath string `json:"database_path"`
+	RequestID      string            `json:"request_id"`
+	CommandHash    string            `json:"command_hash"`
+	SessionID      string            `json:"session_id"`
+	DatabasePath   string            `json:"database_path"`
+	ApprovalPolicy db.ApprovalPolicy `json:"approval_policy"`
+	ReviewNotice   string            `json:"review_notice"`
 }
 
 // HookQueryResult is the result of a hook query.
@@ -45,6 +47,8 @@ type HookQueryResult struct {
 	ExecutionHandoff *HookExecutionHandoff `json:"execution_handoff,omitempty"`
 	AuditRecorded    bool                  `json:"audit_recorded,omitempty"`
 	AuditError       string                `json:"audit_error,omitempty"`
+	ApprovalPolicy   db.ApprovalPolicy     `json:"approval_policy,omitempty"`
+	ReviewNotice     string                `json:"review_notice,omitempty"`
 }
 
 // slowHookQueryThreshold is well above the typical 10-30ms policy load.
@@ -91,14 +95,17 @@ func recordHookAudit(directory string, params HookQueryParams, result *HookQuery
 		MatchedPattern:  result.MatchedPattern,
 		MinApprovals:    result.MinApprovals,
 		Source:          "daemon",
+		ApprovalPolicy:  string(result.ApprovalPolicy),
+		ReviewNotice:    result.ReviewNotice,
 	})
 }
 
 // hookPolicy is the effective, project-local policy for one hook query.
 type hookPolicy struct {
-	engine        *core.PatternEngine
-	cautionAction string
-	projectRoot   string
+	engine         *core.PatternEngine
+	approvalPolicy db.ApprovalPolicy
+	cautionAction  string
+	projectRoot    string
 	// statePath is the project's state database, or empty before `slb init`.
 	statePath string
 }
@@ -225,7 +232,7 @@ func readHookCustomPatterns(path string) ([]core.Pattern, error) {
 // cached compilation when none of its inputs changed.
 func (c *hookPolicyCache) policyFor(cwd string) (hookPolicy, error) {
 	if cwd == "" {
-		return hookPolicy{engine: core.NewPatternEngine(), cautionAction: "block"}, nil
+		return hookPolicy{engine: core.NewPatternEngine(), approvalPolicy: db.ApprovalPolicyIndependent, cautionAction: "block"}, nil
 	}
 	root, err := PhysicalProjectRootForCWD(cwd)
 	if err != nil {
@@ -302,7 +309,7 @@ func (c *hookPolicyCache) policyFor(cwd string) (hookPolicy, error) {
 		}
 		entry = &cachedHookPolicy{
 			sources: sources, cfg: cfg, hasState: hasState, state: state, custom: custom,
-			policy: hookPolicy{engine: engine, cautionAction: cfg.Integrations.HookCautionAction, projectRoot: root, statePath: statePath},
+			policy: hookPolicy{engine: engine, approvalPolicy: db.ApprovalPolicy(cfg.General.ApprovalPolicy), cautionAction: cfg.Integrations.HookCautionAction, projectRoot: root, statePath: statePath},
 		}
 	}
 	c.store(root, entry)
@@ -350,7 +357,8 @@ func (s *IPCServer) classifyCommand(params HookQueryParams) *HookQueryResult {
 	classification := engine.ClassifyCommand(params.Command, params.CWD)
 	result := &HookQueryResult{
 		Tier: string(classification.Tier), MatchedPattern: classification.MatchedPattern,
-		MinApprovals: classification.MinApprovals,
+		MinApprovals:   classification.MinApprovals,
+		ApprovalPolicy: policy.approvalPolicy.Normalized(), ReviewNotice: policy.approvalPolicy.Label(),
 	}
 	switch {
 	case classification.IsSafe:
@@ -372,6 +380,7 @@ func (s *IPCServer) classifyCommand(params HookQueryParams) *HookQueryResult {
 		return result
 	}
 
+	result.Message += " Review policy: " + result.ReviewNotice + "."
 	if policy.statePath == "" || params.SessionID == "" {
 		return result
 	}
@@ -387,12 +396,15 @@ func (s *IPCServer) classifyCommand(params HookQueryParams) *HookQueryResult {
 	}
 	result.RequestID = approved.ID
 	result.MinApprovals = approved.MinApprovals
-	result.Message = "Approval ready. Execute with slb execute " + approved.ID + " --session-id <SLB_SESSION_ID>."
+	result.ApprovalPolicy = approved.ApprovalPolicy.Normalized()
+	result.ReviewNotice = approved.ApprovalPolicy.Label()
+	result.Message = "Review complete (" + result.ReviewNotice + "). Execute with slb execute " + approved.ID + " --session-id <SLB_SESSION_ID>."
 	if params.ExecutionHandoff {
 		result.Action = "execute"
 		result.ExecutionHandoff = &HookExecutionHandoff{
 			RequestID: approved.ID, CommandHash: approved.Command.Hash,
 			SessionID: params.SessionID, DatabasePath: policy.statePath,
+			ApprovalPolicy: result.ApprovalPolicy, ReviewNotice: result.ReviewNotice,
 		}
 	}
 	// Old clients must never get a raw-shell permit from this lookup.

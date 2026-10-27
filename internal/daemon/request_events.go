@@ -32,6 +32,8 @@ func requestStateEvents(state *db.ProjectWatchState) ([]Event, int32) {
 			"risk_tier": string(r.RiskTier), "command": command, "command_hash": r.CommandHash,
 			"requestor": r.Requestor, "min_approvals": r.MinApprovals,
 			"approvals": r.Approvals, "rejections": r.Rejections, "created_at": r.CreatedAt,
+			"approval_policy": r.ApprovalPolicy.Normalized(), "review_notice": r.ApprovalPolicy.Label(),
+			"execution_assurance": r.ExecutionAssurance,
 		}
 		if r.ResolvedAt != "" {
 			payload["resolved_at"] = r.ResolvedAt

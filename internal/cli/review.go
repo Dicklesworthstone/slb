@@ -93,6 +93,7 @@ var reviewListCmd = &cobra.Command{
 
 		// Build output
 		type requestSummary struct {
+			approvalPolicyView
 			ID             string `json:"id"`
 			Command        string `json:"command"`
 			RiskTier       string `json:"risk_tier"`
@@ -114,12 +115,13 @@ var reviewListCmd = &cobra.Command{
 			}
 
 			summary := requestSummary{
-				ID:             r.ID,
-				Command:        cmd,
-				RiskTier:       string(r.RiskTier),
-				RequestorAgent: r.RequestorAgent,
-				MinApprovals:   r.MinApprovals,
-				CreatedAt:      r.CreatedAt.Format(time.RFC3339),
+				approvalPolicyView: policyView(r.ApprovalPolicy),
+				ID:                 r.ID,
+				Command:            cmd,
+				RiskTier:           string(r.RiskTier),
+				RequestorAgent:     r.RequestorAgent,
+				MinApprovals:       r.MinApprovals,
+				CreatedAt:          r.CreatedAt.Format(time.RFC3339),
 			}
 			if flagReviewAll || flagReviewPool {
 				summary.ProjectPath = r.ProjectPath
@@ -166,15 +168,18 @@ func showRequestDetails(requestID string) error {
 
 	// Build output structure
 	type reviewView struct {
-		ID            string `json:"id"`
-		ReviewerAgent string `json:"reviewer_agent"`
-		ReviewerModel string `json:"reviewer_model"`
-		Decision      string `json:"decision"`
-		Comments      string `json:"comments,omitempty"`
-		CreatedAt     string `json:"created_at"`
+		approvalPolicyView
+		Assurance     db.ReviewAssurance `json:"assurance"`
+		ID            string             `json:"id"`
+		ReviewerAgent string             `json:"reviewer_agent"`
+		ReviewerModel string             `json:"reviewer_model"`
+		Decision      string             `json:"decision"`
+		Comments      string             `json:"comments,omitempty"`
+		CreatedAt     string             `json:"created_at"`
 	}
 
 	type requestDetail struct {
+		approvalPolicyView
 		ID                    string       `json:"id"`
 		Status                string       `json:"status"`
 		RiskTier              string       `json:"risk_tier"`
@@ -206,6 +211,7 @@ func showRequestDetails(requestID string) error {
 	}
 
 	detail := requestDetail{
+		approvalPolicyView:    policyView(request.ApprovalPolicy),
 		ID:                    request.ID,
 		Status:                string(request.Status),
 		RiskTier:              string(request.RiskTier),
@@ -238,17 +244,19 @@ func showRequestDetails(requestID string) error {
 	// Add reviews
 	for _, rev := range reviews {
 		detail.Reviews = append(detail.Reviews, reviewView{
-			ID:            rev.ID,
-			ReviewerAgent: rev.ReviewerAgent,
-			ReviewerModel: rev.ReviewerModel,
-			Decision:      string(rev.Decision),
-			Comments:      rev.Comments,
-			CreatedAt:     rev.CreatedAt.Format(time.RFC3339),
+			approvalPolicyView: policyView(rev.ApprovalPolicy),
+			Assurance:          rev.Assurance,
+			ID:                 rev.ID,
+			ReviewerAgent:      rev.ReviewerAgent,
+			ReviewerModel:      rev.ReviewerModel,
+			Decision:           string(rev.Decision),
+			Comments:           rev.Comments,
+			CreatedAt:          rev.CreatedAt.Format(time.RFC3339),
 		})
 	}
 
 	out := output.New(output.Format(GetOutput()))
-	if GetOutput() == "json" {
+	if executionOutputStructured() {
 		return out.Write(detail)
 	}
 
@@ -256,6 +264,7 @@ func showRequestDetails(requestID string) error {
 	fmt.Printf("Request: %s\n", detail.ID)
 	fmt.Printf("Status:  %s\n", strings.ToUpper(detail.Status))
 	fmt.Printf("Risk:    %s\n", strings.ToUpper(detail.RiskTier))
+	fmt.Printf("Approval policy: %s\n", detail.ApprovalPolicyLabel)
 	fmt.Println()
 	fmt.Printf("Command: %s\n", detail.Command)
 	fmt.Printf("Hash:    %s\n", detail.CommandHash)
@@ -300,6 +309,7 @@ func showRequestDetails(requestID string) error {
 		fmt.Println("Reviews:")
 		for _, rev := range detail.Reviews {
 			fmt.Printf("  - %s by %s (%s)\n", strings.ToUpper(rev.Decision), rev.ReviewerAgent, rev.ReviewerModel)
+			fmt.Printf("    Assurance: %s; %s\n", rev.Assurance, rev.ApprovalPolicyLabel)
 			if rev.Comments != "" {
 				fmt.Printf("    Comment: %s\n", rev.Comments)
 			}

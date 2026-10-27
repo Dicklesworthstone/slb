@@ -36,6 +36,8 @@ type Event struct {
 	MatchedPattern  string    `json:"matched_pattern,omitempty"`
 	MinApprovals    int       `json:"min_approvals"`
 	Source          string    `json:"source"`
+	ApprovalPolicy  string    `json:"approval_policy,omitempty"`
+	ReviewNotice    string    `json:"review_notice,omitempty"`
 }
 
 // Filter selects audit records. Limit defaults to 100 and cannot exceed 10000.

@@ -198,15 +198,18 @@ func (v *Verifier) MarkExecutionComplete(p CompleteExecuteParams) error {
 // VerifyExecuteResponse supplies the complete reviewed command specification.
 // Clients must preserve argv, cwd and shell mode, rather than reparse Command.
 type VerifyExecuteResponse struct {
-	Allowed                  bool            `json:"allowed"`
-	Reason                   string          `json:"reason,omitempty"`
-	ApprovalRemainingSeconds int             `json:"approval_remaining_seconds"`
-	RequestID                string          `json:"request_id,omitempty"`
-	Command                  string          `json:"command,omitempty"`
-	CommandHash              string          `json:"command_hash,omitempty"`
-	RiskTier                 string          `json:"risk_tier,omitempty"`
-	CommandSpec              *db.CommandSpec `json:"command_spec,omitempty"`
-	ExecutionReceipt         string          `json:"execution_receipt,omitempty"`
+	Allowed                  bool               `json:"allowed"`
+	Reason                   string             `json:"reason,omitempty"`
+	ApprovalRemainingSeconds int                `json:"approval_remaining_seconds"`
+	RequestID                string             `json:"request_id,omitempty"`
+	Command                  string             `json:"command,omitempty"`
+	CommandHash              string             `json:"command_hash,omitempty"`
+	RiskTier                 string             `json:"risk_tier,omitempty"`
+	CommandSpec              *db.CommandSpec    `json:"command_spec,omitempty"`
+	ExecutionReceipt         string             `json:"execution_receipt,omitempty"`
+	ApprovalPolicy           db.ApprovalPolicy  `json:"approval_policy,omitempty"`
+	Assurance                db.ReviewAssurance `json:"assurance,omitempty"`
+	ReviewNotice             string             `json:"review_notice,omitempty"`
 }
 
 // ToIPCResponse never turns an advisory check into a raw-command permit.
@@ -225,6 +228,11 @@ func (r *VerificationResult) ToIPCResponse() *VerifyExecuteResponse {
 	resp.Command = r.Request.Command.Raw
 	resp.CommandHash = r.Request.Command.Hash
 	resp.RiskTier = string(r.Request.RiskTier)
+	resp.ApprovalPolicy = r.Request.ApprovalPolicy.Normalized()
+	resp.ReviewNotice = r.Request.ApprovalPolicy.Label()
+	if r.Request.Execution != nil {
+		resp.Assurance = r.Request.Execution.Assurance
+	}
 	spec := r.Request.Command
 	if spec.Argv != nil {
 		spec.Argv = make([]string, len(r.Request.Command.Argv))

@@ -14,6 +14,8 @@ type WatchRequestState struct {
 	ID, ProjectPath, Command, CommandHash, Requestor string
 	Status                                           RequestStatus
 	RiskTier                                         RiskTier
+	ApprovalPolicy                                   ApprovalPolicy
+	ExecutionAssurance                               ReviewAssurance
 	MinApprovals, Approvals, Rejections              int
 	ExitCode                                         *int
 	CreatedAt, ResolvedAt                            string
@@ -46,7 +48,8 @@ func (db *DB) ReadProjectWatchState(ctx context.Context, project string, since t
 			r.command_hash, r.requestor_agent, r.status, r.risk_tier, r.min_approvals,
 			(SELECT COUNT(*) FROM reviews v WHERE v.request_id = r.id AND v.decision = 'approve'),
 			(SELECT COUNT(*) FROM reviews v WHERE v.request_id = r.id AND v.decision = 'reject'),
-			r.execution_exit_code, r.created_at, COALESCE(r.resolved_at, '')
+			r.execution_exit_code, r.created_at, COALESCE(r.resolved_at, ''),
+			r.approval_policy, r.execution_assurance
 		FROM requests r
 		WHERE r.project_path = ? AND (
 			r.status NOT IN ('executed', 'execution_failed', 'rejected', 'cancelled', 'timed_out')
@@ -63,7 +66,7 @@ func (db *DB) ReadProjectWatchState(ctx context.Context, project string, since t
 		var exit sql.NullInt64
 		if err := rows.Scan(&r.ID, &r.ProjectPath, &r.Command, &r.CommandHash, &r.Requestor,
 			&r.Status, &r.RiskTier, &r.MinApprovals, &r.Approvals, &r.Rejections,
-			&exit, &r.CreatedAt, &r.ResolvedAt); err != nil {
+			&exit, &r.CreatedAt, &r.ResolvedAt, &r.ApprovalPolicy, &r.ExecutionAssurance); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}

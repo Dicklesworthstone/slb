@@ -116,6 +116,135 @@ func TestRequestJournalAtomicLifecycle(t *testing.T) {
 	}
 }
 
+func TestRequestJournalSameHostEvidenceAndExecution(t *testing.T) {
+	database := journalTestDB(t)
+	author := &Session{AgentName: "requester", Model: "model-a", ProjectPath: "/project"}
+	peer := &Session{AgentName: "reviewer", Model: "model-b", ProjectPath: "/project"}
+	for _, session := range []*Session{author, peer} {
+		if err := database.CreateSession(session); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req := &Request{
+		ProjectPath: "/project", RequestorSessionID: author.ID, RequestorAgent: author.AgentName,
+		RequestorModel: author.Model, ApprovalPolicy: ApprovalPolicySameHost,
+		Command:  CommandSpec{Raw: "echo reviewed", Argv: []string{"echo", "reviewed"}, Cwd: "/project"},
+		RiskTier: RiskTierDangerous, MinApprovals: 1, RequireDifferentModel: true,
+		Justification: Justification{Reason: "audit metadata test; no process is started"},
+	}
+	if err := database.CreateRequest(req); err != nil {
+		t.Fatal(err)
+	}
+	review := &Review{RequestID: req.ID, ReviewerSessionID: peer.ID, Decision: DecisionApprove}
+	outcome, err := database.ApplyReview(review, peer.SessionKey, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	execution := &Execution{ExecutedAt: &now, ExecutedBySessionID: author.ID,
+		ExecutedByAgent: author.AgentName, ExecutedByModel: author.Model, LogPath: "test-claim"}
+	if err := database.ClaimRequestExecution(outcome.Request, execution); err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	execution.ExitCode = &zero
+	if err := database.CompleteRequestExecution(req.ID, StatusExecuted, execution); err != nil {
+		t.Fatal(err)
+	}
+	page := journalPage(t, database, "/project", "", 100)
+	var foundReview, foundClaim, foundCompletion bool
+	for _, event := range page.Events {
+		if event.State.ApprovalPolicy != ApprovalPolicySameHost {
+			t.Fatalf("event lost the request policy: %+v", event)
+		}
+		if event.Review != nil {
+			foundReview = true
+			if event.Review.ApprovalPolicy != ApprovalPolicySameHost || event.Review.Assurance != AssuranceSameHost ||
+				event.Review.CommandHash != req.Command.Hash || event.Review.SignatureVersion != 2 {
+				t.Fatalf("review category lost in journal: %+v", event.Review)
+			}
+		}
+		if event.State.Status == string(StatusExecuting) || event.State.Status == string(StatusExecuted) {
+			if event.State.ExecutionApprovalPolicy != ApprovalPolicySameHost || event.State.ExecutionAssurance != AssuranceSameHost {
+				t.Fatalf("execution category lost in journal: %+v", event.State)
+			}
+			foundClaim = foundClaim || event.State.Status == string(StatusExecuting)
+			foundCompletion = foundCompletion || event.State.Status == string(StatusExecuted)
+		}
+	}
+	if !foundReview || !foundClaim || !foundCompletion {
+		t.Fatalf("missing review/claim/completion observations: %+v", page.Events)
+	}
+	// Relabeling evidence is itself an observable mutation, and cannot rewrite
+	// the original observation or turn it into stronger evidence.
+	journalExec(t, database, `UPDATE reviews SET assurance='independent' WHERE id=?`, review.ID)
+	changed := journalPage(t, database, "/project", page.Cursor, 100)
+	if len(changed.Events) != 1 || changed.Events[0].Kind != "review_updated" || changed.Events[0].Review.Assurance != AssuranceIndependent {
+		t.Fatal("evidence relabeling was not recorded")
+	}
+	original := journalPage(t, database, "/project", "", 100)
+	for _, event := range original.Events {
+		if event.Kind == "review_added" && event.Review.Assurance != AssuranceSameHost {
+			t.Fatal("current evidence category rewrote historical evidence")
+		}
+	}
+}
+
+func TestRequestJournalPolicyMigrationPreservesHistoricalCursors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v4.db")
+	legacy, err := OpenWithOptions(path, OpenOptions{CreateIfNotExists: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacy.Close()
+	if err := ensureMigrationsTable(legacy.conn); err != nil {
+		t.Fatal(err)
+	}
+	for _, migration := range migrations {
+		if migration.Version > 4 {
+			continue
+		}
+		journalExec(t, legacy, migration.Up)
+		journalExec(t, legacy, `INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)`, migration.Version, time.Now().UTC().Format(time.RFC3339))
+	}
+	journalTestSession(t, legacy, "author", "/project")
+	journalTestSession(t, legacy, "reviewer", "/project")
+	journalTestRequest(t, legacy, "old-request", "/project", "author")
+	journalTestReview(t, legacy, "old-review", "old-request", "reviewer")
+	before := journalPage(t, legacy, "/project", "", 100)
+	var storedPayload string
+	if err := legacy.QueryRow(`SELECT payload FROM request_events ORDER BY sequence DESC LIMIT 1`).Scan(&storedPayload); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.ApplyMigrations(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	after := journalPage(t, legacy, "/project", "", 100)
+	if len(after.Events) != len(before.Events) || after.Cursor != before.Cursor {
+		t.Fatal("policy migration changed historical event identity or seeded duplicate events")
+	}
+	var migratedPayload string
+	if err := legacy.QueryRow(`SELECT payload FROM request_events ORDER BY sequence DESC LIMIT 1`).Scan(&migratedPayload); err != nil {
+		t.Fatal(err)
+	}
+	if migratedPayload != storedPayload {
+		t.Fatal("policy migration rewrote historical evidence")
+	}
+	old := after.Events[len(after.Events)-1]
+	if old.State.ApprovalPolicy != ApprovalPolicyIndependent || old.Review == nil ||
+		old.Review.Assurance != AssuranceLegacyLocal || old.Review.SignatureVersion != 1 {
+		t.Fatalf("historical evidence was promoted or lost: %+v", old)
+	}
+	if resumed := journalPage(t, legacy, "/project", before.Cursor, 100); len(resumed.Events) != 0 {
+		t.Fatal("historical cursor no longer resumes after its original event")
+	}
+	journalExec(t, legacy, `UPDATE requests SET approval_policy='same_host' WHERE id='old-request'`)
+	changed := journalPage(t, legacy, "/project", before.Cursor, 100)
+	if len(changed.Events) != 1 || changed.Events[0].Kind != "request_updated" || changed.Events[0].State.ApprovalPolicy != ApprovalPolicySameHost {
+		t.Fatal("policy-only changes were not journaled")
+	}
+}
+
 func TestRequestJournalRollbackAndMandatoryRecording(t *testing.T) {
 	database := journalTestDB(t)
 	journalTestSession(t, database, "author", "/project")

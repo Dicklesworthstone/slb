@@ -60,6 +60,12 @@ Gate conditions are validated before execution:
 - Approval must not be expired
 - Command hash must match (no tampering)
 - Current pattern policy must not require higher tier
+- Stored review evidence must match the request's approval policy
+- Current policy must still explicitly permit same-host review when used
+
+Same-host reviews are low assurance, not independently authenticated security
+approvals. Restoring the independent policy disables their execution; changing
+configuration never promotes existing evidence into independent authorization.
 
 Examples:
   slb execute abc123 --session-id $SESSION_ID
@@ -112,6 +118,9 @@ Examples:
 		if flagExecuteBackground {
 			return launchBackgroundExecution(cmd, dbConn, req, sessionID, expectedHash, executionTimeout, cfg)
 		}
+		if !structured {
+			fmt.Printf("Approval policy: %s\n", req.ApprovalPolicy.Label())
+		}
 		result, execErr := executor.ExecuteApprovedRequest(cmd.Context(), core.ExecuteOptions{
 			RequestID:           requestID,
 			ExpectedCommandHash: expectedHash,
@@ -124,16 +133,18 @@ Examples:
 		})
 
 		type executeResult struct {
-			RequestID  string `json:"request_id"`
-			Status     string `json:"status"`
-			ExitCode   int    `json:"exit_code"`
-			DurationMs int64  `json:"duration_ms"`
-			LogPath    string `json:"log_path"`
-			Output     string `json:"output,omitempty"`
-			TimedOut   bool   `json:"timed_out,omitempty"`
-			Error      string `json:"error,omitempty"`
+			approvalPolicyView
+			Assurance  db.ReviewAssurance `json:"assurance,omitempty"`
+			RequestID  string             `json:"request_id"`
+			Status     string             `json:"status"`
+			ExitCode   int                `json:"exit_code"`
+			DurationMs int64              `json:"duration_ms"`
+			LogPath    string             `json:"log_path"`
+			Output     string             `json:"output,omitempty"`
+			TimedOut   bool               `json:"timed_out,omitempty"`
+			Error      string             `json:"error,omitempty"`
 		}
-		resp := executeResult{RequestID: requestID, Status: "not_executed", ExitCode: -1}
+		resp := executeResult{approvalPolicyView: policyView(req.ApprovalPolicy), RequestID: requestID, Status: "not_executed", ExitCode: -1}
 		if result != nil {
 			resp.ExitCode = result.ExitCode
 			resp.DurationMs = result.Duration.Milliseconds()
@@ -141,7 +152,11 @@ Examples:
 			resp.Output = result.Output
 			resp.TimedOut = result.TimedOut
 			if result.Request != nil {
+				resp.approvalPolicyView = policyView(result.Request.ApprovalPolicy)
 				resp.Status = string(result.Request.Status)
+				if result.Request.Execution != nil {
+					resp.Assurance = result.Request.Execution.Assurance
+				}
 			}
 		}
 		if execErr == nil && resp.ExitCode != 0 {
@@ -164,6 +179,9 @@ Examples:
 			fmt.Printf("Executed request %s\n", requestID)
 		}
 		fmt.Printf("Exit code: %d\n", resp.ExitCode)
+		if resp.Assurance != "" {
+			fmt.Printf("Evidence assurance: %s\n", resp.Assurance)
+		}
 		fmt.Printf("Duration: %dms\n", resp.DurationMs)
 		if resp.LogPath != "" {
 			fmt.Printf("Log: %s\n", resp.LogPath)

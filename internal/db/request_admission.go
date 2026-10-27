@@ -60,6 +60,10 @@ func (db *DB) admitRequest(ctx context.Context, r *Request, limits RequestAdmiss
 		return nil, errors.New("only pending requests may be admitted")
 	}
 	candidate := *r
+	candidate.ApprovalPolicy = candidate.ApprovalPolicy.Normalized()
+	if !candidate.ApprovalPolicy.Valid() {
+		return nil, fmt.Errorf("unknown approval policy %q", candidate.ApprovalPolicy)
+	}
 	computedHash := ComputeCommandHash(candidate.Command)
 	if candidate.Command.Hash != "" && candidate.Command.Hash != computedHash {
 		return nil, errors.New("request command hash does not match its contents")
@@ -171,8 +175,8 @@ func (db *DB) admitRequest(ctx context.Context, r *Request, limits RequestAdmiss
 			justification_reason, justification_expected_effect, justification_goal, justification_safety_argument,
 			dry_run_command, dry_run_output, attachments_json,
 			status, min_approvals, require_different_model,
-			created_at, expires_at, approval_expires_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			created_at, expires_at, approval_expires_at, approval_policy
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		candidate.ID, candidate.ProjectPath,
 		candidate.Command.Raw, string(argv), candidate.Command.Cwd, boolToInt(candidate.Command.Shell), candidate.Command.Hash,
@@ -182,6 +186,7 @@ func (db *DB) admitRequest(ctx context.Context, r *Request, limits RequestAdmiss
 		nullDryRunCommand(candidate.DryRun), nullDryRunOutput(candidate.DryRun), string(attachments),
 		string(candidate.Status), candidate.MinApprovals, boolToInt(candidate.RequireDifferentModel),
 		candidate.CreatedAt.Format(time.RFC3339), formatTimePtr(candidate.ExpiresAt), formatTimePtr(candidate.ApprovalExpiresAt),
+		string(candidate.ApprovalPolicy),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("inserting admitted request: %w", err)

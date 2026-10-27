@@ -36,10 +36,12 @@ func (s requestJournalSource) ReadNotices(ctx context.Context, project, after st
 			Status: state.Status, Tier: state.RiskTier, CommandHash: state.CommandHash,
 			RequestorSessionID: state.RequestorSessionID, MinApprovals: state.MinApprovals,
 			RequireDifferentModel: state.RequireDifferentModel, Approvals: state.Approvals, Rejections: state.Rejections,
-			ExitCode: state.ExitCode,
+			ExitCode:       state.ExitCode,
+			ApprovalPolicy: string(state.ApprovalPolicy), ExecutionAssurance: string(state.ExecutionAssurance),
 		}
 		if event.Review != nil {
 			notice.ReviewDecision = event.Review.Decision
+			notice.ReviewAssurance = string(event.Review.Assurance)
 		}
 		result.Notices = append(result.Notices, notice)
 	}

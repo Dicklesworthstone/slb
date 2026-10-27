@@ -75,26 +75,29 @@ Examples:
 
 		// Build response
 		type historyView struct {
-			RequestID      string `json:"request_id"`
-			Command        string `json:"command"`
-			RiskTier       string `json:"risk_tier"`
-			Status         string `json:"status"`
-			RequestorAgent string `json:"requestor_agent"`
-			ProjectPath    string `json:"project_path"`
-			CreatedAt      string `json:"created_at"`
-			ResolvedAt     string `json:"resolved_at,omitempty"`
+			approvalPolicyView
+			ExecutionAssurance db.ReviewAssurance `json:"execution_assurance,omitempty"`
+			RequestID          string             `json:"request_id"`
+			Command            string             `json:"command"`
+			RiskTier           string             `json:"risk_tier"`
+			Status             string             `json:"status"`
+			RequestorAgent     string             `json:"requestor_agent"`
+			ProjectPath        string             `json:"project_path"`
+			CreatedAt          string             `json:"created_at"`
+			ResolvedAt         string             `json:"resolved_at,omitempty"`
 		}
 
 		resp := make([]historyView, 0, len(requests))
 		for _, r := range requests {
 			view := historyView{
-				RequestID:      r.ID,
-				Command:        r.Command.Raw,
-				RiskTier:       string(r.RiskTier),
-				Status:         string(r.Status),
-				RequestorAgent: r.RequestorAgent,
-				ProjectPath:    r.ProjectPath,
-				CreatedAt:      r.CreatedAt.Format(time.RFC3339),
+				approvalPolicyView: policyView(r.ApprovalPolicy),
+				RequestID:          r.ID,
+				Command:            r.Command.Raw,
+				RiskTier:           string(r.RiskTier),
+				Status:             string(r.Status),
+				RequestorAgent:     r.RequestorAgent,
+				ProjectPath:        r.ProjectPath,
+				CreatedAt:          r.CreatedAt.Format(time.RFC3339),
 			}
 			// Use redacted version for display if available
 			if r.Command.DisplayRedacted != "" {
@@ -102,6 +105,9 @@ Examples:
 			}
 			if r.ResolvedAt != nil {
 				view.ResolvedAt = r.ResolvedAt.Format(time.RFC3339)
+			}
+			if r.Execution != nil {
+				view.ExecutionAssurance = r.Execution.Assurance
 			}
 			resp = append(resp, view)
 		}

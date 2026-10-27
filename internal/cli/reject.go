@@ -136,18 +136,22 @@ database contains the request you want to reject.
 
 		// Build output
 		type rejectionResult struct {
-			ReviewID             string `json:"review_id"`
-			RequestID            string `json:"request_id"`
-			Decision             string `json:"decision"`
-			Reason               string `json:"reason"`
-			Approvals            int    `json:"approvals"`
-			Rejections           int    `json:"rejections"`
-			RequestStatusChanged bool   `json:"request_status_changed"`
-			NewRequestStatus     string `json:"new_request_status,omitempty"`
-			CreatedAt            string `json:"created_at"`
+			approvalPolicyView
+			Assurance            db.ReviewAssurance `json:"assurance"`
+			ReviewID             string             `json:"review_id"`
+			RequestID            string             `json:"request_id"`
+			Decision             string             `json:"decision"`
+			Reason               string             `json:"reason"`
+			Approvals            int                `json:"approvals"`
+			Rejections           int                `json:"rejections"`
+			RequestStatusChanged bool               `json:"request_status_changed"`
+			NewRequestStatus     string             `json:"new_request_status,omitempty"`
+			CreatedAt            string             `json:"created_at"`
 		}
 
 		resp := rejectionResult{
+			approvalPolicyView:   policyView(result.Review.ApprovalPolicy),
+			Assurance:            result.Review.Assurance,
 			ReviewID:             result.Review.ID,
 			RequestID:            requestID,
 			Decision:             string(result.Review.Decision),
@@ -163,12 +167,14 @@ database contains the request you want to reject.
 		}
 
 		out := output.New(output.Format(GetOutput()))
-		if GetOutput() == "json" {
+		if executionOutputStructured() {
 			return out.Write(resp)
 		}
 
 		// Human-readable output
 		fmt.Printf("Rejected request %s\n", requestID)
+		fmt.Printf("Approval policy: %s\n", resp.ApprovalPolicyLabel)
+		fmt.Printf("Evidence assurance: %s\n", resp.Assurance)
 		fmt.Printf("Review ID: %s\n", resp.ReviewID)
 		fmt.Printf("Reason: %s\n", resp.Reason)
 		fmt.Printf("Approvals: %d, Rejections: %d\n", resp.Approvals, resp.Rejections)

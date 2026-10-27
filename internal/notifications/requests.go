@@ -37,6 +37,9 @@ type RequestNotice struct {
 	Approvals             int       `json:"submitted_approvals"`
 	Rejections            int       `json:"submitted_rejections"`
 	ReviewDecision        string    `json:"review_decision,omitempty"`
+	ApprovalPolicy        string    `json:"approval_policy"`
+	ReviewAssurance       string    `json:"review_assurance,omitempty"`
+	ExecutionAssurance    string    `json:"execution_assurance,omitempty"`
 	ExitCode              *int      `json:"exit_code,omitempty"`
 	// Cursor is the source's opaque, validated resume position. It is never
 	// sent to external destinations and is advanced only after handling.

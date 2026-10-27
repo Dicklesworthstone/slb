@@ -208,6 +208,21 @@ ALTER TABLE execution_outcomes ADD COLUMN human_notes TEXT;
 		Version: 6,
 		Name:    "vacuum_after_session_key_digests",
 	},
+	{
+		Version: 7,
+		Name:    "explicit_same_host_review_policy",
+		Up: `
+-- Defaults preserve historical requirements and never invent stronger evidence.
+ALTER TABLE requests ADD COLUMN approval_policy TEXT NOT NULL DEFAULT 'independent';
+ALTER TABLE requests ADD COLUMN execution_approval_policy TEXT NOT NULL DEFAULT '';
+ALTER TABLE requests ADD COLUMN execution_assurance TEXT NOT NULL DEFAULT 'legacy_unknown';
+ALTER TABLE reviews ADD COLUMN approval_policy TEXT NOT NULL DEFAULT 'independent';
+ALTER TABLE reviews ADD COLUMN assurance TEXT NOT NULL DEFAULT 'legacy_local';
+ALTER TABLE reviews ADD COLUMN command_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE reviews ADD COLUMN request_binding TEXT NOT NULL DEFAULT '';
+ALTER TABLE reviews ADD COLUMN signature_version INTEGER NOT NULL DEFAULT 1;
+` + sameHostRequestEventsSchema,
+	},
 }
 
 // ApplyMigrations applies any pending migrations in order.

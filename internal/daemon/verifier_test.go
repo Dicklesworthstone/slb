@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -111,6 +112,70 @@ func requireNotaryClaim(t *testing.T, v *Verifier, p VerifyExecuteParams) *Verif
 		t.Fatalf("claim failed: result=%+v error=%v", result, err)
 	}
 	return result
+}
+
+func TestVerifierSameHostClaimLabelsAndCurrentPolicy(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, revoke := range []bool{false, true} {
+		t.Run(fmt.Sprint("revoke=", revoke), func(t *testing.T) {
+			project := t.TempDir()
+			database, err := db.OpenAndMigrate(filepath.Join(project, ".slb", "state.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			configPath := filepath.Join(project, ".slb", "config.toml")
+			if err := os.WriteFile(configPath, []byte("[general]\napproval_policy = \"same_host\"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			author := &db.Session{AgentName: "requester", Model: "model-a", ProjectPath: project}
+			peer := &db.Session{AgentName: "reviewer", Model: "model-b", ProjectPath: project}
+			for _, session := range []*db.Session{author, peer} {
+				if err := database.CreateSession(session); err != nil {
+					t.Fatal(err)
+				}
+			}
+			request := &db.Request{ProjectPath: project, RequestorSessionID: author.ID,
+				RequestorAgent: author.AgentName, RequestorModel: author.Model, ApprovalPolicy: db.ApprovalPolicySameHost,
+				Command:  db.CommandSpec{Raw: "echo reviewed", Argv: []string{"echo", "reviewed"}, Cwd: project},
+				RiskTier: db.RiskTierDangerous, MinApprovals: 1, Justification: db.Justification{Reason: "test claim only"}}
+			if err := database.CreateRequest(request); err != nil {
+				t.Fatal(err)
+			}
+			_, err = database.ApplyReview(&db.Review{RequestID: request.ID, ReviewerSessionID: peer.ID, Decision: db.DecisionApprove},
+				peer.SessionKey, db.ReviewPolicy{ApprovalPolicy: db.ApprovalPolicySameHost})
+			if err != nil {
+				t.Fatal(err)
+			}
+			v := NewVerifier(database)
+			params := VerifyExecuteParams{RequestID: request.ID, SessionID: author.ID,
+				SessionKey: author.SessionKey, CommandHash: request.Command.Hash}
+			advisory, err := v.VerifyExecutionAllowed(params)
+			if err != nil || !advisory.Allowed {
+				t.Fatalf("intentional workflow refused: %+v %v", advisory, err)
+			}
+			if revoke {
+				if err := os.WriteFile(configPath, []byte("[general]\napproval_policy = \"independent\"\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			claim, err := v.VerifyAndMarkExecuting(params)
+			if revoke {
+				if err != nil || claim.Allowed || !strings.Contains(claim.Reason, "approval policy") {
+					t.Fatalf("notary ignored current policy: %+v %v", claim, err)
+				}
+				return
+			}
+			if err != nil || !claim.Allowed {
+				t.Fatalf("claim failed: %+v %v", claim, err)
+			}
+			response := claim.ToIPCResponse()
+			if response.ApprovalPolicy != db.ApprovalPolicySameHost || response.Assurance != db.AssuranceSameHost ||
+				!strings.Contains(response.ReviewNotice, "not independently authenticated authorization") {
+				t.Fatalf("notary promoted or concealed local evidence: %+v", response)
+			}
+		})
+	}
 }
 
 func TestVerifier_AdvisoryAndAtomicClaim(t *testing.T) {

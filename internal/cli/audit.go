@@ -25,6 +25,8 @@ func newAuditCommand() *cobra.Command {
 Records are private JSONL files under ~/.slb/audit/blocked. Commands are
 redacted before storage; hashes identify the exact command and working directory.
 These records describe attempted commands, not proof that a command executed.
+Use slb events for durable request, review and execution history with the
+recorded approval policy and evidence assurance.
 Use query --jsonl to export a single JSONL stream. Retention is explicit.`,
 	}
 	command.PersistentFlags().StringVar(&directory, "directory", "", "audit directory (default ~/.slb/audit/blocked)")

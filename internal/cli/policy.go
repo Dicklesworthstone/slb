@@ -9,6 +9,25 @@ import (
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
+// approvalPolicyView keeps the requested assurance explicit in every CLI
+// representation. A policy label describes what is required, never a claim
+// that a reviewer identity has been independently authenticated.
+type approvalPolicyView struct {
+	ApprovalPolicy      db.ApprovalPolicy `json:"approval_policy"`
+	ApprovalPolicyLabel string            `json:"approval_policy_label"`
+}
+
+func policyView(policy db.ApprovalPolicy) approvalPolicyView {
+	return approvalPolicyView{
+		ApprovalPolicy: policy.Normalized(), ApprovalPolicyLabel: policy.Label(),
+	}
+}
+
+func addApprovalPolicyMetadata(view map[string]any, policy db.ApprovalPolicy) {
+	view["approval_policy"] = policy.Normalized()
+	view["approval_policy_label"] = policy.Label()
+}
+
 // loadCustomPatternsIntoDefaultEngine publishes the complete effective policy:
 // defaults < user config < project (or explicit) config < environment,
 // followed by the project's persisted custom rules. Read-only classification

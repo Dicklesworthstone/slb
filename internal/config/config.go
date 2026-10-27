@@ -18,6 +18,9 @@ type Config struct {
 
 // GeneralConfig holds core behavior knobs.
 type GeneralConfig struct {
+	// ApprovalPolicy is independent by default. same_host explicitly enables
+	// local peer review for mistake prevention, without authenticated identities.
+	ApprovalPolicy            string   `toml:"approval_policy" mapstructure:"approval_policy"`
 	MinApprovals              int      `toml:"min_approvals" mapstructure:"min_approvals"`
 	RequireDifferentModel     bool     `toml:"require_different_model" mapstructure:"require_different_model"`
 	DifferentModelTimeoutSecs int      `toml:"different_model_timeout" mapstructure:"different_model_timeout"`

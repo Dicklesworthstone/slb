@@ -66,26 +66,32 @@ This shows the full request details including:
 		}
 
 		type reviewView struct {
-			ReviewID          string         `json:"review_id"`
-			ReviewerSessionID string         `json:"reviewer_session_id"`
-			ReviewerAgent     string         `json:"reviewer_agent"`
-			ReviewerModel     string         `json:"reviewer_model"`
-			Decision          string         `json:"decision"`
-			Signature         string         `json:"signature,omitempty"`
-			SignatureTime     string         `json:"signature_timestamp,omitempty"`
-			Responses         *responsesView `json:"responses,omitempty"`
-			Comments          string         `json:"comments,omitempty"`
-			CreatedAt         string         `json:"created_at"`
+			approvalPolicyView
+			Assurance         db.ReviewAssurance `json:"assurance"`
+			CommandHash       string             `json:"command_hash,omitempty"`
+			SignatureVersion  int                `json:"signature_version"`
+			ReviewID          string             `json:"review_id"`
+			ReviewerSessionID string             `json:"reviewer_session_id"`
+			ReviewerAgent     string             `json:"reviewer_agent"`
+			ReviewerModel     string             `json:"reviewer_model"`
+			Decision          string             `json:"decision"`
+			Signature         string             `json:"signature,omitempty"`
+			SignatureTime     string             `json:"signature_timestamp,omitempty"`
+			Responses         *responsesView     `json:"responses,omitempty"`
+			Comments          string             `json:"comments,omitempty"`
+			CreatedAt         string             `json:"created_at"`
 		}
 
 		type executionView struct {
-			LogPath             string `json:"log_path,omitempty"`
-			ExitCode            *int   `json:"exit_code,omitempty"`
-			DurationMs          *int64 `json:"duration_ms,omitempty"`
-			ExecutedAt          string `json:"executed_at,omitempty"`
-			ExecutedBySessionID string `json:"executed_by_session_id,omitempty"`
-			ExecutedByAgent     string `json:"executed_by_agent,omitempty"`
-			ExecutedByModel     string `json:"executed_by_model,omitempty"`
+			approvalPolicyView
+			Assurance           db.ReviewAssurance `json:"assurance"`
+			LogPath             string             `json:"log_path,omitempty"`
+			ExitCode            *int               `json:"exit_code,omitempty"`
+			DurationMs          *int64             `json:"duration_ms,omitempty"`
+			ExecutedAt          string             `json:"executed_at,omitempty"`
+			ExecutedBySessionID string             `json:"executed_by_session_id,omitempty"`
+			ExecutedByAgent     string             `json:"executed_by_agent,omitempty"`
+			ExecutedByModel     string             `json:"executed_by_model,omitempty"`
 		}
 
 		type rollbackView struct {
@@ -116,6 +122,7 @@ This shows the full request details including:
 		}
 
 		type showView struct {
+			approvalPolicyView
 			RequestID             string            `json:"request_id"`
 			ProjectPath           string            `json:"project_path"`
 			Command               commandView       `json:"command"`
@@ -139,6 +146,7 @@ This shows the full request details including:
 		}
 
 		view := showView{
+			approvalPolicyView:    policyView(request.ApprovalPolicy),
 			RequestID:             request.ID,
 			ProjectPath:           request.ProjectPath,
 			RiskTier:              string(request.RiskTier),
@@ -190,14 +198,18 @@ This shows the full request details including:
 			view.Reviews = make([]reviewView, 0, len(reviews))
 			for _, r := range reviews {
 				rv := reviewView{
-					ReviewID:          r.ID,
-					ReviewerSessionID: r.ReviewerSessionID,
-					ReviewerAgent:     r.ReviewerAgent,
-					ReviewerModel:     r.ReviewerModel,
-					Decision:          string(r.Decision),
-					Signature:         r.Signature,
-					Comments:          r.Comments,
-					CreatedAt:         r.CreatedAt.Format(time.RFC3339),
+					approvalPolicyView: policyView(r.ApprovalPolicy),
+					Assurance:          r.Assurance,
+					CommandHash:        r.CommandHash,
+					SignatureVersion:   r.SignatureVersion,
+					ReviewID:           r.ID,
+					ReviewerSessionID:  r.ReviewerSessionID,
+					ReviewerAgent:      r.ReviewerAgent,
+					ReviewerModel:      r.ReviewerModel,
+					Decision:           string(r.Decision),
+					Signature:          r.Signature,
+					Comments:           r.Comments,
+					CreatedAt:          r.CreatedAt.Format(time.RFC3339),
 				}
 				if !r.SignatureTimestamp.IsZero() {
 					rv.SignatureTime = r.SignatureTimestamp.Format(time.RFC3339)
@@ -219,6 +231,8 @@ This shows the full request details including:
 		// Execution
 		if flagShowWithExecution && request.Execution != nil {
 			view.Execution = &executionView{
+				approvalPolicyView:  policyView(request.Execution.ApprovalPolicy),
+				Assurance:           request.Execution.Assurance,
 				LogPath:             request.Execution.LogPath,
 				ExitCode:            request.Execution.ExitCode,
 				DurationMs:          request.Execution.DurationMs,

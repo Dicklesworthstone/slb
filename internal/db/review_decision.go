@@ -19,6 +19,7 @@ var (
 	ErrReviewInvalidDecision    = errors.New("invalid decision (must be approve or reject)")
 	ErrReviewTargetChanged      = errors.New("request changed since it was displayed; reload before reviewing")
 	ErrReviewDelegationMismatch = errors.New("cross-project reviewer identity mismatch")
+	ErrReviewPolicyMismatch     = errors.New("approval policy differs from this request; submit a new request under the intended policy")
 	// The local backend has no external reviewer authenticator. Session keys,
 	// agent names and model labels cannot establish independent principals.
 	ErrIndependentIdentityUnavailable = errors.New("independent reviewer identity unavailable: local sessions cannot authorize approvals; use an external identity and execution boundary")
@@ -26,7 +27,7 @@ var (
 
 // DelegatedReviewerIdentity describes a credential-authenticated session in
 // another project's database, not an independently authenticated principal.
-// Approvals remain disabled; rejection provenance uses an ended session row
+// Independent approvals remain disabled; review provenance uses an ended session row
 // solely to satisfy review provenance/FK requirements; it never becomes an
 // active reviewer session or contributes to dynamic quorum.
 type DelegatedReviewerIdentity struct {
@@ -40,6 +41,9 @@ type DelegatedReviewerIdentity struct {
 // finite defaults; negative durations and unknown conflict modes are rejected.
 // The caller loads this policy from the target project's configuration.
 type ReviewPolicy struct {
+	// Same-host approval requires both an explicitly opted-in request and the
+	// caller's current policy. Changing configuration never relabels a request.
+	ApprovalPolicy          ApprovalPolicy
 	ConflictResolution      string
 	TrustedSelfApprove      []string
 	TrustedSelfApproveDelay time.Duration
@@ -63,10 +67,10 @@ type ReviewOutcome struct {
 	StatusChanged bool
 }
 
-// ApplyReview refuses local approvals because no external identity verifier
-// exists. Rejections authenticate session-key possession and are committed in
-// one transaction. Names and models copied from sessions remain unverified
-// labels, even though callers cannot override them in an individual review.
+// ApplyReview refuses independent local approvals because no external identity
+// verifier exists. Explicit same-host reviews authenticate session-key possession
+// only. All eligibility, evidence and resolution writes share one transaction.
+// Session names and models remain unverified labels in same-host mode.
 func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy) (*ReviewOutcome, error) {
 	if review == nil || review.RequestID == "" || review.ReviewerSessionID == "" {
 		return nil, fmt.Errorf("request_id and reviewer_session_id are required")
@@ -77,11 +81,11 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 	if review.Decision != DecisionApprove && review.Decision != DecisionReject {
 		return nil, ErrReviewInvalidDecision
 	}
-	if review.Decision == DecisionApprove && !independentIdentityAttested() {
+	if review.Decision == DecisionApprove && policy.ApprovalPolicy.Normalized() == ApprovalPolicyIndependent && !independentIdentityAttested() {
 		// Fail closed for every approval entry point (CLI, TUI, RPC and
 		// cross-project delegation). Neither trusted_self_approve nor an
-		// authenticated HMAC session proves an independent reviewer. There is
-		// deliberately no environment/configuration switch to bypass this.
+		// authenticated HMAC session proves an independent reviewer. Explicit
+		// same-host review uses a distinct request and evidence category.
 		return nil, ErrIndependentIdentityUnavailable
 	}
 	if err := policy.validate(); err != nil {
@@ -108,6 +112,12 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 		request, err := db.GetRequestTx(tx, accepted.RequestID)
 		if err != nil {
 			return err
+		}
+		if !request.ApprovalPolicy.Valid() {
+			return fmt.Errorf("unknown request approval policy %q", request.ApprovalPolicy)
+		}
+		if accepted.Decision == DecisionApprove && request.ApprovalPolicy.Normalized() != policy.ApprovalPolicy.Normalized() {
+			return ErrReviewPolicyMismatch
 		}
 		if (policy.ExpectedCommandHash != "" && request.Command.Hash != policy.ExpectedCommandHash) ||
 			(policy.ExpectedProjectPath != "" && request.ProjectPath != policy.ExpectedProjectPath) {
@@ -165,6 +175,9 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 		// Restarting a session does not create an independent second agent.
 		self := accepted.ReviewerSessionID == request.RequestorSessionID || agent == request.RequestorAgent
 		if self {
+			if request.ApprovalPolicy == ApprovalPolicySameHost {
+				return ErrSelfReview
+			}
 			trusted := false
 			for _, name := range policy.TrustedSelfApprove {
 				trusted = trusted || name == agent
@@ -196,19 +209,42 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 			return ErrReviewExists
 		}
 		accepted.ReviewerAgent, accepted.ReviewerModel = agent, model
-		if accepted.Signature == "" {
-			accepted.SignatureTimestamp = now.Truncate(time.Second)
-			accepted.Signature = signReviewWithDigest(storedDigest, request.ID, accepted.Decision, accepted.SignatureTimestamp)
-		} else {
-			if accepted.SignatureTimestamp.IsZero() || accepted.SignatureTimestamp.Before(now.Add(-5*time.Minute)) ||
-				accepted.SignatureTimestamp.After(now.Add(time.Minute)) ||
-				!verifyReviewWithDigest(storedDigest, request.ID, accepted.Decision, accepted.SignatureTimestamp, accepted.Signature) {
+		if accepted.Signature != "" {
+			if accepted.SignatureTimestamp.IsZero() || accepted.SignatureTimestamp.Before(now.Add(-5*time.Minute)) || accepted.SignatureTimestamp.After(now.Add(time.Minute)) {
 				return ErrInvalidSignature
+			}
+		}
+		if request.ApprovalPolicy == ApprovalPolicySameHost {
+			if accepted.Signature == "" {
+				accepted.ApprovalPolicy, accepted.Assurance = ApprovalPolicySameHost, AssuranceSameHost
+				accepted.CommandHash, accepted.RequestBinding = request.Command.Hash, reviewRequestBinding(request)
+				accepted.SignatureVersion = 2
+				accepted.SignatureTimestamp = now.Truncate(time.Second)
+				accepted.Signature = signReviewEvidenceWithDigest(storedDigest, &accepted)
+			} else if !reviewMatchesRequest(&accepted, request) || !verifyReviewEvidenceWithDigest(storedDigest, &accepted) {
+				return ErrInvalidSignature
+			}
+		} else {
+			// Historical v1 evidence remains local evidence, even when tests
+			// simulate an independent authority. Never relabel it as same-host.
+			if accepted.Signature != "" && (!legacyReviewMetadata(&accepted) || !verifyReviewWithDigest(storedDigest, request.ID, accepted.Decision, accepted.SignatureTimestamp, accepted.Signature)) {
+				return ErrInvalidSignature
+			}
+			accepted.ApprovalPolicy, accepted.Assurance = ApprovalPolicyIndependent, AssuranceLegacyLocal
+			accepted.CommandHash, accepted.RequestBinding, accepted.SignatureVersion = "", "", 1
+			if accepted.Signature == "" {
+				accepted.SignatureTimestamp = now.Truncate(time.Second)
+				accepted.Signature = signReviewWithDigest(storedDigest, request.ID, accepted.Decision, accepted.SignatureTimestamp)
 			}
 		}
 		accepted.CreatedAt = now.Truncate(time.Second)
 		if err := db.CreateReviewTx(tx, &accepted); err != nil {
 			return err
+		}
+		if request.ApprovalPolicy == ApprovalPolicySameHost {
+			if _, err := verifyReviewEvidenceTx(tx, request, now); err != nil {
+				return err
+			}
 		}
 		approvals, rejections, err := db.CountReviewsByDecisionTx(tx, request.ID)
 		if err != nil {
@@ -295,6 +331,9 @@ func deriveDelegatedReviewKey(sourceSessionKey, targetProject, sourceProject, so
 }
 
 func (p ReviewPolicy) validate() error {
+	if !p.ApprovalPolicy.Valid() {
+		return fmt.Errorf("unknown approval policy %q", p.ApprovalPolicy)
+	}
 	switch p.ConflictResolution {
 	case "", "any_rejection_blocks", "first_wins", "human_breaks_tie":
 	default:

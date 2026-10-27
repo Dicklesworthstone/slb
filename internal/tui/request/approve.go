@@ -150,6 +150,7 @@ func (m *ApproveModel) View() string {
 		Padding(0, 2)
 
 	confirmMsg := "You are about to APPROVE this request."
+	confirmMsg += "\n" + m.Request.ApprovalPolicy.Label() + "."
 	if m.Request.RiskTier == db.RiskTierCritical {
 		confirmMsg += "\nThis is a CRITICAL tier request requiring 2+ approvals."
 	}

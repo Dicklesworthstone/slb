@@ -65,6 +65,7 @@ the target project's policy explicitly contains your reviewer identity.`,
 
 		// Build response
 		type pendingView struct {
+			approvalPolicyView
 			RequestID       string `json:"request_id"`
 			Command         string `json:"command"`
 			CommandRedacted string `json:"command_redacted,omitempty"`
@@ -81,15 +82,16 @@ the target project's policy explicitly contains your reviewer identity.`,
 		resp := make([]pendingView, 0, len(requests))
 		for _, r := range requests {
 			view := pendingView{
-				RequestID:      r.ID,
-				Command:        r.Command.Raw,
-				RiskTier:       string(r.RiskTier),
-				MinApprovals:   r.MinApprovals,
-				RequestorAgent: r.RequestorAgent,
-				RequestorModel: r.RequestorModel,
-				ProjectPath:    r.ProjectPath,
-				Reason:         r.Justification.Reason,
-				CreatedAt:      r.CreatedAt.Format(time.RFC3339),
+				approvalPolicyView: policyView(r.ApprovalPolicy),
+				RequestID:          r.ID,
+				Command:            r.Command.Raw,
+				RiskTier:           string(r.RiskTier),
+				MinApprovals:       r.MinApprovals,
+				RequestorAgent:     r.RequestorAgent,
+				RequestorModel:     r.RequestorModel,
+				ProjectPath:        r.ProjectPath,
+				Reason:             r.Justification.Reason,
+				CreatedAt:          r.CreatedAt.Format(time.RFC3339),
 			}
 			if r.Command.DisplayRedacted != "" {
 				view.CommandRedacted = r.Command.DisplayRedacted

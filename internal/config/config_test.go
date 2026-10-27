@@ -17,6 +17,47 @@ func TestDefaultConfig_Validate(t *testing.T) {
 	}
 }
 
+func TestApprovalPolicyRequiresExplicitOptIn(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SLB_APPROVAL_POLICY", "")
+	project := t.TempDir()
+	opts := LoadOptions{ProjectDir: project}
+	cfg, err := Load(opts)
+	if err != nil || cfg.General.ApprovalPolicy != "independent" {
+		t.Fatalf("secure default = %q, %v", cfg.General.ApprovalPolicy, err)
+	}
+	value, err := ParseValue("general.approval_policy", "same_host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteValue(filepath.Join(project, ".slb", "config.toml"), "general.approval_policy", value); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(opts)
+	if err != nil || cfg.General.ApprovalPolicy != "same_host" {
+		t.Fatalf("explicit opt-in = %q, %v", cfg.General.ApprovalPolicy, err)
+	}
+	before, err := ReadSources(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SLB_APPROVAL_POLICY", "independent")
+	after, err := ReadSources(opts)
+	if err != nil || before.Equal(after) {
+		t.Fatalf("approval policy change did not invalidate cached config: %v", err)
+	}
+	cfg, err = Load(opts)
+	if err != nil || cfg.General.ApprovalPolicy != "independent" {
+		t.Fatalf("environment revocation = %q, %v", cfg.General.ApprovalPolicy, err)
+	}
+	for _, invalid := range []string{"same-host", "true", "authenticated", "SAME_HOST"} {
+		t.Setenv("SLB_APPROVAL_POLICY", invalid)
+		if _, err := Load(opts); err == nil {
+			t.Fatalf("invalid policy %q was accepted", invalid)
+		}
+	}
+}
+
 func TestValidate_Errors(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.General.MinApprovals = 0
@@ -340,6 +381,7 @@ func TestGetValue(t *testing.T) {
 		key  string
 		want any
 	}{
+		{"general.approval_policy", cfg.General.ApprovalPolicy},
 		{"general.min_approvals", cfg.General.MinApprovals},
 		{"general.require_different_model", cfg.General.RequireDifferentModel},
 		{"general.different_model_timeout", cfg.General.DifferentModelTimeoutSecs},

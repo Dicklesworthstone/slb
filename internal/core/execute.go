@@ -3,6 +3,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +35,9 @@ type ExecuteOptions struct {
 	// ExpectedCommandHash binds a handoff to the exact command seen by its
 	// caller. Empty means no additional caller-side binding is requested.
 	ExpectedCommandHash string
+	// ExpectedApprovalPolicy binds a background handoff to the policy observed
+	// by its launcher. Empty requests no additional caller-side binding.
+	ExpectedApprovalPolicy db.ApprovalPolicy
 	// SessionID is the executor's session ID (required for tracking).
 	SessionID string
 	// Timeout is the maximum execution duration (default 5 minutes).
@@ -62,6 +66,8 @@ type ExecuteOptions struct {
 // LogPath belongs to the already committed claim; PID is the actual command.
 type ExecutionStart struct {
 	RequestID, CommandHash, LogPath string
+	ApprovalPolicy                  db.ApprovalPolicy
+	Assurance                       db.ReviewAssurance
 	PID                             int
 }
 
@@ -151,6 +157,9 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 	}
 	if opts.ExpectedCommandHash != "" && opts.ExpectedCommandHash != request.Command.Hash {
 		return nil, fmt.Errorf("%w: command changed since execution was requested", ErrCommandHashMismatch)
+	}
+	if opts.ExpectedApprovalPolicy != "" && opts.ExpectedApprovalPolicy != request.ApprovalPolicy.Normalized() {
+		return nil, fmt.Errorf("%w: approval policy changed since execution was requested", ErrApprovalPolicyChanged)
 	}
 
 	// Get the session (for tracking who executed)
@@ -269,10 +278,18 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 	var onStarted func(int) error
 	if opts.OnStarted != nil {
 		onStarted = func(pid int) error {
-			return opts.OnStarted(ExecutionStart{RequestID: request.ID, CommandHash: request.Command.Hash, LogPath: logPath, PID: pid})
+			return opts.OnStarted(ExecutionStart{RequestID: request.ID, CommandHash: request.Command.Hash,
+				ApprovalPolicy: exec.ApprovalPolicy, Assurance: exec.Assurance, LogPath: logPath, PID: pid})
 		}
 	}
-	cmdResult, err := runCommand(execCtx, &request.Command, logPath, streamWriter, onStarted)
+	// Keep the recorded assurance with the standalone command log, before a
+	// child can emit output. A failed evidence write consumes this claim as a
+	// failed startup; it must not run an unlabelled command or reopen approval.
+	var cmdResult *CommandResult
+	err = writeExecutionEvidence(logPath, request, exec)
+	if err == nil {
+		cmdResult, err = runCommand(execCtx, &request.Command, logPath, streamWriter, onStarted)
+	}
 	if cmdResult != nil {
 		// Cancellation and I/O failures can still have output and a real exit
 		// status. Preserve these before handling the error.
@@ -314,6 +331,25 @@ func (e *Executor) ExecuteApprovedRequest(ctx context.Context, opts ExecuteOptio
 	_ = e.notifier.NotifyRequestExecuted(request, exec, result.ExitCode)
 
 	return result, result.Error
+}
+
+func writeExecutionEvidence(path string, request *db.Request, execution *db.Execution) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return fmt.Errorf("opening execution evidence log: %w", err)
+	}
+	err = json.NewEncoder(file).Encode(map[string]any{
+		"event": "execution_claim", "request_id": request.ID, "command_hash": request.Command.Hash,
+		"approval_policy": execution.ApprovalPolicy, "approval_policy_label": execution.ApprovalPolicy.Label(),
+		"assurance": execution.Assurance, "executed_by_session_id": execution.ExecutedBySessionID,
+	})
+	if err == nil {
+		err = file.Sync()
+	}
+	if err = errors.Join(err, file.Close()); err != nil {
+		return fmt.Errorf("recording execution assurance: %w", err)
+	}
+	return nil
 }
 
 // createLogFile creates the log file for command output.
@@ -397,7 +433,8 @@ func (e *Executor) verifyApprovalSnapshot(request *db.Request) error {
 	}
 	if verified.Command.Hash != request.Command.Hash || verified.ProjectPath != request.ProjectPath ||
 		verified.RiskTier != request.RiskTier || verified.MinApprovals != request.MinApprovals ||
-		verified.RequireDifferentModel != request.RequireDifferentModel {
+		verified.RequireDifferentModel != request.RequireDifferentModel ||
+		verified.ApprovalPolicy.Normalized() != request.ApprovalPolicy.Normalized() {
 		return fmt.Errorf("%w: request changed during preflight", db.ErrInvalidTransition)
 	}
 	return CheckExecutionPolicy(e.db, request, e.configPath)

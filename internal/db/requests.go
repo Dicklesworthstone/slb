@@ -26,6 +26,10 @@ const DefaultRequestTimeout = 30 * time.Minute
 // CreateRequest creates a new request in the database.
 // Generates a UUID and computes the command hash.
 func (db *DB) CreateRequest(r *Request) error {
+	r.ApprovalPolicy = r.ApprovalPolicy.Normalized()
+	if !r.ApprovalPolicy.Valid() {
+		return fmt.Errorf("unknown approval policy %q", r.ApprovalPolicy)
+	}
 	// Generate UUID if not set
 	if r.ID == "" {
 		r.ID = uuid.New().String()
@@ -60,8 +64,8 @@ func (db *DB) CreateRequest(r *Request) error {
 			justification_reason, justification_expected_effect, justification_goal, justification_safety_argument,
 			dry_run_command, dry_run_output, attachments_json,
 			status, min_approvals, require_different_model,
-			created_at, expires_at, approval_expires_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			created_at, expires_at, approval_expires_at, approval_policy
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		r.ID, r.ProjectPath,
 		r.Command.Raw, string(argvJSON), r.Command.Cwd, boolToInt(r.Command.Shell), r.Command.Hash,
@@ -71,6 +75,7 @@ func (db *DB) CreateRequest(r *Request) error {
 		nullDryRunCommand(r.DryRun), nullDryRunOutput(r.DryRun), string(attachmentsJSON),
 		string(r.Status), r.MinApprovals, boolToInt(r.RequireDifferentModel),
 		r.CreatedAt.Format(time.RFC3339), formatTimePtr(r.ExpiresAt), formatTimePtr(r.ApprovalExpiresAt),
+		string(r.ApprovalPolicy),
 	)
 
 	if err != nil {
@@ -93,7 +98,8 @@ func (db *DB) GetRequestTx(tx *sql.Tx, id string) (*Request, error) {
 			execution_log_path, execution_exit_code, execution_duration_ms,
 			execution_executed_at, execution_executed_by_session_id, execution_executed_by_agent, execution_executed_by_model,
 			rollback_path, rollback_rolled_back_at,
-			created_at, resolved_at, expires_at, approval_expires_at
+			created_at, resolved_at, expires_at, approval_expires_at,
+			approval_policy, execution_approval_policy, execution_assurance
 		FROM requests WHERE id = ?
 	`, id)
 
@@ -113,7 +119,8 @@ func (db *DB) GetRequest(id string) (*Request, error) {
 			execution_log_path, execution_exit_code, execution_duration_ms,
 			execution_executed_at, execution_executed_by_session_id, execution_executed_by_agent, execution_executed_by_model,
 			rollback_path, rollback_rolled_back_at,
-			created_at, resolved_at, expires_at, approval_expires_at
+			created_at, resolved_at, expires_at, approval_expires_at,
+			approval_policy, execution_approval_policy, execution_assurance
 		FROM requests WHERE id = ?
 	`, id)
 
@@ -129,7 +136,8 @@ func (db *DB) GetRequestWithReviews(id string) (*Request, []*Review, error) {
 
 	rows, err := db.Query(`
 		SELECT id, request_id, reviewer_session_id, reviewer_agent, reviewer_model,
-			decision, signature, signature_timestamp, responses_json, comments, created_at
+			decision, signature, signature_timestamp, responses_json, comments, created_at,
+			approval_policy, assurance, command_hash, request_binding, signature_version
 		FROM reviews WHERE request_id = ?
 		ORDER BY created_at ASC
 	`, id)
@@ -175,7 +183,8 @@ func (db *DB) ListPendingRequestsByProjects(projectPaths []string) ([]*Request, 
 			execution_log_path, execution_exit_code, execution_duration_ms,
 			execution_executed_at, execution_executed_by_session_id, execution_executed_by_agent, execution_executed_by_model,
 			rollback_path, rollback_rolled_back_at,
-			created_at, resolved_at, expires_at, approval_expires_at
+			created_at, resolved_at, expires_at, approval_expires_at,
+			approval_policy, execution_approval_policy, execution_assurance
 		FROM requests
 		WHERE project_path IN (%s) AND status = ?
 		ORDER BY created_at DESC
@@ -203,7 +212,8 @@ func (db *DB) ListPendingRequestsAllProjects() ([]*Request, error) {
 			execution_log_path, execution_exit_code, execution_duration_ms,
 			execution_executed_at, execution_executed_by_session_id, execution_executed_by_agent, execution_executed_by_model,
 			rollback_path, rollback_rolled_back_at,
-			created_at, resolved_at, expires_at, approval_expires_at
+			created_at, resolved_at, expires_at, approval_expires_at,
+			approval_policy, execution_approval_policy, execution_assurance
 		FROM requests WHERE status = ?
 		ORDER BY created_at DESC
 	`, string(StatusPending))
@@ -228,7 +238,8 @@ func (db *DB) ListRequestsByStatus(status RequestStatus, projectPath string) ([]
 			execution_log_path, execution_exit_code, execution_duration_ms,
 			execution_executed_at, execution_executed_by_session_id, execution_executed_by_agent, execution_executed_by_model,
 			rollback_path, rollback_rolled_back_at,
-			created_at, resolved_at, expires_at, approval_expires_at
+			created_at, resolved_at, expires_at, approval_expires_at,
+			approval_policy, execution_approval_policy, execution_assurance
 		FROM requests WHERE status = ? AND project_path = ?
 		ORDER BY created_at DESC
 	`, string(status), projectPath)
@@ -253,7 +264,8 @@ func (db *DB) ListAllRequests(projectPath string) ([]*Request, error) {
 			execution_log_path, execution_exit_code, execution_duration_ms,
 			execution_executed_at, execution_executed_by_session_id, execution_executed_by_agent, execution_executed_by_model,
 			rollback_path, rollback_rolled_back_at,
-			created_at, resolved_at, expires_at, approval_expires_at
+			created_at, resolved_at, expires_at, approval_expires_at,
+			approval_policy, execution_approval_policy, execution_assurance
 		FROM requests WHERE project_path = ?
 		ORDER BY created_at DESC
 	`, projectPath)
@@ -494,7 +506,8 @@ func (db *DB) SearchRequests(query string) ([]*Request, error) {
 			r.execution_log_path, r.execution_exit_code, r.execution_duration_ms,
 			r.execution_executed_at, r.execution_executed_by_session_id, r.execution_executed_by_agent, r.execution_executed_by_model,
 			r.rollback_path, r.rollback_rolled_back_at,
-			r.created_at, r.resolved_at, r.expires_at, r.approval_expires_at
+			r.created_at, r.resolved_at, r.expires_at, r.approval_expires_at,
+			r.approval_policy, r.execution_approval_policy, r.execution_assurance
 		FROM requests r
 		JOIN requests_fts fts ON r.rowid = fts.rowid
 		WHERE requests_fts MATCH ?
@@ -523,7 +536,8 @@ func (db *DB) FindExpiredRequests() ([]*Request, error) {
 			execution_log_path, execution_exit_code, execution_duration_ms,
 			execution_executed_at, execution_executed_by_session_id, execution_executed_by_agent, execution_executed_by_model,
 			rollback_path, rollback_rolled_back_at,
-			created_at, resolved_at, expires_at, approval_expires_at
+			created_at, resolved_at, expires_at, approval_expires_at,
+			approval_policy, execution_approval_policy, execution_assurance
 		FROM requests
 		WHERE status = ? AND expires_at IS NOT NULL AND expires_at < ?
 		ORDER BY expires_at ASC
@@ -562,6 +576,7 @@ func scanRequest(row *sql.Row) (*Request, error) {
 		rollbackPath, rollbackAt                            sql.NullString
 		createdAt, resolvedAt, expiresAt, approvalExpiresAt sql.NullString
 		riskTier, status                                    string
+		policy, execPolicy, execAssurance                   string
 		minApprovals                                        int
 		requireDiffModel, cmdShell, containsSensitive       int
 	)
@@ -578,6 +593,7 @@ func scanRequest(row *sql.Row) (*Request, error) {
 		&execAt, &execBySessionID, &execByAgent, &execByModel,
 		&rollbackPath, &rollbackAt,
 		&createdAt, &resolvedAt, &expiresAt, &approvalExpiresAt,
+		&policy, &execPolicy, &execAssurance,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -593,6 +609,7 @@ func scanRequest(row *sql.Row) (*Request, error) {
 	r.RiskTier = RiskTier(riskTier)
 	r.Status = RequestStatus(status)
 	r.MinApprovals = minApprovals
+	r.ApprovalPolicy = ApprovalPolicy(policy).Normalized()
 
 	if cmdDisplayRedacted.Valid {
 		r.Command.DisplayRedacted = cmdDisplayRedacted.String
@@ -622,7 +639,8 @@ func scanRequest(row *sql.Row) (*Request, error) {
 	// Execution info
 	if execLogPath.Valid || execExitCode.Valid || execAt.Valid {
 		r.Execution = &Execution{
-			LogPath: execLogPath.String,
+			LogPath: execLogPath.String, ApprovalPolicy: ApprovalPolicy(execPolicy),
+			Assurance: ReviewAssurance(execAssurance),
 		}
 		if execExitCode.Valid {
 			var exitCode int
@@ -695,6 +713,7 @@ func scanRequests(rows *sql.Rows) ([]*Request, error) {
 			rollbackPath, rollbackAt                            sql.NullString
 			createdAt, resolvedAt, expiresAt, approvalExpiresAt sql.NullString
 			riskTier, status                                    string
+			policy, execPolicy, execAssurance                   string
 			minApprovals                                        int
 			requireDiffModel, cmdShell, containsSensitive       int
 		)
@@ -711,6 +730,7 @@ func scanRequests(rows *sql.Rows) ([]*Request, error) {
 			&execAt, &execBySessionID, &execByAgent, &execByModel,
 			&rollbackPath, &rollbackAt,
 			&createdAt, &resolvedAt, &expiresAt, &approvalExpiresAt,
+			&policy, &execPolicy, &execAssurance,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning request row: %w", err)
@@ -723,6 +743,7 @@ func scanRequests(rows *sql.Rows) ([]*Request, error) {
 		r.RiskTier = RiskTier(riskTier)
 		r.Status = RequestStatus(status)
 		r.MinApprovals = minApprovals
+		r.ApprovalPolicy = ApprovalPolicy(policy).Normalized()
 
 		if cmdDisplayRedacted.Valid {
 			r.Command.DisplayRedacted = cmdDisplayRedacted.String
@@ -752,7 +773,8 @@ func scanRequests(rows *sql.Rows) ([]*Request, error) {
 		// Execution info
 		if execLogPath.Valid || execExitCode.Valid || execAt.Valid {
 			r.Execution = &Execution{
-				LogPath: execLogPath.String,
+				LogPath: execLogPath.String, ApprovalPolicy: ApprovalPolicy(execPolicy),
+				Assurance: ReviewAssurance(execAssurance),
 			}
 			if execExitCode.Valid {
 				var exitCode int

@@ -15,10 +15,12 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
 // The helper is a separate real process. It models the worker protocol only;
-// database approval tests belong to core/CLI, not this stdlib transport suite.
+// database approval tests belong to core/CLI, not this transport suite.
 func TestBackgroundWorkerProcess(t *testing.T) {
 	mode := os.Getenv("SLB_TEST_BACKGROUND_MODE")
 	if mode == "" {
@@ -74,12 +76,25 @@ printf 'done\n' >> "$SLB_TEST_BACKGROUND_MARKER"
 		t.Fatal(err)
 	}
 	receipt := Receipt{Version: Version, RequestID: job.RequestID, CommandHash: job.CommandHash,
+		ApprovalPolicy: job.ApprovalPolicy.Normalized(), ApprovalPolicyLabel: job.ApprovalPolicy.Label(), Assurance: db.AssuranceIndependent,
 		Status: "executing", SupervisorPID: os.Getpid(), PID: command.Process.Pid, LogPath: filepath.Join(job.LogDir, "execution.log")}
+	if job.ApprovalPolicy == db.ApprovalPolicySameHost {
+		receipt.Assurance = db.AssuranceSameHost
+	}
 	if mode == "wrong-request" {
 		receipt.RequestID = "other-request"
 	}
 	if mode == "wrong-hash" {
 		receipt.CommandHash = strings.Repeat("b", 64)
+	}
+	if mode == "wrong-policy" {
+		receipt.ApprovalPolicy = db.ApprovalPolicySameHost
+	}
+	if mode == "wrong-assurance" {
+		receipt.Assurance = db.AssuranceSameHost
+	}
+	if mode == "missing-assurance" {
+		receipt.Assurance = ""
 	}
 	if mode == "wrong-supervisor" {
 		receipt.SupervisorPID++
@@ -202,7 +217,7 @@ func TestBackgroundLaunchSurvivesCallerCancellation(t *testing.T) {
 }
 
 func TestBackgroundLaunchRejectsUnconfirmedStartup(t *testing.T) {
-	for _, mode := range []string{"refused", "malformed", "empty", "oversized", "wrong-request", "wrong-hash", "wrong-supervisor", "wrong-log", "not-started", "claimed-only", "trailing"} {
+	for _, mode := range []string{"refused", "malformed", "empty", "oversized", "wrong-request", "wrong-hash", "wrong-policy", "wrong-assurance", "missing-assurance", "wrong-supervisor", "wrong-log", "not-started", "claimed-only", "trailing"} {
 		t.Run(mode, func(t *testing.T) {
 			t.Setenv("SLB_TEST_BACKGROUND_MODE", mode)
 			job := testJob(t)
@@ -252,6 +267,7 @@ func TestBackgroundProtocolAndPreflightValidation(t *testing.T) {
 		}
 	}
 	for _, change := range []func(*Job){
+		func(j *Job) { j.ApprovalPolicy = "unknown" },
 		func(j *Job) { j.Version = 0 }, func(j *Job) { j.RequestID = "" }, func(j *Job) { j.SessionID = "" },
 		func(j *Job) { j.CommandHash = "unknown" }, func(j *Job) { j.Database = "relative.db" },
 		func(j *Job) { j.Project = "relative" }, func(j *Job) { j.LogDir = "relative" },

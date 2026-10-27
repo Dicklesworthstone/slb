@@ -87,10 +87,10 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 			}
 			return decideAndAuditNativeHook(cmd, command, sessionID, cwd, "block",
 				"SLB: execution handoff unavailable or invalid; use slb execute explicitly.",
-				live.Tier, live.MinApprovals, live.MatchedPattern, "hook_native_daemon", live.AuditRecorded)
+				live.Tier, live.MinApprovals, live.MatchedPattern, "hook_native_daemon", live.AuditRecorded, live.ApprovalPolicy)
 		}
 		return decideAndAuditNativeHook(cmd, command, sessionID, cwd, live.Action, live.Message,
-			live.Tier, live.MinApprovals, live.MatchedPattern, "hook_native_daemon", live.AuditRecorded)
+			live.Tier, live.MinApprovals, live.MatchedPattern, "hook_native_daemon", live.AuditRecorded, live.ApprovalPolicy)
 	}
 
 	// The local fallback stays fail-closed whatever the cause. A deadline on a
@@ -105,7 +105,7 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return decideAndAuditNativeHook(cmd, command, sessionID, cwd, "block",
 			"SLB: classification failed; command blocked until policy is available.",
-			"unknown", 0, "policy_load_error", source, false)
+			"unknown", 0, "policy_load_error", source, false, "")
 	}
 	message := fallback.Message
 	if timedOut && fallback.Action != "allow" {
@@ -113,7 +113,7 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 			queryTimeout, message)
 	}
 	return decideAndAuditNativeHook(cmd, command, sessionID, cwd, fallback.Action, message,
-		fallback.Tier, fallback.MinApprovals, fallback.MatchedPattern, source, false)
+		fallback.Tier, fallback.MinApprovals, fallback.MatchedPattern, source, false, fallback.ApprovalPolicy)
 }
 
 // hookQueryTimeout is the configured daemon-query deadline for cwd's physical project.
@@ -213,7 +213,9 @@ func classifyNativeHookFallback(command, cwd string) (*daemon.HookQueryResult, e
 	classified := engine.ClassifyCommand(command, cwd)
 	result := &daemon.HookQueryResult{
 		Tier: string(classified.Tier), MatchedPattern: classified.MatchedPattern,
-		MinApprovals: classified.MinApprovals,
+		MinApprovals:   classified.MinApprovals,
+		ApprovalPolicy: db.ApprovalPolicy(cfg.General.ApprovalPolicy),
+		ReviewNotice:   db.ApprovalPolicy(cfg.General.ApprovalPolicy).Label(),
 	}
 	switch {
 	case classified.IsSafe:
@@ -236,21 +238,29 @@ func classifyNativeHookFallback(command, cwd string) (*daemon.HookQueryResult, e
 		result.Tier = "unknown"
 		result.Message = "SLB OFFLINE: command is not covered by policy; confirmation required while the daemon is unavailable."
 	}
+	if result.Action != "allow" {
+		result.Message += " Review policy: " + result.ReviewNotice + "."
+	}
 	return result, nil
 }
 
 func decideAndAuditNativeHook(cmd *cobra.Command, command, sessionID, cwd, action, message, tier string,
-	minApprovals int, matchedPattern, source string, alreadyRecorded bool,
+	minApprovals int, matchedPattern, source string, alreadyRecorded bool, policy db.ApprovalPolicy,
 ) error {
 	action = normalizedNativeHookAction(action)
 	if action != "allow" && !alreadyRecorded {
 		directory, err := audit.DefaultDirectory()
 		if err == nil {
+			notice := ""
+			if policy != "" {
+				notice = policy.Label()
+			}
 			err = audit.Record(directory, audit.Event{
 				CommandRedacted: core.ApplyRedaction(command, nil),
 				CommandHash:     audit.CommandHash(command, cwd), CWD: cwd, SessionID: sessionID,
 				Action: action, Tier: tier, MatchedPattern: matchedPattern,
 				MinApprovals: minApprovals, Source: source,
+				ApprovalPolicy: string(policy), ReviewNotice: notice,
 			})
 		}
 		if err != nil {
@@ -336,7 +346,7 @@ func emitNativeExecutionHandoff(cmd *cobra.Command, response *daemon.HookQueryRe
 		"hookSpecificOutput": map[string]any{
 			"hookEventName": "PreToolUse", "permissionDecision": "allow",
 			"updatedInput":      updated,
-			"additionalContext": "SLB is executing the reviewed request once and recording its outcome.",
+			"additionalContext": "SLB is executing the reviewed request once and recording its outcome. Review policy: " + handoff.ApprovalPolicy.Label() + ".",
 		},
 	})
 }

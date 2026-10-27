@@ -77,6 +77,7 @@ func loadSources(sources Sources, flagOverrides map[string]any) (Config, error) 
 func setDefaults(v *viper.Viper) {
 	def := DefaultConfig()
 
+	v.SetDefault("general.approval_policy", def.General.ApprovalPolicy)
 	v.SetDefault("general.min_approvals", def.General.MinApprovals)
 	v.SetDefault("general.require_different_model", def.General.RequireDifferentModel)
 	v.SetDefault("general.different_model_timeout", def.General.DifferentModelTimeoutSecs)
@@ -342,6 +343,8 @@ func GetValue(cfg Config, key string) (any, bool) {
 			}
 		case GeneralConfig:
 			switch seg {
+			case "approval_policy":
+				return c.ApprovalPolicy, true
 			case "min_approvals":
 				return c.MinApprovals, true
 			case "require_different_model":
@@ -565,6 +568,7 @@ const (
 )
 
 var keyKinds = map[string]valueKind{
+	"general.approval_policy":               kindString,
 	"general.min_approvals":                 kindInt,
 	"general.require_different_model":       kindBool,
 	"general.different_model_timeout":       kindInt,
@@ -641,6 +645,7 @@ var envBindings = []struct {
 	Key  string
 	Kind valueKind
 }{
+	{"SLB_APPROVAL_POLICY", "general.approval_policy", kindString},
 	{"SLB_MIN_APPROVALS", "general.min_approvals", kindInt},
 	{"SLB_REQUIRE_DIFFERENT_MODEL", "general.require_different_model", kindBool},
 	{"SLB_DIFFERENT_MODEL_TIMEOUT", "general.different_model_timeout", kindInt},

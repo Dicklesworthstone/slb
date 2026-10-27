@@ -4,11 +4,11 @@
 [![License](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](LICENSE)
 [![Build Status](https://github.com/Dicklesworthstone/slb/workflows/CI/badge.svg)](https://github.com/Dicklesworthstone/slb/actions)
 
-A cross-platform CLI that implements a **two-person rule** for running potentially destructive commands from AI coding agents.
+A cross-platform CLI for reviewing potentially destructive commands from AI coding agents before execution.
 
 When an agent wants to run something risky (e.g., `rm -rf`, `git push --force`, `kubectl delete`, `DROP TABLE`), `slb` requires peer review and explicit approval before execution.
 
-**Security restriction (issue #30):** The local backend cannot authenticate independent reviewer or model identities. Approval submissions and execution of requests requiring peer approvals or a different model now fail closed, including historical approvals. No external identity provider is implemented yet. Rejections and explicit zero-review CAUTION auto-approval remain available. The peer-approval examples below describe the intended workflow, which is currently blocked. See [the identity boundary and deployment requirements](references/SECURITY.md#reviewer-identity-security-boundary-issue-30).
+**Choose the assurance level explicitly:** The default `independent` approval policy refuses local approvals and execution requiring independently authenticated reviewers. No external identity provider is implemented yet. Cooperating agents on one host can opt into `same_host` peer review, a **mistake-prevention workflow, not a security boundary**. This mode does not authenticate agent or model identities and cannot contain a malicious process sharing the same OS user. Requests, reviews, execution records, and history keep their policy labels; local reviews never become independent authorization. See [the identity boundary and deployment requirements](references/SECURITY.md#reviewer-identity-security-boundary-issue-30).
 
 ## Why This Exists
 
@@ -33,6 +33,10 @@ Coding agents can get tunnel vision, hallucinate, or misunderstand context. A se
 | **DANGEROUS** | 1 | Never | `rm -rf ./build`, `git reset --hard`, `kubectl delete`, `DROP TABLE` |
 | **CAUTION** | 0 | After 30s | `rm file.txt`, `git branch -d`, `npm uninstall` |
 | **SAFE** | 0 | Immediately | `rm *.log`, `git stash`, `kubectl delete pod` |
+
+These counts are review requirements. With the default `independent` policy,
+local sessions cannot satisfy a requirement for independent approval. With
+`same_host`, they count cooperating local reviewers under the limitations above.
 
 ## Quick Start
 
@@ -107,23 +111,49 @@ This creates a `.slb/` directory with:
 - `config.toml` - Project-specific configuration
 - `pending/` - JSON files for pending requests (for watching/interop)
 
-### Basic Workflow
+### Same-Host Peer-Review Workflow
+
+Enable this only when the agents cooperate and you want a second session to
+check for mistakes. From the initialized project, opt in before creating requests:
 
 ```bash
-# 1. Start a session (as an AI agent)
-slb session start --agent "GreenLake" --program "claude-code" --model "opus"
-# Returns: session_id and session_key
-
-# 2. Run a dangerous command (blocks until approved)
-slb run "rm -rf ./build" --reason "Clean build artifacts before fresh compile" --session-id <id>
-
-# 3. Another agent reviews and approves
-slb pending                    # See what's waiting for review
-slb review <request-id>        # View full details
-slb approve <request-id> --session-id <reviewer-id> --comment "Looks safe"
-
-# 4. Original command executes automatically after approval
+slb config set general.approval_policy same_host
 ```
+
+This writes `approval_policy = "same_host"` under `[general]` in
+`.slb/config.toml`. The default is `"independent"`. Each request keeps the policy
+under which it was created; changing configuration does not convert existing
+requests or reviews. Both approving a request and executing it require the current
+policy to match. Set it back to `independent` to disable local approval and
+execution of outstanding same-host requests.
+
+```bash
+# 1. Each agent starts a session and retains its own returned ID and key.
+slb session start --agent "Requester" --program "claude-code" --model "opus"
+slb session start --agent "Reviewer" --program "codex-cli" --model "codex"
+
+# 2. The requester explains the exact command and its intended effects.
+slb request "rm -rf ./build" --session-id <requester-id> \
+  --reason "Clean generated artifacts before a fresh compile" \
+  --expected-effect "Remove only this project's build directory" \
+  --safety "Source files are outside build; all outputs can be regenerated"
+
+# 3. A different agent inspects the command, working directory and explanation.
+slb show <request-id>
+slb approve <request-id> --session-id <reviewer-id> --session-key <reviewer-key> \
+  --comments "Checked the working directory and build contents"
+
+# 4. The requester executes only after the required reviews are recorded.
+slb execute <request-id> --session-id <requester-id>
+```
+
+The output identifies these as same-host reviews, not independently
+authenticated authorization. Quorum, different-model checks when configured,
+signatures, expiry, and command binding still apply. The requester cannot review
+its own request, including through a restarted session with the same agent name
+or the `trusted_self_approve` setting. Names and model labels remain self-reported.
+`slb run` provides the same workflow while waiting and executing automatically
+after review.
 
 ## Commands Reference
 
@@ -154,7 +184,7 @@ slb cancel <request-id>                        # Cancel own request
 
 ```bash
 slb review <request-id>                        # Show full details
-slb approve <request-id> --session-id <id>     # Approve request
+slb approve <request-id> --session-id <id> --session-key <key>  # Review under the request's policy
 slb reject <request-id> --session-id <id> --reason "..."
 ```
 
@@ -162,7 +192,7 @@ slb reject <request-id> --session-id <id> --reason "..."
 
 ```bash
 slb execute <request-id>                       # Execute approved request
-slb emergency-execute "<cmd>" --reason "..."   # Human override (logged)
+slb emergency-execute "<cmd>" --reason "..."   # Unreviewed override (logged)
 slb rollback <request-id>                      # Rollback if captured
 ```
 
@@ -197,6 +227,7 @@ Configuration is hierarchical (lowest to highest priority):
 
 ```toml
 [general]
+approval_policy = "independent"    # Default; "same_host" explicitly opts into local workflow review
 min_approvals = 2
 request_timeout = 1800              # 30 minutes
 approval_ttl_minutes = 30
@@ -329,7 +360,7 @@ slb completion fish | source
     └── req-<uuid>.log
 ```
 
-**Key Design Decision**: Client-side execution. The daemon is a NOTARY (verifies approvals) not an executor. Commands execute in the calling process's shell environment to inherit:
+**Key Design Decision**: Client-side execution. The daemon checks review evidence and policy; it is not an independently protected authorization service. Commands execute in the calling process's shell environment to inherit:
 - AWS_PROFILE, AWS_ACCESS_KEY_ID
 - KUBECONFIG
 - Activated virtualenvs
@@ -372,7 +403,8 @@ slb run "<command>" --reason "..."  # Creates new request
 
 ### Command hash mismatch
 
-The command was modified after approval. This is a security feature - re-request approval for the modified command.
+The command was modified after review. Submit a new request for the modified
+command; changing its stored hash does not make the existing signed review valid.
 
 ## Safety Note
 
@@ -520,11 +552,15 @@ Approvals have a time-to-live to prevent stale approvals:
 - **Standard requests**: 30 minutes (configurable)
 - **CRITICAL requests**: 10 minutes (stricter by default)
 
-If an approval expires before execution, the request must be re-approved.
+If an approval expires before execution, submit a new request for review.
 
 ## Execution Verification
 
-Before any command executes, five security gates must pass:
+Before a reviewed command executes, its policy and supporting evidence must
+verify in addition to these execution checks. `same_host` evidence is accepted
+only for a same-host request while that policy remains enabled. The default
+`independent` policy continues to refuse local approvals, including historical
+ones. An `approved` status alone is never an execution permit.
 
 ### Gate 1: Status Check
 Request must be in APPROVED state.
@@ -662,7 +698,9 @@ review_pool = ["agent-a", "agent-b", "human-reviewer"]
 
 ### Trusted Self-Approval
 
-Designated agents can self-approve after a delay:
+This legacy setting does not enable production self-approval: the default
+`independent` policy still needs an external identity authority, and `same_host`
+always requires another agent. A trusted name cannot supply a peer review.
 
 ```toml
 [agents]
@@ -682,13 +720,16 @@ conflict_resolution = "any_rejection_blocks"  # Default
 
 ### Different Model Requirement
 
-Require reviewers to use a different AI model:
+Require reviewers to report a different AI model:
 
 ```toml
 [general]
 require_different_model = true
 different_model_timeout = 300    # Escalate to human after 5 min
 ```
+
+In `same_host` mode this compares session model labels. It helps cooperating
+agents choose another model, but does not authenticate which model produced a review.
 
 ### Rate Limiting
 
@@ -726,7 +767,8 @@ Payload includes request details, classification, and event type.
 
 ### Defense in Depth
 
-`slb` implements multiple security layers:
+`slb` implements multiple checks for the selected review policy. In `same_host`
+mode they prevent workflow mistakes, not malicious actions by the same OS user:
 
 1. **Pattern-based classification** - First line of defense
 2. **Peer review requirement** - Human/agent oversight
@@ -738,7 +780,7 @@ Payload includes request details, classification, and event type.
 ### Cryptographic Guarantees
 
 - **Command binding**: SHA-256 hash computed at request time, verified at execution
-- **Review signatures**: HMAC-SHA256 keyed with the digest of the reviewer's session key. A valid signature shows the vote was written by a holder of that key or by something that can read the database, not that the reviewer is an independent principal.
+- **Review signatures**: HMAC-SHA256 keyed with the digest of the reviewer's session key. Same-host evidence uses a separate signature format that binds the decision to the exact command and review policy. Relabeling the policy or replacing the command invalidates that evidence. A holder of the signing material, including a process that can read the database, can still forge local reviews; a signature does not establish an independent principal.
 - **Session keys**: Generated per session and shown once, by `slb session start` (or by `slb session resume` when it creates a session). SQLite stores only a SHA-256 digest of each key, and supplied keys are compared with it in constant time, so a copy or backup of `state.db` does not contain a key slb will accept. Upgrading converts existing keys in place and then rebuilds the file, so no old copy of a key is left in it; agents keep using the keys they hold. Hashing protects copies of the database. It does not separate agents that run as the same OS user: such a process can read another agent's key from its environment, files or terminal, write the database, or run commands directly. See [the identity boundary](references/SECURITY.md#reviewer-identity-security-boundary-issue-30).
 - **Session recovery**: Resuming an existing session requires its original `--session-id` and `--session-key`, including with `--force`. Names, programs, and models are not recovery credentials. slb cannot return a lost key, because it does not have it; start a new session instead.
 
@@ -760,6 +802,7 @@ Every action is logged to SQLite with:
 - Actor (session ID, agent name)
 - Action type
 - Request/review details
+- Approval policy and review assurance (same-host workflow reviews remain labeled)
 - Outcome
 
 Query history:
@@ -773,6 +816,7 @@ All config options can be set via environment:
 
 | Variable | Description |
 |----------|-------------|
+| `SLB_APPROVAL_POLICY` | `independent` (default) or explicitly opt into low-assurance `same_host` review |
 | `SLB_MIN_APPROVALS` | Minimum approval count |
 | `SLB_REQUEST_TIMEOUT` | Request timeout in seconds |
 | `SLB_TIMEOUT_ACTION` | What to do on timeout |
@@ -919,7 +963,10 @@ slb session reset-limits --session-id <id>
 
 ## Emergency Override
 
-For true emergencies, humans can bypass the approval process with extensive logging.
+`emergency-execute` bypasses peer review with acknowledgment and logging. A
+same-UID agent can supply that acknowledgment too; it does not authenticate a
+human or supply independent authorization. Use the explicit same-host workflow
+when a second session should inspect the command before execution.
 
 ### Usage
 

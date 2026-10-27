@@ -50,6 +50,9 @@ var runCmd = &cobra.Command{
 	Long: `Run a command atomically with approval handling.
 
 This is the primary command for executing dangerous commands with SLB.
+The default independent policy refuses local approvals. Explicitly configure
+general.approval_policy = "same_host" to use low-assurance local peer review;
+these reviews are not independently authenticated authorization.
 
 Flow:
 1. Classify the command by risk tier
@@ -158,6 +161,9 @@ Examples:
 		}
 
 		request := result.Request
+		if !executionOutputStructured() && request.ApprovalPolicy == db.ApprovalPolicySameHost {
+			fmt.Printf("Review policy: %s\n", request.ApprovalPolicy.Label())
+		}
 
 		// Step 3: If yield mode and not immediately approved, return request info
 		if flagRunYield && request.Status == db.StatusPending {
@@ -168,6 +174,7 @@ Examples:
 				"min_approvals": request.MinApprovals,
 				"message":       "Request created, yielding to background. Check status with: slb status " + request.ID,
 			}
+			addApprovalPolicyMetadata(resp, request.ApprovalPolicy)
 			addRequestAdmissionMetadata(resp, result)
 			return out.Write(resp)
 		}
@@ -324,6 +331,12 @@ func runApprovedRequest(ctx context.Context, out *output.Writer, dbConn *db.DB, 
 		}
 		return resp.ExitCode, execErr
 	}
+	if resp.ApprovalPolicy != "" {
+		fmt.Printf("Approval policy: %s\n", resp.ApprovalPolicyLabel)
+	}
+	if resp.Assurance != "" {
+		fmt.Printf("Evidence assurance: %s\n", resp.Assurance)
+	}
 
 	if execErr != nil {
 		fmt.Fprintf(os.Stderr, "[slb] Execution failed: %s\n", execErr.Error())
@@ -421,6 +434,7 @@ func toRequestCreatorConfig(cfg config.Config) *core.RequestCreatorConfig {
 		timeoutMinutes = 30
 	}
 	return &core.RequestCreatorConfig{
+		ApprovalPolicy:             db.ApprovalPolicy(cfg.General.ApprovalPolicy),
 		EnableDryRun:               cfg.General.EnableDryRun,
 		BlockedAgents:              cfg.Agents.Blocked,
 		DynamicQuorumEnabled:       false,

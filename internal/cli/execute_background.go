@@ -58,7 +58,8 @@ func launchBackgroundExecution(cmd *cobra.Command, conn *db.DB, request *db.Requ
 		ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		receipt, err = background.Launch(ctx, executable, []string{"__execute-background"}, background.Job{
-			Version: background.Version, RequestID: request.ID, SessionID: sessionID,
+			ApprovalPolicy: request.ApprovalPolicy.Normalized(),
+			Version:        background.Version, RequestID: request.ID, SessionID: sessionID,
 			CommandHash: request.Command.Hash, Database: database, Project: request.ProjectPath,
 			Config: configPath, LogDir: logDir, TimeoutSeconds: int64(timeout / time.Second),
 			CaptureRollback: cfg.General.EnableRollbackCapture, MaxRollbackSizeMB: cfg.General.MaxRollbackSizeMB,
@@ -68,6 +69,7 @@ func launchBackgroundExecution(cmd *cobra.Command, conn *db.DB, request *db.Requ
 	err := launch()
 	if err != nil {
 		payload := map[string]any{"request_id": request.ID, "status": "not_launched", "error": err.Error()}
+		addApprovalPolicyMetadata(payload, request.ApprovalPolicy)
 		var startup *background.StartError
 		if errors.As(err, &startup) {
 			payload["status"] = "startup_unconfirmed"
@@ -82,8 +84,8 @@ func launchBackgroundExecution(cmd *cobra.Command, conn *db.DB, request *db.Requ
 	if executionOutputStructured() {
 		return writeGitHookOutput(cmd, receipt)
 	}
-	_, err = fmt.Fprintf(cmd.OutOrStdout(), "Started request %s in background\nCommand PID: %d\nSupervisor PID: %d\nLog: %s\nSupervisor log: %s\nCheck completion: slb status %s\n",
-		receipt.RequestID, receipt.PID, receipt.SupervisorPID, receipt.LogPath, receipt.SupervisorLog, receipt.RequestID)
+	_, err = fmt.Fprintf(cmd.OutOrStdout(), "Started request %s in background\nApproval policy: %s\nEvidence assurance: %s\nCommand PID: %d\nSupervisor PID: %d\nLog: %s\nSupervisor log: %s\nCheck completion: slb status %s\n",
+		receipt.RequestID, receipt.ApprovalPolicyLabel, receipt.Assurance, receipt.PID, receipt.SupervisorPID, receipt.LogPath, receipt.SupervisorLog, receipt.RequestID)
 	return err
 }
 
@@ -126,6 +128,7 @@ func runBackgroundWorker(cmd *cobra.Command, _ []string) error {
 			return err
 		}
 		receipt := background.Receipt{Version: background.Version, RequestID: start.RequestID,
+			ApprovalPolicy: start.ApprovalPolicy, ApprovalPolicyLabel: start.ApprovalPolicy.Label(), Assurance: start.Assurance,
 			CommandHash: start.CommandHash, Status: "executing", SupervisorPID: os.Getpid(), PID: start.PID, LogPath: start.LogPath}
 		// Keep PIDs and startup identity recoverable even if the reply is lost.
 		if err := json.NewEncoder(os.Stderr).Encode(receipt); err != nil {
@@ -158,6 +161,10 @@ func runBackgroundWorker(cmd *cobra.Command, _ []string) error {
 		outcome["exit_code"], outcome["log_path"] = result.ExitCode, result.LogPath
 		if result.Request != nil {
 			outcome["status"] = result.Request.Status
+			addApprovalPolicyMetadata(outcome, result.Request.ApprovalPolicy)
+			if result.Request.Execution != nil {
+				outcome["assurance"] = result.Request.Execution.Assurance
+			}
 		}
 		if runErr == nil && result.ExitCode != 0 {
 			runErr = commandExitError{code: result.ExitCode}
@@ -201,7 +208,8 @@ func executeBackgroundJob(ctx context.Context, job background.Job, onStarted fun
 	executor := core.NewExecutor(conn, engine).WithNotifier(buildAgentMailNotifier(job.Project))
 	return executor.ExecuteApprovedRequest(ctx, core.ExecuteOptions{
 		RequestID: job.RequestID, SessionID: job.SessionID, ExpectedCommandHash: job.CommandHash,
-		Timeout: time.Duration(job.TimeoutSeconds) * time.Second, LogDir: job.LogDir, SuppressOutput: true,
+		ExpectedApprovalPolicy: job.ApprovalPolicy.Normalized(),
+		Timeout:                time.Duration(job.TimeoutSeconds) * time.Second, LogDir: job.LogDir, SuppressOutput: true,
 		CaptureRollback: job.CaptureRollback, MaxRollbackSizeMB: job.MaxRollbackSizeMB, OnStarted: onStarted,
 	})
 }

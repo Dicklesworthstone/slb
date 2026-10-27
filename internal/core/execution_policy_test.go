@@ -80,6 +80,66 @@ func assertPolicyUnclaimed(t *testing.T, database *db.DB, id string) {
 	}
 }
 
+func TestSameHostExecutionPolicyRevocationIsCheckedAtClaim(t *testing.T) {
+	// This exercises real local reviews without simulated independent identity.
+	database, existing, requester := policyExecutionFixture(t)
+	writeExecutionPolicy(t, existing.ProjectPath, "[general]\napproval_policy = 'same_host'\n")
+	engine, err := LoadCommandPolicy(database, config.LoadOptions{ProjectDir: existing.ProjectPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := DefaultRequestCreatorConfig()
+	options.ApprovalPolicy = db.ApprovalPolicySameHost
+	options.AgentMailEnabled, options.EnableDryRun = false, false
+	creator := NewRequestCreator(database, nil, engine, options)
+	created, err := creator.CreateRequest(CreateRequestOptions{SessionID: requester.ID,
+		Command: "echo same-host-policy-test", Cwd: existing.ProjectPath,
+		Justification: Justification{Reason: "exercise explicit local review"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := created.Request
+	if request.ApprovalPolicy != db.ApprovalPolicySameHost {
+		t.Fatalf("new request lost explicit policy: %+v", request)
+	}
+	reviewer := &db.Session{AgentName: "SameHostReviewer", Program: "test", Model: "different-model", ProjectPath: request.ProjectPath}
+	if err := database.CreateSession(reviewer); err != nil {
+		t.Fatal(err)
+	}
+	reviewOptions := ReviewOptions{RequestID: request.ID, SessionID: reviewer.ID, SessionKey: reviewer.SessionKey, Decision: db.DecisionApprove}
+	if _, err := NewReviewService(database, DefaultReviewConfig()).SubmitReview(reviewOptions); err == nil {
+		t.Fatal("default review service accepted same-host request without opt-in")
+	}
+	reviewConfig := DefaultReviewConfig()
+	reviewConfig.ApprovalPolicy = db.ApprovalPolicySameHost
+	result, err := NewReviewService(database, reviewConfig).SubmitReview(reviewOptions)
+	if err != nil || result == nil || !VerifyReview(result.Review, reviewer.SessionKey) {
+		t.Fatalf("same-host review failed signature verification: %+v %v", result, err)
+	}
+	request, err = database.GetRequest(request.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckExecutionPolicy(database, request, ""); err != nil {
+		t.Fatal(err)
+	}
+	// Even adding a SAFE rule cannot promote the recorded local review after
+	// the operator restores the independent policy between preflight and claim.
+	writeExecutionPolicy(t, request.ProjectPath, "[general]\napproval_policy = 'independent'\n[patterns.safe]\npatterns = ['^echo same-host-policy-test$']\n")
+	if err := database.ClaimRequestExecution(request, policyExecutionIdentity(requester), ExecutionPolicyGuard("")); !errors.Is(err, ErrApprovalPolicyChanged) {
+		t.Fatalf("claim ignored same-host opt-in revocation: %v", err)
+	}
+	assertPolicyUnclaimed(t, database, request.ID)
+	writeExecutionPolicy(t, request.ProjectPath, "[general]\napproval_policy = 'same_host'\n")
+	if err := database.ClaimRequestExecution(request, policyExecutionIdentity(requester), ExecutionPolicyGuard("")); err != nil {
+		t.Fatalf("restoring explicit same-host policy should allow unchanged evidence: %v", err)
+	}
+	claimed, err := database.GetRequest(request.ID)
+	if err != nil || claimed.Execution == nil || claimed.Execution.ApprovalPolicy != db.ApprovalPolicySameHost || claimed.Execution.Assurance != db.AssuranceSameHost {
+		t.Fatalf("claim lost same-host evidence classification: %+v %v", claimed, err)
+	}
+}
+
 func TestExecutionPolicyRejectsChangesBeforePreflight(t *testing.T) {
 	db.SimulateIndependentIdentityForTest(t)
 	for _, tc := range []struct {

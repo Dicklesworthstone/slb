@@ -101,7 +101,8 @@ func (rc *RequestCreator) CreateGitHookRequest(ctx context.Context, intent GitHo
 		reason = "Native Git hook detected a review-required change. No operator rationale was supplied; review the exact snapshot before approving."
 	}
 	request := &db.Request{
-		ProjectPath: intent.ProjectPath, Command: intent.CommandSpec(), RiskTier: tier,
+		ApprovalPolicy: rc.config.ApprovalPolicy.Normalized(),
+		ProjectPath:    intent.ProjectPath, Command: intent.CommandSpec(), RiskTier: tier,
 		RequestorSessionID: session.ID, RequestorAgent: session.AgentName, RequestorModel: session.Model,
 		Status: db.StatusPending, MinApprovals: max(1, rc.patternEngine.RequiredApprovals(tier, available)),
 		RequireDifferentModel: rc.patternEngine.RequiresDifferentModel(), ExpiresAt: &expiry,
@@ -136,8 +137,11 @@ func (intent GitHookIntent) checkRequest(request *db.Request, sessionID string) 
 }
 
 func (intent GitHookIntent) checkPolicy(reader PolicyReader, request *db.Request, configPath string) error {
-	engine, err := LoadCommandPolicy(reader, config.LoadOptions{ProjectDir: intent.ProjectPath, ConfigPath: configPath})
+	engine, cfg, err := loadCommandPolicy(reader, config.LoadOptions{ProjectDir: intent.ProjectPath, ConfigPath: configPath})
 	if err != nil {
+		return err
+	}
+	if err := checkApprovalPolicy(request, cfg.General.ApprovalPolicy); err != nil {
 		return err
 	}
 	tier := intent.effectiveTier(engine)
@@ -193,7 +197,11 @@ func (e *Executor) AuthorizeGitHook(ctx context.Context, intent GitHookIntent, r
 	now := time.Now().UTC()
 	// A prepared receipt is not a permit: only successful durable completion
 	// below allows the CLI to return zero to Git.
-	receipt, err := json.Marshal(map[string]any{"event": "git_hook_authorization", "phase": "prepared", "request_id": requestID, "session_id": sessionID, "intent": intent, "prepared_at": now, "git_outcome": "not_observed"})
+	receipt, err := json.Marshal(map[string]any{
+		"event": "git_hook_authorization", "phase": "prepared", "request_id": requestID, "session_id": sessionID,
+		"approval_policy": request.ApprovalPolicy.Normalized(), "approval_policy_label": request.ApprovalPolicy.Label(),
+		"intent": intent, "prepared_at": now, "git_outcome": "not_observed",
+	})
 	if err != nil {
 		return nil, err
 	}

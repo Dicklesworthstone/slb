@@ -31,7 +31,11 @@ Project: {{printf "%q" .Project}}
 Request: {{printf "%q" .RequestID}}
 Event: {{printf "%q" .Event}} at {{.OccurredAt}}
 Observed status: {{printf "%q" .Status}}
-Risk tier: {{printf "%q" .Tier}}
+Review policy: {{printf "%q" .ApprovalPolicy}}
+{{if eq .ApprovalPolicy "same_host"}}Same-host peer review is low assurance, not independently authenticated authorization.
+{{end}}{{if .ReviewAssurance}}Review evidence: {{printf "%q" .ReviewAssurance}}
+{{end}}{{if .ExecutionAssurance}}Execution evidence: {{printf "%q" .ExecutionAssurance}}
+{{end}}Risk tier: {{printf "%q" .Tier}}
 Requestor session: {{printf "%q" .RequestorSessionID}}
 Command fingerprint: {{.CommandHash}}
 Required approvals: {{.MinApprovals}}
@@ -86,8 +90,14 @@ func renderRequestNotice(renderer *template.Template, notice RequestNotice) (str
 	switch notice.Status {
 	case "pending":
 		subject = "[SLB] Request awaiting independent review"
+		if notice.ApprovalPolicy == "same_host" {
+			subject = "[SLB] Request awaiting same-host peer review (low assurance)"
+		}
 	case "approved":
 		subject = "[SLB] Request approval recorded; recheck before execution"
+		if notice.ApprovalPolicy == "same_host" {
+			subject = "[SLB] Same-host review recorded (low assurance); recheck before execution"
+		}
 	case "rejected":
 		subject = "[SLB] Request rejected"
 	case "escalated", "timeout":

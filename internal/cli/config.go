@@ -7,6 +7,7 @@ import (
 	"os/exec"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
+	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/output"
 	"github.com/spf13/cobra"
 )
@@ -99,11 +100,15 @@ var configSetCmd = &cobra.Command{
 		}
 
 		out := output.New(output.Format(GetOutput()))
-		return out.Write(map[string]any{
+		response := map[string]any{
 			"path":  target,
 			"key":   args[0],
 			"value": value,
-		})
+		}
+		if args[0] == "general.approval_policy" {
+			addApprovalPolicyMetadata(response, db.ApprovalPolicy(args[1]))
+		}
+		return out.Write(response)
 	},
 }
 

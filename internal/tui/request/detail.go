@@ -128,6 +128,7 @@ func (m *DetailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.Reviews = append(m.Reviews, *msg.Review)
 			}
 			m.ReviewFeedback = fmt.Sprintf("Review recorded: %s. Request: %s (%d/%d approvals, %d rejections).", msg.Review.Decision, msg.Request.Status, msg.Approvals, msg.Request.MinApprovals, msg.Rejections)
+			m.ReviewFeedback += " " + msg.Request.ApprovalPolicy.Label() + "."
 			m.reviewFailed = false
 			m.approveForm, m.rejectForm = nil, nil
 			m.Mode = DetailModeView
@@ -343,6 +344,7 @@ func (m *DetailModel) renderContent() string {
 		cmdBox = cmdBox.WithMaxWidth(m.Width - 4)
 	}
 	sections = append(sections, cmdBox.Render())
+	sections = append(sections, "Review policy: "+m.Request.ApprovalPolicy.Label())
 	sections = append(sections, m.renderRequestorInfo())
 	if justification := m.renderJustification(); justification != "" {
 		sections = append(sections, justification)
@@ -479,6 +481,11 @@ func (m *DetailModel) renderReviews() string {
 		decision := lipgloss.NewStyle().Foreground(decisionColor).Render(strings.ToUpper(string(rev.Decision)))
 		timeStr := lipgloss.NewStyle().Foreground(th.Subtext).Render(formatTimeAgo(rev.CreatedAt))
 		line := fmt.Sprintf("%s %s %s  %s", icon, reviewer, decision, timeStr)
+		assurance := rev.Assurance
+		if assurance == "" {
+			assurance = db.AssuranceLegacyLocal
+		}
+		line += fmt.Sprintf("\n   Evidence: %s", assurance)
 		if rev.Comments != "" {
 			line += "\n   " + lipgloss.NewStyle().Foreground(th.Subtext).Italic(true).Render(rev.Comments)
 		}

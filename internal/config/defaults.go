@@ -156,7 +156,8 @@ var (
 func DefaultConfig() Config {
 	return Config{
 		General: GeneralConfig{
-			MinApprovals: 2, RequireDifferentModel: false, DifferentModelTimeoutSecs: 300,
+			ApprovalPolicy: "independent",
+			MinApprovals:   2, RequireDifferentModel: false, DifferentModelTimeoutSecs: 300,
 			ConflictResolution: "any_rejection_blocks", RequestTimeoutSecs: 1800,
 			ApprovalTTLMins: 30, ApprovalTTLCriticalMins: 10, TimeoutAction: "escalate",
 			EnableDryRun: true, EnableRollbackCapture: true, MaxRollbackSizeMB: 100,

@@ -43,19 +43,34 @@ slb cancel <request-id>                        # Cancel own request
 
 ## Review & Approve
 
+Local peer review requires an explicit opt-in before creating the request:
+
+```bash
+slb config set general.approval_policy same_host
+```
+
+This is a low-assurance mistake-prevention workflow, not independently
+authenticated authorization. The default `independent` policy refuses local
+approvals. Existing requests keep their policy; create a new request after
+changing it. See [Approval Policy](CONFIG.md#approval-policy).
+
 ```bash
 slb review <request-id>                        # Show full details
-slb approve <request-id> --session-id <id> --comment "..."
+slb approve <request-id> --session-id <id> --session-key <key> --comments "..."
 slb reject <request-id> --session-id <id> --reason "..."
 ```
+
+The reviewer must be a different agent/session and supply its session key.
+Same-host request, review and execution output retain the policy and assurance
+labels. Quorum, model-difference checks, signatures and expiration still apply.
 
 ---
 
 ## Execution
 
 ```bash
-slb execute <request-id>                       # Execute approved request
-slb emergency-execute "<cmd>" --reason "..."   # Human override (logged)
+slb execute <request-id> --session-id <id>    # Execute after rechecking policy and evidence
+slb emergency-execute "<cmd>" --reason "..."   # Unreviewed override (logged)
 slb rollback <request-id>                      # Rollback if captured
 slb rollback <request-id> --force              # Force overwrite
 ```
@@ -145,6 +160,7 @@ slb request "terraform destroy" --reason "..." --attach-cmd "terraform plan -des
 
 | Variable | Description |
 |----------|-------------|
+| `SLB_APPROVAL_POLICY` | `independent` (default) or explicit low-assurance `same_host` review |
 | `SLB_MIN_APPROVALS` | Minimum approval count |
 | `SLB_REQUEST_TIMEOUT` | Request timeout in seconds |
 | `SLB_TIMEOUT_ACTION` | What to do on timeout |

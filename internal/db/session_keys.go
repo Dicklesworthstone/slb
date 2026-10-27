@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -157,6 +158,76 @@ func signReviewWithDigest(digest, requestID string, decision Decision, timestamp
 func verifyReviewWithDigest(digest, requestID string, decision Decision, timestamp time.Time, signature string) bool {
 	expected := signReviewWithDigest(digest, requestID, decision, timestamp)
 	return expected != "" && hmac.Equal([]byte(expected), []byte(signature))
+}
+
+// reviewRequestBinding is independent of mutable lifecycle state: later votes,
+// resolution, execution and session endings do not change what was reviewed.
+// Exact command bytes are covered by Command.Hash; justification is included
+// because the stated purpose and expected effects are part of peer review.
+func reviewRequestBinding(request *Request) string {
+	data, _ := json.Marshal([]any{"slb-reviewed-request-v2", request.ID, request.ProjectPath,
+		request.Command.Hash, request.ApprovalPolicy.Normalized(), request.RiskTier,
+		request.RequestorSessionID, request.RequestorAgent, request.RequestorModel,
+		request.MinApprovals, request.RequireDifferentModel, request.Justification,
+		request.CreatedAt.UTC().Format(time.RFC3339)})
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func legacyReviewMetadata(review *Review) bool {
+	return (review.SignatureVersion == 0 || review.SignatureVersion == 1) &&
+		review.ApprovalPolicy.Normalized() == ApprovalPolicyIndependent &&
+		(review.Assurance == "" || review.Assurance == AssuranceLegacyLocal) &&
+		review.CommandHash == "" && review.RequestBinding == ""
+}
+
+func reviewMatchesRequest(review *Review, request *Request) bool {
+	if request.ApprovalPolicy.Normalized() == ApprovalPolicyIndependent {
+		return legacyReviewMetadata(review)
+	}
+	return request.ApprovalPolicy == ApprovalPolicySameHost && review.SignatureVersion == 2 &&
+		review.ApprovalPolicy == ApprovalPolicySameHost && review.Assurance == AssuranceSameHost &&
+		review.CommandHash == request.Command.Hash && review.RequestBinding == reviewRequestBinding(request)
+}
+
+// Version 2 is domain separated from legacy HMACs and uses unambiguous JSON
+// encoding. Its assurance and immutable request binding are signed, preventing
+// a changed command or relabeled vote from reusing a previous signature.
+func signReviewEvidenceWithDigest(digest string, review *Review) string {
+	if review == nil || review.SignatureVersion != 2 || review.ApprovalPolicy != ApprovalPolicySameHost ||
+		review.Assurance != AssuranceSameHost || review.CommandHash == "" || review.RequestBinding == "" {
+		return ""
+	}
+	key, err := hex.DecodeString(digest)
+	if err != nil || len(key) != sha256.Size {
+		return ""
+	}
+	data, _ := json.Marshal([]any{"slb-review-evidence-v2", review.RequestID, review.CommandHash,
+		review.RequestBinding, review.ApprovalPolicy, review.Assurance, review.ReviewerSessionID,
+		review.ReviewerAgent, review.ReviewerModel, review.Decision,
+		review.SignatureTimestamp.UTC().Format(time.RFC3339)})
+	mac := hmac.New(sha256.New, key)
+	mac.Write(data)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func verifyReviewEvidenceWithDigest(digest string, review *Review) bool {
+	if review == nil {
+		return false
+	}
+	if legacyReviewMetadata(review) {
+		return verifyReviewWithDigest(digest, review.RequestID, review.Decision, review.SignatureTimestamp, review.Signature)
+	}
+	expected := signReviewEvidenceWithDigest(digest, review)
+	return expected != "" && hmac.Equal([]byte(expected), []byte(review.Signature))
+}
+
+// VerifyReviewEvidenceSignature verifies the stored signature and its evidence
+// metadata for display. It does not authorize execution: that additionally
+// recomputes RequestBinding and verifies the complete policy and review set.
+func VerifyReviewEvidenceSignature(review *Review, sessionKey string) bool {
+	digest, ok := SessionKeyDigest(sessionKey)
+	return ok && verifyReviewEvidenceWithDigest(digest, review)
 }
 
 // legacyReviewSignature is the scheme used while keys were stored in

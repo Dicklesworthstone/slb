@@ -18,6 +18,9 @@ import (
 //go:embed request_events.sql
 var requestEventsSchema string
 
+//go:embed request_events_policy.sql
+var sameHostRequestEventsSchema string
+
 const (
 	DefaultRequestEventLimit = 100
 	MaxRequestEventLimit     = 1000
@@ -35,29 +38,36 @@ var (
 // request. Counts are submitted review rows, not verified execution permission.
 // Sensitive/free-form evidence and execution receipts are intentionally absent.
 type RequestEventState struct {
-	CommandHash           string  `json:"command_hash"`
-	Status                string  `json:"status"`
-	RiskTier              string  `json:"risk_tier"`
-	RequestorSessionID    string  `json:"requestor_session_id"`
-	MinApprovals          int     `json:"min_approvals"`
-	RequireDifferentModel bool    `json:"require_different_model"`
-	Approvals             int     `json:"approvals"`
-	Rejections            int     `json:"rejections"`
-	CreatedAt             string  `json:"created_at"`
-	ExpiresAt             *string `json:"expires_at"`
-	ResolvedAt            *string `json:"resolved_at"`
-	ApprovalExpiresAt     *string `json:"approval_expires_at"`
-	ExecutorSessionID     *string `json:"executor_session_id"`
-	ExecutedAt            *string `json:"executed_at"`
-	ExitCode              *int    `json:"exit_code"`
-	DurationMs            *int64  `json:"duration_ms"`
-	RolledBackAt          *string `json:"rolled_back_at"`
+	ApprovalPolicy          ApprovalPolicy  `json:"approval_policy"`
+	ExecutionApprovalPolicy ApprovalPolicy  `json:"execution_approval_policy,omitempty"`
+	ExecutionAssurance      ReviewAssurance `json:"execution_assurance,omitempty"`
+	CommandHash             string          `json:"command_hash"`
+	Status                  string          `json:"status"`
+	RiskTier                string          `json:"risk_tier"`
+	RequestorSessionID      string          `json:"requestor_session_id"`
+	MinApprovals            int             `json:"min_approvals"`
+	RequireDifferentModel   bool            `json:"require_different_model"`
+	Approvals               int             `json:"approvals"`
+	Rejections              int             `json:"rejections"`
+	CreatedAt               string          `json:"created_at"`
+	ExpiresAt               *string         `json:"expires_at"`
+	ResolvedAt              *string         `json:"resolved_at"`
+	ApprovalExpiresAt       *string         `json:"approval_expires_at"`
+	ExecutorSessionID       *string         `json:"executor_session_id"`
+	ExecutedAt              *string         `json:"executed_at"`
+	ExitCode                *int            `json:"exit_code"`
+	DurationMs              *int64          `json:"duration_ms"`
+	RolledBackAt            *string         `json:"rolled_back_at"`
 }
 
 type RequestEventReview struct {
-	ID        string `json:"id"`
-	SessionID string `json:"session_id"`
-	Decision  string `json:"decision"`
+	ID               string          `json:"id"`
+	SessionID        string          `json:"session_id"`
+	Decision         string          `json:"decision"`
+	ApprovalPolicy   ApprovalPolicy  `json:"approval_policy"`
+	Assurance        ReviewAssurance `json:"assurance"`
+	CommandHash      string          `json:"command_hash,omitempty"`
+	SignatureVersion int             `json:"signature_version"`
 }
 
 // RequestEvent is a durable lifecycle observation. Baselines capture rows that
@@ -253,6 +263,22 @@ func scanRequestEvent(scanner requestEventScanner, journal string) (RequestEvent
 		return event, "", err
 	}
 	event.State, event.Review, event.PreviousStatus = data.State, data.Review, data.PreviousStatus
+	// Old payloads remain byte-for-byte intact, including cursor anchors.
+	// Their missing categories describe legacy local evidence, never a new
+	// opt-in or independently authenticated approval.
+	event.State.ApprovalPolicy = event.State.ApprovalPolicy.Normalized()
+	if event.State.ExecutionAssurance == "" && event.State.ExecutorSessionID != nil {
+		event.State.ExecutionAssurance = AssuranceLegacyUnknown
+	}
+	if event.Review != nil {
+		event.Review.ApprovalPolicy = event.Review.ApprovalPolicy.Normalized()
+		if event.Review.Assurance == "" {
+			event.Review.Assurance = AssuranceLegacyLocal
+		}
+		if event.Review.SignatureVersion == 0 {
+			event.Review.SignatureVersion = 1
+		}
+	}
 	// Hash the STORED representation, so future display/serialization changes
 	// cannot invalidate a cursor and no plaintext evidence is needed in it.
 	binding, err := json.Marshal([]any{event.Version, event.Sequence, event.Kind, event.ProjectPath,

@@ -125,6 +125,9 @@ func CheckExecutionPolicy(reader PolicyReader, request *db.Request, configPath s
 	if err != nil {
 		return err
 	}
+	if err := checkApprovalPolicy(request, cfg.General.ApprovalPolicy); err != nil {
+		return err
+	}
 	// Blocking a requester revokes permission to execute their outstanding
 	// approvals too. Check the same freshly loaded policy as the classifier,
 	// before its SAFE shortcut or quorum calculation. The final atomic claim
@@ -140,6 +143,17 @@ func CheckExecutionPolicy(reader PolicyReader, request *db.Request, configPath s
 		return err
 	}
 	return engine.checkRequestPolicy(request, available)
+}
+
+// A change in assurance requires a new request and new reviews. In particular,
+// switching back to the default must revoke outstanding same-host workflows,
+// even if the command now happens to match a SAFE rule.
+func checkApprovalPolicy(request *db.Request, current string) error {
+	stored := request.ApprovalPolicy.Normalized()
+	if !stored.Valid() || stored != db.ApprovalPolicy(current) {
+		return fmt.Errorf("%w: request approval policy is %q, current policy is %q; submit a new request", ErrApprovalPolicyChanged, stored, current)
+	}
+	return nil
 }
 
 func (e *PatternEngine) checkRequestPolicy(request *db.Request, available int) error {

@@ -58,15 +58,18 @@ rejection, timeout or escalation). Due policy is processed without a daemon.`,
 
 		// Build response
 		type reviewView struct {
-			ReviewID  string `json:"review_id"`
-			Reviewer  string `json:"reviewer"`
-			Model     string `json:"model"`
-			Decision  string `json:"decision"`
-			Comments  string `json:"comments,omitempty"`
-			CreatedAt string `json:"created_at"`
+			approvalPolicyView
+			Assurance db.ReviewAssurance `json:"assurance"`
+			ReviewID  string             `json:"review_id"`
+			Reviewer  string             `json:"reviewer"`
+			Model     string             `json:"model"`
+			Decision  string             `json:"decision"`
+			Comments  string             `json:"comments,omitempty"`
+			CreatedAt string             `json:"created_at"`
 		}
 
 		type statusView struct {
+			approvalPolicyView
 			RequestID             string       `json:"request_id"`
 			Command               string       `json:"command"`
 			CommandRedacted       string       `json:"command_redacted,omitempty"`
@@ -93,6 +96,7 @@ rejection, timeout or escalation). Due policy is processed without a daemon.`,
 		}
 
 		view := statusView{
+			approvalPolicyView:    policyView(request.ApprovalPolicy),
 			RequestID:             request.ID,
 			Command:               request.Command.Raw,
 			CommandHash:           request.Command.Hash,
@@ -134,12 +138,14 @@ rejection, timeout or escalation). Due policy is processed without a daemon.`,
 			}
 
 			rv := reviewView{
-				ReviewID:  r.ID,
-				Reviewer:  r.ReviewerAgent,
-				Model:     r.ReviewerModel,
-				Decision:  string(r.Decision),
-				Comments:  r.Comments,
-				CreatedAt: r.CreatedAt.Format(time.RFC3339),
+				approvalPolicyView: policyView(r.ApprovalPolicy),
+				Assurance:          r.Assurance,
+				ReviewID:           r.ID,
+				Reviewer:           r.ReviewerAgent,
+				Model:              r.ReviewerModel,
+				Decision:           string(r.Decision),
+				Comments:           r.Comments,
+				CreatedAt:          r.CreatedAt.Format(time.RFC3339),
 			}
 			view.Reviews = append(view.Reviews, rv)
 		}

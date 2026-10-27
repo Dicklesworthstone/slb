@@ -86,7 +86,7 @@ func (r *HistoryRepo) CommitRequest(req *db.Request) (bool, string, error) {
 		return false, "", err
 	}
 
-	msg := fmt.Sprintf("Request: %s %s", req.RiskTier, truncateForCommit(requestCommandForDisplay(req), 72))
+	msg := fmt.Sprintf("Request [%s]: %s %s", req.ApprovalPolicy.Normalized(), req.RiskTier, truncateForCommit(requestCommandForDisplay(req), 72))
 	committed, err := gitCommitIfNeeded(r.Path, msg)
 	return committed, abs, err
 }
@@ -115,7 +115,11 @@ func (r *HistoryRepo) CommitReview(rev *db.Review) (bool, string, error) {
 	}
 
 	reqID := truncateForCommit(rev.RequestID, 8)
-	msg := fmt.Sprintf("Review: %s for %s", rev.Decision, reqID)
+	assurance := rev.Assurance
+	if assurance == "" {
+		assurance = db.AssuranceLegacyLocal
+	}
+	msg := fmt.Sprintf("Review [%s]: %s for %s", assurance, rev.Decision, reqID)
 	committed, err := gitCommitIfNeeded(r.Path, msg)
 	return committed, abs, err
 }
@@ -150,7 +154,11 @@ func (r *HistoryRepo) CommitExecution(requestID string, exec *db.Execution) (boo
 	if exec.ExitCode != nil {
 		exit = fmt.Sprintf("%d", *exec.ExitCode)
 	}
-	msg := fmt.Sprintf("Execution: %s exit=%s", truncateForCommit(requestID, 8), exit)
+	assurance := exec.Assurance
+	if assurance == "" {
+		assurance = db.AssuranceLegacyUnknown
+	}
+	msg := fmt.Sprintf("Execution [%s]: %s exit=%s", assurance, truncateForCommit(requestID, 8), exit)
 	committed, err := gitCommitIfNeeded(r.Path, msg)
 	return committed, abs, err
 }

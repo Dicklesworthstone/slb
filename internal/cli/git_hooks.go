@@ -147,10 +147,10 @@ func newNativeGitHookCmd(operation string) *cobra.Command {
 			return fmt.Errorf("SLB: Git operation blocked: %w", err)
 		}
 		if !decision.Allowed {
-			return fmt.Errorf("SLB: %s (request %s). Review with 'slb review %s'; approve from an independent session, then retry Git. Do not use slb execute on this token", decision.Message, decision.RequestID, decision.RequestID)
+			return fmt.Errorf("SLB: %s (request %s). Review policy: %s. Review with 'slb review %s'; complete review under that policy, then retry Git. Do not use slb execute on this token", decision.Message, decision.RequestID, decision.ApprovalPolicyLabel, decision.RequestID)
 		}
 		if decision.RequestID != "" {
-			fmt.Fprintf(cmd.ErrOrStderr(), "SLB: consumed Git hook approval %s; Git's eventual outcome is not recorded by this hook.\n", decision.RequestID)
+			fmt.Fprintf(cmd.ErrOrStderr(), "SLB: consumed Git hook review %s (%s); Git's eventual outcome is not recorded by this hook.\n", decision.RequestID, decision.ApprovalPolicyLabel)
 		}
 		return nil // Native hooks never emit machine protocol on Git's stdout.
 	}
@@ -220,6 +220,8 @@ func assessNativeGit(ctx context.Context, operation, first, second string, input
 }
 
 type gitHookDecision struct {
+	approvalPolicyView
+	Assurance  db.ReviewAssurance     `json:"assurance,omitempty"`
 	Allowed    bool                   `json:"allowed"`
 	RequestID  string                 `json:"request_id,omitempty"`
 	Status     db.RequestStatus       `json:"status,omitempty"`
@@ -334,7 +336,8 @@ func processNativeGitHook(ctx context.Context, assessment *gitutil.GitAssessment
 	}
 	decision.RequestID = request.ID
 	decision.Status = request.Status
-	decision.Message = "awaiting independent approval"
+	decision.approvalPolicyView = policyView(request.ApprovalPolicy)
+	decision.Message = "awaiting review under the recorded approval policy"
 	if request.Status != db.StatusApproved {
 		if request.Status != db.StatusPending {
 			decision.Message = "prior request is " + string(request.Status) + "; explicitly resubmit with SLB_GIT_NEW_REQUEST=1 and a rationale"
@@ -355,6 +358,9 @@ func processNativeGitHook(ctx context.Context, assessment *gitutil.GitAssessment
 	}
 	decision.Allowed = true
 	decision.Status = request.Status
+	if request.Execution != nil {
+		decision.Assurance = request.Execution.Assurance
+	}
 	decision.Message = "Git hook authorized; Git outcome not observed"
 	return decision, nil
 }

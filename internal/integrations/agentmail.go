@@ -59,6 +59,7 @@ func (c *AgentMailClient) NotifyNewRequest(req *db.Request) error {
 		req.Justification.SafetyArgument,
 		req.ID, req.ID, req.ID,
 	)
+	body += "\nReview policy: " + req.ApprovalPolicy.Label() + ".\n"
 	return c.send(subject, body, importanceForTier(req.RiskTier))
 }
 
@@ -67,6 +68,10 @@ func (c *AgentMailClient) NotifyRequestApproved(req *db.Request, review *db.Revi
 	subject := fmt.Sprintf("[SLB] APPROVED: %s", truncate(safeDisplay(req), 60))
 	body := fmt.Sprintf("Request %s approved by %s (%s) at %s\n\nCommand: `%s`\n",
 		req.ID, review.ReviewerAgent, review.ReviewerModel, review.CreatedAt.Format(time.RFC3339), safeDisplay(req))
+	if req.ApprovalPolicy.Normalized() == db.ApprovalPolicySameHost {
+		subject = fmt.Sprintf("[SLB] SAME-HOST REVIEW (low assurance): %s", truncate(safeDisplay(req), 60))
+	}
+	body += fmt.Sprintf("\nReview policy: %s.\nEvidence: %s.\nRequest status: %s.\n", req.ApprovalPolicy.Label(), review.Assurance, req.Status)
 	return c.send(subject, body, ImportanceNormal)
 }
 
@@ -75,6 +80,7 @@ func (c *AgentMailClient) NotifyRequestRejected(req *db.Request, review *db.Revi
 	subject := fmt.Sprintf("[SLB] REJECTED: %s", truncate(safeDisplay(req), 60))
 	body := fmt.Sprintf("Request %s rejected by %s (%s) at %s\n\nComments: %s\nCommand: `%s`\n",
 		req.ID, review.ReviewerAgent, review.ReviewerModel, review.CreatedAt.Format(time.RFC3339), review.Comments, safeDisplay(req))
+	body += fmt.Sprintf("\nReview policy: %s.\nEvidence: %s.\n", req.ApprovalPolicy.Label(), review.Assurance)
 	return c.send(subject, body, ImportanceNormal)
 }
 
@@ -95,6 +101,10 @@ func (c *AgentMailClient) NotifyRequestExecuted(req *db.Request, exec *db.Execut
 	}
 	body := fmt.Sprintf("Request %s executed by %s (%s) at %s\nExit code: %d\nLog: %s\nCommand: `%s`\n",
 		req.ID, byAgent, byModel, execTime, exitCode, logPath, safeDisplay(req))
+	body += "\nReview policy: " + req.ApprovalPolicy.Label() + ".\n"
+	if exec != nil {
+		body += fmt.Sprintf("Execution evidence: %s.\n", exec.Assurance)
+	}
 	return c.send(subject, body, ImportanceLow)
 }
 

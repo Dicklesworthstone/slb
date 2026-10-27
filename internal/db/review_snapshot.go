@@ -45,7 +45,8 @@ func (db *DB) ReadRequestReviewSnapshot(ctx context.Context, project, id, sessio
 		return nil, errors.New("request belongs to another project")
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT id, request_id, reviewer_session_id, reviewer_agent, reviewer_model,
-		decision, signature, signature_timestamp, responses_json, comments, created_at
+		decision, signature, signature_timestamp, responses_json, comments, created_at,
+		approval_policy, assurance, command_hash, request_binding, signature_version
 		FROM reviews WHERE request_id = ? ORDER BY created_at, rowid`, id)
 	if err != nil {
 		return nil, fmt.Errorf("reading review snapshot: %w", err)

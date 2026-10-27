@@ -34,15 +34,21 @@ var (
 
 var rootCmd = &cobra.Command{
 	Use:   "slb",
-	Short: "Simultaneous Launch Button - Two-person rule for dangerous commands",
-	Long: `SLB implements a two-person authorization rule for dangerous commands.
+	Short: "Simultaneous Launch Button - Review workflow for dangerous commands",
+	Long: `SLB coordinates review of dangerous commands.
 
 Before running commands like 'rm -rf', 'git push --force', or 'kubectl delete',
-SLB requires approval from another authorized agent or human reviewer.
+the default independent policy requires independently authenticated approval.
+The local backend has no external identity authority and refuses these approvals.
+
+Explicitly setting general.approval_policy = "same_host" enables cooperating
+local sessions to peer-review commands for mistake prevention. Same-host review
+is low assurance, not independently authenticated authorization or protection
+against a malicious process sharing the operating-system account.
 
 Commands are classified by risk level:
-  CRITICAL   - Requires 2+ approvals (data destruction, production deploys)
-  DANGEROUS  - Requires 1 approval (force pushes, schema changes)
+  CRITICAL   - Requires 2+ reviews under the selected policy
+  DANGEROUS  - Requires 1 review under the selected policy
   CAUTION    - Auto-approved after 30s with notification
   SAFE       - Skipped entirely (read-only commands)`,
 	SilenceUsage: true,

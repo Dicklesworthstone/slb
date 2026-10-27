@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
 const (
@@ -29,20 +31,24 @@ const (
 // keys. The worker reads the authoritative command and approval from Database.
 // Paths are absolute so a worker cannot reinterpret the parent's relative flags.
 type Job struct {
-	Version           int    `json:"version"`
-	RequestID         string `json:"request_id"`
-	SessionID         string `json:"session_id"`
-	CommandHash       string `json:"command_hash"`
-	Database          string `json:"database"`
-	Project           string `json:"project"`
-	Config            string `json:"config,omitempty"`
-	LogDir            string `json:"log_dir"`
-	TimeoutSeconds    int64  `json:"timeout_seconds"`
-	CaptureRollback   bool   `json:"capture_rollback"`
-	MaxRollbackSizeMB int    `json:"max_rollback_size_mb"`
+	ApprovalPolicy    db.ApprovalPolicy `json:"approval_policy"`
+	Version           int               `json:"version"`
+	RequestID         string            `json:"request_id"`
+	SessionID         string            `json:"session_id"`
+	CommandHash       string            `json:"command_hash"`
+	Database          string            `json:"database"`
+	Project           string            `json:"project"`
+	Config            string            `json:"config,omitempty"`
+	LogDir            string            `json:"log_dir"`
+	TimeoutSeconds    int64             `json:"timeout_seconds"`
+	CaptureRollback   bool              `json:"capture_rollback"`
+	MaxRollbackSizeMB int               `json:"max_rollback_size_mb"`
 }
 
 func (j Job) Validate() error {
+	if !j.ApprovalPolicy.Normalized().Valid() {
+		return errors.New("invalid background approval policy")
+	}
 	if j.Version != Version || strings.TrimSpace(j.RequestID) == "" || strings.TrimSpace(j.SessionID) == "" ||
 		len(j.RequestID) > 256 || len(j.SessionID) > 256 || strings.ContainsAny(j.RequestID+j.SessionID, "\x00\r\n") {
 		return errors.New("invalid background job identity")
@@ -69,15 +75,18 @@ func (j Job) Validate() error {
 // completion. A very fast command may already be terminal when this is read.
 // SupervisorLog is filled by the launcher, not accepted from the worker.
 type Receipt struct {
-	Version       int    `json:"version"`
-	RequestID     string `json:"request_id"`
-	CommandHash   string `json:"command_hash"`
-	Status        string `json:"status"`
-	SupervisorPID int    `json:"supervisor_pid"`
-	PID           int    `json:"pid"`
-	LogPath       string `json:"log_path"`
-	SupervisorLog string `json:"supervisor_log,omitempty"`
-	Error         string `json:"error,omitempty"`
+	ApprovalPolicy      db.ApprovalPolicy  `json:"approval_policy"`
+	ApprovalPolicyLabel string             `json:"approval_policy_label"`
+	Assurance           db.ReviewAssurance `json:"assurance"`
+	Version             int                `json:"version"`
+	RequestID           string             `json:"request_id"`
+	CommandHash         string             `json:"command_hash"`
+	Status              string             `json:"status"`
+	SupervisorPID       int                `json:"supervisor_pid"`
+	PID                 int                `json:"pid"`
+	LogPath             string             `json:"log_path"`
+	SupervisorLog       string             `json:"supervisor_log,omitempty"`
+	Error               string             `json:"error,omitempty"`
 }
 
 // StartError is deliberately ambiguous about execution. The command may have
@@ -221,6 +230,8 @@ func Launch(ctx context.Context, executable string, args []string, job Job) (*Re
 		case r.Error != "":
 			received.err = fmt.Errorf("worker refused execution: %s", r.Error)
 		case r.Version != Version || r.RequestID != job.RequestID || r.CommandHash != job.CommandHash ||
+			!r.ApprovalPolicy.Valid() || r.ApprovalPolicy != job.ApprovalPolicy.Normalized() ||
+			!validReceiptAssurance(r.ApprovalPolicy, r.Assurance) || r.ApprovalPolicyLabel != r.ApprovalPolicy.Label() ||
 			r.SupervisorPID != command.Process.Pid || r.PID <= 0 || r.Status != "executing" ||
 			!filepath.IsAbs(r.LogPath) || filepath.Dir(r.LogPath) != filepath.Clean(job.LogDir) || r.SupervisorLog != "":
 			received.err = errors.New("invalid background startup acknowledgment")
@@ -241,4 +252,12 @@ func Launch(ctx context.Context, executable string, args []string, job Job) (*Re
 	}
 	r.SupervisorLog = diagnostics.Name()
 	return &r, nil
+}
+
+func validReceiptAssurance(policy db.ApprovalPolicy, assurance db.ReviewAssurance) bool {
+	if assurance == db.AssurancePolicyAuto {
+		return true
+	}
+	return policy == db.ApprovalPolicySameHost && assurance == db.AssuranceSameHost ||
+		policy == db.ApprovalPolicyIndependent && assurance == db.AssuranceIndependent
 }

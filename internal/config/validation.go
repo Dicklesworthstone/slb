@@ -9,6 +9,9 @@ import (
 func Validate(cfg Config) error {
 	var errs []string
 
+	if !oneOf(cfg.General.ApprovalPolicy, "independent", "same_host") {
+		errs = append(errs, "general.approval_policy must be independent or same_host (low-assurance peer review)")
+	}
 	if cfg.General.MinApprovals < 1 {
 		errs = append(errs, "general.min_approvals must be >= 1")
 	}

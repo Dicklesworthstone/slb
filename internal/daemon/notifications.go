@@ -39,13 +39,15 @@ const (
 
 // WebhookPayload is the JSON payload sent to webhook URLs.
 type WebhookPayload struct {
-	Event     WebhookEvent `json:"event"`
-	RequestID string       `json:"request_id"`
-	Command   string       `json:"command"`
-	Tier      string       `json:"tier"`
-	Requestor string       `json:"requestor"`
-	Timestamp string       `json:"timestamp"`
-	Project   string       `json:"project,omitempty"`
+	Event          WebhookEvent      `json:"event"`
+	RequestID      string            `json:"request_id"`
+	Command        string            `json:"command"`
+	Tier           string            `json:"tier"`
+	Requestor      string            `json:"requestor"`
+	Timestamp      string            `json:"timestamp"`
+	Project        string            `json:"project,omitempty"`
+	ApprovalPolicy db.ApprovalPolicy `json:"approval_policy"`
+	ReviewNotice   string            `json:"review_notice"`
 }
 
 // WebhookNotifier handles webhook notifications.
@@ -260,6 +262,7 @@ func (m *NotificationManager) Check(ctx context.Context) error {
 		if hasDesktop && req.RiskTier == db.RiskTierCritical {
 			title := "SLB: CRITICAL request pending"
 			message := fmt.Sprintf("%s\nRequestor: %s\nID: %s", cmd, req.RequestorAgent, shortID(req.ID))
+			message += "\n" + req.ApprovalPolicy.Label()
 
 			if err := m.notifier.Notify(title, message); err != nil {
 				m.logger.Warn("desktop notification failed", "error", err)
@@ -269,13 +272,14 @@ func (m *NotificationManager) Check(ctx context.Context) error {
 		// Send webhook notification
 		if hasWebhook {
 			payload := WebhookPayload{
-				Event:     webhookEvent,
-				RequestID: req.ID,
-				Command:   cmd,
-				Tier:      string(req.RiskTier),
-				Requestor: req.RequestorAgent,
-				Timestamp: now.Format(time.RFC3339),
-				Project:   m.projectPath,
+				Event:          webhookEvent,
+				RequestID:      req.ID,
+				Command:        cmd,
+				Tier:           string(req.RiskTier),
+				Requestor:      req.RequestorAgent,
+				Timestamp:      now.Format(time.RFC3339),
+				Project:        m.projectPath,
+				ApprovalPolicy: req.ApprovalPolicy.Normalized(), ReviewNotice: req.ApprovalPolicy.Label(),
 			}
 
 			// Use a timeout context for webhook calls
@@ -313,13 +317,14 @@ func (m *NotificationManager) SendWebhook(ctx context.Context, event WebhookEven
 	}
 
 	payload := WebhookPayload{
-		Event:     event,
-		RequestID: req.ID,
-		Command:   cmd,
-		Tier:      string(req.RiskTier),
-		Requestor: req.RequestorAgent,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Project:   m.projectPath,
+		Event:          event,
+		RequestID:      req.ID,
+		Command:        cmd,
+		Tier:           string(req.RiskTier),
+		Requestor:      req.RequestorAgent,
+		Timestamp:      time.Now().UTC().Format(time.RFC3339),
+		Project:        m.projectPath,
+		ApprovalPolicy: req.ApprovalPolicy.Normalized(), ReviewNotice: req.ApprovalPolicy.Label(),
 	}
 
 	webhookCtx, cancel := context.WithTimeout(ctx, WebhookTimeout)

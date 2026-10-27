@@ -93,6 +93,7 @@ func submitInteractiveReview(opts Options, id, commandHash string, decision db.D
 
 func interactiveReviewPolicy(cfg config.Config) (db.ReviewPolicy, error) {
 	policy := db.ReviewPolicy{
+		ApprovalPolicy:     db.ApprovalPolicy(cfg.General.ApprovalPolicy),
 		ConflictResolution: cfg.General.ConflictResolution,
 		TrustedSelfApprove: cfg.Agents.TrustedSelfApprove,
 	}

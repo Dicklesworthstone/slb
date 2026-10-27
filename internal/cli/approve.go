@@ -49,9 +49,14 @@ var approveCmd = &cobra.Command{
 	Short: "Approve a pending request",
 	Long: `Approve a command request, allowing it to proceed.
 
-The approval is cryptographically signed with your session key to ensure
-authenticity. Your session must be active, and you cannot approve your own
-requests (unless you are a trusted self-approve agent).
+The default independent policy refuses approvals from local sessions because
+session keys cannot authenticate independent reviewer identities.
+
+Requests created with general.approval_policy = "same_host" accept explicitly
+low-assurance peer reviews. Session signatures bind the command and review
+policy for mistake prevention; they do not provide a security boundary against
+processes sharing the operating-system account. Your session must be active,
+and same-host requests cannot be self-reviewed, including by trusted agents.
 
 For cross-project reviews, use --target-project to specify which project's
 database contains the request you want to approve.
@@ -145,17 +150,21 @@ database contains the request you want to approve.
 
 		// Build output
 		type approvalResult struct {
-			ReviewID             string `json:"review_id"`
-			RequestID            string `json:"request_id"`
-			Decision             string `json:"decision"`
-			Approvals            int    `json:"approvals"`
-			Rejections           int    `json:"rejections"`
-			RequestStatusChanged bool   `json:"request_status_changed"`
-			NewRequestStatus     string `json:"new_request_status,omitempty"`
-			CreatedAt            string `json:"created_at"`
+			approvalPolicyView
+			Assurance            db.ReviewAssurance `json:"assurance"`
+			ReviewID             string             `json:"review_id"`
+			RequestID            string             `json:"request_id"`
+			Decision             string             `json:"decision"`
+			Approvals            int                `json:"approvals"`
+			Rejections           int                `json:"rejections"`
+			RequestStatusChanged bool               `json:"request_status_changed"`
+			NewRequestStatus     string             `json:"new_request_status,omitempty"`
+			CreatedAt            string             `json:"created_at"`
 		}
 
 		resp := approvalResult{
+			approvalPolicyView:   policyView(result.Review.ApprovalPolicy),
+			Assurance:            result.Review.Assurance,
 			ReviewID:             result.Review.ID,
 			RequestID:            requestID,
 			Decision:             string(result.Review.Decision),
@@ -170,19 +179,25 @@ database contains the request you want to approve.
 		}
 
 		out := output.New(output.Format(GetOutput()))
-		if GetOutput() == "json" {
+		if executionOutputStructured() {
 			return out.Write(resp)
 		}
 
 		// Human-readable output
-		fmt.Printf("Approved request %s\n", requestID)
+		if result.Review.ApprovalPolicy == db.ApprovalPolicySameHost {
+			fmt.Printf("Same-host review accepted for request %s\n", requestID)
+		} else {
+			fmt.Printf("Approved request %s\n", requestID)
+		}
+		fmt.Printf("Approval policy: %s\n", resp.ApprovalPolicyLabel)
+		fmt.Printf("Evidence assurance: %s\n", resp.Assurance)
 		fmt.Printf("Review ID: %s\n", resp.ReviewID)
 		fmt.Printf("Approvals: %d, Rejections: %d\n", resp.Approvals, resp.Rejections)
 
 		if result.RequestStatusChanged {
 			fmt.Printf("Request status changed to: %s\n", resp.NewRequestStatus)
 			if result.NewRequestStatus == db.StatusApproved {
-				fmt.Println("Request is now approved and ready for execution!")
+				fmt.Println("Request is ready for execution under the recorded approval policy.")
 			}
 		}
 
@@ -203,6 +218,7 @@ func buildConfiguredReviewService(database *db.DB, requestID string) (*core.Revi
 		return nil, fmt.Errorf("loading review policy: %w", err)
 	}
 	review := core.DefaultReviewConfig()
+	review.ApprovalPolicy = db.ApprovalPolicy(cfg.General.ApprovalPolicy)
 	review.ConflictResolution = core.ConflictResolution(cfg.General.ConflictResolution)
 	review.TrustedSelfApprove = cfg.Agents.TrustedSelfApprove
 	review.TrustedSelfApproveDelay = time.Duration(cfg.Agents.TrustedSelfApproveDelaySecs) * time.Second

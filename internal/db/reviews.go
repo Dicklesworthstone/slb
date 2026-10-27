@@ -21,6 +21,7 @@ var ErrInvalidSignature = errors.New("invalid review signature")
 
 // CreateReviewTx inserts a review within a transaction.
 func (db *DB) CreateReviewTx(tx *sql.Tx, r *Review) error {
+	normalizeHistoricalReview(r)
 	if r.ID == "" {
 		r.ID = uuid.New().String()
 	}
@@ -38,12 +39,14 @@ func (db *DB) CreateReviewTx(tx *sql.Tx, r *Review) error {
 		INSERT INTO reviews (
 			id, request_id, reviewer_session_id, reviewer_agent, reviewer_model,
 			decision, signature, signature_timestamp,
-			responses_json, comments, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			responses_json, comments, created_at,
+			approval_policy, assurance, command_hash, request_binding, signature_version
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		r.ID, r.RequestID, r.ReviewerSessionID, r.ReviewerAgent, r.ReviewerModel,
 		string(r.Decision), r.Signature, r.SignatureTimestamp.Format(time.RFC3339),
 		nullString(string(respJSON)), nullString(r.Comments), r.CreatedAt.Format(time.RFC3339),
+		string(r.ApprovalPolicy), string(r.Assurance), r.CommandHash, r.RequestBinding, r.SignatureVersion,
 	)
 	if err != nil {
 		if isUniqueConstraintError(err) {
@@ -56,6 +59,7 @@ func (db *DB) CreateReviewTx(tx *sql.Tx, r *Review) error {
 
 // CreateReview inserts a review, generating ID and timestamps if missing.
 func (db *DB) CreateReview(r *Review) error {
+	normalizeHistoricalReview(r)
 	if r.ID == "" {
 		r.ID = uuid.New().String()
 	}
@@ -80,12 +84,14 @@ func (db *DB) CreateReview(r *Review) error {
 		INSERT INTO reviews (
 			id, request_id, reviewer_session_id, reviewer_agent, reviewer_model,
 			decision, signature, signature_timestamp,
-			responses_json, comments, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			responses_json, comments, created_at,
+			approval_policy, assurance, command_hash, request_binding, signature_version
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		r.ID, r.RequestID, r.ReviewerSessionID, r.ReviewerAgent, r.ReviewerModel,
 		string(r.Decision), r.Signature, r.SignatureTimestamp.Format(time.RFC3339),
 		nullString(string(respJSON)), nullString(r.Comments), r.CreatedAt.Format(time.RFC3339),
+		string(r.ApprovalPolicy), string(r.Assurance), r.CommandHash, r.RequestBinding, r.SignatureVersion,
 	)
 	if err != nil {
 		if isUniqueConstraintError(err) {
@@ -100,7 +106,8 @@ func (db *DB) CreateReview(r *Review) error {
 func (db *DB) GetReview(id string) (*Review, error) {
 	row := db.QueryRow(`
 		SELECT id, request_id, reviewer_session_id, reviewer_agent, reviewer_model,
-		       decision, signature, signature_timestamp, responses_json, comments, created_at
+		       decision, signature, signature_timestamp, responses_json, comments, created_at,
+		       approval_policy, assurance, command_hash, request_binding, signature_version
 		FROM reviews WHERE id = ?
 	`, id)
 	return scanReviewRow(row)
@@ -110,7 +117,8 @@ func (db *DB) GetReview(id string) (*Review, error) {
 func (db *DB) ListReviewsForRequest(requestID string) ([]*Review, error) {
 	rows, err := db.Query(`
 		SELECT id, request_id, reviewer_session_id, reviewer_agent, reviewer_model,
-		       decision, signature, signature_timestamp, responses_json, comments, created_at
+		       decision, signature, signature_timestamp, responses_json, comments, created_at,
+		       approval_policy, assurance, command_hash, request_binding, signature_version
 		FROM reviews WHERE request_id = ?
 		ORDER BY created_at ASC
 	`, requestID)
@@ -196,7 +204,8 @@ func scanReviewRow(row *sql.Row) (*Review, error) {
 	var comments sql.NullString
 
 	err := row.Scan(&r.ID, &r.RequestID, &r.ReviewerSessionID, &r.ReviewerAgent, &r.ReviewerModel,
-		&decision, &r.Signature, &sigTs, &responsesJSON, &comments, &created)
+		&decision, &r.Signature, &sigTs, &responsesJSON, &comments, &created,
+		&r.ApprovalPolicy, &r.Assurance, &r.CommandHash, &r.RequestBinding, &r.SignatureVersion)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrReviewNotFound
@@ -228,7 +237,8 @@ func scanReviewList(rows *sql.Rows) ([]*Review, error) {
 		var comments sql.NullString
 
 		if err := rows.Scan(&r.ID, &r.RequestID, &r.ReviewerSessionID, &r.ReviewerAgent, &r.ReviewerModel,
-			&decision, &r.Signature, &sigTs, &responsesJSON, &comments, &created); err != nil {
+			&decision, &r.Signature, &sigTs, &responsesJSON, &comments, &created,
+			&r.ApprovalPolicy, &r.Assurance, &r.CommandHash, &r.RequestBinding, &r.SignatureVersion); err != nil {
 			return nil, fmt.Errorf("scanning reviews: %w", err)
 		}
 
@@ -248,6 +258,20 @@ func scanReviewList(rows *sql.Rows) ([]*Review, error) {
 		return nil, err
 	}
 	return list, nil
+}
+
+// Old import/fixture callers have no evidence metadata. Preserve their v1
+// category instead of inferring stronger assurance from the request or config.
+func normalizeHistoricalReview(r *Review) {
+	if r.SignatureVersion == 0 {
+		r.SignatureVersion = 1
+	}
+	if r.ApprovalPolicy == "" {
+		r.ApprovalPolicy = ApprovalPolicyIndependent
+	}
+	if r.Assurance == "" {
+		r.Assurance = AssuranceLegacyLocal
+	}
 }
 
 // ComputeReviewSignature computes the signature a session key makes over a
@@ -286,6 +310,31 @@ func (db *DB) CheckRequestApprovalStatus(requestID string) (approved bool, rejec
 	req, err := db.GetRequest(requestID)
 	if err != nil {
 		return false, false, err
+	}
+	if !req.ApprovalPolicy.Valid() {
+		return false, false, fmt.Errorf("unknown request approval policy %q", req.ApprovalPolicy)
+	}
+	if req.ApprovalPolicy == ApprovalPolicySameHost {
+		// This helper is advisory. Still inspect one consistent signed review
+		// set rather than treating raw rows or the status bit as authority.
+		err = db.Transaction(func(tx *sql.Tx) error {
+			current, err := db.GetRequestTx(tx, requestID)
+			if err != nil {
+				return err
+			}
+			if current.ApprovalPolicy != ApprovalPolicySameHost || current.MinApprovals < 0 ||
+				current.Command.Hash == "" || ComputeCommandHash(current.Command) != current.Command.Hash {
+				return ErrInvalidApprovalProof
+			}
+			proof, err := verifyReviewEvidenceTx(tx, current, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			rejected = proof.rejections > 0
+			approved = !rejected && proof.approvals >= current.MinApprovals && (!current.RequireDifferentModel || proof.differentModel)
+			return nil
+		})
+		return approved, rejected, err
 	}
 
 	approvalCount, rejectionCount, err := db.CountReviewsByDecision(requestID)

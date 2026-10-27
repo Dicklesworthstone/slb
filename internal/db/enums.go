@@ -3,6 +3,53 @@ package db
 
 import "errors"
 
+// ApprovalPolicy names the kind of review a request requires. Same-host review
+// is an explicit mistake-prevention workflow, not independent authorization.
+type ApprovalPolicy string
+
+const (
+	ApprovalPolicyIndependent ApprovalPolicy = "independent"
+	ApprovalPolicySameHost    ApprovalPolicy = "same_host"
+)
+
+// Normalized gives historical requests and zero-value callers the secure
+// default. An unknown nonempty policy never falls back to same-host review.
+func (p ApprovalPolicy) Normalized() ApprovalPolicy {
+	if p == "" {
+		return ApprovalPolicyIndependent
+	}
+	return p
+}
+
+func (p ApprovalPolicy) Valid() bool {
+	p = p.Normalized()
+	return p == ApprovalPolicyIndependent || p == ApprovalPolicySameHost
+}
+
+func (p ApprovalPolicy) Label() string {
+	switch p.Normalized() {
+	case ApprovalPolicySameHost:
+		return "same-host peer review (low assurance; not independently authenticated authorization)"
+	case ApprovalPolicyIndependent:
+		return "independently authenticated authorization required"
+	default:
+		return "unknown approval policy"
+	}
+}
+
+// ReviewAssurance describes evidence actually recorded, separately from the
+// policy that requested it. A policy named independent is not itself proof of
+// independent reviewer identity. Legacy local HMACs never acquire that claim.
+type ReviewAssurance string
+
+const (
+	AssuranceSameHost      ReviewAssurance = "same_host"
+	AssuranceIndependent   ReviewAssurance = "independent"
+	AssuranceLegacyLocal   ReviewAssurance = "legacy_local"
+	AssuranceLegacyUnknown ReviewAssurance = "legacy_unknown"
+	AssurancePolicyAuto    ReviewAssurance = "policy_auto"
+)
+
 // RiskTier represents the risk classification of a command.
 type RiskTier string
 

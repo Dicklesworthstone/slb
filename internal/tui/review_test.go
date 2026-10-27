@@ -15,7 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-func interactiveReviewFixture(t *testing.T, quorum int) (*db.DB, *db.Request, *db.Session, Options) {
+func interactiveReviewFixture(t *testing.T, quorum int, policies ...db.ApprovalPolicy) (*db.DB, *db.Request, *db.Session, Options) {
 	t.Helper()
 	project := t.TempDir()
 	database, err := db.OpenAndMigrate(filepath.Join(project, ".slb", "state.db"))
@@ -24,7 +24,11 @@ func interactiveReviewFixture(t *testing.T, quorum int) (*db.DB, *db.Request, *d
 	}
 	t.Cleanup(func() { _ = database.Close() })
 	configPath := filepath.Join(project, ".slb", "config.toml")
-	if err := os.WriteFile(configPath, []byte("[integrations]\nagent_mail_enabled = false\n"), 0600); err != nil {
+	policy := db.ApprovalPolicyIndependent
+	if len(policies) != 0 {
+		policy = policies[0]
+	}
+	if err := os.WriteFile(configPath, []byte("[general]\napproval_policy = \""+string(policy)+"\"\n[integrations]\nagent_mail_enabled = false\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	author := &db.Session{AgentName: "requester", Model: "model-a", ProjectPath: project}
@@ -38,12 +42,52 @@ func interactiveReviewFixture(t *testing.T, quorum int) (*db.DB, *db.Request, *d
 		ProjectPath: project, RequestorSessionID: author.ID, RequestorAgent: author.AgentName, RequestorModel: author.Model,
 		Command:  db.CommandSpec{Raw: "echo reviewed", Argv: []string{"echo", "reviewed"}, Cwd: project},
 		RiskTier: db.RiskTierDangerous, Status: db.StatusPending, MinApprovals: quorum,
-		Justification: db.Justification{Reason: "test; never execute"},
+		ApprovalPolicy: policy,
+		Justification:  db.Justification{Reason: "test; never execute"},
 	}
 	if _, err := database.AdmitRequest(context.Background(), r, db.RequestAdmissionLimits{MaxPending: 5, MaxPerMinute: 10}); err != nil {
 		t.Fatal(err)
 	}
 	return database, r, reviewer, Options{ProjectPath: project, ConfigPath: configPath, SessionID: reviewer.ID, SessionKey: reviewer.SessionKey}
+}
+
+func TestInteractiveSameHostReviewPolicyAndEvidence(t *testing.T) {
+	for _, revoke := range []bool{false, true} {
+		name := "intentional opt-in"
+		if revoke {
+			name = "opt-in revoked before submission"
+		}
+		t.Run(name, func(t *testing.T) {
+			database, target, _, opts := interactiveReviewFixture(t, 1, db.ApprovalPolicySameHost)
+			if revoke {
+				if err := os.WriteFile(opts.ConfigPath, []byte("[general]\napproval_policy = \"independent\"\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result := submitInteractiveReview(opts, target.ID, target.Command.Hash, db.DecisionApprove, "Checked the exact command and expected effects")
+			if revoke {
+				if result.Err == nil || result.Recorded {
+					t.Fatalf("UI ignored policy revocation: %+v", result)
+				}
+				stored, err := database.GetRequest(target.ID)
+				if err != nil || stored.Status != db.StatusPending {
+					t.Fatalf("refused UI review changed state: %+v %v", stored, err)
+				}
+				return
+			}
+			if result.Err != nil || !result.Recorded || result.Review == nil || result.Review.Assurance != db.AssuranceSameHost {
+				t.Fatalf("same-host UI review was not recorded with its category: %+v", result)
+			}
+			if !db.VerifyReviewEvidenceSignature(result.Review, opts.SessionKey) {
+				t.Fatal("UI review has invalid signed evidence")
+			}
+			model := request.NewDetailModel(result.Request, []db.Review{*result.Review})
+			_, _ = model.Update(tea.WindowSizeMsg{Width: 120, Height: 50})
+			if view := model.View(); !strings.Contains(view, "not independently authenticated authorization") || !strings.Contains(view, "same_host") {
+				t.Fatalf("UI concealed the low-assurance category: %s", view)
+			}
+		})
+	}
 }
 
 func interactiveReviewModel(opts Options, target *db.Request, session *db.Session) Model {

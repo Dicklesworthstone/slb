@@ -86,6 +86,10 @@ type DryRunResult struct {
 
 // Execution contains information about command execution.
 type Execution struct {
+	// ApprovalPolicy and Assurance are copied from verified evidence when the
+	// execution is claimed; a later configuration change cannot relabel it.
+	ApprovalPolicy ApprovalPolicy  `json:"approval_policy"`
+	Assurance      ReviewAssurance `json:"assurance"`
 	// ExecutedAt is when the command was executed.
 	ExecutedAt *time.Time `json:"executed_at,omitempty"`
 	// ExecutedBySessionID is the session that executed the command.
@@ -143,6 +147,9 @@ type Request struct {
 	MinApprovals int `json:"min_approvals"`
 	// RequireDifferentModel requires a different model for approval.
 	RequireDifferentModel bool `json:"require_different_model"`
+	// ApprovalPolicy is chosen when the request is created. Existing requests
+	// are never upgraded or downgraded by changing the project's configuration.
+	ApprovalPolicy ApprovalPolicy `json:"approval_policy"`
 
 	// Execution contains execution information.
 	Execution *Execution `json:"execution,omitempty"`
@@ -207,7 +214,20 @@ type Review struct {
 
 	// Decision is approve or reject.
 	Decision Decision `json:"decision"`
-	// Signature is HMAC(SessionKeyDigest(key), request_id + decision + timestamp).
+	// ApprovalPolicy and Assurance distinguish same-host workflow evidence
+	// from independent authorization and from historical unauthenticated rows.
+	ApprovalPolicy ApprovalPolicy  `json:"approval_policy"`
+	Assurance      ReviewAssurance `json:"assurance"`
+	// CommandHash is the exact command binding for version 2 reviews.
+	CommandHash string `json:"command_hash"`
+	// RequestBinding captures the immutable request fields reviewed. It is
+	// signed and recomputed against the request before execution.
+	RequestBinding string `json:"request_binding"`
+	// SignatureVersion 1 is the historical local signature. Version 2 binds
+	// policy, assurance, command, requester, quorum, model rule and reviewer.
+	SignatureVersion int `json:"signature_version"`
+	// Signature is an HMAC using the stored session key digest, not proof of
+	// an independently authenticated reviewer identity.
 	Signature string `json:"signature"`
 	// SignatureTimestamp is included in the signature to prevent replay.
 	SignatureTimestamp time.Time `json:"signature_timestamp"`

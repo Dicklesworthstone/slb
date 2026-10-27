@@ -12,15 +12,17 @@ import (
 // of the requested action. A rejected preflight has no child exit status; an
 // outcome persistence failure must retain EXECUTING rather than claim success.
 type executionOutcome struct {
-	RequestID  string `json:"request_id"`
-	Status     string `json:"status"`
-	Executed   bool   `json:"executed"`
-	ExitCode   int    `json:"exit_code"`
-	DurationMs int64  `json:"duration_ms"`
-	LogPath    string `json:"log_path"`
-	Output     string `json:"output,omitempty"`
-	TimedOut   bool   `json:"timed_out,omitempty"`
-	Error      string `json:"error,omitempty"`
+	approvalPolicyView
+	Assurance  db.ReviewAssurance `json:"assurance,omitempty"`
+	RequestID  string             `json:"request_id"`
+	Status     string             `json:"status"`
+	Executed   bool               `json:"executed"`
+	ExitCode   int                `json:"exit_code"`
+	DurationMs int64              `json:"duration_ms"`
+	LogPath    string             `json:"log_path"`
+	Output     string             `json:"output,omitempty"`
+	TimedOut   bool               `json:"timed_out,omitempty"`
+	Error      string             `json:"error,omitempty"`
 }
 
 func executionOutputStructured() bool {
@@ -46,10 +48,14 @@ func executionOutcomeFor(requestID string, result *core.ExecutionResult, execErr
 		view.Output = result.Output
 		view.TimedOut = result.TimedOut
 		if result.Request != nil {
+			view.approvalPolicyView = policyView(result.Request.ApprovalPolicy)
 			view.Status = string(result.Request.Status)
 			// Core only records an exit status after a child starts. Even -1
 			// may be a real (signal-terminated) result; a failed start is nil.
 			view.Executed = result.Request.Execution != nil && result.Request.Execution.ExitCode != nil
+			if result.Request.Execution != nil {
+				view.Assurance = result.Request.Execution.Assurance
+			}
 		}
 		if execErr == nil {
 			execErr = result.Error

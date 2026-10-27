@@ -43,6 +43,9 @@ The journal records metadata, not commands, attachments, comments, credentials,
 preview output or execution receipts. request_baseline is the state observed
 when an existing database was upgraded, not a reconstruction of older history.
 Events and review counts are NOT execution authority; use slb execute's gate.
+New events preserve the approval policy and review/execution assurance.
+Same-host reviews are low-assurance mistake prevention, not independently
+authenticated authorization. Historical events retain their original metadata.
 
 This command opens the existing local database selected by --db (or the current
 project), applies pending schema migrations, and reads without needing a daemon.

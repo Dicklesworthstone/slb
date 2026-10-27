@@ -93,6 +93,9 @@ func showQuickReference() {
 	title := titleStyle.Copy().Width(width - 4).Align(lipgloss.Center).Render(titleRendered)
 
 	setup := renderSection(useUnicode, "🔷 SETUP (once per session)", []string{
+		mutedStyle.Render("  Default independent policy refuses local approvals."),
+		bullet("slb config set general.approval_policy same_host", "optional local peer review"),
+		mutedStyle.Render("  Same-host review is low assurance, not authenticated authorization."),
 		bullet("slb session start -a <name> -p <program> -m <model> -j", "start an agent session (get session_id)"),
 		bullet("slb daemon start", "optional: start background daemon (faster + notifications)"),
 		bullet("slb patterns test \"rm -rf ./build\" --json", "see if command needs approval"),

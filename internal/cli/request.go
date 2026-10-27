@@ -53,9 +53,13 @@ var requestCmd = &cobra.Command{
 This is the lower-level command for creating approval requests.
 For atomic command execution, use 'slb run' instead.
 
+The default independent policy refuses local approvals. Explicitly configure
+general.approval_policy = "same_host" for low-assurance local peer review;
+these reviews are not independently authenticated authorization.
+
 The command is classified by risk tier:
-  CRITICAL   - Requires 2+ approvals
-  DANGEROUS  - Requires 1 approval
+  CRITICAL   - Requires 2+ reviews under the selected policy
+  DANGEROUS  - Requires 1 review under the selected policy
   CAUTION    - Auto-approved after the configured delay, if policy permits
   SAFE       - Skipped (no request created)
 
@@ -164,6 +168,7 @@ Use --execute with --wait to execute after approval.`,
 			"min_approvals": request.MinApprovals,
 			"created_at":    request.CreatedAt.Format(time.RFC3339),
 		}
+		addApprovalPolicyMetadata(resp, request.ApprovalPolicy)
 		addRequestAdmissionMetadata(resp, result)
 
 		if request.Command.DisplayRedacted != "" {
@@ -205,6 +210,9 @@ Use --execute with --wait to execute after approval.`,
 
 		// Execute if approved and --execute was specified
 		if flagRequestExecute && request.Status == db.StatusApproved {
+			if !executionOutputStructured() {
+				fmt.Printf("Approval policy: %s\n", request.ApprovalPolicy.Label())
+			}
 			executor := core.NewExecutor(dbConn, nil).WithNotifier(buildAgentMailNotifier(project))
 			execResult, execErr := executor.ExecuteApprovedRequest(cmd.Context(), core.ExecuteOptions{
 				RequestID:         request.ID,
@@ -223,6 +231,7 @@ Use --execute with --wait to execute after approval.`,
 			resp["log_path"] = outcome.LogPath
 			resp["output"] = outcome.Output
 			resp["timed_out"] = outcome.TimedOut
+			resp["assurance"] = outcome.Assurance
 			if execErr != nil {
 				resp["execution_error"] = execErr.Error()
 			}

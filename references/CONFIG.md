@@ -3,6 +3,7 @@
 ## Table of Contents
 - [Configuration Hierarchy](#configuration-hierarchy)
 - [Example Configuration](#example-configuration)
+- [Approval Policy](#approval-policy)
 - [Advanced Configuration](#advanced-configuration)
 - [Daemon Architecture](#daemon-architecture)
 - [Dry Run & Rollback](#dry-run--rollback)
@@ -25,6 +26,7 @@ Configuration is hierarchical (lowest to highest priority):
 
 ```toml
 [general]
+approval_policy = "independent"    # Default; see the explicit same_host option below
 min_approvals = 2
 request_timeout = 1800              # 30 minutes
 approval_ttl_minutes = 30
@@ -50,9 +52,51 @@ trusted_self_approve_delay_seconds = 300
 
 ---
 
+## Approval Policy
+
+`general.approval_policy` accepts two values:
+
+| Value | Behavior |
+|-------|----------|
+| `independent` (default) | Requires independently authenticated reviewer identities. No external authority is implemented, so local approvals and execution requiring them are refused. |
+| `same_host` | Allows cooperating local sessions to perform low-assurance peer review. It catches mistakes but does not protect against malicious processes sharing the OS user. |
+
+Opt in for new requests in the current project:
+
+```bash
+slb config set general.approval_policy same_host
+```
+
+Or edit the existing `[general]` section in `.slb/config.toml`:
+
+```toml
+[general]
+approval_policy = "same_host"
+```
+
+Requests keep the policy chosen at creation. Approving a request and executing it
+require the current configuration to match that stored policy. Switching to
+`same_host` does not revive historical local approvals or convert pending
+independent requests; submit a new request. Switching back to `independent`
+disables execution of outstanding same-host requests and never promotes their
+reviews to independently authenticated authorization.
+
+Quorum, command binding, signatures, expiration and the optional different-model
+check remain active. Different-model checks compare self-reported labels.
+Self-review is rejected in `same_host`, including agents listed in
+`trusted_self_approve`. CLI output, stored evidence and execution history label
+the low-assurance policy. See [the security reference](SECURITY.md#optional-same-host-peer-review-issue-31)
+for the threat model and historical-evidence handling.
+
+---
+
 ## Advanced Configuration
 
 ### Cross-Project Reviews
+
+Target-project policy controls the review. Cross-project delegation does not
+create an independent identity boundary; same-host reviews retain their
+low-assurance label across projects.
 
 ```toml
 [general]
@@ -182,6 +226,21 @@ Re-request:
 ```bash
 slb run "<command>" --reason "..."
 ```
+
+### "Independent reviewer identity unavailable"
+
+This is expected with the default `independent` policy: local session credentials
+cannot attest a separate principal. If the intended use is cooperating local
+agents checking each other's work, explicitly select `same_host` and submit a
+new request. For mutually untrusted agents, use a separately protected identity
+authority and execution boundary; this backend does not implement one.
+
+### Approval policy changed
+
+The request's stored policy differs from current configuration. Review evidence
+is not converted when configuration changes. Submit a new request under the
+intended policy, or restore the request's policy only if its assurance is still
+the intended one.
 
 ### Command hash mismatch
 

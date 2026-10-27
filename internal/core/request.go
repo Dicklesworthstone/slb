@@ -85,6 +85,9 @@ type RequestCreator struct {
 
 // RequestCreatorConfig holds configuration for request creation.
 type RequestCreatorConfig struct {
+	// ApprovalPolicy is fixed on each new request; changing configuration
+	// cannot reinterpret existing review evidence under another policy.
+	ApprovalPolicy db.ApprovalPolicy
 	// EnableDryRun collects advisory preview evidence before admitting requests.
 	EnableDryRun bool
 	// BlockedAgents is a list of agent names that cannot create requests.
@@ -110,6 +113,7 @@ type RequestCreatorConfig struct {
 // DefaultRequestCreatorConfig returns the default configuration.
 func DefaultRequestCreatorConfig() *RequestCreatorConfig {
 	return &RequestCreatorConfig{
+		ApprovalPolicy:             db.ApprovalPolicyIndependent,
 		EnableDryRun:               true,
 		BlockedAgents:              []string{},
 		DynamicQuorumEnabled:       false,
@@ -266,6 +270,7 @@ func (rc *RequestCreator) createRequestOnce(ctx context.Context, opts CreateRequ
 
 	// Step 11: Create request in DB
 	request := &db.Request{
+		ApprovalPolicy:        rc.config.ApprovalPolicy.Normalized(),
 		ProjectPath:           projectPath,
 		Command:               cmdSpec,
 		RiskTier:              classification.Tier,

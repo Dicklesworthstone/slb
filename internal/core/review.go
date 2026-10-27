@@ -53,6 +53,9 @@ type ReviewOptions struct {
 
 // ReviewConfig provides configuration for the review process.
 type ReviewConfig struct {
+	// ApprovalPolicy must match the request's stored policy. same_host is
+	// an explicit low-assurance workflow, never independent authorization.
+	ApprovalPolicy db.ApprovalPolicy
 	// ConflictResolution specifies how to handle conflicting reviews.
 	ConflictResolution ConflictResolution
 	// TrustedSelfApprove lists agents that can self-approve after delay.
@@ -75,6 +78,7 @@ type ReviewConfig struct {
 // DefaultReviewConfig returns the default review configuration.
 func DefaultReviewConfig() ReviewConfig {
 	return ReviewConfig{
+		ApprovalPolicy:          db.ApprovalPolicyIndependent,
 		ConflictResolution:      ConflictAnyRejectionBlocks,
 		TrustedSelfApprove:      nil,
 		TrustedSelfApproveDelay: 5 * time.Minute,
@@ -190,6 +194,7 @@ func (rs *ReviewService) submitReview(opts ReviewOptions, delegated *db.Delegate
 		Decision: opts.Decision, Responses: opts.Responses, Comments: opts.Comments,
 	}
 	outcome, err := rs.db.ApplyReview(review, opts.SessionKey, db.ReviewPolicy{
+		ApprovalPolicy:          rs.config.ApprovalPolicy,
 		ConflictResolution:      string(rs.config.ConflictResolution),
 		TrustedSelfApprove:      rs.config.TrustedSelfApprove,
 		TrustedSelfApproveDelay: rs.config.TrustedSelfApproveDelay,
@@ -276,13 +281,7 @@ func (rs *ReviewService) determineNewStatus(
 
 // VerifyReview validates a review's signature.
 func VerifyReview(review *db.Review, sessionKey string) bool {
-	return db.VerifyReviewSignature(
-		sessionKey,
-		review.RequestID,
-		review.Decision,
-		review.SignatureTimestamp,
-		review.Signature,
-	)
+	return db.VerifyReviewEvidenceSignature(review, sessionKey)
 }
 
 // CanReview checks if a session can submit a review for a request.
@@ -310,7 +309,7 @@ func (rs *ReviewService) CanReview(sessionID, requestID string) (bool, string) {
 
 	// Check self-review, including a restarted session with the same agent.
 	if sessionID == request.RequestorSessionID || session.AgentName == request.RequestorAgent {
-		if !rs.isTrustedSelfApprove(session.AgentName) {
+		if request.ApprovalPolicy.Normalized() == db.ApprovalPolicySameHost || !rs.isTrustedSelfApprove(session.AgentName) {
 			return false, "cannot review your own request"
 		}
 		delay := rs.config.TrustedSelfApproveDelay

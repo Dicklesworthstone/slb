@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-func reviewDecisionFixture(t *testing.T, quorum int) (*DB, *Request, []*Session) {
+func reviewDecisionFixture(t *testing.T, quorum int, policies ...ApprovalPolicy) (*DB, *Request, []*Session) {
 	t.Helper()
 	project := t.TempDir()
 	database, err := Open(filepath.Join(project, "state.db"))
@@ -32,6 +32,9 @@ func reviewDecisionFixture(t *testing.T, quorum int) (*DB, *Request, []*Session)
 		Command:  CommandSpec{Raw: "echo reviewed", Argv: []string{"echo", "reviewed"}, Cwd: project},
 		RiskTier: RiskTierDangerous, Status: StatusPending, MinApprovals: quorum,
 		Justification: Justification{Reason: "Review transaction test"}}
+	if len(policies) > 0 {
+		r.ApprovalPolicy = policies[0]
+	}
 	if err := database.CreateRequest(r); err != nil {
 		t.Fatal(err)
 	}
@@ -434,5 +437,288 @@ func TestSignedReviewEntryPointAuthenticatesPersistedSession(t *testing.T) {
 	}
 	if stored.Status != StatusApproved || stored.ApprovalExpiresAt == nil {
 		t.Fatal("signed review entry point omitted deadline")
+	}
+}
+
+// No simulated authority: this is the actual low-assurance production path.
+func TestSameHostReviewIntegrationOptIn(t *testing.T) {
+	database, request, sessions := reviewDecisionFixture(t, 2, ApprovalPolicySameHost)
+	policy := ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost, ApprovalTTL: 4 * time.Minute}
+	for i := 1; i <= 2; i++ {
+		outcome, err := applyFixtureReview(database, request, sessions[i], DecisionApprove, policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if outcome.Approvals != i || outcome.StatusChanged != (i == 2) {
+			t.Fatalf("wrong quorum transition: %+v", outcome)
+		}
+		vote, err := database.GetReview(outcome.Review.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if vote.ApprovalPolicy != ApprovalPolicySameHost || vote.Assurance != AssuranceSameHost ||
+			vote.CommandHash != request.Command.Hash || vote.SignatureVersion != 2 || vote.RequestBinding == "" {
+			t.Fatalf("missing same-host evidence: %+v", vote)
+		}
+		if !VerifyReviewEvidenceSignature(vote, sessions[i].SessionKey) ||
+			VerifyReviewSignature(sessions[i].SessionKey, vote.RequestID, vote.Decision, vote.SignatureTimestamp, vote.Signature) {
+			t.Fatal("versioned signature failed verification or crossed into the historical signature domain")
+		}
+		request = outcome.Request
+	}
+	if request.ApprovalExpiresAt == nil || request.ResolvedAt == nil || request.ApprovalExpiresAt.Sub(*request.ResolvedAt) != 4*time.Minute {
+		t.Fatalf("missing finite approval deadline: %+v", request)
+	}
+	// Ending a reviewer's session does not invalidate a completed review.
+	if err := database.EndSession(sessions[1].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.VerifyRequestApproval(request.ID); err != nil {
+		t.Fatal(err)
+	}
+	if approved, rejected, err := database.CheckRequestApprovalStatus(request.ID); err != nil || !approved || rejected {
+		t.Fatalf("advisory status lost same-host review: %v %v %v", approved, rejected, err)
+	}
+	now := time.Now().UTC()
+	execution := &Execution{ExecutedAt: &now, ExecutedBySessionID: sessions[0].ID,
+		ExecutedByAgent: sessions[0].AgentName, ExecutedByModel: sessions[0].Model, LogPath: "same-host.log",
+		ApprovalPolicy: ApprovalPolicyIndependent, Assurance: AssuranceIndependent}
+	if err := database.ClaimRequestExecutionAuthenticated(request, execution, sessions[0].SessionKey); err != nil {
+		t.Fatal(err)
+	}
+	if execution.ApprovalPolicy != ApprovalPolicySameHost || execution.Assurance != AssuranceSameHost {
+		t.Fatal("caller-supplied stronger execution assurance was trusted")
+	}
+	code := 0
+	execution.ExitCode = &code
+	execution.ApprovalPolicy, execution.Assurance = ApprovalPolicyIndependent, AssuranceIndependent
+	if err := database.CompleteRequestExecutionAuthenticated(request.ID, StatusExecuted, execution, sessions[0].SessionKey); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := database.GetRequest(request.ID)
+	if err != nil || stored.Execution == nil || stored.Execution.ApprovalPolicy != ApprovalPolicySameHost || stored.Execution.Assurance != AssuranceSameHost {
+		t.Fatalf("completion relabeled verified execution: %+v %v", stored, err)
+	}
+}
+
+func TestSameHostReviewIntegrationRequiresBothOptIns(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		requestPolicy ApprovalPolicy
+		reviewPolicy  ApprovalPolicy
+		want          error
+	}{
+		{"secure default", "", "", ErrIndependentIdentityUnavailable},
+		{"historical request after opt in", "", ApprovalPolicySameHost, ErrReviewPolicyMismatch},
+		{"opt in revoked", ApprovalPolicySameHost, "", ErrIndependentIdentityUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database, request, sessions := reviewDecisionFixture(t, 1, tc.requestPolicy)
+			out, err := applyFixtureReview(database, request, sessions[1], DecisionApprove, ReviewPolicy{ApprovalPolicy: tc.reviewPolicy})
+			if out != nil || !errors.Is(err, tc.want) {
+				t.Fatalf("unintended policy accepted: %+v %v", out, err)
+			}
+			a, r, err := database.CountReviewsByDecision(request.ID)
+			if err != nil || a+r != 0 {
+				t.Fatalf("denied opt-in persisted a review: %d/%d %v", a, r, err)
+			}
+		})
+	}
+}
+
+func TestSameHostReviewIntegrationSelfAndModelRestrictions(t *testing.T) {
+	for _, mode := range []string{"same session", "trusted self", "restarted requester", "same model"} {
+		t.Run(mode, func(t *testing.T) {
+			database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+			policy := ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost}
+			reviewer, want := sessions[0], ErrSelfReview
+			switch mode {
+			case "trusted self":
+				policy.TrustedSelfApprove = []string{reviewer.AgentName}
+			case "restarted requester":
+				if err := database.EndSession(reviewer.ID); err != nil {
+					t.Fatal(err)
+				}
+				reviewer = &Session{AgentName: reviewer.AgentName, ProjectPath: request.ProjectPath, Model: "other"}
+				if err := database.CreateSession(reviewer); err != nil {
+					t.Fatal(err)
+				}
+			case "same model":
+				reviewer, want = sessions[1], ErrReviewDifferentModel
+				journalExec(t, database, `UPDATE requests SET require_different_model = 1, requestor_model = ? WHERE id = ?`, reviewer.Model, request.ID)
+			}
+			if out, err := applyFixtureReview(database, request, reviewer, DecisionApprove, policy); out != nil || !errors.Is(err, want) {
+				t.Fatalf("restriction bypassed: %+v %v, want %v", out, err, want)
+			}
+		})
+	}
+}
+
+func TestSameHostReviewIntegrationSignedSubmission(t *testing.T) {
+	for _, mode := range []string{"valid", "wrong key", "invalid signature", "stale", "future", "legacy signature"} {
+		t.Run(mode, func(t *testing.T) {
+			database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+			reviewer := sessions[1]
+			at := time.Now().UTC().Truncate(time.Second)
+			if mode == "stale" {
+				at = at.Add(-6 * time.Minute)
+			} else if mode == "future" {
+				at = at.Add(2 * time.Minute)
+			}
+			vote := &Review{RequestID: request.ID, ReviewerSessionID: reviewer.ID,
+				ReviewerAgent: reviewer.AgentName, ReviewerModel: reviewer.Model, Decision: DecisionApprove,
+				ApprovalPolicy: ApprovalPolicySameHost, Assurance: AssuranceSameHost, CommandHash: request.Command.Hash,
+				RequestBinding: reviewRequestBinding(request), SignatureVersion: 2, SignatureTimestamp: at}
+			digest, _ := SessionKeyDigest(reviewer.SessionKey)
+			vote.Signature = signReviewEvidenceWithDigest(digest, vote)
+			key, want := reviewer.SessionKey, ErrInvalidSignature
+			switch mode {
+			case "wrong key":
+				key, want = strings.Repeat("ab", 32), ErrReviewSessionKeyMismatch
+			case "invalid signature":
+				vote.Signature = strings.Repeat("0", 64)
+			case "legacy signature":
+				vote.Signature = ComputeReviewSignature(key, request.ID, vote.Decision, at)
+			}
+			out, err := database.ApplyReview(vote, key, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost})
+			if mode == "valid" {
+				if err != nil || out.Request.Status != StatusApproved {
+					t.Fatalf("valid same-host signature rejected: %+v %v", out, err)
+				}
+			} else if out != nil || !errors.Is(err, want) {
+				t.Fatalf("invalid submission accepted: %+v %v, want %v", out, err, want)
+			}
+		})
+	}
+}
+
+func TestSameHostExecutionIntegrationRechecksEvidence(t *testing.T) {
+	for _, tc := range []struct{ name, query string }{
+		{"invalid signature", `UPDATE reviews SET signature = 'invalid'`},
+		{"expired", `UPDATE requests SET approval_expires_at = '2000-01-01T00:00:00Z'`},
+		{"missing expiration", `UPDATE requests SET approval_expires_at = NULL`},
+		{"command mutation", `UPDATE requests SET command_raw = 'echo changed'`},
+		{"changed quorum", `UPDATE requests SET min_approvals = 2`},
+		{"changed model policy", `UPDATE requests SET require_different_model = 1`},
+		{"changed justification", `UPDATE requests SET justification_reason = 'different purpose'`},
+		{"unknown policy", `UPDATE requests SET approval_policy = 'unknown'`},
+		{"request promotion", `UPDATE requests SET approval_policy = 'independent'`},
+		{"review promotion", `UPDATE reviews SET assurance = 'independent'`},
+		{"missing assurance", `UPDATE reviews SET assurance = ''`},
+		{"missing policy", `UPDATE reviews SET approval_policy = ''`},
+		{"signature downgrade", `UPDATE reviews SET signature_version = 1`},
+		{"missing command binding", `UPDATE reviews SET command_hash = ''`},
+		{"changed requester", `UPDATE requests SET requestor_agent = 'SomeoneElse'`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+			out, err := applyFixtureReview(database, request, sessions[1], DecisionApprove, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request = out.Request
+			if _, err := database.VerifyRequestApproval(request.ID); err != nil {
+				t.Fatal(err)
+			}
+			journalExec(t, database, tc.query)
+			if _, err := database.VerifyRequestApproval(request.ID); !errors.Is(err, ErrInvalidApprovalProof) {
+				t.Fatalf("changed evidence passed advisory verification: %v", err)
+			}
+			now := time.Now().UTC()
+			exec := &Execution{ExecutedAt: &now, ExecutedBySessionID: sessions[0].ID,
+				ExecutedByAgent: sessions[0].AgentName, ExecutedByModel: sessions[0].Model, LogPath: "denied.log"}
+			if err := database.ClaimRequestExecutionAuthenticated(request, exec, sessions[0].SessionKey); !errors.Is(err, ErrInvalidApprovalProof) {
+				t.Fatalf("changed evidence authorized execution: %v", err)
+			}
+			assertNoExecutionClaim(t, database, request.ID)
+		})
+	}
+}
+
+func TestSameHostExecutionIntegrationCommandAndBindingMutation(t *testing.T) {
+	for _, rewriteBinding := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rewrite_binding_%v", rewriteBinding), func(t *testing.T) {
+			database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+			out, err := applyFixtureReview(database, request, sessions[1], DecisionApprove, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost})
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed := *out.Request
+			changed.Command.Raw = "echo changed"
+			changed.Command.Hash = ComputeCommandHash(changed.Command)
+			journalExec(t, database, `UPDATE requests SET command_raw = ?, command_hash = ? WHERE id = ?`, changed.Command.Raw, changed.Command.Hash, changed.ID)
+			if rewriteBinding {
+				journalExec(t, database, `UPDATE reviews SET command_hash = ?, request_binding = ? WHERE request_id = ?`, changed.Command.Hash, reviewRequestBinding(&changed), changed.ID)
+			}
+			if _, err := database.VerifyRequestApproval(request.ID); !errors.Is(err, ErrInvalidApprovalProof) {
+				t.Fatalf("new command reused old signature: %v", err)
+			}
+		})
+	}
+}
+
+func TestSameHostEvidenceNeverBecomesIndependent(t *testing.T) {
+	// Even if a genuine authority is added later, a low-assurance signature
+	// must not be reusable as that authority's evidence.
+	SimulateIndependentIdentityForTest(t)
+	for _, relabelEvidence := range []bool{false, true} {
+		t.Run(fmt.Sprintf("relabel_evidence_%v", relabelEvidence), func(t *testing.T) {
+			database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+			if _, err := applyFixtureReview(database, request, sessions[1], DecisionApprove, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost}); err != nil {
+				t.Fatal(err)
+			}
+			journalExec(t, database, `UPDATE requests SET approval_policy = 'independent' WHERE id = ?`, request.ID)
+			if relabelEvidence {
+				journalExec(t, database, `UPDATE reviews SET approval_policy = 'independent', assurance = 'legacy_local',
+					command_hash = '', request_binding = '', signature_version = 1 WHERE request_id = ?`, request.ID)
+			}
+			if _, err := database.VerifyRequestApproval(request.ID); !errors.Is(err, ErrInvalidApprovalProof) {
+				t.Fatalf("low-assurance review promoted to independent authorization: %v", err)
+			}
+		})
+	}
+}
+
+func TestSameHostReviewIntegrationCannotCountChangedPriorVote(t *testing.T) {
+	database, request, sessions := reviewDecisionFixture(t, 2, ApprovalPolicySameHost)
+	policy := ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost}
+	if _, err := applyFixtureReview(database, request, sessions[1], DecisionApprove, policy); err != nil {
+		t.Fatal(err)
+	}
+	request.Command.Raw = "echo different-command"
+	request.Command.Hash = ComputeCommandHash(request.Command)
+	journalExec(t, database, `UPDATE requests SET command_raw = ?, command_hash = ? WHERE id = ?`, request.Command.Raw, request.Command.Hash, request.ID)
+	if out, err := applyFixtureReview(database, request, sessions[2], DecisionApprove, policy); out != nil || !errors.Is(err, ErrInvalidApprovalProof) {
+		t.Fatalf("new vote laundered a previous command's approval: %+v %v", out, err)
+	}
+	stored, err := database.GetRequest(request.ID)
+	a, r, countErr := database.CountReviewsByDecision(request.ID)
+	if err != nil || countErr != nil || stored.Status != StatusPending || a != 1 || r != 0 {
+		t.Fatalf("failed review did not roll back: %+v %d/%d %v %v", stored, a, r, err, countErr)
+	}
+}
+
+func TestSameHostReviewIntegrationDistinctSessionsAndRejection(t *testing.T) {
+	database, request, sessions := reviewDecisionFixture(t, 2, ApprovalPolicySameHost)
+	policy := ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost}
+	if _, err := applyFixtureReview(database, request, sessions[1], DecisionApprove, policy); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.EndSession(sessions[1].ID); err != nil {
+		t.Fatal(err)
+	}
+	restarted := &Session{AgentName: sessions[1].AgentName, ProjectPath: request.ProjectPath, Model: "new-model"}
+	if err := database.CreateSession(restarted); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := applyFixtureReview(database, request, restarted, DecisionApprove, policy); out != nil || !errors.Is(err, ErrReviewExists) {
+		t.Fatalf("reviewer restart supplied another vote: %+v %v", out, err)
+	}
+	// Opting out stops future approvals, but must not prevent a reviewer from
+	// rejecting a request. The rejection retains the request's low assurance.
+	out, err := applyFixtureReview(database, request, sessions[2], DecisionReject, ReviewPolicy{})
+	if err != nil || out.Request.Status != StatusRejected || out.Review.Assurance != AssuranceSameHost ||
+		out.Review.ApprovalPolicy != ApprovalPolicySameHost || !VerifyReviewEvidenceSignature(out.Review, sessions[2].SessionKey) {
+		t.Fatalf("rejection lost its evidence category: %+v %v", out, err)
 	}
 }
