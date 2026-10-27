@@ -359,6 +359,38 @@ func TestPendingDifferentModelTimeoutDatabaseGuard(t *testing.T) {
 	}
 }
 
+func TestPendingExpiredDifferentModelRequestEscalates(t *testing.T) {
+	for _, expiredOnly := range []bool{false, true} {
+		t.Run(fmt.Sprintf("expired_only=%t", expiredOnly), func(t *testing.T) {
+			database, request := pendingFixture(t)
+			pendingSQL(t, database, `UPDATE requests SET approval_policy = 'same_host', risk_tier = 'dangerous',
+				min_approvals = 1, require_different_model = 1, expires_at = ? WHERE id = ?`,
+				time.Now().UTC().Add(-time.Second).Format(time.RFC3339), request.ID)
+			pendingConfig(t, request, "[general]\napproval_policy = 'same_host'\nrequire_different_model = true\ndifferent_model_timeout = 30\ntimeout_action = 'auto_approve_warn'\n")
+			// Both the model wait and request lifetime have elapsed. Waiters
+			// and daemonless admission must commit normal expiry escalation,
+			// without granting approval or emitting an invalid early decision.
+			result, err := AdvancePendingRequest(context.Background(), database, request.ID, PendingOptions{ExpiredOnly: expiredOnly})
+			if err != nil || result == nil || !result.Changed || result.Request.Status != db.StatusEscalated {
+				t.Fatalf("expired different-model request did not escalate: %+v %v", result, err)
+			}
+			stored, err := database.GetRequest(request.ID)
+			if err != nil || stored.Status != db.StatusEscalated || stored.ResolvedAt == nil ||
+				stored.ApprovalExpiresAt != nil || stored.Execution != nil || stored.MinApprovals != 1 ||
+				!stored.RequireDifferentModel || stored.ApprovalPolicy != db.ApprovalPolicySameHost {
+				t.Fatalf("expiry changed the review contract or granted execution: %+v %v", stored, err)
+			}
+			if pending, err := database.CountPendingBySession(request.RequestorSessionID); err != nil || pending != 0 {
+				t.Fatalf("expired request still consumes pending capacity: %d %v", pending, err)
+			}
+			approvals, rejections, err := database.CountReviewsByDecision(request.ID)
+			if err != nil || approvals+rejections != 0 {
+				t.Fatalf("expiry manufactured peer evidence: %d/%d %v", approvals, rejections, err)
+			}
+		})
+	}
+}
+
 func TestPendingAutoApproveOnlyDoesNotEscalateModelTimeout(t *testing.T) {
 	database, request := pendingFixture(t)
 	pendingSQL(t, database, "UPDATE requests SET risk_tier = 'dangerous', min_approvals = 1, require_different_model = 1, created_at = ?, expires_at = ? WHERE id = ?",

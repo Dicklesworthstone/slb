@@ -46,10 +46,11 @@ func AdvancePendingRequest(ctx context.Context, database *db.DB, id string, opts
 		}
 
 		// A stored different-model requirement is part of the request's review
-		// contract. Escalate for human attention when its wait expires instead
-		// of leaving the request indefinitely pending. The DB rechecks reviewer
-		// availability under the same writer reservation as the transition.
-		if request.RequireDifferentModel && !opts.OnlyAutoApprove {
+		// contract. Before request expiry, escalate when its model wait expires;
+		// the DB rechecks reviewer availability under the writer reservation.
+		// Already expired requests use the normal expiry decision below, which
+		// must not carry the separate early model-timeout authorization.
+		if !expired && request.RequireDifferentModel && !opts.OnlyAutoApprove {
 			modelTimeout, err := pendingDuration(cfg.General.DifferentModelTimeoutSecs, time.Second)
 			if err != nil || modelTimeout == 0 {
 				return nil, errors.New("different-model review requires a positive, representable timeout")
