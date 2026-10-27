@@ -3,11 +3,13 @@ package core
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,9 +19,15 @@ import (
 
 const defaultDryRunTimeout = 30 * time.Second
 
-// GetDryRunCommand returns a shell-safe dry-run variant of cmd when supported.
-// The second return value is false when no dry-run variant is available.
+// GetDryRunCommand describes the advisory preview when supported. Git reset
+// requires several inspections, displayed on separate lines. RunDryRunContext
+// executes every inspection as argv; this description is never a shell script.
 func GetDryRunCommand(cmd string) (string, bool) {
+	if requested, ok := parsePreviewTokens(cmd, 0); ok {
+		if plan, supported := dryRunGit(requested); supported {
+			return describeGitResetPreview(plan.steps("HEAD", plan.target, "<resolved repository root>")), true
+		}
+	}
 	tokens, ok := getDryRunTokens(cmd)
 	if !ok {
 		return "", false
@@ -47,11 +55,11 @@ func RunDryRunContext(parent context.Context, spec *db.CommandSpec) (*db.DryRunR
 		return nil, fmt.Errorf("command is required")
 	}
 
-	tokens, ok := getDryRunTokens(spec.Raw)
+	requested, ok := parsePreviewTokens(spec.Raw, 0)
 	if !spec.Shell && len(spec.Argv) > 0 {
 		// Argv is authoritative for non-shell execution. Do not reinterpret a
 		// display string and preview different arguments from those approved.
-		tokens, ok = transformDryRunTokens(spec.Argv)
+		requested, ok = append([]string(nil), spec.Argv...), true
 	}
 	if !ok {
 		return nil, nil
@@ -59,6 +67,13 @@ func RunDryRunContext(parent context.Context, spec *db.CommandSpec) (*db.DryRunR
 
 	ctx, cancel := context.WithTimeout(parent, defaultDryRunTimeout)
 	defer cancel()
+	if plan, supported := dryRunGit(requested); supported {
+		return runGitResetPreview(ctx, plan, spec.Cwd)
+	}
+	tokens, ok := transformDryRunTokens(requested)
+	if !ok {
+		return nil, nil
+	}
 
 	out, err := runDryRunProcess(ctx, tokens, spec.Cwd)
 	return &db.DryRunResult{
@@ -225,15 +240,6 @@ func transformDryRunTokens(tokens []string) ([]string, bool) {
 		return dryRunTerraform(tokens)
 	case "rm":
 		return dryRunRM(tokens)
-	case "git":
-		preview, ok := dryRunGit(tokens)
-		if !ok {
-			return nil, false
-		}
-		// Git's normal diff presentation can execute repository-configured
-		// external diff/textconv programs. Suppress those at the common
-		// preview boundary for both raw commands and authoritative argv.
-		return append([]string{"git", "diff", "--no-ext-diff", "--no-textconv"}, preview[2:]...), true
 	case "helm":
 		return dryRunHelm(tokens)
 	default:
@@ -343,27 +349,179 @@ func dryRunRM(tokens []string) ([]string, bool) {
 	return out, true
 }
 
-func dryRunGit(tokens []string) ([]string, bool) {
-	if len(tokens) < 2 || tokens[1] != "reset" {
-		return nil, false
-	}
+type gitResetPreviewPlan struct {
+	mode, target string
+	noRecurse    bool
+}
 
-	target := ""
-	for i := 2; i < len(tokens); i++ {
-		if tokens[i] == "--hard" {
-			continue
-		}
-		if strings.HasPrefix(tokens[i], "-") {
-			continue
-		}
-		target = tokens[i]
-		break
-	}
-	if target == "" {
-		return nil, false
-	}
+type gitResetPreviewStep struct {
+	label string
+	args  []string
+}
 
-	return []string{"git", "diff", fmt.Sprintf("%s..HEAD", target)}, true
+// Only whole-repository reset forms are supported. In particular, a pathspec,
+// interactive reset, or recursive submodule reset must not silently become a
+// preview of one guessed commit. Resolve the requested revision before any
+// diff, so a filename can never be reinterpreted as its target.
+func dryRunGit(tokens []string) (gitResetPreviewPlan, bool) {
+	plan := gitResetPreviewPlan{mode: "--mixed", target: "HEAD"}
+	if len(tokens) < 2 || tokens[0] != "git" || tokens[1] != "reset" {
+		return plan, false
+	}
+	modeSeen, targetSeen := false, false
+	for _, arg := range tokens[2:] {
+		switch arg {
+		case "--soft", "--mixed", "--hard", "--merge", "--keep":
+			if modeSeen {
+				return plan, false
+			}
+			plan.mode, modeSeen = arg, true
+		case "-q", "--quiet", "--no-quiet":
+		case "--no-recurse-submodules", "--recurse-submodules=false":
+			plan.noRecurse = true
+		default:
+			if arg == "" || strings.HasPrefix(arg, "-") || targetSeen || strings.Contains(arg, "..") {
+				return plan, false
+			}
+			plan.target, targetSeen = arg, true
+		}
+	}
+	return plan, true
+}
+
+func gitPreviewArgs(args ...string) []string {
+	// Optional index refreshes and filesystem-monitor programs are unnecessary
+	// for a preview. Diff/textconv programs are independently disabled below.
+	return append([]string{"git", "--no-pager", "--no-optional-locks", "--literal-pathspecs", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "-c", "core.quotePath=true"}, args...)
+}
+
+func (plan gitResetPreviewPlan) steps(head, target, root string) []gitResetPreviewStep {
+	diff := func(args ...string) []string {
+		base := []string{"diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-relative", "--submodule=short", "--ignore-submodules=dirty"}
+		return gitPreviewArgs(append(base, args...)...)
+	}
+	steps := []gitResetPreviewStep{{"HEAD to target (ref movement)", diff(head, target, "--")}}
+	if plan.mode == "--soft" {
+		return steps
+	}
+	indexLabel := "Index to target (staged content that would be replaced)"
+	if plan.mode == "--merge" || plan.mode == "--keep" {
+		indexLabel = "Index to target (candidate differences; preservation and abort rules apply)"
+	}
+	steps = append(steps, gitResetPreviewStep{indexLabel, diff("--cached", "-R", target, "--")})
+	if plan.mode == "--mixed" {
+		return steps
+	}
+	label := "Working tree to target (tracked content that would be replaced)"
+	if plan.mode == "--merge" || plan.mode == "--keep" {
+		label = "Working tree to target (candidate differences; preservation and abort rules apply)"
+	}
+	return append(steps,
+		gitResetPreviewStep{label, diff("-R", target, "--")},
+		gitResetPreviewStep{"Untracked paths (inventory, not an exact collision list)", gitPreviewArgs("ls-files", "--others", "--exclude-standard", "--full-name", "--", root)},
+		gitResetPreviewStep{"Ignored paths (inventory, not an exact collision list)", gitPreviewArgs("ls-files", "--others", "--ignored", "--exclude-standard", "--full-name", "--", root)},
+	)
+}
+
+func describeGitResetPreview(steps []gitResetPreviewStep) string {
+	lines := []string{"Read-only Git reset preview; each command is executed separately as argv:"}
+	for _, step := range steps {
+		lines = append(lines, step.label+": "+shellJoin(step.args))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func runGitResetPreview(ctx context.Context, plan gitResetPreviewPlan, cwd string) (*db.DryRunResult, error) {
+	result := &db.DryRunResult{Command: describeGitResetPreview(plan.steps("HEAD", plan.target, "<resolved repository root>"))}
+	resolve := func(revision string) (string, error) {
+		out, err := runDryRunProcess(ctx, gitPreviewArgs("rev-parse", "--verify", "--end-of-options", revision+"^{commit}"), cwd)
+		if err != nil {
+			return "", fmt.Errorf("resolving Git reset revision: %w", err)
+		}
+		oid := strings.TrimSpace(out)
+		if len(oid) != 40 && len(oid) != 64 {
+			return "", errors.New("Git reset preview did not resolve one commit")
+		}
+		if _, err := hex.DecodeString(oid); err != nil {
+			return "", errors.New("Git reset preview returned an invalid commit ID")
+		}
+		return oid, nil
+	}
+	head, err := resolve("HEAD")
+	if err != nil {
+		return result, err
+	}
+	target, err := resolve(plan.target)
+	if err != nil {
+		return result, err
+	}
+	worktree := plan.mode != "--soft" && plan.mode != "--mixed"
+	root := ""
+	if worktree {
+		// A reset invoked below the top level still affects the entire repo.
+		// An absolute literal path keeps inventories complete even with pathspec
+		// environment settings; --no-relative above also defeats diff.relative.
+		rootOutput, err := runDryRunProcess(ctx, gitPreviewArgs("rev-parse", "--show-toplevel"), cwd)
+		if err != nil {
+			return result, err
+		}
+		root = strings.TrimSuffix(rootOutput, "\n")
+		if !filepath.IsAbs(root) || strings.IndexByte(root, 0) >= 0 {
+			return result, errors.New("Git reset preview did not resolve an absolute repository root")
+		}
+		// Comparing working files can run clean/process filters even with
+		// --no-textconv. Decline that environment instead of executing a
+		// repository-configured program before approval. Names reveal no values.
+		keys, err := runDryRunProcess(ctx, gitPreviewArgs("config", "--name-only", "--list"), cwd)
+		if err != nil {
+			return result, err
+		}
+		if strings.Contains(keys, "[SLB: output truncated;") {
+			return result, errors.New("Git configuration is too large to inspect safely")
+		}
+		for _, key := range strings.Split(keys, "\n") {
+			key = strings.ToLower(strings.TrimSpace(key))
+			if strings.HasPrefix(key, "filter.") && (strings.HasSuffix(key, ".clean") || strings.HasSuffix(key, ".process")) {
+				return result, errors.New("Git reset preview declines configured clean/process filters; working-tree inspection could execute them")
+			}
+		}
+		if !plan.noRecurse {
+			recurse, err := runDryRunProcess(ctx, gitPreviewArgs("config", "--bool", "--default=false", "--get", "submodule.recurse"), cwd)
+			if err != nil {
+				return result, err
+			}
+			if strings.TrimSpace(recurse) != "false" {
+				return result, errors.New("Git reset preview does not inspect recursive submodule changes; use an explicit nonrecursive command")
+			}
+		}
+	}
+	steps := plan.steps(head, target, root)
+	result.Command = describeGitResetPreview(steps)
+	output := &outputCapture{limit: maxCapturedOutputBytes}
+	fmt.Fprintf(output, "Git reset %s: HEAD %s -> target %s. Read-only observations; the repository can change after this preview.\n", plan.mode, head, target)
+	switch plan.mode {
+	case "--soft":
+		fmt.Fprintln(output, "Only refs move; the index and working tree are preserved.")
+	case "--mixed":
+		fmt.Fprintln(output, "The index is reset; working-tree files are preserved.")
+	case "--hard":
+		fmt.Fprintln(output, "Tracked contents are discarded/replaced. Untracked or ignored paths obstructing the target may be deleted; inventories below do not simulate collisions.")
+	case "--merge":
+		fmt.Fprintln(output, "Unstaged changes are preserved where Git permits; conflicting index/target changes can abort reset. Candidate diffs do not simulate Git's merge checks.")
+	case "--keep":
+		fmt.Fprintln(output, "Local changes are preserved where Git permits; paths changed between HEAD and target can cause reset to abort. Candidate diffs do not simulate Git's keep checks.")
+	}
+	for _, step := range steps {
+		fmt.Fprintf(output, "\n--- %s ---\n", step.label)
+		text, err := runDryRunProcess(ctx, step.args, cwd)
+		fmt.Fprintln(output, text)
+		if err != nil {
+			result.Output = output.String()
+			return result, err
+		}
+	}
+	result.Output = output.String()
+	return result, nil
 }
 
 func dryRunHelm(tokens []string) ([]string, bool) {

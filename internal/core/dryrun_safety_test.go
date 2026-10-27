@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,210 @@ import (
 
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
+
+func gitResetPreviewFixture(t *testing.T) (string, func(...string) string, func(string, string)) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is unavailable")
+	}
+	repo := t.TempDir()
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(repo, "no-global-config"))
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return string(out)
+	}
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git("init", "-b", "main")
+	git("config", "user.name", "SLB Preview Fixture")
+	git("config", "user.email", "fixture@example.invalid")
+	git("config", "commit.gpgsign", "false")
+	for _, name := range []string{"staged.txt", "unstaged.txt", "index-only.txt"} {
+		write(name, "original\n")
+	}
+	git("add", "--", "staged.txt", "unstaged.txt", "index-only.txt")
+	git("commit", "-m", "fixture baseline")
+	write("committed.txt", "content in the newer commit\n")
+	git("add", "--", "committed.txt")
+	git("commit", "-m", "fixture newer commit")
+	write("staged.txt", "staged content that reset would discard\n")
+	write("index-only.txt", "index-only content that reset would discard\n")
+	git("add", "--", "staged.txt", "index-only.txt")
+	write("index-only.txt", "original\n")
+	write("unstaged.txt", "unstaged content that reset would discard\n")
+	write("untracked.txt", "untracked content must survive preview\n")
+	write(".gitignore", "ignored.txt\n")
+	write("ignored.txt", "ignored content must survive preview\n")
+	return repo, git, write
+}
+
+func TestGitResetPreviewShowsDiscardedLocalState(t *testing.T) {
+	repo, git, _ := gitResetPreviewFixture(t)
+	headBefore := git("rev-parse", "HEAD")
+	worktreeBefore := git("diff", "--no-ext-diff", "--no-textconv", "HEAD", "--")
+	indexBefore, err := os.ReadFile(filepath.Join(repo, ".git", "index"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range []string{"git reset --hard HEAD", "git reset --hard"} {
+		preview, err := RunDryRun(&db.CommandSpec{Raw: command, Cwd: repo})
+		if err != nil || preview == nil {
+			t.Fatalf("%s preview: %+v, %v", command, preview, err)
+		}
+		for _, want := range []string{"staged content that reset would discard", "unstaged content that reset would discard", "index-only content that reset would discard", "untracked.txt", "ignored.txt", "not an exact collision list"} {
+			if !strings.Contains(preview.Output, want) {
+				t.Errorf("%s preview omitted %q:\n%s", command, want, preview.Output)
+			}
+		}
+	}
+	indexAfter, err := os.ReadFile(filepath.Join(repo, ".git", "index"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(indexBefore, indexAfter) || git("rev-parse", "HEAD") != headBefore || git("diff", "--no-ext-diff", "--no-textconv", "HEAD", "--") != worktreeBefore {
+		t.Fatal("preview changed the index, HEAD, or working tree")
+	}
+	if content, err := os.ReadFile(filepath.Join(repo, "untracked.txt")); err != nil || string(content) != "untracked content must survive preview\n" {
+		t.Fatalf("preview changed untracked content: %q, %v", content, err)
+	}
+}
+
+func TestGitResetPreviewRespectsModesAndExecutionArgv(t *testing.T) {
+	repo, git, _ := gitResetPreviewFixture(t)
+	head := strings.TrimSpace(git("rev-parse", "HEAD"))
+	target := strings.TrimSpace(git("rev-parse", "HEAD~1"))
+	for _, tc := range []struct {
+		mode            string
+		wantIndex       bool
+		wantWorkingTree bool
+		wantNotice      string
+	}{
+		{"--soft", false, false, "Only refs move"},
+		{"--mixed", true, false, "working-tree files are preserved"},
+		{"", true, false, "working-tree files are preserved"},
+		{"--hard", true, true, "may be deleted"},
+		{"--merge", true, true, "do not simulate Git's merge checks"},
+		{"--keep", true, true, "do not simulate Git's keep checks"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			preview, err := RunDryRun(&db.CommandSpec{Raw: "git reset " + tc.mode + " HEAD~1", Cwd: repo})
+			if err != nil || preview == nil {
+				t.Fatalf("preview failed: %+v, %v", preview, err)
+			}
+			if !strings.Contains(preview.Output, "content in the newer commit") || !strings.Contains(preview.Output, tc.wantNotice) {
+				t.Fatalf("missing ref change/mode explanation:\n%s", preview.Output)
+			}
+			if strings.Contains(preview.Output, "index-only content that reset would discard") != tc.wantIndex || strings.Contains(preview.Output, "unstaged content that reset would discard") != tc.wantWorkingTree {
+				t.Fatalf("wrong index/worktree evidence for %s:\n%s", tc.mode, preview.Output)
+			}
+			if !strings.Contains(preview.Command, head) || !strings.Contains(preview.Command, target) || strings.Contains(preview.Command, "HEAD~1") {
+				t.Fatalf("inspection did not pin resolved commits: %s", preview.Command)
+			}
+		})
+	}
+	argv := []string{"git", "reset", "--soft", "HEAD~1"}
+	for _, shell := range []bool{false, true} {
+		preview, err := RunDryRun(&db.CommandSpec{Raw: "git reset --hard HEAD", Argv: argv, Shell: shell, Cwd: repo})
+		if err != nil || preview == nil || strings.Contains(preview.Output, "unstaged content that reset would discard") != shell {
+			t.Fatalf("preview did not follow authoritative execution mode %v: %+v, %v", shell, preview, err)
+		}
+	}
+	if !reflect.DeepEqual(argv, []string{"git", "reset", "--soft", "HEAD~1"}) {
+		t.Fatal("preview mutated requested argv")
+	}
+}
+
+func TestGitResetPreviewDeclinesAmbiguousForms(t *testing.T) {
+	for _, raw := range []string{
+		"git reset --hard --soft HEAD", "git reset --hard HEAD extra",
+		"git reset --hard HEAD -- tracked.txt", "git reset -- tracked.txt",
+		"git reset --patch HEAD", "git reset -N HEAD", "git reset HEAD..main",
+		"git reset --pathspec-from-file=paths", "git reset --recurse-submodules HEAD",
+		"git -C elsewhere reset --hard", "git reset --unknown-option HEAD",
+	} {
+		if description, ok := GetDryRunCommand(raw); ok {
+			t.Errorf("ambiguous or incomplete preview accepted for %q: %s", raw, description)
+		}
+	}
+	repo, _, _ := gitResetPreviewFixture(t)
+	for _, target := range []string{"no-such-ref", "staged.txt"} {
+		if result, err := RunDryRun(&db.CommandSpec{Raw: "git reset --hard " + target, Cwd: repo}); err == nil || result == nil {
+			t.Errorf("unresolved target %q was treated as a successful preview: %+v, %v", target, result, err)
+		}
+	}
+}
+
+func TestGitResetPreviewDeclinesRecursiveSubmodules(t *testing.T) {
+	repo, git, _ := gitResetPreviewFixture(t)
+	git("config", "submodule.recurse", "true")
+	if _, err := RunDryRun(&db.CommandSpec{Raw: "git reset --hard", Cwd: repo}); err == nil || !strings.Contains(err.Error(), "recursive submodule") {
+		t.Fatalf("uninspected recursive work was accepted: %v", err)
+	}
+	preview, err := RunDryRun(&db.CommandSpec{Raw: "git reset --hard --no-recurse-submodules", Cwd: repo})
+	if err != nil || preview == nil || !strings.Contains(preview.Output, "unstaged content that reset would discard") {
+		t.Fatalf("explicit nonrecursive reset was not previewed: %+v, %v", preview, err)
+	}
+}
+
+func TestGitResetPreviewFromSubdirectoryIncludesEntireRepository(t *testing.T) {
+	repo, git, _ := gitResetPreviewFixture(t)
+	subdir := filepath.Join(repo, "subdir")
+	if err := os.Mkdir(subdir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	git("config", "diff.relative", "true")
+	t.Setenv("GIT_LITERAL_PATHSPECS", "1")
+	preview, err := RunDryRun(&db.CommandSpec{Raw: "git reset --hard", Cwd: subdir})
+	if err != nil || preview == nil {
+		t.Fatalf("subdirectory preview failed: %+v, %v", preview, err)
+	}
+	for _, want := range []string{"unstaged content that reset would discard", "index-only content that reset would discard", "untracked.txt", "ignored.txt"} {
+		if !strings.Contains(preview.Output, want) {
+			t.Errorf("subdirectory preview omitted %q outside its working directory:\n%s", want, preview.Output)
+		}
+	}
+}
+
+func TestGitResetPreviewDoesNotRunCleanFilters(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("clean filter fixture uses a POSIX shell script")
+	}
+	repo, git, write := gitResetPreviewFixture(t)
+	marker := filepath.Join(repo, "filter-ran")
+	t.Setenv("SLB_TEST_CLEAN_FILTER_MARKER", marker)
+	program := filepath.Join(repo, "clean-filter.sh")
+	if err := os.WriteFile(program, []byte("#!/bin/sh\nprintf invoked > \"$SLB_TEST_CLEAN_FILTER_MARKER\"\ncat\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	write(".gitattributes", "*.txt filter=slbpreview\n")
+	git("config", "filter.slbpreview.clean", program)
+	// This demonstrates that --no-textconv alone still runs a clean filter
+	// when inspecting working files. Only the fixture's marker is written.
+	git("diff", "--no-ext-diff", "--no-textconv", "HEAD", "--")
+	if contents, err := os.ReadFile(marker); err != nil || len(contents) == 0 {
+		t.Fatalf("clean filter fixture did not execute: %q, %v", contents, err)
+	}
+	if err := os.WriteFile(marker, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RunDryRun(&db.CommandSpec{Raw: "git reset --hard", Cwd: repo}); err == nil || !strings.Contains(err.Error(), "clean/process filters") {
+		t.Fatalf("working-file filter was not refused: %v", err)
+	}
+	if contents, err := os.ReadFile(marker); err != nil || len(contents) != 0 {
+		t.Fatalf("preview executed a clean filter: %q, %v", contents, err)
+	}
+}
 
 func TestDryRunKubectlCannotDisablePreview(t *testing.T) {
 	tests := []struct {
@@ -148,7 +353,6 @@ func TestPreviewPreservesLiteralArgumentBoundaries(t *testing.T) {
 		{`rm -- 'a\b'`, []string{"ls", "-la", "--", `a\b`}},
 		{`rm -- ''`, []string{"ls", "-la", "--", ""}},
 		{`rm -- file~backup#suffix`, []string{"ls", "-la", "--", "file~backup#suffix"}},
-		{`git reset --hard HEAD~1`, []string{"git", "diff", "--no-ext-diff", "--no-textconv", "HEAD~1..HEAD"}},
 		{`bash -c 'rm -rf "directory with spaces"'`, []string{"ls", "-la", "--", "directory with spaces"}},
 		{`sudo rm -rf 'directory with spaces'`, []string{"ls", "-la", "--", "directory with spaces"}},
 		{`kubectl delete pod --selector='env in (one, two)'`, []string{"kubectl", "delete", "--dry-run=client", "-o", "yaml", "pod", "--selector=env in (one, two)"}},
@@ -365,7 +569,9 @@ func TestGitPreviewDoesNotRunConfiguredDiffPrograms(t *testing.T) {
 			if !strings.Contains(result.Command, "--no-ext-diff") || !strings.Contains(result.Command, "--no-textconv") {
 				t.Fatalf("preview omitted its safety options: %s", result.Command)
 			}
-			if !strings.Contains(result.Output, "-old") || !strings.Contains(result.Output, "+new") {
+			// Reset replaces the current new content with the target's old
+			// content. The prior target-to-HEAD diff showed the reverse action.
+			if !strings.Contains(result.Output, "-new") || !strings.Contains(result.Output, "+old") {
 				t.Fatalf("preview did not produce the builtin diff: %q", result.Output)
 			}
 			if head != git("rev-parse", "HEAD") {

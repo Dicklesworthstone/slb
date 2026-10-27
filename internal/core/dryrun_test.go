@@ -45,10 +45,10 @@ func TestGetDryRunCommand(t *testing.T) {
 			wantParts: []string{"ls", "-la", "./build"},
 		},
 		{
-			name:      "git reset --hard becomes diff",
+			name:      "git reset --hard describes all inspected states",
 			in:        "git reset --hard HEAD~5",
 			wantOK:    true,
-			wantParts: []string{"git", "diff", "HEAD~5..HEAD"},
+			wantParts: []string{"git", "diff", "HEAD~5", "Index to target", "Working tree to target", "Untracked paths"},
 		},
 		{
 			name:      "helm uninstall becomes get manifest",
@@ -471,23 +471,20 @@ func TestDryRunInternalFunctions(t *testing.T) {
 		}
 	})
 
-	t.Run("dryRunGit reset without target returns false", func(t *testing.T) {
-		_, ok := dryRunGit([]string{"git", "reset", "--hard"})
-		if ok {
-			t.Error("expected ok=false for reset without target")
+	t.Run("dryRunGit reset without target uses HEAD", func(t *testing.T) {
+		plan, ok := dryRunGit([]string{"git", "reset", "--hard"})
+		if !ok || plan.target != "HEAD" || plan.mode != "--hard" {
+			t.Errorf("expected hard reset to HEAD, got %+v, %v", plan, ok)
 		}
 	})
 
-	t.Run("dryRunGit reset with target returns diff command", func(t *testing.T) {
-		tokens, ok := dryRunGit([]string{"git", "reset", "--hard", "HEAD~2"})
+	t.Run("dryRunGit reset with target retains mode and target", func(t *testing.T) {
+		plan, ok := dryRunGit([]string{"git", "reset", "--hard", "HEAD~2"})
 		if !ok {
 			t.Fatal("expected ok=true")
 		}
-		if len(tokens) != 3 {
-			t.Fatalf("expected 3 tokens, got %d", len(tokens))
-		}
-		if tokens[0] != "git" || tokens[1] != "diff" {
-			t.Errorf("expected git diff command, got %v", tokens)
+		if plan.mode != "--hard" || plan.target != "HEAD~2" {
+			t.Errorf("requested reset changed: %+v", plan)
 		}
 	})
 
@@ -649,12 +646,12 @@ func TestGetDryRunTokens(t *testing.T) {
 	})
 
 	t.Run("git reset recognized", func(t *testing.T) {
-		tokens, ok := getDryRunTokens("git reset --hard HEAD~1")
+		description, ok := GetDryRunCommand("git reset --hard HEAD~1")
 		if !ok {
 			t.Error("expected true for git reset")
 		}
-		if len(tokens) == 0 {
-			t.Error("expected non-empty tokens")
+		if !strings.Contains(description, "Index to target") || !strings.Contains(description, "Working tree to target") {
+			t.Errorf("incomplete reset preview description: %s", description)
 		}
 	})
 

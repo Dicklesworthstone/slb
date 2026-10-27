@@ -317,13 +317,19 @@ func TestRequestPreflightSupportedToolTransformations(t *testing.T) {
 		// pods), so it is skipped without a request; use a deployment.
 		{"kubectl", "kubectl delete deployment obsolete --dry-run=none", "delete --dry-run=client -o yaml deployment obsolete"},
 		{"terraform", "terraform destroy -auto-approve", "plan -destroy -input=false"},
-		{"git", "git reset --hard HEAD~1", "diff --no-ext-diff --no-textconv HEAD~1..HEAD"},
+		{"git", "git reset --hard HEAD~1", "ls-files --others --ignored --exclude-standard --full-name --"},
 		{"helm", "helm uninstall old-release --namespace team", "get manifest old-release --namespace=team"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			creator, session, _ := creatorAdmissionFixture(t, RateLimitActionReject)
 			dir := t.TempDir()
-			if err := os.WriteFile(filepath.Join(dir, tc.name), []byte("#!/bin/sh\nprintf '%s' \"$*\"\n"), 0700); err != nil {
+			script := "#!/bin/sh\nprintf '%s' \"$*\"\n"
+			if tc.name == "git" {
+				// Resolve a fixed fixture commit and declare a plain Git config;
+				// inspection commands then report their real argv as before.
+				script = "#!/bin/sh\ncase \" $* \" in\n  *' rev-parse --show-toplevel '*) pwd ;;\n  *' rev-parse '*) printf '%s\\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;\n  *' config --name-only '*) exit 0 ;;\n  *' config --bool '*) printf 'false\\n' ;;\n  *) printf '%s' \"$*\" ;;\nesac\n"
+			}
+			if err := os.WriteFile(filepath.Join(dir, tc.name), []byte(script), 0700); err != nil {
 				t.Fatal(err)
 			}
 			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -338,7 +344,11 @@ func TestRequestPreflightSupportedToolTransformations(t *testing.T) {
 			if result.Request == nil || result.Preflight == nil || result.Request.DryRun == nil {
 				t.Fatalf("no request/preflight evidence was produced: %+v", result)
 			}
-			if result.Preflight.Status != "succeeded" || !strings.HasSuffix(result.Request.DryRun.Output, tc.want) {
+			matches := strings.HasSuffix(strings.TrimSpace(result.Request.DryRun.Output), tc.want)
+			if tc.name == "git" {
+				matches = strings.Contains(result.Request.DryRun.Output, tc.want) && strings.Contains(result.Request.DryRun.Output, "diff --no-ext-diff --no-textconv")
+			}
+			if result.Preflight.Status != "succeeded" || !matches {
 				t.Fatalf("incorrect preapproval argv: %+v", result.Request.DryRun)
 			}
 			if result.Request.Command.Raw != tc.command {
