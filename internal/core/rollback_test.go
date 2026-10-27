@@ -4,12 +4,16 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -292,37 +296,7 @@ func TestRollbackGitCaptureWritesMetadata(t *testing.T) {
 }
 
 func TestRollbackKubernetesCaptureAndRestoreWithFakeKubectl(t *testing.T) {
-	project := t.TempDir()
-	work := filepath.Join(project, "work")
-	if err := os.MkdirAll(work, 0755); err != nil {
-		t.Fatalf("mkdir work: %v", err)
-	}
-
-	binDir := filepath.Join(project, "bin")
-	if err := os.MkdirAll(binDir, 0755); err != nil {
-		t.Fatalf("mkdir bin: %v", err)
-	}
-	logPath := filepath.Join(project, "kubectl.log")
-	t.Setenv("KUBECTL_LOG", logPath)
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	kubectlPath := filepath.Join(binDir, "kubectl")
-	script := "#!/bin/sh\nset -eu\ncmd=\"$1\"\nshift\ncase \"$cmd\" in\n  get)\n    kind=\"$1\"; name=\"$2\";\n    echo \"kind: $kind\"\n    echo \"metadata:\"\n    echo \"  name: $name\"\n    ;;\n  apply)\n    echo \"apply $*\" >> \"${KUBECTL_LOG}\"\n    ;;\n  *)\n    ;;\nesac\n"
-	if runtime.GOOS == "windows" {
-		t.Skip("shell script kubectl not supported on windows")
-	}
-	if err := os.WriteFile(kubectlPath, []byte(script), 0755); err != nil {
-		t.Fatalf("write kubectl: %v", err)
-	}
-
-	req := &db.Request{
-		ID:          "test-k8s",
-		ProjectPath: project,
-		Command: db.CommandSpec{
-			Raw: "kubectl delete deployment myapp",
-			Cwd: work,
-		},
-	}
+	req, _, logPath := kubernetesRollbackFixture(t)
 	data, err := CaptureRollbackState(context.Background(), req, RollbackCaptureOptions{})
 	if err != nil {
 		t.Fatalf("capture: %v", err)
@@ -346,8 +320,541 @@ func TestRollbackKubernetesCaptureAndRestoreWithFakeKubectl(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read kubectl log: %v", err)
 	}
-	if !strings.Contains(string(b), "apply") {
-		t.Fatalf("expected kubectl apply to be invoked, got: %q", string(b))
+	if !strings.Contains(string(b), "create") || strings.Contains(string(b), "apply") {
+		t.Fatalf("expected create-only restoration, got: %q", string(b))
+	}
+}
+
+// This helper acts as kubectl in a disposable project. Its two contexts expose
+// different resource contents, so losing --context is an observable data-loss
+// bug rather than just an argument-format assertion.
+func TestKubernetesRollbackKubectlHelper(t *testing.T) {
+	if os.Getenv("SLB_KUBECTL_HELPER") != "1" {
+		return
+	}
+	var args []string
+	for i, arg := range os.Args {
+		if arg == "--" {
+			args = os.Args[i+1:]
+			break
+		}
+	}
+	if len(args) == 0 {
+		os.Exit(2)
+	}
+	logFile, err := os.OpenFile(os.Getenv("SLB_KUBECTL_CALLS"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		os.Exit(3)
+	}
+	err = json.NewEncoder(logFile).Encode(map[string]any{"args": args, "kubeconfig": os.Getenv("KUBECONFIG")})
+	if closeErr := logFile.Close(); err != nil || closeErr != nil {
+		os.Exit(4)
+	}
+	var positional []string
+	flags := map[string]string{}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if strings.HasPrefix(arg, "-") {
+			key, value, hasValue := strings.Cut(arg, "=")
+			if !hasValue && key != "--minify" && i+1 < len(args) {
+				i++
+				value = args[i]
+			}
+			flags[key] = value
+			continue
+		}
+		positional = append(positional, arg)
+	}
+	if len(positional) == 0 {
+		os.Exit(5)
+	}
+	configPaths := filepath.SplitList(os.Getenv("KUBECONFIG"))
+	if flags["--kubeconfig"] != "" {
+		configPaths = []string{flags["--kubeconfig"]}
+	}
+	if len(configPaths) == 0 {
+		os.Exit(6)
+	}
+	configBytes, err := os.ReadFile(configPaths[0])
+	if err != nil {
+		os.Exit(7)
+	}
+	var cfg map[string]any
+	if json.Unmarshal(configBytes, &cfg) != nil {
+		os.Exit(8)
+	}
+	selected, _ := cfg["current-context"].(string)
+	if flags["--context"] != "" {
+		selected = flags["--context"]
+	}
+	var selectedContext, selectedCluster map[string]any
+	for _, raw := range cfg["contexts"].([]any) {
+		item := raw.(map[string]any)
+		if item["name"] == selected {
+			selectedContext = item
+		}
+	}
+	if selectedContext == nil {
+		os.Exit(9)
+	}
+	contextConfig := selectedContext["context"].(map[string]any)
+	for _, raw := range cfg["clusters"].([]any) {
+		item := raw.(map[string]any)
+		if item["name"] == contextConfig["cluster"] {
+			selectedCluster = item
+		}
+	}
+	switch positional[0] {
+	case "config":
+		cfg["current-context"] = selected
+		cfg["contexts"] = []any{selectedContext}
+		cfg["clusters"] = []any{selectedCluster}
+		if json.NewEncoder(os.Stdout).Encode(cfg) != nil {
+			os.Exit(10)
+		}
+	case "get":
+		if os.Getenv("SLB_KUBECTL_HANG") == "1" {
+			time.Sleep(time.Minute)
+		}
+		if size, _ := strconv.Atoi(os.Getenv("SLB_KUBECTL_OUTPUT_BYTES")); size > 0 {
+			if _, err := fmt.Fprint(os.Stdout, strings.Repeat("x", size)); err != nil {
+				os.Exit(11)
+			}
+			os.Exit(0)
+		}
+		if len(positional) < 3 {
+			os.Exit(12)
+		}
+		namespace, _ := contextConfig["namespace"].(string)
+		if flags["--namespace"] != "" {
+			namespace = flags["--namespace"]
+		} else if flags["-n"] != "" {
+			namespace = flags["-n"]
+		}
+		kind, apiVersion := "Deployment", "apps/v1"
+		if positional[1] == "secret" {
+			kind, apiVersion = "Secret", "v1"
+		}
+		resource := map[string]any{
+			"apiVersion": apiVersion, "kind": kind,
+			"metadata": map[string]any{"name": positional[2], "namespace": namespace, "uid": "server-uid", "resourceVersion": "42", "managedFields": []any{}},
+			"spec":     map[string]any{"captured_context": selected}, "status": map[string]any{"observedGeneration": 7},
+		}
+		if kind == "Secret" {
+			resource["data"] = map[string]string{"token": "ZmFrZS1hcHBsaWNhdGlvbi1zZWNyZXQ="}
+			delete(resource, "spec")
+		}
+		if json.NewEncoder(os.Stdout).Encode(resource) != nil {
+			os.Exit(13)
+		}
+	case "create", "apply":
+		if positional[0] == "create" && os.Getenv("SLB_KUBECTL_EXISTS") == "1" {
+			os.Exit(14)
+		}
+		if flags["-f"] == "-" {
+			var resource map[string]any
+			if json.NewDecoder(os.Stdin).Decode(&resource) != nil {
+				os.Exit(15)
+			}
+		}
+	default:
+		os.Exit(16)
+	}
+	os.Exit(0)
+}
+
+func kubernetesRollbackFixture(t *testing.T) (*db.Request, string, string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake kubectl launcher requires a POSIX shell")
+	}
+	project := t.TempDir()
+	bin := filepath.Join(project, "bin")
+	if err := os.Mkdir(bin, 0700); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\nexec '" + strings.ReplaceAll(executable, "'", "'\"'\"'") + "' -test.run='^TestKubernetesRollbackKubectlHelper$' -- \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "kubectl"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(project, "kubeconfig.json")
+	configJSON := `{"current-context":"dev","contexts":[{"name":"dev","context":{"cluster":"dev-cluster","namespace":"devspace"}},{"name":"prod","context":{"cluster":"prod-cluster","namespace":"prodspace"}}],"clusters":[{"name":"dev-cluster","cluster":{"server":"https://dev.invalid"}},{"name":"prod-cluster","cluster":{"server":"https://prod.invalid"}}],"users":[{"name":"fixture","user":{"token":"fixture-credential-do-not-copy"}}]}`
+	if err := os.WriteFile(configPath, []byte(configJSON), 0600); err != nil {
+		t.Fatal(err)
+	}
+	callsPath := filepath.Join(project, "calls.jsonl")
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("KUBECONFIG", configPath)
+	t.Setenv("KUBECTL_KUBERC", "false")
+	t.Setenv("SLB_KUBECTL_HELPER", "1")
+	t.Setenv("SLB_KUBECTL_CALLS", callsPath)
+	req := &db.Request{ID: "kubernetes-context", ProjectPath: project, Command: db.CommandSpec{
+		Raw: "kubectl delete deployment api --context prod -n workloads", Cwd: project,
+	}}
+	return req, configPath, callsPath
+}
+
+func TestKubernetesRollbackCapturesRequestedContext(t *testing.T) {
+	req, _, _ := kubernetesRollbackFixture(t)
+	data, err := CaptureRollbackState(context.Background(), req, RollbackCaptureOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data == nil || data.Kubernetes == nil || len(data.Kubernetes.Manifests) != 1 {
+		t.Fatalf("missing captured manifest: %+v", data)
+	}
+	contents, err := os.ReadFile(filepath.Join(data.RollbackPath, data.Kubernetes.Manifests[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resource struct {
+		Spec struct {
+			CapturedContext string `json:"captured_context"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(contents, &resource); err != nil {
+		t.Fatal(err)
+	}
+	if resource.Spec.CapturedContext != "prod" {
+		t.Fatalf("backup came from %q; destructive request targets prod", resource.Spec.CapturedContext)
+	}
+	if data.Kubernetes.Context != "prod" || data.Kubernetes.Namespace != "workloads" || data.Kubernetes.Server != "https://prod.invalid" {
+		t.Fatalf("incorrect captured target: %+v", data.Kubernetes)
+	}
+	if strings.Contains(string(contents), "resourceVersion") || strings.Contains(string(contents), "server-uid") || strings.Contains(string(contents), `"status"`) {
+		t.Fatalf("server-owned fields survived normalization: %s", contents)
+	}
+	metadata, err := os.ReadFile(filepath.Join(data.RollbackPath, rollbackMetadataFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(metadata), "fixture-credential-do-not-copy") || strings.Contains(string(metadata), `"users"`) {
+		t.Fatal("kubeconfig credentials were copied into recovery metadata")
+	}
+	for _, item := range []struct {
+		path string
+		mode os.FileMode
+	}{
+		{data.RollbackPath, 0700},
+		{filepath.Join(data.RollbackPath, rollbackKubernetesDirName), 0700},
+		{filepath.Join(data.RollbackPath, data.Kubernetes.Manifests[0]), 0600},
+	} {
+		info, err := os.Stat(item.path)
+		if err != nil || info.Mode().Perm() != item.mode {
+			t.Fatalf("private recovery mode %s: info=%v err=%v", item.path, info, err)
+		}
+	}
+}
+
+type kubernetesCall struct {
+	Args       []string `json:"args"`
+	Kubeconfig string   `json:"kubeconfig"`
+}
+
+func readKubernetesCalls(t *testing.T, path string) []kubernetesCall {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls []kubernetesCall
+	decoder := json.NewDecoder(strings.NewReader(string(contents)))
+	for {
+		var call kubernetesCall
+		if err := decoder.Decode(&call); err == io.EOF {
+			return calls
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		calls = append(calls, call)
+	}
+}
+
+func assertNoKubernetesWrites(t *testing.T, callsPath string) {
+	t.Helper()
+	for _, call := range readKubernetesCalls(t, callsPath) {
+		for _, arg := range call.Args {
+			if arg == "create" || arg == "apply" {
+				t.Fatalf("invalid snapshot reached a mutating kubectl call: %v", call.Args)
+			}
+		}
+	}
+}
+
+func TestKubernetesRollbackConfigurationSelection(t *testing.T) {
+	t.Run("explicit file before verb overrides environment and preserves colon filename", func(t *testing.T) {
+		req, configPath, _ := kubernetesRollbackFixture(t)
+		contents, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		explicit := filepath.Join(req.ProjectPath, "config:production")
+		if err := os.WriteFile(explicit, contents, 0600); err != nil {
+			t.Fatal(err)
+		}
+		req.Command.Argv = []string{"kubectl", "--kubeconfig", "config:production", "--context=prod", "-nworkloads", "delete", "deployment/api"}
+		data, err := CaptureRollbackState(context.Background(), req, RollbackCaptureOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data.Kubernetes.ConfigFiles) != 1 || data.Kubernetes.ConfigFiles[0].Path != explicit || data.Kubernetes.Context != "prod" {
+			t.Fatalf("explicit configuration was not preserved: %+v", data.Kubernetes)
+		}
+		if err := RestoreRollbackState(context.Background(), data, RollbackRestoreOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("environment merge list is fixed and empty entries ignored", func(t *testing.T) {
+		req, configPath, callsPath := kubernetesRollbackFixture(t)
+		other := filepath.Join(req.ProjectPath, "second-config")
+		if err := os.WriteFile(other, []byte(`{}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("KUBECONFIG", string(os.PathListSeparator)+configPath+string(os.PathListSeparator)+other+string(os.PathListSeparator))
+		data, err := CaptureRollbackState(context.Background(), req, RollbackCaptureOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data.Kubernetes.ConfigFiles) != 2 || data.Kubernetes.ConfigFiles[1].Path != other {
+			t.Fatalf("merge list lost: %+v", data.Kubernetes.ConfigFiles)
+		}
+		t.Setenv("KUBECONFIG", filepath.Join(req.ProjectPath, "wrong-config"))
+		if err := RestoreRollbackState(context.Background(), data, RollbackRestoreOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		want := configPath + string(os.PathListSeparator) + other
+		for _, call := range readKubernetesCalls(t, callsPath) {
+			if call.Kubeconfig != want {
+				t.Fatalf("mutable environment retargeted recovery: %+v", call)
+			}
+		}
+	})
+	t.Run("default home config and context namespace", func(t *testing.T) {
+		req, configPath, _ := kubernetesRollbackFixture(t)
+		contents, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		homeDir := filepath.Join(req.ProjectPath, "home")
+		if err := os.MkdirAll(filepath.Join(homeDir, ".kube"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		defaultPath := filepath.Join(homeDir, ".kube", "config")
+		if err := os.WriteFile(defaultPath, contents, 0600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("HOME", homeDir)
+		t.Setenv("KUBECONFIG", "")
+		req.Command.Raw = "kubectl delete deployment api"
+		data, err := CaptureRollbackState(context.Background(), req, RollbackCaptureOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if data.Kubernetes.Context != "dev" || data.Kubernetes.Namespace != "devspace" || data.Kubernetes.ConfigFiles[0].Path != defaultPath {
+			t.Fatalf("default target was not resolved: %+v", data.Kubernetes)
+		}
+	})
+}
+
+func TestKubernetesRollbackRefusesChangedConfiguration(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		t.Run(fmt.Sprintf("force=%t", force), func(t *testing.T) {
+			req, configPath, callsPath := kubernetesRollbackFixture(t)
+			data, err := CaptureRollbackState(context.Background(), req, RollbackCaptureOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			contents, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			contents = []byte(strings.ReplaceAll(string(contents), `"current-context":"dev"`, `"current-context":"prod"`))
+			if err := os.WriteFile(configPath, contents, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := RestoreRollbackState(context.Background(), data, RollbackRestoreOptions{Force: force}); err == nil || !strings.Contains(err.Error(), "kubeconfig changed") {
+				t.Fatalf("changed configuration accepted: %v", err)
+			}
+			assertNoKubernetesWrites(t, callsPath)
+		})
+	}
+}
+
+func TestKubernetesRollbackDoesNotOverwriteWithoutForce(t *testing.T) {
+	req, _, callsPath := kubernetesRollbackFixture(t)
+	data, err := CaptureRollbackState(context.Background(), req, RollbackCaptureOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SLB_KUBECTL_EXISTS", "1")
+	if err := RestoreRollbackState(context.Background(), data, RollbackRestoreOptions{}); err == nil {
+		t.Fatal("existing remote resource was silently overwritten")
+	}
+	for _, call := range readKubernetesCalls(t, callsPath) {
+		for _, arg := range call.Args {
+			if arg == "apply" {
+				t.Fatal("default restore used apply")
+			}
+		}
+	}
+	if err := RestoreRollbackState(context.Background(), data, RollbackRestoreOptions{Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	var created, applied bool
+	for _, call := range readKubernetesCalls(t, callsPath) {
+		for _, arg := range call.Args {
+			created = created || arg == "create"
+			applied = applied || arg == "apply"
+		}
+	}
+	if !created || !applied {
+		t.Fatalf("restore operations did not honor force: create=%t apply=%t", created, applied)
+	}
+}
+
+func TestKubernetesRollbackPreflightsAllManifests(t *testing.T) {
+	for _, scenario := range []string{"corrupt second", "traversal", "symlink", "wrong namespace", "legacy target", "missing digest"} {
+		t.Run(scenario, func(t *testing.T) {
+			req, _, callsPath := kubernetesRollbackFixture(t)
+			req.Command.Raw = "kubectl delete deployment api worker --context prod -n workloads"
+			data, err := CaptureRollbackState(context.Background(), req, RollbackCaptureOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rel := data.Kubernetes.Manifests[1]
+			switch scenario {
+			case "corrupt second":
+				if err := os.WriteFile(filepath.Join(data.RollbackPath, rel), []byte(`{broken`), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "traversal":
+				data.Kubernetes.Manifests[1] = "../outside.json"
+			case "symlink":
+				link := filepath.Join(data.RollbackPath, "redirect.json")
+				if err := os.Symlink(filepath.Join(data.RollbackPath, rel), link); err != nil {
+					t.Fatal(err)
+				}
+				data.Kubernetes.Manifests[1] = "redirect.json"
+				data.Kubernetes.ManifestSHA256["redirect.json"] = data.Kubernetes.ManifestSHA256[rel]
+			case "wrong namespace":
+				body := []byte(`{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"worker","namespace":"other"}}`)
+				if err := os.WriteFile(filepath.Join(data.RollbackPath, rel), body, 0600); err != nil {
+					t.Fatal(err)
+				}
+				data.Kubernetes.ManifestSHA256[rel] = fmt.Sprintf("%x", sha256.Sum256(body))
+			case "legacy target":
+				data.Kubernetes.Context = ""
+			case "missing digest":
+				delete(data.Kubernetes.ManifestSHA256, rel)
+			}
+			if err := RestoreRollbackState(context.Background(), data, RollbackRestoreOptions{Force: true}); err == nil {
+				t.Fatal("invalid snapshot was accepted")
+			}
+			assertNoKubernetesWrites(t, callsPath)
+		})
+	}
+}
+
+func TestKubernetesRollbackRefusesIncompleteSelections(t *testing.T) {
+	for _, raw := range []string{
+		"kubectl delete deployment api --context prod --selector app=x",
+		"kubectl --server https://other.invalid delete deployment api",
+		"kubectl delete deployment api --all",
+		"kubectl delete deployment api --all-namespaces",
+		"kubectl delete -f manifest.json",
+		"kubectl delete deployment api --namespace",
+		"kubectl delete pod/api service",
+		"kubectl delete deployments,services api",
+		"kubectl delete pod api --token fixture-secret-never-echo",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			req, _, callsPath := kubernetesRollbackFixture(t)
+			req.Command.Raw = raw
+			if data, err := CaptureRollbackState(context.Background(), req, RollbackCaptureOptions{}); err == nil || data != nil {
+				t.Fatalf("partial selection captured: data=%+v error=%v", data, err)
+			} else if strings.Contains(err.Error(), "fixture-secret-never-echo") {
+				t.Fatal("credential argument leaked into error")
+			}
+			if len(readKubernetesCalls(t, callsPath)) != 0 {
+				t.Fatal("unsupported selection reached kubectl")
+			}
+		})
+	}
+	selection, err := parseKubectlDelete([]string{"kubectl", "--context=prod", "delete", "deployment/api", "--force", "deployment/api", "--grace-period=0", "--cascade=foreground", "--timeout=10s"})
+	if err != nil || selection == nil || len(selection.Resources) != 1 {
+		t.Fatalf("complete named selection with controls rejected: %+v %v", selection, err)
+	}
+}
+
+func TestKubernetesRollbackCaptureBoundsAndCancellation(t *testing.T) {
+	t.Run("maximum size", func(t *testing.T) {
+		req, _, _ := kubernetesRollbackFixture(t)
+		t.Setenv("SLB_KUBECTL_OUTPUT_BYTES", "8192")
+		if data, err := CaptureRollbackState(context.Background(), req, RollbackCaptureOptions{MaxSizeBytes: 1024}); err == nil || data != nil || !strings.Contains(err.Error(), "max size") {
+			t.Fatalf("oversized output was accepted: %+v %v", data, err)
+		}
+	})
+	t.Run("cancellation", func(t *testing.T) {
+		req, _, _ := kubernetesRollbackFixture(t)
+		t.Setenv("SLB_KUBECTL_HANG", "1")
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		started := time.Now()
+		if data, err := CaptureRollbackState(ctx, req, RollbackCaptureOptions{}); data != nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("cancellation did not stop capture: %+v %v", data, err)
+		}
+		if time.Since(started) > 3*time.Second {
+			t.Fatal("capture failed to reap its cancelled subprocess promptly")
+		}
+	})
+}
+
+func TestKubernetesManifestPreservesLargeIntegers(t *testing.T) {
+	body := []byte(`{"apiVersion":"example.io/v1","kind":"Counter","metadata":{"name":"counter","namespace":"workloads"},"spec":{"positive":9007199254740993,"negative":-9007199254740993,"nested":[9223372036854775807]}}`)
+	manifest, err := normalizeKubernetesManifest(body, "workloads", "counter")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, number := range []string{"9007199254740993", "-9007199254740993", "9223372036854775807"} {
+		if !strings.Contains(string(manifest), number) {
+			t.Fatalf("custom-resource integer %s lost precision: %s", number, manifest)
+		}
+	}
+	if _, err := normalizeKubernetesManifest(append(body, []byte(` {}`)...), "workloads", "counter"); err == nil {
+		t.Fatal("multiple JSON values were accepted as one resource")
+	}
+}
+
+func TestKubernetesRollbackPreservesRequestedSecret(t *testing.T) {
+	req, _, _ := kubernetesRollbackFixture(t)
+	req.Command.Raw = "kubectl delete secret application-token --context prod -n workloads"
+	data, err := CaptureRollbackState(context.Background(), req, RollbackCaptureOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := os.ReadFile(filepath.Join(data.RollbackPath, data.Kubernetes.Manifests[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(manifest), "ZmFrZS1hcHBsaWNhdGlvbi1zZWNyZXQ=") {
+		t.Fatal("requested application Secret data was discarded")
+	}
+	metadata, err := os.ReadFile(filepath.Join(data.RollbackPath, rollbackMetadataFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(metadata), "fixture-credential-do-not-copy") || strings.Contains(string(metadata), "ZmFrZS1hcHBsaWNhdGlvbi1zZWNyZXQ=") {
+		t.Fatal("resource or kubeconfig credentials leaked into metadata")
+	}
+	if err := RestoreRollbackState(context.Background(), data, RollbackRestoreOptions{}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -729,7 +1236,17 @@ func TestParseKubectlDelete(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ns, resources := parseKubectlDelete(tc.args)
+			selection, err := parseKubectlDelete(append([]string{"kubectl", "delete"}, tc.args...))
+			if tc.wantResCount == 0 {
+				if err == nil {
+					t.Fatal("incomplete resource selection was accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			ns, resources := selection.Namespace, selection.Resources
 			if ns != tc.wantNS {
 				t.Errorf("namespace: got %q, want %q", ns, tc.wantNS)
 			}

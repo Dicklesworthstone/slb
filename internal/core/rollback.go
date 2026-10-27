@@ -3,17 +3,22 @@ package core
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,7 +46,8 @@ const (
 )
 
 type RollbackCaptureOptions struct {
-	// MaxSizeBytes limits filesystem and Git capture. 0 disables the limit.
+	// MaxSizeBytes limits capture. Kubernetes also has fixed per-object and
+	// aggregate bounds; 0 disables the configured limit, not those bounds.
 	MaxSizeBytes int64
 	// Retention controls cleanup of old rollback captures. 0 uses the default.
 	Retention time.Duration
@@ -50,7 +56,7 @@ type RollbackCaptureOptions struct {
 }
 
 type RollbackRestoreOptions struct {
-	// Force allows overwriting existing files and running destructive git restores.
+	// Force allows overwriting existing files/resources and destructive git restores.
 	Force bool
 }
 
@@ -83,8 +89,19 @@ type FilesystemRoot struct {
 }
 
 type KubernetesRollbackData struct {
-	Namespace string   `json:"namespace,omitempty"`
-	Manifests []string `json:"manifests"`
+	Namespace      string                 `json:"namespace"`
+	Context        string                 `json:"context"`
+	Server         string                 `json:"server"`
+	ConfigFiles    []KubernetesConfigFile `json:"config_files"`
+	Manifests      []string               `json:"manifests"`
+	ManifestSHA256 map[string]string      `json:"manifest_sha256"`
+}
+
+// Kubeconfig contents can contain credentials. Keep only their paths and
+// integrity fingerprints, never their raw contents or authentication fields.
+type KubernetesConfigFile struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
 }
 
 // CaptureRollbackState captures pre-execution state for supported destructive commands.
@@ -169,7 +186,7 @@ func CaptureRollbackState(ctx context.Context, req *db.Request, opts RollbackCap
 		}
 		data.Git = gitData
 	case rollbackKindKubernetes:
-		k8sData, err := captureKubernetesRollback(ctx, rollbackDir, req, tokens)
+		k8sData, err := captureKubernetesRollback(ctx, rollbackDir, req, tokens, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -280,7 +297,10 @@ func detectRollbackKind(tokens []string) string {
 	case "git":
 		return rollbackKindGit
 	case "kubectl":
-		if len(tokens) >= 2 && tokens[1] == "delete" {
+		selection, err := parseKubectlDelete(tokens)
+		if selection != nil || err != nil {
+			// An unsupported option may select another cluster or hide the
+			// verb. Let capture return the error, never silently skip it.
 			return rollbackKindKubernetes
 		}
 		return ""
@@ -861,143 +881,524 @@ func restoreFilesystemRollback(data *RollbackData, opts RollbackRestoreOptions) 
 	return nil
 }
 
-func captureKubernetesRollback(ctx context.Context, rollbackDir string, req *db.Request, tokens []string) (*KubernetesRollbackData, error) {
-	if len(tokens) < 2 || tokens[1] != "delete" {
-		return nil, fmt.Errorf("unsupported kubectl command")
-	}
-	if _, err := exec.LookPath("kubectl"); err != nil {
-		return nil, fmt.Errorf("kubectl not found in PATH")
-	}
+const (
+	maxKubernetesObjectBytes = 16 << 20
+	maxKubernetesBackupBytes = 100 << 20
+	maxKubernetesObjects     = 256
+)
 
-	captureCtx, cancel := context.WithTimeout(ctx, defaultRollbackCmdTimeout)
-	defer cancel()
+type kubectlResource struct{ Kind, Name string }
 
-	cwd := req.Command.Cwd
-	if strings.TrimSpace(cwd) == "" {
-		cwd = req.ProjectPath
-	}
-
-	ns, resources := parseKubectlDelete(tokens[2:])
-	if len(resources) == 0 {
-		return nil, fmt.Errorf("no kubectl delete targets found")
-	}
-
-	outDir := filepath.Join(rollbackDir, rollbackKubernetesDirName)
-	if err := os.MkdirAll(outDir, 0755); err != nil {
-		return nil, fmt.Errorf("creating k8s rollback dir: %w", err)
-	}
-
-	var manifests []string
-	for _, r := range resources {
-		filename := fmt.Sprintf("%s_%s.yaml", sanitizeFilename(r.Kind), sanitizeFilename(r.Name))
-		fullPath := filepath.Join(outDir, filename)
-
-		args := []string{"get", r.Kind, r.Name}
-		if ns != "" {
-			args = append(args, "-n", ns)
-		}
-		args = append(args, "-o", "yaml")
-
-		out, err := runCmdString(captureCtx, cwd, "kubectl", args...)
-		if err != nil {
-			return nil, fmt.Errorf("kubectl get %s/%s: %w", r.Kind, r.Name, err)
-		}
-		if err := os.WriteFile(fullPath, []byte(out), 0600); err != nil {
-			return nil, fmt.Errorf("writing manifest: %w", err)
-		}
-		manifests = append(manifests, filepath.ToSlash(filepath.Join(rollbackKubernetesDirName, filename)))
-	}
-
-	return &KubernetesRollbackData{
-		Namespace: ns,
-		Manifests: manifests,
-	}, nil
+type kubectlDeleteSelection struct {
+	Context, Namespace, Kubeconfig string
+	Resources                      []kubectlResource
 }
 
-type kubectlResource struct {
-	Kind string
-	Name string
-}
-
-func parseKubectlDelete(args []string) (string, []kubectlResource) {
-	var ns string
-	var out []kubectlResource
-
-	// Extract namespace flag.
-	rest := make([]string, 0, len(args))
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if a == "-n" || a == "--namespace" {
-			if i+1 < len(args) {
-				ns = args[i+1]
+// Parse the entire invocation. Ignoring an unknown flag can back up a different
+// cluster, namespace or resource set than the reviewed delete will affect.
+func parseKubectlDelete(tokens []string) (*kubectlDeleteSelection, error) {
+	if len(tokens) == 0 || tokens[0] != "kubectl" {
+		return nil, errors.New("kubectl invocation is required")
+	}
+	selection := &kubectlDeleteSelection{}
+	seen := map[string]string{}
+	var operands []string
+	verb, literal := false, false
+	for i := 1; i < len(tokens); i++ {
+		arg := tokens[i]
+		if arg == "--" && verb && !literal {
+			literal = true
+			continue
+		}
+		if strings.HasPrefix(arg, "-") && !literal {
+			key, value, assigned := strings.Cut(arg, "=")
+			if strings.HasPrefix(key, "-n") && key != "-n" && !strings.HasPrefix(key, "--") {
+				value, key, assigned = strings.TrimPrefix(arg, "-n"), "-n", true
+			}
+			if key == "-n" {
+				key = "--namespace"
+			}
+			valueFlag := key == "--context" || key == "--namespace" || key == "--kubeconfig" ||
+				(verb && (key == "--grace-period" || key == "--timeout" || key == "--cascade"))
+			boolFlag := verb && (key == "--force" || key == "--now" || key == "--wait" || key == "--ignore-not-found")
+			if !valueFlag && !boolFlag {
+				return nil, fmt.Errorf("rollback capture does not support kubectl option %q", key)
+			}
+			if valueFlag && !assigned {
+				if i+1 >= len(tokens) {
+					return nil, fmt.Errorf("kubectl option %s requires a value", key)
+				}
 				i++
+				value = tokens[i]
+			}
+			if boolFlag {
+				if assigned {
+					if _, err := strconv.ParseBool(value); err != nil {
+						return nil, fmt.Errorf("invalid boolean for kubectl option %s", key)
+					}
+				}
 				continue
 			}
-		}
-		if strings.HasPrefix(a, "--namespace=") {
-			ns = strings.TrimPrefix(a, "--namespace=")
-			continue
-		}
-		rest = append(rest, a)
-	}
-
-	// Parse resources: either kind/name or kind name1 name2.
-	i := 0
-	for i < len(rest) {
-		tok := rest[i]
-		if tok == "--" {
-			i++
-			continue
-		}
-		if strings.HasPrefix(tok, "-") {
-			// Stop at flags; capturing selectors is out of scope.
-			break
-		}
-		if strings.Contains(tok, "/") {
-			parts := strings.SplitN(tok, "/", 2)
-			if parts[0] != "" && parts[1] != "" {
-				out = append(out, kubectlResource{Kind: parts[0], Name: parts[1]})
+			if value == "" || strings.ContainsAny(value, "\x00\r\n") {
+				return nil, fmt.Errorf("invalid value for kubectl option %s", key)
 			}
-			i++
+			if previous, exists := seen[key]; exists && previous != value {
+				return nil, fmt.Errorf("conflicting kubectl option %s", key)
+			}
+			seen[key] = value
+			switch key {
+			case "--context":
+				selection.Context = value
+			case "--namespace":
+				if !kubernetesIdentifier(value) {
+					return nil, errors.New("invalid Kubernetes namespace")
+				}
+				selection.Namespace = value
+			case "--kubeconfig":
+				selection.Kubeconfig = value
+			case "--grace-period":
+				n, err := strconv.ParseInt(value, 10, 64)
+				if err != nil || n < -1 {
+					return nil, errors.New("invalid Kubernetes grace period")
+				}
+			case "--timeout":
+				if d, err := time.ParseDuration(value); err != nil || d < 0 {
+					return nil, errors.New("invalid Kubernetes delete timeout")
+				}
+			case "--cascade":
+				if value != "background" && value != "foreground" && value != "orphan" {
+					return nil, errors.New("unsupported Kubernetes cascade policy")
+				}
+			}
 			continue
 		}
-
-		kind := tok
-		i++
-		for i < len(rest) && !strings.HasPrefix(rest[i], "-") && rest[i] != "--" && !strings.Contains(rest[i], "/") {
-			out = append(out, kubectlResource{Kind: kind, Name: rest[i]})
-			i++
+		if !verb {
+			if arg != "delete" {
+				return nil, nil // An ordinary non-delete command needs no snapshot.
+			}
+			verb = true
+			continue
 		}
-		if len(out) == 0 || out[len(out)-1].Kind != kind {
-			// No names captured for this kind; stop.
-			break
+		operands = append(operands, arg)
+	}
+	if !verb || len(operands) == 0 {
+		return nil, errors.New("explicit named kubectl delete targets are required")
+	}
+	if strings.Contains(operands[0], "/") {
+		for _, operand := range operands {
+			kind, name, found := strings.Cut(operand, "/")
+			if !found || !kubernetesIdentifier(kind) || !kubernetesIdentifier(name) {
+				return nil, errors.New("rollback requires complete kind/name resource targets")
+			}
+			selection.Resources = append(selection.Resources, kubectlResource{kind, name})
+		}
+	} else {
+		if len(operands) < 2 || !kubernetesIdentifier(operands[0]) {
+			return nil, errors.New("rollback requires a resource kind and explicit names")
+		}
+		for _, name := range operands[1:] {
+			if !kubernetesIdentifier(name) {
+				return nil, errors.New("rollback requires literal Kubernetes resource names")
+			}
+			selection.Resources = append(selection.Resources, kubectlResource{operands[0], name})
 		}
 	}
-
-	return ns, out
+	unique := selection.Resources[:0]
+	resourceSeen := map[kubectlResource]bool{}
+	for _, resource := range selection.Resources {
+		if !resourceSeen[resource] {
+			unique = append(unique, resource)
+			resourceSeen[resource] = true
+		}
+	}
+	selection.Resources = unique
+	if len(selection.Resources) > maxKubernetesObjects {
+		return nil, errors.New("too many Kubernetes resources for one rollback capture")
+	}
+	return selection, nil
 }
 
-func restoreKubernetesRollback(ctx context.Context, data *RollbackData, _ RollbackRestoreOptions) error {
-	if data.Kubernetes == nil {
-		return fmt.Errorf("kubernetes rollback data missing")
+func kubernetesIdentifier(value string) bool {
+	if value == "" || value[0] == '-' || value == "." || value == ".." {
+		return false
 	}
-	if _, err := exec.LookPath("kubectl"); err != nil {
-		return fmt.Errorf("kubectl not found in PATH")
+	for _, r := range value {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '.') {
+			return false
+		}
 	}
+	return true
+}
 
-	restoreCtx, cancel := context.WithTimeout(ctx, 2*DefaultExecutionTimeout)
+func captureKubernetesRollback(ctx context.Context, rollbackDir string, req *db.Request, tokens []string, opts RollbackCaptureOptions) (*KubernetesRollbackData, error) {
+	selection, err := parseKubectlDelete(tokens)
+	if err != nil || selection == nil {
+		return nil, errors.Join(errors.New("unsupported Kubernetes rollback capture"), err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, defaultRollbackCmdTimeout)
 	defer cancel()
+	cwd := req.Command.Cwd
+	if cwd == "" {
+		cwd = req.ProjectPath
+	}
+	files, err := kubernetesConfigFiles(cwd, selection.Kubeconfig)
+	if err != nil {
+		return nil, err
+	}
+	data, err := readKubernetesTarget(ctx, cwd, files, selection.Context, selection.Namespace)
+	if err != nil {
+		return nil, err
+	}
+	outDir := filepath.Join(rollbackDir, rollbackKubernetesDirName)
+	if err := os.Mkdir(outDir, 0700); err != nil {
+		return nil, fmt.Errorf("creating Kubernetes rollback directory: %w", err)
+	}
+	remaining := int64(maxKubernetesBackupBytes)
+	if opts.MaxSizeBytes > 0 && opts.MaxSizeBytes < remaining {
+		remaining = opts.MaxSizeBytes
+	}
+	data.ManifestSHA256 = make(map[string]string)
+	for i, resource := range selection.Resources {
+		limit := remaining
+		if limit > maxKubernetesObjectBytes {
+			limit = maxKubernetesObjectBytes
+		}
+		out, err := runKubernetesCommand(ctx, cwd, data.ConfigFiles, nil, limit,
+			kubernetesTargetArgs(data, "get", resource.Kind, resource.Name, "--output=json")...)
+		if err != nil {
+			return nil, fmt.Errorf("capturing Kubernetes resource %d: %w", i+1, err)
+		}
+		manifest, err := normalizeKubernetesManifest(out, data.Namespace, resource.Name)
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(manifest)) > remaining || len(manifest) > maxKubernetesObjectBytes {
+			return nil, errors.New("Kubernetes rollback capture exceeds max size")
+		}
+		remaining -= int64(len(manifest))
+		// Indexes avoid collisions between aliases, API groups or names that
+		// sanitize to the same filename. The object itself carries its identity.
+		rel := filepath.ToSlash(filepath.Join(rollbackKubernetesDirName, fmt.Sprintf("%03d.json", i)))
+		file, err := os.OpenFile(filepath.Join(rollbackDir, filepath.FromSlash(rel)), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			return nil, err
+		}
+		_, writeErr := file.Write(manifest)
+		if writeErr == nil {
+			writeErr = file.Sync()
+		}
+		if err := errors.Join(writeErr, file.Close()); err != nil {
+			return nil, fmt.Errorf("writing Kubernetes manifest: %w", err)
+		}
+		digest := sha256.Sum256(manifest)
+		data.ManifestSHA256[rel] = hex.EncodeToString(digest[:])
+		data.Manifests = append(data.Manifests, rel)
+	}
+	if err := verifyKubernetesConfigFiles(data.ConfigFiles); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
 
+func kubernetesConfigFiles(cwd, explicit string) ([]KubernetesConfigFile, error) {
+	var paths []string
+	switch {
+	case explicit != "":
+		paths = []string{explicit}
+	case os.Getenv("KUBECONFIG") != "":
+		paths = filepath.SplitList(os.Getenv("KUBECONFIG"))
+	default:
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
+		paths = []string{filepath.Join(homeDir, ".kube", "config")}
+	}
+	// kuberc can inject command-specific defaults/aliases not represented in
+	// argv. Refuse active preferences rather than backing up a guessed target.
+	if !strings.EqualFold(os.Getenv("KUBECTL_KUBERC"), "false") {
+		if homeDir, err := os.UserHomeDir(); err != nil {
+			return nil, err
+		} else if _, err := os.Stat(filepath.Join(homeDir, ".kube", "kuberc")); err == nil || !os.IsNotExist(err) {
+			return nil, errors.New("Kubernetes rollback requires kuberc preferences to be disabled")
+		}
+	}
+	seen := map[string]bool{}
+	var files []KubernetesConfigFile
+	for _, name := range paths {
+		if name == "" {
+			continue // Match KUBECONFIG's empty-entry behavior.
+		}
+		if !filepath.IsAbs(name) {
+			name = cwd + string(os.PathSeparator) + name
+		}
+		if !filepath.IsAbs(name) || strings.ContainsRune(name, 0) || seen[name] {
+			if seen[name] {
+				continue
+			}
+			return nil, errors.New("an absolute kubeconfig path is required")
+		}
+		seen[name] = true
+		contents, err := readKubernetesFile(name, maxKubernetesObjectBytes)
+		if err != nil {
+			return nil, fmt.Errorf("reading kubeconfig fingerprint: %w", err)
+		}
+		digest := sha256.Sum256(contents)
+		files = append(files, KubernetesConfigFile{Path: name, SHA256: hex.EncodeToString(digest[:])})
+		if len(files) > 32 {
+			return nil, errors.New("too many kubeconfig files for rollback capture")
+		}
+	}
+	if len(files) == 0 {
+		return nil, errors.New("Kubernetes rollback requires an explicit file-backed configuration")
+	}
+	return files, nil
+}
+
+func verifyKubernetesConfigFiles(files []KubernetesConfigFile) error {
+	if len(files) == 0 || len(files) > 32 {
+		return errors.New("Kubernetes rollback has no bound kubeconfig; recapture before execution")
+	}
+	for _, file := range files {
+		if !filepath.IsAbs(file.Path) || len(file.SHA256) != sha256.Size*2 {
+			return errors.New("invalid Kubernetes configuration fingerprint")
+		}
+		if len(files) > 1 && strings.ContainsRune(file.Path, os.PathListSeparator) {
+			return errors.New("a merged kubeconfig path contains the path-list separator")
+		}
+		contents, err := readKubernetesFile(file.Path, maxKubernetesObjectBytes)
+		if err != nil {
+			return fmt.Errorf("reading captured kubeconfig: %w", err)
+		}
+		digest := sha256.Sum256(contents)
+		if hex.EncodeToString(digest[:]) != file.SHA256 {
+			return errors.New("kubeconfig changed since capture; reconcile the target before restoring")
+		}
+	}
+	return nil
+}
+
+func readKubernetesTarget(ctx context.Context, cwd string, files []KubernetesConfigFile, selected, namespace string) (*KubernetesRollbackData, error) {
+	if err := verifyKubernetesConfigFiles(files); err != nil {
+		return nil, err
+	}
+	args := []string{"config", "view", "--minify", "--output=json"}
+	if selected != "" {
+		args = append(args, "--context="+selected)
+	}
+	out, err := runKubernetesCommand(ctx, cwd, files, nil, maxCapturedOutputBytes, args...)
+	if err != nil {
+		return nil, fmt.Errorf("resolving Kubernetes context: %w", err)
+	}
+	var cfg struct {
+		Current  string `json:"current-context"`
+		Contexts []struct {
+			Name    string                              `json:"name"`
+			Context struct{ Cluster, Namespace string } `json:"context"`
+		} `json:"contexts"`
+		Clusters []struct {
+			Name    string                  `json:"name"`
+			Cluster struct{ Server string } `json:"cluster"`
+		} `json:"clusters"`
+	}
+	if json.Unmarshal(out, &cfg) != nil || len(cfg.Contexts) != 1 || len(cfg.Clusters) != 1 ||
+		cfg.Current == "" || cfg.Contexts[0].Name != cfg.Current || cfg.Contexts[0].Context.Cluster != cfg.Clusters[0].Name ||
+		(selected != "" && cfg.Current != selected) {
+		return nil, errors.New("kubectl did not resolve one unambiguous context and cluster")
+	}
+	if namespace == "" {
+		namespace = cfg.Contexts[0].Context.Namespace
+		if namespace == "" {
+			namespace = "default"
+		}
+	}
+	server, err := url.Parse(cfg.Clusters[0].Cluster.Server)
+	if err != nil || (server.Scheme != "http" && server.Scheme != "https") || server.Host == "" ||
+		server.User != nil || server.RawQuery != "" || server.Fragment != "" || !kubernetesIdentifier(namespace) {
+		return nil, errors.New("unsupported Kubernetes target address or namespace")
+	}
+	return &KubernetesRollbackData{Context: cfg.Current, Namespace: namespace, Server: server.String(), ConfigFiles: files}, nil
+}
+
+func kubernetesTargetArgs(target *KubernetesRollbackData, args ...string) []string {
+	prefix := []string{"--context=" + target.Context, "--namespace=" + target.Namespace, "--server=" + target.Server}
+	return append(prefix, args...)
+}
+
+func runKubernetesCommand(ctx context.Context, cwd string, files []KubernetesConfigFile, input []byte, limit int64, args ...string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > maxKubernetesObjectBytes {
+		return nil, errors.New("Kubernetes rollback capture exceeds max size")
+	}
+	var paths []string
+	for _, file := range files {
+		paths = append(paths, file.Path)
+	}
+	var env []string
+	for _, item := range os.Environ() {
+		key, _, _ := strings.Cut(item, "=")
+		if !strings.EqualFold(key, "KUBECONFIG") && !strings.EqualFold(key, "KUBECTL_KUBERC") && !strings.EqualFold(key, "KUBERNETES_MASTER") {
+			env = append(env, item)
+		}
+	}
+	env = append(env, "KUBECONFIG="+strings.Join(paths, string(os.PathListSeparator)), "KUBECTL_KUBERC=false")
+	if len(paths) == 1 {
+		// A filename such as config:prod is valid on POSIX. It is one
+		// --kubeconfig file, not two entries in the KUBECONFIG merge list.
+		args = append([]string{"--kubeconfig=" + paths[0]}, args...)
+	}
+	cmd := exec.CommandContext(ctx, "kubectl", args...)
+	cmd.Dir, cmd.Env, cmd.Stdin = cwd, env, bytes.NewReader(input)
+	stdout := &outputCapture{limit: int(limit)}
+	cmd.Stdout, cmd.Stderr, cmd.WaitDelay = stdout, io.Discard, time.Second
+	stopGroup := configureCommandCancellation(cmd, false)
+	err := cmd.Run()
+	if err != nil {
+		if stopGroup != nil {
+			if stopErr := stopGroup(); stopErr != nil && !errors.Is(stopErr, os.ErrProcessDone) {
+				err = errors.Join(err, stopErr)
+			}
+		}
+		// kubectl/credential plugins may echo credentials in diagnostics. Do
+		// not persist or return their output, command line or kubeconfig bytes.
+		return nil, fmt.Errorf("kubectl process failed: %w", errors.Join(ctx.Err(), err))
+	}
+	if stdout.omitted > 0 {
+		return nil, errors.New("Kubernetes rollback output exceeds max size")
+	}
+	return []byte(stdout.String()), nil
+}
+
+func readKubernetesFile(name string, limit int64) ([]byte, error) {
+	info, err := os.Stat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() > limit {
+		return nil, errors.New("Kubernetes recovery requires a bounded regular file")
+	}
+	file, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	opened, statErr := file.Stat()
+	if statErr != nil || !opened.Mode().IsRegular() || opened.Size() > limit || !os.SameFile(info, opened) {
+		return nil, errors.Join(errors.New("Kubernetes recovery requires a bounded regular file"), statErr, file.Close())
+	}
+	contents, readErr := io.ReadAll(io.LimitReader(file, limit+1))
+	if err := errors.Join(readErr, file.Close()); err != nil {
+		return nil, err
+	}
+	if int64(len(contents)) > limit {
+		return nil, errors.New("Kubernetes recovery file exceeds max size")
+	}
+	return contents, nil
+}
+
+func normalizeKubernetesManifest(contents []byte, namespace, expectedName string) ([]byte, error) {
+	var resource map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	decoder.UseNumber() // CRDs can contain int64 values beyond float64 precision.
+	if decoder.Decode(&resource) != nil {
+		return nil, errors.New("Kubernetes recovery requires one complete JSON object")
+	}
+	var trailing any
+	if decoder.Decode(&trailing) != io.EOF {
+		return nil, errors.New("Kubernetes recovery requires one complete JSON object")
+	}
+	apiVersion, _ := resource["apiVersion"].(string)
+	kind, _ := resource["kind"].(string)
+	metadata, _ := resource["metadata"].(map[string]any)
+	name, _ := metadata["name"].(string)
+	objectNamespace, _ := metadata["namespace"].(string)
+	if apiVersion == "" || !kubernetesIdentifier(kind) || strings.HasSuffix(kind, "List") || !kubernetesIdentifier(name) ||
+		(expectedName != "" && name != expectedName) || (objectNamespace != "" && objectNamespace != namespace) {
+		return nil, errors.New("Kubernetes object identity differs from the captured target")
+	}
+	delete(resource, "status")
+	for _, key := range []string{"uid", "resourceVersion", "generation", "creationTimestamp", "deletionTimestamp", "deletionGracePeriodSeconds", "managedFields", "selfLink", "generateName"} {
+		delete(metadata, key)
+	}
+	if annotations, ok := metadata["annotations"].(map[string]any); ok {
+		delete(annotations, "kubectl.kubernetes.io/last-applied-configuration")
+	}
+	// Compact encoding avoids quadratic indentation growth for deeply nested
+	// custom resources; the serialized object is still checked against budget.
+	return json.Marshal(resource)
+}
+
+func restoreKubernetesRollback(ctx context.Context, data *RollbackData, opts RollbackRestoreOptions) error {
+	target := data.Kubernetes
+	if target == nil || target.Context == "" || target.Server == "" || target.Namespace == "" ||
+		len(target.Manifests) == 0 || len(target.Manifests) > maxKubernetesObjects {
+		return errors.New("Kubernetes snapshot lacks a bound target; recapture before execution")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*DefaultExecutionTimeout)
+	defer cancel()
 	cwd := data.CommandCwd
-	if strings.TrimSpace(cwd) == "" {
+	if cwd == "" {
 		cwd = data.ProjectPath
 	}
-
-	for _, rel := range data.Kubernetes.Manifests {
-		full := filepath.Join(data.RollbackPath, filepath.FromSlash(rel))
-		args := []string{"apply", "-f", full}
-		if _, err := runCmdString(restoreCtx, cwd, "kubectl", args...); err != nil {
-			return fmt.Errorf("kubectl apply %s: %w", rel, err)
+	current, err := readKubernetesTarget(ctx, cwd, target.ConfigFiles, target.Context, target.Namespace)
+	if err != nil {
+		return err
+	}
+	if current.Server != target.Server || current.Context != target.Context || current.Namespace != target.Namespace {
+		return errors.New("Kubernetes target changed since capture")
+	}
+	// Read and validate the ENTIRE snapshot before the first remote write.
+	// Passing these verified bytes on stdin also avoids a later path reread.
+	var manifests [][]byte
+	seen := map[string]bool{}
+	remaining := int64(maxKubernetesBackupBytes)
+	for _, rel := range target.Manifests {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		local := filepath.FromSlash(rel)
+		if !filepath.IsLocal(local) || strings.Contains(rel, "\\") || seen[rel] {
+			return errors.New("invalid or duplicate Kubernetes manifest path")
+		}
+		seen[rel] = true
+		full := filepath.Join(data.RollbackPath, local)
+		if err := ensureNoSymlinkParents(data.RollbackPath, full); err != nil {
+			return err
+		}
+		limit := remaining
+		if limit > maxKubernetesObjectBytes {
+			limit = maxKubernetesObjectBytes
+		}
+		contents, err := readKubernetesFile(full, limit)
+		if err != nil {
+			return err
+		}
+		digest := sha256.Sum256(contents)
+		if hex.EncodeToString(digest[:]) != target.ManifestSHA256[rel] {
+			return errors.New("Kubernetes manifest integrity check failed")
+		}
+		manifest, err := normalizeKubernetesManifest(contents, target.Namespace, "")
+		if err != nil {
+			return err
+		}
+		remaining -= int64(len(manifest))
+		if remaining < 0 {
+			return errors.New("Kubernetes recovery snapshot exceeds max size")
+		}
+		manifests = append(manifests, manifest)
+	}
+	verb := "create"
+	if opts.Force {
+		verb = "apply"
+	}
+	for i, manifest := range manifests {
+		if err := verifyKubernetesConfigFiles(target.ConfigFiles); err != nil {
+			return err
+		}
+		if _, err := runKubernetesCommand(ctx, cwd, target.ConfigFiles, manifest, maxCapturedOutputBytes,
+			kubernetesTargetArgs(target, verb, "-f", "-")...); err != nil {
+			return fmt.Errorf("restoring Kubernetes manifest %d using %s (overwriting requires --force): %w", i+1, verb, err)
 		}
 	}
 	return nil

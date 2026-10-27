@@ -638,14 +638,34 @@ Only one executor can claim the request. Atomic database transition prevents rac
 
 ### Dry Run Pre-flight
 
-For supported commands, `slb` can run a dry-run variant before the real execution:
+For supported literal command forms, `slb` gathers advisory evidence before
+admitting the request:
 
-```bash
-# Supported dry-run variants:
-terraform plan          # instead of terraform apply
-kubectl diff            # instead of kubectl apply
-git diff                # show what would change
-```
+| Requested command | Preview |
+|---|---|
+| `kubectl delete` | Forces `--dry-run=client`, retaining the selected resources and supported scope flags |
+| `terraform destroy` | Runs `plan -destroy -input=false`, retaining variables, targets and supported `-chdir` selection |
+| `rm` | Lists the literal target paths with `ls -la --` |
+| `git reset` | Inspects the requested ref, index and working-tree changes according to the reset mode |
+| `helm uninstall` | Gets the selected release's manifest with its context and namespace |
+
+A preview is evidence for the reviewer, not an approval or a sandbox. Use
+`--require-dry-run` to refuse admission when a preview is unsupported, fails or
+times out.
+
+Git reset previews default to `HEAD` when no target is supplied. Soft resets
+show the ref change; mixed/default resets also show the index changes. Hard
+resets additionally show tracked working-tree changes and inventories of
+untracked and ignored paths, including when invoked from a subdirectory.
+Merge/keep previews label candidate differences and explain that Git's
+preservation and abort rules still apply. Inventories do not simulate every
+untracked-path collision, and the repository can change after inspection.
+
+Pathspec, interactive, recursive-submodule and ambiguous reset forms are
+declined. Working-tree previews also decline configured clean/process filters
+and implicit recursive-submodule behavior. Preview diffs disable external diff,
+text conversion and filesystem-monitor programs, and preserve the normal time
+and output limits.
 
 Enable in config:
 ```toml
@@ -672,13 +692,39 @@ does not inherit a snapshot left by an earlier preflight.
 Captured state includes:
 - **Filesystem**: Tar archive of affected paths
 - **Git**: HEAD commit, branch, dirty state, untracked files
-- **Kubernetes**: YAML manifests of affected resources
+- **Kubernetes**: Private JSON manifests of explicitly named resources, bound to
+  their context, namespace, API server and kubeconfig fingerprints
 
 Rollback:
 ```bash
 slb rollback <request-id>           # Restore captured state
 slb rollback <request-id> --force   # Force overwrite
 ```
+
+Kubernetes capture supports literal `kubectl delete` commands with named
+`type/name` or `type name` targets. Context, kubeconfig and namespace flags can
+appear before or after `delete`; ordinary force, wait, grace-period, cascade and
+timeout controls are supported. Selectors, `--all`, all namespaces, file/stdin
+or kustomize selections, and unsupported connection/authentication overrides
+are refused instead of producing a partial backup. A file-backed kubeconfig is
+required, and kuberc preferences must be disabled when present.
+
+Recovery validates the entire manifest set and the original configuration
+before writing to the captured target. It creates resources by default;
+`--force` permits applying over existing resources but does not bypass target
+or integrity checks. Changed kubeconfig files, including context or credential
+changes, require deliberate target reconciliation. Historical manifests without
+target bindings remain available on disk for manual recovery; they are not
+automatically applied to the current cluster.
+
+Kubernetes snapshots cover at most 256 named objects, 16 MiB per object and
+100 MiB total; a lower `max_rollback_size_mb` is honored. Resource manifests can
+contain application secrets and are stored in private directories/files
+(`0700`/`0600`). Kubeconfig contents and authentication material are not copied
+into metadata. Recovery restores the named objects, not namespace contents,
+cascaded dependents, ownership graphs or persistent-volume data. It is not an
+atomic cluster-wide transaction: concurrent changes and partial API failures
+still require inspection.
 
 ## Daemon Architecture
 
