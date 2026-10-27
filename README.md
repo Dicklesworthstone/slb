@@ -1088,32 +1088,53 @@ Requests can include attachments to provide context for reviewers.
 
 | Type | Description |
 |------|-------------|
-| `file` | File contents (base64 encoded) |
-| `image` | Screenshots or diagrams (validated dimensions) |
-| `command_output` | Output from context-gathering commands |
+| `file` | Text file contents with source and size metadata |
+| `git_diff` | Diff contents detected from a file |
+| `screenshot` | Image data URI with validated dimensions |
+| `context` | Output and result metadata from a policy-checked context command |
 
 ### Adding Attachments
 
 ```bash
-# Attach file
-slb request "DROP TABLE users" --reason "..." --attach ./schema.sql
+# Attach existing evidence without executing it
+slb request "DROP TABLE users" --session-id "$REQUESTER_ID" \
+  --reason "..." --attach-file ./schema.sql
 
-# Attach image (screenshot)
-slb request "kubectl delete deployment" --reason "..." --attach ./dashboard.png
+# Attach an image
+slb request "kubectl delete deployment nginx" --session-id "$REQUESTER_ID" \
+  --reason "..." --attach-screenshot ./dashboard.png
 
-# Attach command output
-slb request "terraform destroy" --reason "..." --attach-cmd "terraform plan -destroy"
+# Capture context only when this exact command is allowed by current SAFE policy
+slb request "terraform destroy" --session-id "$REQUESTER_ID" \
+  --reason "..." --attach-context "pwd"
 ```
+
+The same flags work with `slb run`. File and screenshot attachments are validated
+before context subprocesses start. Context collection validates the active
+requester, project and selected `--config`, then requires every context command
+to classify entirely as SAFE. Unknown commands, opaque shell execution and
+commands requiring review are refused before the batch runs. A SAFE program
+with a file-writing redirection also fails this check. `pwd` in the example
+therefore needs an explicit matching SAFE rule in the selected project policy;
+it is not a built-in exemption.
+
+Each subprocess receives another fresh policy/session check and runs in the
+request's working directory. Its attachment records that directory, the command
+hash and `policy_check: "safe"`. Request admission reloads configuration after
+collection. Context output supplies evidence, not an approval or execution
+assurance for the main command. SAFE rules are explicit operator policy, not a
+sandbox or a guarantee that a program has no side effects.
+
+For a context command that needs review, use the ordinary `slb run` workflow
+first, save its output, and attach that file to a new request. A pending request
+cannot authorize its own context-gathering commands.
 
 ### Attachment Limits
 
-```toml
-[attachments]
-max_file_size = 1048576        # 1MB
-max_output_size = 102400       # 100KB
-max_command_runtime = 10       # seconds
-max_image_dimension = 4096     # pixels
-```
+The CLI uses a 1 MiB limit per file or image, a 100 KiB combined context-output
+limit per command, a 10-second context runtime, and a 4096-pixel maximum image
+dimension. These are the attachment collector's defaults; there is no
+`[attachments]` configuration section.
 
 ### Viewing Attachments
 

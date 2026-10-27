@@ -37,7 +37,7 @@ func init() {
 	runCmd.Flags().IntVar(&flagRunTimeout, "timeout", 300, "timeout in seconds to wait for approval")
 	runCmd.Flags().BoolVar(&flagRunYield, "yield", false, "yield to background if approval is needed")
 	runCmd.Flags().StringSliceVar(&flagRunAttachFile, "attach-file", nil, "attach file content as context")
-	runCmd.Flags().StringSliceVar(&flagRunAttachContext, "attach-context", nil, "run command and attach output as context")
+	runCmd.Flags().StringSliceVar(&flagRunAttachContext, "attach-context", nil, "run a command allowed by current SAFE policy and attach its output")
 	runCmd.Flags().StringSliceVar(&flagRunAttachScreen, "attach-screenshot", nil, "attach screenshot/image file")
 
 	rootCmd.AddCommand(runCmd)
@@ -61,6 +61,10 @@ Flow:
 5. If rejected/timeout: exit 1 with error
 
 The command inherits the caller's environment and working directory.
+
+--attach-context executes only commands entirely allowed by current SAFE policy,
+after validating the requester and project. Unknown or review-required context
+commands must go through 'slb run'; attach their saved output with --attach-file.
 
 Examples:
   slb run "rm -rf ./build" --reason "Clean build artifacts"
@@ -114,9 +118,18 @@ Examples:
 			Files:       flagRunAttachFile,
 			Contexts:    flagRunAttachContext,
 			Screenshots: flagRunAttachScreen,
-		})
+		}, &AttachmentCommandScope{Database: dbConn, ProjectPath: project,
+			WorkingDirectory: cwd, SessionID: flagSessionID, ConfigPath: flagConfig})
 		if err != nil {
 			return writeError(cmd, out, "attachment_error", command, err)
+		}
+		if len(flagRunAttachContext) > 0 {
+			// Context programs may change configuration. Admission must use
+			// the policy visible after evidence collection has finished.
+			cfg, err = config.Load(config.LoadOptions{ProjectDir: project, ConfigPath: flagConfig})
+			if err != nil {
+				return writeError(cmd, out, "config_failed", command, fmt.Errorf("reloading config after context collection: %w", err))
+			}
 		}
 
 		// Merge project patterns before admission rather than classifying

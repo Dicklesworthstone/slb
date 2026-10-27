@@ -187,6 +187,18 @@ evidence again; it never raises that evidence's assurance. Changing a provenance
 record's program label or making its reserved delegation session active cannot
 turn delegated evidence into local approval.
 
+### Context command evidence
+
+`--attach-context` executes before the main command receives review, so each
+context command needs its own fresh SAFE-policy check for the active requester,
+project, selected configuration and working directory. The entire context batch
+and all file/image attachments are checked before the first subprocess; policy
+and session checks repeat before each launch. Admission reloads configuration
+after collection. Unknown or review-required contexts must use the ordinary
+reviewed execution path first, then attach saved output. A context attachment
+records its command hash, directory and SAFE check without granting peer-review
+assurance. SAFE configuration is operator policy, not process isolation.
+
 ## Table of Contents
 - [Reviewer Identity Security Boundary](#reviewer-identity-security-boundary-issue-30)
 - [Optional Same-Host Peer Review](#optional-same-host-peer-review-issue-31)

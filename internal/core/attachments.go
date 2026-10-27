@@ -25,6 +25,9 @@ import (
 
 // AttachmentConfig holds configuration for attachment handling.
 type AttachmentConfig struct {
+	// WorkingDirectory binds context commands to the caller's selected CWD.
+	// Empty captures the current directory before the subprocess is started.
+	WorkingDirectory string
 	// MaxFileSize bounds file/image bytes and selected log excerpts (default 1MB).
 	// Nonpositive values mean no size limit.
 	MaxFileSize int64
@@ -304,6 +307,8 @@ func (b *cappedBuffer) Truncated() bool {
 }
 
 // RunContextCommand executes a command and captures output as an attachment.
+// Callers must authorize the command before invoking this execution-only helper.
+// The CLI requires a fresh SAFE policy check bound to the requester and project.
 func RunContextCommand(ctx context.Context, command string, config *AttachmentConfig) (*db.Attachment, error) {
 	if config == nil {
 		cfg := DefaultAttachmentConfig()
@@ -312,6 +317,10 @@ func RunContextCommand(ctx context.Context, command string, config *AttachmentCo
 
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	cwd, err := bindCommandCWD(config.WorkingDirectory)
+	if err != nil {
+		return nil, err
 	}
 
 	execCtx := ctx
@@ -334,6 +343,7 @@ func RunContextCommand(ctx context.Context, command string, config *AttachmentCo
 		cmd = exec.CommandContext(execCtx, shell, "-c", command)
 	}
 	cmd.Env = os.Environ()
+	cmd.Dir = cwd
 
 	stdout := &cappedBuffer{max: config.MaxOutputSize}
 	stderr := &cappedBuffer{max: config.MaxOutputSize}
@@ -399,9 +409,12 @@ func RunContextCommand(ctx context.Context, command string, config *AttachmentCo
 	}
 
 	meta := map[string]any{
-		"source":      command,
-		"exit_code":   exitCode,
-		"duration_ms": duration.Milliseconds(),
+		"source":       command,
+		"cwd":          cwd,
+		"shell":        true,
+		"command_hash": db.ComputeCommandHash(db.CommandSpec{Raw: command, Cwd: cwd, Shell: true}),
+		"exit_code":    exitCode,
+		"duration_ms":  duration.Milliseconds(),
 	}
 	if timedOut {
 		meta["timed_out"] = true

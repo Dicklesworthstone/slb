@@ -39,7 +39,7 @@ func init() {
 	requestCmd.Flags().BoolVar(&flagRequestExecute, "execute", false, "execute the command if approved (use 'slb run' for atomic flow)")
 	requestCmd.Flags().IntVar(&flagRequestTimeout, "timeout", 300, "timeout in seconds when waiting")
 	requestCmd.Flags().StringSliceVar(&flagRequestAttachFile, "attach-file", nil, "attach file content as context")
-	requestCmd.Flags().StringSliceVar(&flagRequestAttachContext, "attach-context", nil, "attach context")
+	requestCmd.Flags().StringSliceVar(&flagRequestAttachContext, "attach-context", nil, "run a command allowed by current SAFE policy and attach its output")
 	requestCmd.Flags().StringSliceVar(&flagRequestAttachScreen, "attach-screenshot", nil, "attach screenshot/image file")
 
 	rootCmd.AddCommand(requestCmd)
@@ -64,7 +64,11 @@ The command is classified by risk tier:
   SAFE       - Skipped (no request created)
 
 Use --wait to block until approval/rejection.
-Use --execute with --wait to execute after approval.`,
+Use --execute with --wait to execute after approval.
+
+--attach-context executes only commands entirely allowed by current SAFE policy,
+after validating the requester and project. Unknown or review-required context
+commands must go through 'slb run'; attach their saved output with --attach-file.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		finish, err := beginRequestCommand(cmd)
@@ -114,9 +118,18 @@ Use --execute with --wait to execute after approval.`,
 			Files:       flagRequestAttachFile,
 			Contexts:    flagRequestAttachContext,
 			Screenshots: flagRequestAttachScreen,
-		})
+		}, &AttachmentCommandScope{Database: dbConn, ProjectPath: project,
+			WorkingDirectory: cwd, SessionID: flagSessionID, ConfigPath: flagConfig})
 		if err != nil {
 			return fmt.Errorf("collecting attachments: %w", err)
+		}
+		if len(flagRequestAttachContext) > 0 {
+			// Context programs may change configuration. Admission must use
+			// the policy visible after evidence collection has finished.
+			cfg, err = config.Load(config.LoadOptions{ProjectDir: project, ConfigPath: flagConfig})
+			if err != nil {
+				return fmt.Errorf("reloading config after context collection: %w", err)
+			}
 		}
 
 		// Merge the project's custom patterns into the default engine before

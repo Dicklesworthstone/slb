@@ -288,14 +288,27 @@ fails while preserving the observed child outcome in that invocation's output.
 
 ```bash
 # Attach file
-slb request "DROP TABLE users" --reason "..." --attach ./schema.sql
+slb request "DROP TABLE users" --session-id "$REQUESTER_ID" \
+  --reason "..." --attach-file ./schema.sql
 
 # Attach screenshot
-slb request "kubectl delete deployment" --reason "..." --attach ./dashboard.png
+slb request "kubectl delete deployment nginx" --session-id "$REQUESTER_ID" \
+  --reason "..." --attach-screenshot ./dashboard.png
 
-# Attach command output
-slb request "terraform destroy" --reason "..." --attach-cmd "terraform plan -destroy"
+# Attach command output only if the selected policy explicitly marks pwd SAFE
+slb request "terraform destroy" --session-id "$REQUESTER_ID" \
+  --reason "..." --attach-context "pwd"
 ```
+
+These flags also work with `slb run`. Context commands execute before the main
+request is reviewed, so they must independently pass a fresh SAFE check for the
+active requester, project, working directory and selected `--config`. SLB checks
+the entire context batch and validates files/images before launching anything,
+then rechecks policy and session state before each subprocess. Unknown commands,
+file-writing redirections and commands needing review are refused. Captured
+output records its command hash, directory and SAFE-policy check; it grants no
+peer approval for the main command. For context that needs review, run it through
+`slb run` first and attach its saved output with `--attach-file`.
 
 ---
 

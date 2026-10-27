@@ -2,6 +2,8 @@
 package e2e
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -9,6 +11,128 @@ import (
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 )
+
+// Context collection runs before request admission, so the production CLI must
+// require a complete SAFE decision independently of the main command's review.
+func TestBuiltCLIAttachmentContextSafety(t *testing.T) {
+	binary := buildIdentityBoundaryCLI(t)
+	for _, entrypoint := range []string{"request", "run"} {
+		for _, scenario := range []struct {
+			name, command string
+		}{
+			{"unreviewed command", "touch unreviewed-context"},
+			{"SAFE prefix with output redirection", "git status > unreviewed-context"},
+			{"compound context", "git status; touch unreviewed-context"},
+			{"unclassified context", "./context-probe"},
+		} {
+			t.Run(entrypoint+"/"+scenario.name, func(t *testing.T) {
+				f := newSameHostCLI(t, binary, 1, true)
+				requester := f.session("Requester", "model-a")
+				f.WriteFile("context-probe", []byte("#!/bin/sh\nprintf 'started\\n' > unreviewed-context\n"), 0700)
+				args := []string{entrypoint, "touch reviewed-marker", "--session-id", requester.ID,
+					"--reason", "Context must not execute outside the review workflow",
+					"--attach-context", scenario.command, "--json"}
+				if entrypoint == "run" {
+					args = append(args, "--yield")
+				}
+				f.fails("SAFE", args...)
+				for _, marker := range []string{"unreviewed-context", "reviewed-marker"} {
+					if _, err := os.Stat(filepath.Join(f.ProjectDir, marker)); !os.IsNotExist(err) {
+						t.Fatalf("refused context produced %s: %v", marker, err)
+					}
+				}
+				var count int
+				if err := f.DB.QueryRow(`SELECT COUNT(*) FROM requests`).Scan(&count); err != nil || count != 0 {
+					t.Fatalf("refused context left a request: count=%d err=%v", count, err)
+				}
+			})
+		}
+
+		t.Run(entrypoint+"/configured SAFE contexts and reviewed execution", func(t *testing.T) {
+			f := newSameHostCLI(t, binary, 1, true)
+			requester := f.session("Requester", "model-a")
+			reviewer := f.session("Reviewer", "model-b")
+			f.WriteFile("reviewed-probe", []byte("#!/bin/sh\nprintf 'reviewed\\n' >> reviewed-marker\n"), 0700)
+			// The project defaults do not allow these context commands. Only
+			// the explicitly selected policy grants these exact read-only forms.
+			policy := f.WriteFile("attachment-policy.toml", []byte(`[general]
+approval_policy = 'same_host'
+require_different_model = true
+enable_dry_run = false
+enable_rollback_capture = false
+[patterns.safe]
+patterns = ['^pwd$', '^echo context-captured$']
+[patterns.dangerous]
+min_approvals = 1
+[integrations]
+agent_mail_enabled = false
+[notifications]
+desktop_enabled = false
+`), 0600)
+			args := []string{entrypoint, "./reviewed-probe", "--session-id", requester.ID,
+				"--reason", "Review a counted command after collecting SAFE context",
+				"--attach-context", "pwd", "--attach-context", "echo context-captured"}
+			if entrypoint == "run" {
+				args = append(args, "--yield")
+			}
+			f.fails("SAFE", append(args, "--json")...)
+			result := f.json(append([]string{"--config", policy}, args...)...)
+			id, ok := result["request_id"].(string)
+			if !ok || id == "" || result["status"] != "pending" || result["approval_policy"] != "same_host" {
+				t.Fatalf("SAFE contexts bypassed main command review: %+v", result)
+			}
+			request, err := f.DB.GetRequest(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var contexts []db.Attachment
+			for _, attachment := range request.Attachments {
+				// Request admission also records its own preflight advisory,
+				// including when preflight is disabled in this fixture.
+				if attachment.Metadata["kind"] != "preflight" {
+					contexts = append(contexts, attachment)
+				}
+			}
+			if request.Command.Raw != "./reviewed-probe" || request.Command.Cwd != f.ProjectDir ||
+				request.Command.Hash != db.ComputeCommandHash(request.Command) || len(contexts) != 2 {
+				t.Fatalf("request lost the command or its contexts: %+v", request)
+			}
+			physicalCWD, err := filepath.EvalSymlinks(f.ProjectDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, context := range []struct{ command, output string }{
+				{"pwd", physicalCWD}, {"echo context-captured", "context-captured"},
+			} {
+				attachment := contexts[i]
+				expectedHash := db.ComputeCommandHash(db.CommandSpec{Raw: context.command, Cwd: f.ProjectDir, Shell: true})
+				if attachment.Type != db.AttachmentTypeContext || strings.TrimSpace(attachment.Content) != context.output ||
+					attachment.Metadata["source"] != context.command || attachment.Metadata["cwd"] != f.ProjectDir ||
+					attachment.Metadata["shell"] != true || attachment.Metadata["command_hash"] != expectedHash ||
+					attachment.Metadata["policy_check"] != "safe" || attachment.Metadata["exit_code"] != float64(0) {
+					t.Fatalf("context %d lost its bound SAFE evidence: %+v", i, attachment)
+				}
+			}
+			if approvals, rejections, err := f.DB.CountReviewsByDecision(id); err != nil || approvals != 0 || rejections != 0 {
+				t.Fatalf("context evidence became peer approval: approvals=%d rejections=%d err=%v", approvals, rejections, err)
+			}
+			f.fails("not approved", "--config", policy, "execute", id, "--session-id", requester.ID)
+			f.assertNotExecuted(request)
+			f.json("--config", policy, "approve", id, "--session-id", reviewer.ID, "--session-key", reviewer.SessionKey,
+				"--comments", "Reviewed the exact command and captured directory context")
+			executed := f.json("--config", policy, "execute", id, "--session-id", requester.ID)
+			if executed["status"] != "executed" || executed["assurance"] != "same_host" {
+				t.Fatalf("reviewed execution lost its assurance: %+v", executed)
+			}
+			f.assertExecuted(id)
+			f.fails("already been executed", "--config", policy, "execute", id, "--session-id", requester.ID)
+			data, err := os.ReadFile(filepath.Join(f.ProjectDir, "reviewed-marker"))
+			if err != nil || string(data) != "reviewed\n" {
+				t.Fatalf("reviewed command did not execute exactly once: %q %v", data, err)
+			}
+		})
+	}
+}
 
 // TestMultiAgentApproval_FullWorkflow tests the complete two-person rule workflow
 // where multiple agents must approve a CRITICAL request before execution.
