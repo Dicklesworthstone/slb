@@ -67,7 +67,7 @@ var daemonStartCmd = &cobra.Command{
 			return err
 		}
 		startedAt := time.Now().UTC().Format(time.RFC3339)
-		opts := daemon.ServerOptions{ProjectDir: project}
+		opts := daemon.ServerOptions{ProjectDir: project, ConfigPath: flagConfig}
 		socketPath := daemon.SocketPathForCWD(project)
 
 		if flagDaemonStartForeground {

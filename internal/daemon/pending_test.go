@@ -50,6 +50,53 @@ func TestPendingTimerApprovesDueCautionWithoutExpiry(t *testing.T) {
 	}
 }
 
+func TestPendingTimerRechecksExplicitPolicy(t *testing.T) {
+	database, request := pendingTimerFixture(t)
+	configPath := filepath.Join(t.TempDir(), "timer policy.toml")
+	handler := NewTimeoutHandler(database, TimeoutHandlerConfig{ProjectPath: request.ProjectPath, ConfigPath: configPath})
+	if err := handler.advance(context.Background(), request.ID, "", false); err == nil {
+		t.Fatal("missing selected policy fell back to project defaults")
+	}
+	if err := os.WriteFile(configPath, []byte("[patterns.caution]\nmin_approvals = 1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.advance(context.Background(), request.ID, "", false); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := database.GetRequest(request.ID)
+	if err != nil || stored.Status != db.StatusPending || stored.ApprovalExpiresAt != nil {
+		t.Fatalf("stricter selected policy was bypassed: %+v %v", stored, err)
+	}
+	// Timers re-read the same selected file; a legitimate edit must take
+	// effect without replacing the handler or falling back to project config.
+	if err := os.WriteFile(configPath, []byte("[patterns.caution]\nmin_approvals = 0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.advance(context.Background(), request.ID, "", false); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = database.GetRequest(request.ID)
+	if err != nil || stored.Status != db.StatusApproved || stored.ApprovalExpiresAt == nil {
+		t.Fatalf("current selected policy was not applied: %+v %v", stored, err)
+	}
+}
+
+func TestPendingTimerUsesSelectedTimeoutAction(t *testing.T) {
+	database, request := expiredTimerFixture(t)
+	configPath := filepath.Join(t.TempDir(), "timer policy.toml")
+	if err := os.WriteFile(configPath, []byte("[general]\ntimeout_action = 'auto_reject'\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewTimeoutHandler(database, TimeoutHandlerConfig{ProjectPath: request.ProjectPath, ConfigPath: configPath})
+	if err := handler.advance(context.Background(), request.ID, "", false); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := database.GetRequest(request.ID)
+	if err != nil || stored.Status != db.StatusTimeout {
+		t.Fatalf("selected timeout action ignored: %+v %v", stored, err)
+	}
+}
+
 func TestPendingTimerIgnoresStaleExpiredSnapshots(t *testing.T) {
 	for _, status := range []db.RequestStatus{db.StatusRejected, db.StatusApproved, db.StatusExecuting, db.StatusCancelled} {
 		t.Run(string(status), func(t *testing.T) {

@@ -17,15 +17,17 @@ import (
 // startProjectServices wires the existing components into the running daemon.
 // The caller owns database and listeners; stop joins every worker before either
 // can be closed. No component here executes an approved command.
-func startProjectServices(parent context.Context, database *db.DB, project string, cfg config.Config, servers []*IPCServer, logger *log.Logger) (func(), error) {
+func startProjectServices(parent context.Context, database *db.DB, project, configPath string, cfg config.Config, servers []*IPCServer, logger *log.Logger) (func(), error) {
 	ctx, cancel := context.WithCancel(parent)
 	if err := reconcileRequestState(ctx, database, project, servers); err != nil {
 		cancel()
 		return nil, fmt.Errorf("initial request snapshot: %w", err)
 	}
 	verifier := NewVerifier(database)
+	verifier.projectPath, verifier.configPath = project, configPath
 	for _, server := range servers {
 		server.SetVerifier(verifier)
+		server.hookPolicies.projectPath, server.hookPolicies.configPath = project, configPath
 	}
 
 	var watcher *Watcher
@@ -43,6 +45,10 @@ func startProjectServices(parent context.Context, database *db.DB, project strin
 	pendingConfig := TimeoutConfigFromConfig(cfg)
 	pendingConfig.Logger = logger
 	pendingConfig.ProjectPath = project
+	pendingConfig.ConfigPath = configPath
+	// Administrative handlers may force an action, but a running project
+	// daemon must re-read the selected policy at each writer reservation.
+	pendingConfig.Action = ""
 	pending := NewTimeoutHandler(database, pendingConfig)
 	if err := pending.Start(ctx); err != nil {
 		cancel()

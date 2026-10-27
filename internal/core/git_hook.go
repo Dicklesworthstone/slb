@@ -123,7 +123,7 @@ func (rc *RequestCreator) CreateGitHookRequest(ctx context.Context, intent GitHo
 	}
 	notifier := rc.notifier
 	if rc.config.AgentMailEnabled {
-		notifier = integrations.NewAgentMailClient(intent.ProjectPath, rc.config.AgentMailThread, rc.config.AgentMailSender)
+		notifier = integrations.NewAgentMailClient(intent.ProjectPath, rc.config.AgentMailThread, rc.config.AgentMailSender, rc.config.RequestJournalEnabled)
 	}
 	_ = notifier.NotifyNewRequest(request)
 	return request, nil

@@ -53,7 +53,7 @@ func TestProjectServicesWiresEveryListenerAndReconciles(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Daemon.UseFileWatcher = false
 	cfg.Notifications.DesktopEnabled = false
-	stop, err := startProjectServices(context.Background(), database, project, cfg, []*IPCServer{first, second}, log.Default())
+	stop, err := startProjectServices(context.Background(), database, project, "", cfg, []*IPCServer{first, second}, log.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +84,7 @@ func TestProjectServicesInitialReadFailureIsNotEmptySuccess(t *testing.T) {
 	}
 	_ = database.Close()
 	server, _ := deliveryServer(t)
-	stop, err := startProjectServices(context.Background(), database, project, config.DefaultConfig(), []*IPCServer{server}, log.Default())
+	stop, err := startProjectServices(context.Background(), database, project, "", config.DefaultConfig(), []*IPCServer{server}, log.Default())
 	if err == nil || stop != nil {
 		t.Fatal("unavailable DB started healthy project services")
 	}
@@ -273,7 +273,7 @@ agent_mail_enabled = false
 		t.Fatal(err)
 	}
 	server, _ := deliveryServer(t)
-	stop, err := startProjectServices(context.Background(), database, project, cfg, []*IPCServer{server}, log.Default())
+	stop, err := startProjectServices(context.Background(), database, project, "", cfg, []*IPCServer{server}, log.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestProjectServicesInvalidAlertConfigDoesNotDisableNotary(t *testing.T) {
 	cfg.Daemon.UseFileWatcher = false
 	cfg.Notifications.DesktopEnabled = false
 	cfg.Notifications.Blocked = blockedalerts.Config{Enabled: true, WindowSeconds: -1}
-	stop, err := startProjectServices(context.Background(), database, project, cfg, []*IPCServer{server}, log.Default())
+	stop, err := startProjectServices(context.Background(), database, project, "", cfg, []*IPCServer{server}, log.Default())
 	if err != nil {
 		t.Fatal(err)
 	}

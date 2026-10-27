@@ -417,6 +417,42 @@ func TestNormalizeServerOptions_EmptyPaths(t *testing.T) {
 	}
 }
 
+func TestResolveServerOptions_PinsExplicitConfigBeforeProjectDiscovery(t *testing.T) {
+	project, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(project, "src")
+	for _, path := range []string{filepath.Join(project, ".slb"), nested} {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(nested)
+	opts, err := resolveServerOptions(ServerOptions{ProjectDir: ".", ConfigPath: "review notifications.toml"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantConfig := filepath.Join(nested, "review notifications.toml")
+	if opts.ProjectDir != project || opts.ConfigPath != wantConfig {
+		t.Fatalf("selected config was rebased to discovered root: %+v", opts)
+	}
+	// The detached child changes cwd to the discovered project. Re-resolving
+	// its serialized options must still select the original config file.
+	t.Chdir(project)
+	child, err := resolveServerOptions(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.ConfigPath != wantConfig {
+		t.Fatalf("child config = %q, want %q", child.ConfigPath, wantConfig)
+	}
+	defaults, err := resolveServerOptions(ServerOptions{ProjectDir: project})
+	if err != nil || defaults.ConfigPath != "" {
+		t.Fatalf("default config selection changed: %+v, %v", defaults, err)
+	}
+}
+
 func TestNormalizeServerOptions_WhitespacePaths(t *testing.T) {
 	opts := normalizeServerOptions(ServerOptions{
 		SocketPath: "   ",

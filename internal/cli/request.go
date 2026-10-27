@@ -210,10 +210,16 @@ Use --execute with --wait to execute after approval.`,
 
 		// Execute if approved and --execute was specified
 		if flagRequestExecute && request.Status == db.StatusApproved {
+			// The wait may have outlived a switch to durable notification
+			// delivery. Keep execution and its notifier on the selected config.
+			cfg, err = config.Load(config.LoadOptions{ProjectDir: project, ConfigPath: flagConfig})
+			if err != nil {
+				return writeError(cmd, out, "config_failed", command, fmt.Errorf("loading execution config: %w", err))
+			}
 			if !executionOutputStructured() {
 				fmt.Printf("Approval policy: %s\n", request.ApprovalPolicy.Label())
 			}
-			executor := core.NewExecutor(dbConn, nil).WithNotifier(buildAgentMailNotifier(project))
+			executor := core.NewExecutor(dbConn, nil).WithNotifier(buildAgentMailNotifier(project, cfg))
 			execResult, execErr := executor.ExecuteApprovedRequest(cmd.Context(), core.ExecuteOptions{
 				RequestID:         request.ID,
 				SessionID:         flagSessionID,

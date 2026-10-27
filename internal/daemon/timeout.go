@@ -33,6 +33,8 @@ type TimeoutHandlerConfig struct {
 	// ProjectPath limits a project daemon to its own pending requests. Empty
 	// preserves the explicitly global helper behavior for administrative callers.
 	ProjectPath string
+	// ConfigPath pins an explicit policy override for every timer decision.
+	ConfigPath string
 }
 
 func DefaultTimeoutConfig() TimeoutHandlerConfig {
@@ -182,7 +184,7 @@ func (h *TimeoutHandler) handleAutoApproveWarn(request *db.Request) error {
 
 func (h *TimeoutHandler) advance(ctx context.Context, id string, action TimeoutAction, expiredOnly bool) error {
 	result, err := core.AdvancePendingRequest(ctx, h.db, id, core.PendingOptions{
-		TimeoutAction: string(action), ExpiredOnly: expiredOnly,
+		ConfigPath: h.config.ConfigPath, TimeoutAction: string(action), ExpiredOnly: expiredOnly,
 	})
 	if err != nil {
 		return err

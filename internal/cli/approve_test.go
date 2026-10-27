@@ -3,11 +3,14 @@ package cli
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/integrations"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
@@ -363,7 +366,11 @@ func TestBuildAgentMailNotifier_AgentMailDisabled(t *testing.T) {
 	defer os.Setenv("SLB_AGENT_MAIL_ENABLED", origEnv)
 
 	// By default, agent mail is disabled in config
-	notifier := buildAgentMailNotifier(h.ProjectDir)
+	cfg, err := config.Load(config.LoadOptions{ProjectDir: h.ProjectDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifier := buildAgentMailNotifier(h.ProjectDir, cfg)
 
 	// Verify we can call the notifier without panic
 	// Type check: if it's a NoopNotifier, it handles nil safely
@@ -390,7 +397,11 @@ func TestBuildAgentMailNotifier_WithConfigPath(t *testing.T) {
 	flagConfig = ""
 	flagProject = h.ProjectDir
 
-	notifier := buildAgentMailNotifier(h.ProjectDir)
+	cfg, err := config.Load(config.LoadOptions{ProjectDir: h.ProjectDir, ConfigPath: flagConfig})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifier := buildAgentMailNotifier(h.ProjectDir, cfg)
 
 	// Should return a notifier - verify it exists
 	if notifier == nil {
@@ -416,7 +427,11 @@ agent_mail_thread = "test-thread-123"
 
 	flagConfig = configPath
 
-	notifier := buildAgentMailNotifier(h.ProjectDir)
+	cfg, err := config.Load(config.LoadOptions{ProjectDir: h.ProjectDir, ConfigPath: flagConfig})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifier := buildAgentMailNotifier(h.ProjectDir, cfg)
 
 	// Should return a notifier (either AgentMailClient or fallback)
 	if notifier == nil {
@@ -435,7 +450,11 @@ func TestBuildAgentMailNotifier_DefaultsToNoopWithNoConfig(t *testing.T) {
 	// No config file in project dir, should use defaults (agent mail disabled)
 	flagConfig = ""
 
-	notifier := buildAgentMailNotifier(h.ProjectDir)
+	cfg, err := config.Load(config.LoadOptions{ProjectDir: h.ProjectDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifier := buildAgentMailNotifier(h.ProjectDir, cfg)
 
 	// Should return a notifier - with defaults, agent mail is disabled
 	if notifier == nil {
@@ -447,6 +466,192 @@ func TestBuildAgentMailNotifier_DefaultsToNoopWithNoConfig(t *testing.T) {
 	if !isNoop {
 		// This is acceptable - config might come from environment or defaults
 		// Just verify we got a valid notifier
+	}
+}
+
+// installAgentMailCapture keeps every notification regression local: a shell
+// fixture records arguments without contacting an Agent Mail service.
+func installAgentMailCapture(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX notification transport fixture")
+	}
+	bin := t.TempDir()
+	path := filepath.Join(t.TempDir(), "notifications")
+	t.Setenv("SLB_TEST_NOTIFICATION_ARGS", path)
+	script := "#!/bin/sh\nprintf '%s\\n' CALL \"$@\" >> \"$SLB_TEST_NOTIFICATION_ARGS\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "mcp-agent-mail"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return path
+}
+
+func TestAgentMailNotifierUsesEffectiveDeliveryPolicy(t *testing.T) {
+	for _, journal := range []bool{true, false} {
+		t.Run(fmt.Sprintf("journal=%t", journal), func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("USERPROFILE", t.TempDir())
+			t.Setenv("SLB_AGENT_MAIL_ENABLED", "true")
+			t.Setenv("SLB_AGENT_MAIL_THREAD", "")
+			marker := installAgentMailCapture(t)
+			project := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(project, ".slb"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			projectConfig := fmt.Sprintf("[notifications.requests]\nenabled = %t\n[integrations]\nagent_mail_thread = 'project-thread'\n", !journal)
+			if err := os.WriteFile(filepath.Join(project, ".slb", "config.toml"), []byte(projectConfig), 0600); err != nil {
+				t.Fatal(err)
+			}
+			explicitPath := filepath.Join(t.TempDir(), "selected.toml")
+			explicitConfig := fmt.Sprintf("[notifications.requests]\nenabled = %t\n[integrations]\nagent_mail_thread = 'explicit-thread'\n", journal)
+			if err := os.WriteFile(explicitPath, []byte(explicitConfig), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(config.LoadOptions{ProjectDir: project, ConfigPath: explicitPath})
+			if err != nil {
+				t.Fatal(err)
+			}
+			notifier := buildAgentMailNotifier(project, cfg)
+			request := &db.Request{ID: "request-notification", ApprovalPolicy: db.ApprovalPolicySameHost,
+				Status: db.StatusApproved, RiskTier: db.RiskTierDangerous, Command: db.CommandSpec{Raw: "echo notification"}}
+			review := &db.Review{ReviewerAgent: "Reviewer", ReviewerModel: "reviewer-model", Assurance: db.AssuranceSameHost}
+			for _, notify := range []func() error{
+				func() error { return notifier.NotifyNewRequest(request) },
+				func() error { return notifier.NotifyRequestApproved(request, review) },
+				func() error { return notifier.NotifyRequestRejected(request, review) },
+				func() error {
+					return notifier.NotifyRequestExecuted(request, &db.Execution{ApprovalPolicy: db.ApprovalPolicySameHost, Assurance: db.AssuranceSameHost}, 0)
+				},
+			} {
+				if err := notify(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			data, err := os.ReadFile(marker)
+			if journal {
+				if !os.IsNotExist(err) {
+					t.Fatalf("durable policy invoked legacy transport: %s (%v)", data, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Count(string(data), "CALL\n") != 4 || strings.Count(string(data), "--thread\nexplicit-thread\n") != 4 ||
+				strings.Contains(string(data), "project-thread") || !strings.Contains(string(data), "not independently authenticated") {
+				t.Fatalf("explicit legacy route or review assurance was lost: %s", data)
+			}
+		})
+	}
+}
+
+func TestReviewNotificationsUseRequestProjectAndExplicitPolicy(t *testing.T) {
+	for _, decision := range []string{"approve", "reject"} {
+		for _, journal := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/journal=%t", decision, journal), func(t *testing.T) {
+				resetApproveFlags()
+				resetRejectFlags()
+				t.Cleanup(resetApproveFlags)
+				t.Cleanup(resetRejectFlags)
+				t.Setenv("HOME", t.TempDir())
+				t.Setenv("USERPROFILE", t.TempDir())
+				t.Setenv("SLB_AGENT_MAIL_ENABLED", "true")
+				t.Setenv("SLB_AGENT_MAIL_THREAD", "")
+				marker := installAgentMailCapture(t)
+				h := testutil.NewHarness(t)
+				caller := testutil.NewHarness(t)
+				caller.WriteFile(".slb/config.toml", []byte("[notifications.requests]\nenabled = true\n[integrations]\nagent_mail_thread = 'wrong-project'\n"), 0600)
+				h.WriteFile(".slb/config.toml", []byte("[general]\napproval_policy = 'same_host'\n[notifications.requests]\nenabled = false\n[integrations]\nagent_mail_thread = 'request-project'\n"), 0600)
+				author := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("Author"))
+				reviewer := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("Reviewer"))
+				request := testutil.MakeRequest(t, h.DB, author, func(r *db.Request) { r.ApprovalPolicy = db.ApprovalPolicySameHost })
+				root := newTestApproveCmd(h.DBPath)
+				args := []string{decision, request.ID, "--session-id", reviewer.ID, "--session-key", reviewer.SessionKey, "-C", caller.ProjectDir, "--json"}
+				if decision == "reject" {
+					root = newTestRejectCmd(h.DBPath)
+					args = append(args, "--reason", "review notification regression")
+				}
+				if journal {
+					selected := filepath.Join(t.TempDir(), "selected.toml")
+					if err := os.WriteFile(selected, []byte("[general]\napproval_policy = 'same_host'\n[notifications.requests]\nenabled = true\n"), 0600); err != nil {
+						t.Fatal(err)
+					}
+					args = append(args, "--config", selected)
+				}
+				stdout, err := executeCommandCapture(t, root, args...)
+				if err != nil {
+					t.Fatalf("review failed: %v (%s)", err, stdout)
+				}
+				stored, err := h.DB.GetRequest(request.ID)
+				want := db.StatusApproved
+				if decision == "reject" {
+					want = db.StatusRejected
+				}
+				if err != nil || stored.Status != want || !strings.Contains(stdout, `"assurance": "same_host"`) {
+					t.Fatalf("review was not persisted with low assurance: %+v (%v), %s", stored, err, stdout)
+				}
+				data, err := os.ReadFile(marker)
+				if journal {
+					if !os.IsNotExist(err) {
+						t.Fatalf("explicit journal review invoked legacy transport: %s (%v)", data, err)
+					}
+				} else if err != nil || strings.Count(string(data), "CALL\n") != 1 ||
+					!strings.Contains(string(data), "--project\n"+h.ProjectDir+"\n") || !strings.Contains(string(data), "--thread\nrequest-project\n") ||
+					strings.Contains(string(data), "wrong-project") {
+					t.Fatalf("review notification was routed using the caller's project: %s (%v)", data, err)
+				}
+			})
+		}
+	}
+}
+
+func TestReviewCommandsRefuseUnavailableExplicitConfig(t *testing.T) {
+	for _, decision := range []string{"approve", "reject"} {
+		for _, fault := range []string{"missing", "directory"} {
+			t.Run(decision+"/"+fault, func(t *testing.T) {
+				resetApproveFlags()
+				resetRejectFlags()
+				t.Cleanup(resetApproveFlags)
+				t.Cleanup(resetRejectFlags)
+				t.Setenv("HOME", t.TempDir())
+				t.Setenv("USERPROFILE", t.TempDir())
+				t.Setenv("SLB_AGENT_MAIL_ENABLED", "true")
+				marker := installAgentMailCapture(t)
+				h := testutil.NewHarness(t)
+				author := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("Author"))
+				reviewer := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("Reviewer"))
+				request := testutil.MakeRequest(t, h.DB, author, func(r *db.Request) { r.ApprovalPolicy = db.ApprovalPolicySameHost })
+				selected := filepath.Join(t.TempDir(), "selected.toml")
+				if fault == "directory" {
+					if err := os.Mkdir(selected, 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				root := newTestApproveCmd(h.DBPath)
+				args := []string{decision, request.ID, "--session-id", reviewer.ID, "--session-key", reviewer.SessionKey,
+					"-C", h.ProjectDir, "--config", selected, "--json"}
+				if decision == "reject" {
+					root = newTestRejectCmd(h.DBPath)
+					args = append(args, "--reason", "selected configuration must be available")
+				}
+				stdout, err := executeCommandCapture(t, root, args...)
+				if err == nil || !strings.Contains(err.Error(), "explicit review config") {
+					t.Fatalf("unavailable selected config was accepted: %v (%s)", err, stdout)
+				}
+				stored, err := h.DB.GetRequest(request.ID)
+				if err != nil || stored.Status != db.StatusPending || stored.ResolvedAt != nil || stored.ApprovalExpiresAt != nil {
+					t.Fatalf("unavailable selected config mutated request: %+v (%v)", stored, err)
+				}
+				reviews, err := h.DB.ListReviewsForRequest(request.ID)
+				if err != nil || len(reviews) != 0 {
+					t.Fatalf("unavailable selected config recorded a review: %+v (%v)", reviews, err)
+				}
+				if data, err := os.ReadFile(marker); !os.IsNotExist(err) {
+					t.Fatalf("unavailable selected config invoked a fallback transport: %s (%v)", data, err)
+				}
+			})
+		}
 	}
 }
 

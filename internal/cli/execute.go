@@ -112,7 +112,7 @@ Examples:
 			return fmt.Errorf("loading custom patterns: %w", err)
 		}
 
-		executor := core.NewExecutor(dbConn, engine).WithNotifier(buildAgentMailNotifier(req.ProjectPath))
+		executor := core.NewExecutor(dbConn, engine).WithNotifier(buildAgentMailNotifier(req.ProjectPath, cfg))
 		format := GetOutput()
 		structured := format == "json" || format == "yaml" || format == "toon"
 		if flagExecuteBackground {

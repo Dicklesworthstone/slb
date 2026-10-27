@@ -19,7 +19,9 @@ func TestJournalNotificationsSuppressLegacyCLI(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(project, ".slb"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(project, ".slb", "config.toml"), []byte("[notifications.requests]\nenabled = true\n"), 0600); err != nil {
+	// An explicit configuration has selected journal mode, overriding this
+	// project file. The transport must not independently reload a different policy.
+	if err := os.WriteFile(filepath.Join(project, ".slb", "config.toml"), []byte("[notifications.requests]\nenabled = false\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	bin := t.TempDir()
@@ -29,7 +31,7 @@ func TestJournalNotificationsSuppressLegacyCLI(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin)
-	client := NewAgentMailClient(project, "", "")
+	client := NewAgentMailClient(project, "", "", true)
 	request := &db.Request{ID: "req-test", RiskTier: db.RiskTierDangerous, Command: db.CommandSpec{Raw: "API_KEY=secret", ContainsSensitive: true}}
 	review := &db.Review{}
 	for _, notify := range []func() error{
@@ -45,12 +47,16 @@ func TestJournalNotificationsSuppressLegacyCLI(t *testing.T) {
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatal("journal mode called legacy transport")
 	}
-	// Invalid notification configuration must not silently choose legacy send.
+	// Once the caller has loaded the policy, a malformed unrelated project file
+	// must not replace that decision or make journal mode fall back to a send.
 	if err := os.WriteFile(filepath.Join(project, ".slb", "config.toml"), []byte("invalid TOML ["), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := NewAgentMailClient(project, "", "").send("subject", "body", ImportanceNormal); err == nil {
-		t.Fatal("invalid policy fell back to CLI")
+	if err := NewAgentMailClient(project, "", "", true).send("subject", "body", ImportanceNormal); err != nil {
+		t.Fatalf("transport reloaded unrelated project configuration: %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("journal mode fell back to legacy transport")
 	}
 }
 
@@ -81,7 +87,7 @@ func TestExecutionNotificationPreservesReceiptProvenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin)
-	client := NewAgentMailClient(t.TempDir(), "fixture", "fixture")
+	client := NewAgentMailClient(t.TempDir(), "fixture", "fixture", false)
 	for _, tc := range []struct {
 		name          string
 		requestPolicy db.ApprovalPolicy

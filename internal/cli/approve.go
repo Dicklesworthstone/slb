@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -130,7 +131,6 @@ database contains the request you want to approve.
 		if err != nil {
 			return err
 		}
-		reviewSvc.SetNotifier(buildAgentMailNotifier(project))
 		var result *core.ReviewResult
 		if crossProject {
 			sourceDB, openErr := db.OpenWithOptions(sourceDBPath, db.OpenOptions{
@@ -213,6 +213,18 @@ func buildConfiguredReviewService(database *db.DB, requestID string) (*core.Revi
 	if err != nil {
 		return nil, fmt.Errorf("loading request policy: %w", err)
 	}
+	// A selected file is required even for rejection, which intentionally
+	// does not run the approval guard. Missing it must not select default
+	// notification destinations or silently change the review configuration.
+	if flagConfig != "" {
+		info, err := os.Stat(flagConfig)
+		if err != nil {
+			return nil, fmt.Errorf("reading explicit review config: %w", err)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("explicit review config is not a regular file")
+		}
+	}
 	cfg, err := config.Load(config.LoadOptions{ProjectDir: request.ProjectPath, ConfigPath: flagConfig})
 	if err != nil {
 		return nil, fmt.Errorf("loading review policy: %w", err)
@@ -228,20 +240,16 @@ func buildConfiguredReviewService(database *db.DB, requestID string) (*core.Revi
 	review.CriticalApprovalTTL = time.Duration(cfg.General.ApprovalTTLCriticalMins) * time.Minute
 	review.CrossProjectReviews = cfg.General.CrossProjectReviews
 	review.ReviewPool = append([]string(nil), cfg.General.ReviewPool...)
-	return core.NewReviewService(database, review), nil
+	service := core.NewReviewService(database, review)
+	service.SetNotifier(buildAgentMailNotifier(request.ProjectPath, cfg))
+	return service, nil
 }
 
-// buildAgentMailNotifier constructs a notifier from config; falls back to no-op on errors/disabled.
-func buildAgentMailNotifier(project string) integrations.RequestNotifier {
-	cfg, err := config.Load(config.LoadOptions{
-		ProjectDir: project,
-		ConfigPath: flagConfig,
-	})
-	if err != nil {
-		return integrations.NoopNotifier{}
-	}
+// buildAgentMailNotifier uses the same effective configuration as the caller's
+// request operation. It must not reread project defaults and lose --config.
+func buildAgentMailNotifier(project string, cfg config.Config) integrations.RequestNotifier {
 	if !cfg.Integrations.AgentMailEnabled {
 		return integrations.NoopNotifier{}
 	}
-	return integrations.NewAgentMailClient(project, cfg.Integrations.AgentMailThread, "")
+	return integrations.NewAgentMailClient(project, cfg.Integrations.AgentMailThread, "", cfg.Notifications.Requests.Enabled)
 }

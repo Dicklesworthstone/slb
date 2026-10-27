@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -25,7 +26,9 @@ type VerificationResult struct {
 
 // Verifier validates execution gates. It never starts a command on the daemon.
 type Verifier struct {
-	db *db.DB
+	db          *db.DB
+	projectPath string
+	configPath  string
 }
 
 func NewVerifier(database *db.DB) *Verifier { return &Verifier{db: database} }
@@ -98,7 +101,21 @@ func (v *Verifier) VerifyExecutionAllowed(p VerifyExecuteParams) (*VerificationR
 // project-local quorum and model requirement as the local executor. The final
 // claim repeats the check under its writer reservation after advisory preflight.
 func (v *Verifier) checkExecutionPolicy(request *db.Request) error {
-	return core.CheckExecutionPolicy(v.db, request, "")
+	return core.CheckExecutionPolicy(v.db, request, v.policyConfigPath(request))
+}
+
+func (v *Verifier) policyConfigPath(request *db.Request) string {
+	if v.configPath == "" || v.projectPath == "" {
+		return ""
+	}
+	if request.ProjectPath == v.projectPath {
+		return v.configPath
+	}
+	project, err := filepath.EvalSymlinks(request.ProjectPath)
+	if err != nil || project != v.projectPath {
+		return ""
+	}
+	return v.configPath
 }
 
 // VerifyAndMarkExecuting commits an authenticated, single-use execution claim.
@@ -129,7 +146,7 @@ func (v *Verifier) VerifyAndMarkExecuting(p VerifyExecuteParams) (*VerificationR
 	// This notary claim performs no rollback capture. Do not reuse metadata
 	// left by an earlier local preflight for the remote execution attempt.
 	result.Request.Rollback = nil
-	if err := v.db.ClaimRequestExecutionAuthenticated(result.Request, execution, p.SessionKey, core.ExecutionPolicyGuard("")); err != nil {
+	if err := v.db.ClaimRequestExecutionAuthenticated(result.Request, execution, p.SessionKey, core.ExecutionPolicyGuard(v.policyConfigPath(result.Request))); err != nil {
 		if errors.Is(err, db.ErrExecutionAuthentication) || errors.Is(err, db.ErrInvalidTransition) ||
 			errors.Is(err, core.ErrApprovalPolicyChanged) || errors.Is(err, core.ErrTierEscalated) {
 			return &VerificationResult{Reason: err.Error()}, nil

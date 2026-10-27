@@ -124,6 +124,68 @@ func TestExecuteBackgroundSameHostCarriesAssurance(t *testing.T) {
 	}
 }
 
+func TestExecuteBackgroundUsesJobNotificationConfig(t *testing.T) {
+	for _, journal := range []bool{true, false} {
+		t.Run(fmt.Sprintf("journal=%t", journal), func(t *testing.T) {
+			conn, job := backgroundExecutionFixture(t, "printf 'selected background config\\n'", db.ApprovalPolicySameHost)
+			marker := installAgentMailCapture(t)
+			t.Setenv("SLB_AGENT_MAIL_ENABLED", "true")
+			t.Setenv("SLB_AGENT_MAIL_THREAD", "")
+			projectConfig := fmt.Sprintf("[general]\napproval_policy = 'same_host'\n[notifications.requests]\nenabled = %t\n", !journal)
+			if err := os.WriteFile(filepath.Join(job.Project, ".slb", "config.toml"), []byte(projectConfig), 0600); err != nil {
+				t.Fatal(err)
+			}
+			job.Config = filepath.Join(t.TempDir(), "selected.toml")
+			selectedConfig := fmt.Sprintf("[general]\napproval_policy = 'same_host'\n[notifications.requests]\nenabled = %t\n[integrations]\nagent_mail_thread = 'background-selected'\n", journal)
+			if err := os.WriteFile(job.Config, []byte(selectedConfig), 0600); err != nil {
+				t.Fatal(err)
+			}
+			oldConfig := flagConfig
+			flagConfig = ""
+			t.Cleanup(func() { flagConfig = oldConfig })
+			result, err := executeBackgroundJob(context.Background(), job, func(core.ExecutionStart) error { return nil })
+			if err != nil || result == nil || result.ExitCode != 0 {
+				t.Fatalf("background execution failed: %+v (%v)", result, err)
+			}
+			request, err := conn.GetRequest(job.RequestID)
+			if err != nil || request.Status != db.StatusExecuted || request.Execution == nil || request.Execution.Assurance != db.AssuranceSameHost {
+				t.Fatalf("background evidence missing: %+v (%v)", request, err)
+			}
+			data, err := os.ReadFile(marker)
+			if journal {
+				if !os.IsNotExist(err) {
+					t.Fatalf("background job used legacy transport: %s (%v)", data, err)
+				}
+			} else if err != nil || strings.Count(string(data), "CALL\n") != 1 || !strings.Contains(string(data), "--thread\nbackground-selected\n") {
+				t.Fatalf("background job lost selected legacy route: %s (%v)", data, err)
+			}
+		})
+	}
+}
+
+func TestExecuteBackgroundInvalidSelectedConfigDoesNotClaim(t *testing.T) {
+	conn, job := backgroundExecutionFixture(t, "printf 'must not execute\\n'", db.ApprovalPolicySameHost)
+	marker := installAgentMailCapture(t)
+	job.Config = filepath.Join(t.TempDir(), "invalid.toml")
+	if err := os.WriteFile(job.Config, []byte("[notifications.requests\ninvalid"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := executeBackgroundJob(context.Background(), job, func(core.ExecutionStart) error {
+		t.Fatal("invalid selected configuration launched execution")
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "loading background config") || result == nil || result.LogPath != "" {
+		t.Fatalf("invalid selected configuration was accepted: %+v (%v)", result, err)
+	}
+	request, err := conn.GetRequest(job.RequestID)
+	if err != nil || request.Status != db.StatusApproved || request.Execution != nil {
+		t.Fatalf("invalid selected config consumed approval: %+v (%v)", request, err)
+	}
+	if data, err := os.ReadFile(marker); !os.IsNotExist(err) {
+		t.Fatalf("invalid selected config sent a notification: %s (%v)", data, err)
+	}
+}
+
 func TestExecuteBackgroundSameHostRefusalRetainsStoredPolicy(t *testing.T) {
 	conn, job := backgroundExecutionFixture(t, "echo background-should-not-run", db.ApprovalPolicySameHost)
 	configuration := "[general]\napproval_policy = 'independent'\n[integrations]\nagent_mail_enabled = false\n"

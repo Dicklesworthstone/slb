@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -85,6 +86,83 @@ func TestInteractiveSameHostReviewPolicyAndEvidence(t *testing.T) {
 			_, _ = model.Update(tea.WindowSizeMsg{Width: 120, Height: 50})
 			if view := model.View(); !strings.Contains(view, "not independently authenticated authorization") || !strings.Contains(view, "same_host") {
 				t.Fatalf("UI concealed the low-assurance category: %s", view)
+			}
+		})
+	}
+}
+
+func TestInteractiveReviewUsesExplicitJournalPolicy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell transport fixture")
+	}
+	for _, decision := range []db.Decision{db.DecisionApprove, db.DecisionReject} {
+		t.Run(string(decision), func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			database, target, _, opts := interactiveReviewFixture(t, 1, db.ApprovalPolicySameHost)
+			opts.ConfigPath = filepath.Join(t.TempDir(), "explicit.toml")
+			if err := os.WriteFile(opts.ConfigPath, []byte("[general]\napproval_policy = 'same_host'\n[integrations]\nagent_mail_enabled = true\n[notifications.requests]\nenabled = true\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			bin := t.TempDir()
+			marker := filepath.Join(t.TempDir(), "legacy-called")
+			t.Setenv("SLB_TEST_MAIL_MARKER", marker)
+			if err := os.WriteFile(filepath.Join(bin, "mcp-agent-mail"), []byte("#!/bin/sh\nprintf called > \"$SLB_TEST_MAIL_MARKER\"\n"), 0755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin)
+			result := submitInteractiveReview(opts, target.ID, target.Command.Hash, target.ApprovalPolicy, decision, "reviewed the exact pending command")
+			if result.Err != nil || !result.Recorded || result.Review == nil || result.Review.Assurance != db.AssuranceSameHost {
+				t.Fatalf("review did not commit under its original policy: %+v", result)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatal("interactive review discarded explicit journal delivery policy")
+			}
+			page, err := database.ReadRequestEvents(context.Background(), opts.ProjectPath, "", 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, event := range page.Events {
+				if event.Review != nil && event.Review.ID == result.Review.ID && event.Review.Assurance == db.AssuranceSameHost && event.Review.Decision == string(decision) {
+					return
+				}
+			}
+			t.Fatalf("committed review has no durable notification evidence: %+v", page.Events)
+		})
+	}
+}
+
+func TestInteractiveReviewInvalidExplicitPolicyCannotReject(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell transport fixture")
+	}
+	for _, source := range []string{"missing", "directory"} {
+		t.Run(source, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			database, target, _, opts := interactiveReviewFixture(t, 1, db.ApprovalPolicySameHost)
+			opts.ConfigPath = t.TempDir()
+			if source == "missing" {
+				opts.ConfigPath = filepath.Join(opts.ConfigPath, "missing.toml")
+			}
+			bin := t.TempDir()
+			marker := filepath.Join(t.TempDir(), "legacy-called")
+			t.Setenv("SLB_TEST_MAIL_MARKER", marker)
+			if err := os.WriteFile(filepath.Join(bin, "mcp-agent-mail"), []byte("#!/bin/sh\nprintf called > \"$SLB_TEST_MAIL_MARKER\"\n"), 0755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin)
+			result := submitInteractiveReview(opts, target.ID, target.Command.Hash, target.ApprovalPolicy, db.DecisionReject, "must use the explicitly selected policy")
+			if result.Err == nil || result.Recorded || result.Review != nil {
+				t.Fatalf("invalid explicit policy allowed rejection: %+v", result)
+			}
+			stored, err := database.GetRequest(target.ID)
+			if err != nil || stored.Status != db.StatusPending {
+				t.Fatalf("failed review changed request state: %+v %v", stored, err)
+			}
+			if reviews, err := database.ListReviewsForRequest(target.ID); err != nil || len(reviews) != 0 {
+				t.Fatalf("failed review left evidence: %+v %v", reviews, err)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatal("invalid explicit policy triggered legacy notification")
 			}
 		})
 	}

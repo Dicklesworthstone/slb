@@ -230,11 +230,15 @@ func executeBackgroundJob(ctx context.Context, job background.Job, onStarted fun
 	if request.ProjectPath != job.Project || request.Command.Hash != job.CommandHash {
 		return nil, core.ErrCommandHashMismatch
 	}
+	cfg, err := config.Load(config.LoadOptions{ProjectDir: job.Project, ConfigPath: job.Config})
+	if err != nil {
+		return nil, fmt.Errorf("loading background config: %w", err)
+	}
 	engine, err := core.LoadCommandPolicy(conn, config.LoadOptions{ProjectDir: job.Project, ConfigPath: job.Config})
 	if err != nil {
 		return nil, err
 	}
-	executor := core.NewExecutor(conn, engine).WithNotifier(buildAgentMailNotifier(job.Project))
+	executor := core.NewExecutor(conn, engine).WithNotifier(buildAgentMailNotifier(job.Project, cfg))
 	return executor.ExecuteApprovedRequest(ctx, core.ExecuteOptions{
 		RequestID: job.RequestID, SessionID: job.SessionID, ExpectedCommandHash: job.CommandHash,
 		ExpectedApprovalPolicy: job.ApprovalPolicy.Normalized(),

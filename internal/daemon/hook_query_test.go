@@ -450,6 +450,65 @@ func TestHookHealthRefreshesApprovalPolicyWithoutPatternChanges(t *testing.T) {
 	}
 }
 
+func TestHookQueryExplicitConfigIsFreshAndProjectScoped(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	project, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nestedProject := filepath.Join(project, "separate-project")
+	for _, root := range []string{project, nestedProject} {
+		database, err := db.OpenAndMigrate(filepath.Join(root, ".slb", "state.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = database.Close() })
+		if err := os.WriteFile(filepath.Join(root, ".slb", "config.toml"),
+			[]byte("[integrations]\nhook_caution_action = 'ask'\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	configPath := filepath.Join(t.TempDir(), "selected hook policy.toml")
+	server := &IPCServer{hookPolicies: hookPolicyCache{projectPath: project, configPath: configPath}}
+	query := HookQueryParams{Command: "git branch -d obsolete", CWD: project}
+	if result := server.classifyCommand(query); result.Action != "block" || result.MatchedPattern != "policy_load_error" {
+		t.Fatalf("missing selected config used project fallback: %+v", result)
+	}
+	selected := "[general]\napproval_policy = 'same_host'\n[patterns.caution]\nmin_approvals = 2\n[integrations]\nhook_caution_action = 'block'\n"
+	if err := os.WriteFile(configPath, []byte(selected), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if result := server.classifyCommand(query); result.Action != "block" || result.Tier != "caution" ||
+		result.MinApprovals != 2 || result.ApprovalPolicy != db.ApprovalPolicySameHost {
+		t.Fatalf("selected project policy ignored: %+v", result)
+	}
+	policy, err := server.hookPolicies.policyFor(project)
+	if err != nil || policy.engine.PolicyConfigPath() != configPath {
+		t.Fatalf("execution handoff lost selected policy: %+v %v", policy, err)
+	}
+	foreign := query
+	foreign.CWD = nestedProject
+	if result := server.classifyCommand(foreign); result.Action != "ask" || result.MinApprovals != 0 ||
+		result.ApprovalPolicy != db.ApprovalPolicyIndependent {
+		t.Fatalf("override leaked into nested independent project: %+v", result)
+	}
+	// A change to the selected file must invalidate cached classification,
+	// including an invalid edit that must never revive the project fallback.
+	if err := os.WriteFile(configPath, []byte("[integrations]\nhook_caution_action = 'ask'\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if result := server.classifyCommand(query); result.Action != "ask" || result.MinApprovals != 0 ||
+		result.ApprovalPolicy != db.ApprovalPolicyIndependent {
+		t.Fatalf("cached selected config did not refresh: %+v", result)
+	}
+	if err := os.WriteFile(configPath, []byte("[invalid TOML"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if result := server.classifyCommand(query); result.Action != "block" || result.MatchedPattern != "policy_load_error" {
+		t.Fatalf("malformed selected config revived weaker cached policy: %+v", result)
+	}
+}
+
 func TestIPCClientHookQueryRoundTrip(t *testing.T) {
 	socketPath := filepath.Join(shortSocketDir(t), "hook-client.sock")
 	srv, err := NewIPCServer(socketPath, newTestLogger())

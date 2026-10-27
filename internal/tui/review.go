@@ -3,6 +3,7 @@ package tui
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -62,6 +63,13 @@ func submitInteractiveReview(opts Options, id, commandHash string, approvalPolic
 	if target.ProjectPath != opts.ProjectPath {
 		return fail(errors.New("request belongs to another project"))
 	}
+	if opts.ConfigPath != "" {
+		if info, err := os.Stat(opts.ConfigPath); err != nil {
+			return fail(fmt.Errorf("reading explicit review policy: %w", err))
+		} else if !info.Mode().IsRegular() {
+			return fail(errors.New("explicit review policy is not a regular file"))
+		}
+	}
 	cfg, err := config.Load(config.LoadOptions{ProjectDir: target.ProjectPath, ConfigPath: opts.ConfigPath})
 	if err != nil {
 		return fail(fmt.Errorf("loading review policy: %w", err))
@@ -86,7 +94,7 @@ func submitInteractiveReview(opts Options, id, commandHash string, approvalPolic
 	result.Review = outcome.Review
 	result.Approvals, result.Rejections = outcome.Approvals, outcome.Rejections
 	if cfg.Integrations.AgentMailEnabled {
-		notifier := integrations.NewAgentMailClient(target.ProjectPath, cfg.Integrations.AgentMailThread, "")
+		notifier := integrations.NewAgentMailClient(target.ProjectPath, cfg.Integrations.AgentMailThread, "", cfg.Notifications.Requests.Enabled)
 		if decision == db.DecisionApprove {
 			_ = notifier.NotifyRequestApproved(outcome.Request, outcome.Review)
 		} else {

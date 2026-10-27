@@ -37,12 +37,39 @@ are rejected. Webhooks receive the notice directly as JSON and a stable
 
 Request-journal delivery has its own explicit enable/destination settings.
 `integrations.agent_mail_enabled` still controls legacy callback construction
-and the blocked-alert mail route, not this worker. When the normal project/user
-configuration enables request-journal delivery, newly constructed legacy request
-clients suppress synchronous CLI sends: the journal worker handles the committed
-mutation instead. Existing clients hold their configuration until recreated.
-An explicit CLI `--config` file does not replace the normal daemon configuration;
-configure this feature in the shared project/user TOML, then restart the daemon.
+and the blocked-alert mail route, not this worker. When the effective configuration
+enables request-journal delivery, request, review and execution callbacks suppress
+synchronous CLI sends: the journal worker handles the committed mutation instead.
+This also applies to interactive reviews, native Git requests and detached
+execution workers.
+
+An explicit `--config` file is supported throughout the workflow. Pass the same
+file to the requester, reviewers and project daemon so they select the same
+notification route and approval policy:
+
+```bash
+slb -C /path/to/project --config /path/to/review-policy.toml daemon start
+slb -C /path/to/project --config /path/to/review-policy.toml request "<command>" \
+  --session-id "$REQUESTER_SESSION" --reason "<purpose>" --expected-effect "<effects>"
+slb -C /path/to/project --config /path/to/review-policy.toml approve <request-id> \
+  --session-id "$REVIEWER_SESSION" --session-key "$REVIEWER_KEY"
+slb -C /path/to/project --config /path/to/review-policy.toml execute <request-id> \
+  --session-id "$REQUESTER_SESSION"
+```
+
+The explicit file replaces the project configuration source; user configuration,
+environment overrides and normal validation still apply. As with other commands,
+`-C` selects the directory used to resolve a relative config path. The daemon
+retains the absolute path when starting its background process. Its execution and pending
+request checks reread that selected policy; a missing or invalid explicit file
+cannot silently restore weaker defaults. The selected policy is scoped to the
+daemon's project and does not replace another project's hook policy.
+
+Starting the daemon without `--config` continues to use the normal project/user
+configuration. Enabling journal mode on a request does not start a daemon or
+reconfigure an already running daemon. Restart the daemon with the selected file
+after changing notification settings or templates. Committed events remain in
+the journal while delivery is unavailable, subject to the initial lookback below.
 
 The previous pending desktop/webhook notifier and the blocked-alert worker remain
 separate. Their destinations can overlap, producing intentionally different
@@ -132,5 +159,6 @@ so it cannot reset the rate budget.
 These nested settings are read through TOML and do not yet have individual
 `slb config get/set` key bindings or dedicated `SLB_*` environment overrides.
 No new notify CLI commands are introduced here. The Go integration tests cover
-the actual journal/daemon/TOML paths; run the full repository tests with its
-required toolchain before deployment.
+the actual journal/daemon/TOML paths, explicit configuration overrides, detached
+CLI execution and daemon restart recovery; run the full repository tests with
+its required toolchain before deployment.

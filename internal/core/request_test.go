@@ -3,12 +3,99 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
+	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 )
+
+func TestRequestNotificationUsesEffectiveDeliveryPolicy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell transport fixture")
+	}
+	for _, kind := range []string{"command", "git-hook"} {
+		for _, tc := range []struct {
+			name           string
+			journal        bool
+			projectJournal bool
+			legacyEnabled  bool
+			wantLegacy     bool
+		}{
+			{"journal overrides project legacy", true, false, true, false},
+			{"legacy overrides project journal", false, true, true, true},
+			{"legacy disabled", false, false, false, false},
+			{"journal without legacy integration", true, false, false, false},
+		} {
+			t.Run(kind+"/"+tc.name, func(t *testing.T) {
+				t.Setenv("HOME", t.TempDir())
+				project := t.TempDir()
+				database := testutil.NewTestDBAtPath(t, filepath.Join(project, ".slb", "state.db"))
+				projectConfig := fmt.Sprintf("[notifications.requests]\nenabled = %t\n", tc.projectJournal)
+				if err := os.WriteFile(filepath.Join(project, ".slb", "config.toml"), []byte(projectConfig), 0600); err != nil {
+					t.Fatal(err)
+				}
+				bin := t.TempDir()
+				marker := filepath.Join(t.TempDir(), "legacy-called")
+				t.Setenv("SLB_TEST_MAIL_MARKER", marker)
+				if err := os.WriteFile(filepath.Join(bin, "mcp-agent-mail"), []byte("#!/bin/sh\nprintf 'called\\n' >> \"$SLB_TEST_MAIL_MARKER\"\n"), 0755); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("PATH", bin)
+				session := testutil.MakeSession(t, database, testutil.SessionWithProject(project))
+				options := DefaultRequestCreatorConfig()
+				options.ApprovalPolicy = db.ApprovalPolicySameHost
+				options.EnableDryRun = false
+				options.AgentMailEnabled = tc.legacyEnabled
+				options.RequestJournalEnabled = tc.journal
+				creator := NewRequestCreator(database, nil, nil, options)
+				var request *db.Request
+				if kind == "git-hook" {
+					var err error
+					request, err = creator.CreateGitHookRequest(context.Background(), GitHookIntent{
+						Operation: "pre-commit", ProjectPath: project, Snapshot: strings.Repeat("a", 64),
+						Evidence: "notification fixture; no Git operation runs",
+					}, session.ID, "verify native Git journal delivery")
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					result, err := creator.CreateRequest(CreateRequestOptions{
+						SessionID: session.ID, Command: "git reset --hard HEAD~1", Cwd: project,
+						Justification: Justification{Reason: "notification fixture; command is never executed"},
+					})
+					if err != nil || result.Request == nil {
+						t.Fatalf("create request: %+v %v", result, err)
+					}
+					request = result.Request
+				}
+				calls, err := os.ReadFile(marker)
+				if tc.wantLegacy {
+					if err != nil || string(calls) != "called\n" {
+						t.Fatalf("legacy policy must send once: %q %v", calls, err)
+					}
+				} else if !os.IsNotExist(err) {
+					t.Fatalf("effective policy unexpectedly called legacy transport: %q %v", calls, err)
+				}
+				page, err := database.ReadRequestEvents(context.Background(), project, "", 10)
+				if err != nil || len(page.Events) != 1 {
+					t.Fatalf("durable admission event: %+v %v", page, err)
+				}
+				event := page.Events[0]
+				if event.Kind != "request_created" || event.RequestID != request.ID || event.State.Status != string(db.StatusPending) ||
+					event.State.CommandHash != request.Command.Hash || event.State.ApprovalPolicy != db.ApprovalPolicySameHost {
+					t.Fatalf("notification routing changed committed review evidence: %+v", event)
+				}
+			})
+		}
+	}
+}
 
 func TestCreateRequest_MissingSessionID(t *testing.T) {
 	database := testutil.NewTestDB(t)

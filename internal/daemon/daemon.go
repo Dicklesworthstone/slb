@@ -36,6 +36,7 @@ const (
 // ServerOptions configures daemon lifecycle behavior.
 type ServerOptions struct {
 	ProjectDir string
+	ConfigPath string
 	SocketPath string
 	PIDFile    string
 	Logger     *log.Logger
@@ -272,6 +273,13 @@ func RunDaemon(ctx context.Context, opts ServerOptions) error {
 		logger = l
 	}
 	projectPath := opts.ProjectDir
+	if opts.ConfigPath != "" {
+		if info, err := os.Stat(opts.ConfigPath); err != nil {
+			return fmt.Errorf("reading explicit daemon config: %w", err)
+		} else if !info.Mode().IsRegular() {
+			return errors.New("explicit daemon config is not a regular file")
+		}
+	}
 	owner, err := claimPIDFile(opts.PIDFile, os.Getpid())
 	if err != nil {
 		return fmt.Errorf("claiming daemon pid file: %w", err)
@@ -281,7 +289,7 @@ func RunDaemon(ctx context.Context, opts ServerOptions) error {
 			logger.Warn("daemon pid cleanup", "error", err)
 		}
 	}()
-	cfg, err := config.Load(config.LoadOptions{ProjectDir: projectPath})
+	cfg, err := config.Load(config.LoadOptions{ProjectDir: projectPath, ConfigPath: opts.ConfigPath})
 	if err != nil {
 		// A daemon running a weaker default policy is not graceful degradation.
 		return fmt.Errorf("loading daemon config: %w", err)
@@ -330,7 +338,7 @@ func RunDaemon(ctx context.Context, opts ServerOptions) error {
 		}
 		servers = append(servers, tcpSrv)
 	}
-	stopServices, err := startProjectServices(signalCtx, database, projectPath, cfg, servers, logger)
+	stopServices, err := startProjectServices(signalCtx, database, projectPath, opts.ConfigPath, cfg, servers, logger)
 	if err != nil {
 		// A shutdown request (signal or caller cancellation) that arrives while
 		// startup is still reconciling state is a clean stop, exactly as it is
@@ -386,6 +394,14 @@ func resolveServerOptions(opts ServerOptions) (ServerOptions, error) {
 	opts.ProjectDir, err = filepath.EvalSymlinks(opts.ProjectDir)
 	if err != nil {
 		return opts, fmt.Errorf("resolving daemon project: %w", err)
+	}
+	if opts.ConfigPath != "" {
+		// Pin the caller's selected config before the detached child switches
+		// to the project root. Relative overrides may live outside that root.
+		opts.ConfigPath, err = filepath.Abs(opts.ConfigPath)
+		if err != nil {
+			return opts, fmt.Errorf("resolving daemon config: %w", err)
+		}
 	}
 	return normalizeServerOptions(opts), nil
 }

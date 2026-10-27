@@ -3,6 +3,8 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -94,7 +96,7 @@ func TestProjectServicesDeliverRequestJournalAndResume(t *testing.T) {
 	cfg.Notifications.DesktopEnabled = false
 	cfg.Integrations.AgentMailEnabled = false
 	cfg.Notifications.Requests = notifications.RequestSettings{Enabled: true, WebhookURL: server.URL}
-	stop, err := startProjectServices(context.Background(), database, project, cfg, nil, log.Default())
+	stop, err := startProjectServices(context.Background(), database, project, "", cfg, nil, log.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +166,7 @@ agent_mail_recipients = ["GreenCastle"]
 	cfg.Notifications.DesktopEnabled = false
 	cfg.Notifications.Requests.WebhookURL = "file:///invalid"
 	listener, _ := deliveryServer(t)
-	stop, err := startProjectServices(context.Background(), database, project, cfg, []*IPCServer{listener}, log.Default())
+	stop, err := startProjectServices(context.Background(), database, project, "", cfg, []*IPCServer{listener}, log.Default())
 	if err != nil {
 		t.Fatal("invalid optional route disabled notary", err)
 	}
@@ -174,5 +176,119 @@ agent_mail_recipients = ["GreenCastle"]
 	}
 	if _, err := os.Stat(filepath.Join(project, ".slb", "notifications", "request-delivery.json")); !os.IsNotExist(err) {
 		t.Fatal("invalid config created delivery state")
+	}
+}
+
+func TestDaemonExplicitConfigDeliversRequestJournal(t *testing.T) {
+	for _, subprocessOptions := range []bool{false, true} {
+		t.Run(fmt.Sprintf("subprocess_options=%t", subprocessOptions), func(t *testing.T) {
+			lifecycleEnvironment(t)
+			project := lifecycleProject(t)
+			database, err := db.OpenAndMigrate(filepath.Join(project, ".slb", "state.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			request := serviceRequest(t, database, project)
+			received := make(chan notifications.RequestNotice, 2)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var notice notifications.RequestNotice
+				if err := json.NewDecoder(r.Body).Decode(&notice); err != nil {
+					t.Error(err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				received <- notice
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer server.Close()
+			configPath := filepath.Join(t.TempDir(), "selected notifications.toml")
+			selectedConfig := fmt.Sprintf(`[daemon]
+use_file_watcher = false
+[notifications]
+desktop_enabled = false
+[notifications.requests]
+enabled = true
+webhook_url = %q
+`, server.URL)
+			if err := os.WriteFile(configPath, []byte(selectedConfig), 0600); err != nil {
+				t.Fatal(err)
+			}
+			opts := ServerOptions{ProjectDir: project, ConfigPath: configPath,
+				SocketPath: filepath.Join(shortSocketDir(t), "notices.sock"), Logger: log.New(io.Discard)}
+			if subprocessOptions {
+				// StartDaemonWithOptions must honor the exact options selected by
+				// the parent even when Cobra has reconstructed other child options.
+				child := opts
+				child.Logger = nil
+				encoded, err := json.Marshal(child)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv(daemonModeEnv, "1")
+				t.Setenv(daemonOptionsEnv, string(encoded))
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() {
+				if subprocessOptions {
+					done <- StartDaemonWithOptions(ctx, ServerOptions{ProjectDir: project})
+					return
+				}
+				done <- RunDaemon(ctx, opts)
+			}()
+			defer func() {
+				cancel()
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Errorf("daemon stopped with error: %v", err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Error("daemon did not stop")
+				}
+			}()
+			select {
+			case notice := <-received:
+				if notice.RequestID != request.ID || notice.Project != project || notice.Event != "request_created" {
+					t.Fatalf("unexpected journal notice: %+v", notice)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("explicit config did not enable request notification delivery")
+			}
+		})
+	}
+}
+
+func TestRunDaemonInvalidExplicitConfigDoesNotOpenDatabase(t *testing.T) {
+	lifecycleEnvironment(t)
+	for _, fixture := range []struct{ name, wantError string }{
+		{"malformed", "loading daemon config"},
+		{"missing", "reading explicit daemon config"},
+		{"directory", "explicit daemon config is not a regular file"},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			project := lifecycleProject(t)
+			configPath := filepath.Join(t.TempDir(), "invalid.toml")
+			switch fixture.name {
+			case "malformed":
+				if err := os.WriteFile(configPath, []byte("[not valid TOML"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "directory":
+				if err := os.Mkdir(configPath, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			err := RunDaemon(ctx, ServerOptions{ProjectDir: project, ConfigPath: configPath, Logger: log.New(io.Discard)})
+			if err == nil || !strings.Contains(err.Error(), fixture.wantError) {
+				t.Fatalf("invalid selected config did not fail closed: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(project, ".slb", "state.db")); !os.IsNotExist(err) {
+				t.Fatalf("daemon opened database despite invalid selected config: %v", err)
+			}
+		})
 	}
 }

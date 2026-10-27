@@ -102,7 +102,7 @@ func TestAgentMailClient_MissingCLIIsNonFatal(t *testing.T) {
 	// Ensure mcp-agent-mail is not found even if installed.
 	t.Setenv("PATH", "")
 
-	c := NewAgentMailClient("/proj", "", "")
+	c := NewAgentMailClient("/proj", "", "", false)
 	if c.threadID != "SLB-Reviews" {
 		t.Fatalf("expected default thread id, got %q", c.threadID)
 	}
@@ -220,7 +220,7 @@ func TestAgentMailClient_SendFailureSurface(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 
-	c := NewAgentMailClient("/proj", "thread", "sender")
+	c := NewAgentMailClient("/proj", "thread", "sender", false)
 	if err := c.send("subj", "body", ImportanceNormal); err == nil {
 		t.Fatalf("expected error")
 	}
@@ -237,7 +237,7 @@ func TestAgentMailClient_SendNotFoundMessageIsIgnored(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 
-	c := NewAgentMailClient("/proj", "thread", "sender")
+	c := NewAgentMailClient("/proj", "thread", "sender", false)
 	if err := c.send("subj", "body", ImportanceNormal); err != nil {
 		t.Fatalf("expected nil for not found errors, got: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestAgentMailClient_SendSucceedsWhenCommandSucceeds(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 
-	c := NewAgentMailClient("/proj", "thread", "sender")
+	c := NewAgentMailClient("/proj", "thread", "sender", false)
 	if err := c.send("subj", "body", ImportanceNormal); err != nil {
 		t.Fatalf("expected nil, got: %v", err)
 	}

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -260,6 +261,56 @@ func TestVerifier_AdvisoryAndAtomicClaim(t *testing.T) {
 	second, err := v.VerifyAndMarkExecuting(p)
 	if err != nil || second.Allowed || second.ToIPCResponse().Command != "" {
 		t.Fatalf("claim replay accepted: %+v %v", second, err)
+	}
+}
+
+func TestVerifierRechecksExplicitPolicyForOwnedProject(t *testing.T) {
+	database, request := pendingTimerFixture(t)
+	handler := NewTimeoutHandler(database, TimeoutHandlerConfig{})
+	if err := handler.advance(context.Background(), request.ID, "", false); err != nil {
+		t.Fatal(err)
+	}
+	// The fixture's requester key is deliberately available only at creation;
+	// authenticate the real issued key through a separate executor session.
+	executor := &db.Session{AgentName: "executor", Model: "test", ProjectPath: request.ProjectPath}
+	if err := database.CreateSession(executor); err != nil {
+		t.Fatal(err)
+	}
+	params := VerifyExecuteParams{RequestID: request.ID, SessionID: executor.ID,
+		SessionKey: executor.SessionKey, CommandHash: request.Command.Hash}
+	v := NewVerifier(database)
+	if advisory, err := v.VerifyExecutionAllowed(params); err != nil || !advisory.Allowed {
+		t.Fatalf("baseline automatic approval refused: %+v %v", advisory, err)
+	}
+	configPath := filepath.Join(t.TempDir(), "execution policy.toml")
+	if err := os.WriteFile(configPath, []byte("[patterns.caution]\nmin_approvals = 1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	v.projectPath, v.configPath = request.ProjectPath, configPath
+	if claim, err := v.VerifyAndMarkExecuting(params); err != nil || claim.Allowed || !strings.Contains(claim.Reason, "approval") {
+		t.Fatalf("claim bypassed selected quorum: %+v %v", claim, err)
+	}
+	stored, err := database.GetRequest(request.ID)
+	if err != nil || stored.Status != db.StatusApproved || stored.Execution != nil {
+		t.Fatalf("denied claim changed execution: %+v %v", stored, err)
+	}
+	if err := os.WriteFile(configPath, []byte("[patterns.caution]\nmin_approvals = 0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if advisory, err := v.VerifyExecutionAllowed(params); err != nil || !advisory.Allowed {
+		t.Fatalf("current selected policy not reloaded: %+v %v", advisory, err)
+	}
+	if err := os.WriteFile(configPath, []byte("[patterns.caution]\nmin_approvals = 1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if claim, err := v.VerifyAndMarkExecuting(params); err != nil || claim.Allowed {
+		t.Fatalf("claim reused earlier advisory policy: %+v %v", claim, err)
+	}
+	// One daemon's override must never apply to requests belonging to another
+	// project, even if an administrative database contains both projects.
+	v.projectPath = t.TempDir()
+	if advisory, err := v.VerifyExecutionAllowed(params); err != nil || !advisory.Allowed {
+		t.Fatalf("daemon override leaked into another project: %+v %v", advisory, err)
 	}
 }
 

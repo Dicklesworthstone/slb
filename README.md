@@ -1299,7 +1299,8 @@ notices follow request lifecycle changes.
 Since v0.5.0 the project daemon can deliver committed request, review, status
 and execution changes from its request journal to Agent Mail (HTTP MCP) and/or a
 JSON webhook. Delivery survives daemon downtime and retries failed sends. It is
-opt-in and configured in the project's `.slb/config.toml`:
+opt-in and configured in the project's `.slb/config.toml` or an explicitly selected
+`--config` file:
 
 ```toml
 [notifications.requests]
@@ -1317,6 +1318,10 @@ agent_mail_recipients = ["GreenCastle", "RedStone"] # identities the sender may 
 - `integrations.agent_mail_enabled` does not turn this worker on; only
   `[notifications.requests] enabled` does.
 - Restart the project daemon after changing these settings.
+- When using `--config /path/to/review-policy.toml`, pass that file to requests,
+  reviews, execution and `daemon start`. The background daemon and execution
+  workers retain the selected configuration. A running daemon is not reconfigured
+  by another command's flag.
 - Notices carry request metadata (ID, risk tier, status, review counts, exit
   code), never the command text or justification. Reviewers run
   `slb review <request-id>` for the details.
@@ -1350,7 +1355,9 @@ These messages are sent with the `mcp-agent-mail` CLI to `SLB-Broadcast` (sender
 `SLB-System` unless one is configured), with a two-second timeout. If that CLI is not installed they
 are skipped silently, and a failed send never blocks the request. Enabling
 `[notifications.requests]` turns this route off, so the journal worker is the
-single source of request notices.
+single source of request notices. Route selection uses the command's effective
+configuration, including `--config`; a second project-config load cannot silently
+restore legacy sends.
 
 ## Output Formats
 

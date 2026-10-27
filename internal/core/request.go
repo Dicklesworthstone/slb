@@ -105,6 +105,9 @@ type RequestCreatorConfig struct {
 	ApprovalTTLCriticalMinutes int
 	// AgentMailEnabled toggles Agent Mail notifications.
 	AgentMailEnabled bool
+	// RequestJournalEnabled leaves notification delivery to the durable journal
+	// worker, suppressing legacy synchronous Agent Mail sends.
+	RequestJournalEnabled bool
 	// AgentMailThread is the thread to post notifications.
 	AgentMailThread string
 	// AgentMailSender optional sender name.
@@ -191,7 +194,7 @@ func (rc *RequestCreator) createRequestOnce(ctx context.Context, opts CreateRequ
 	// Initialize notifier with project context if enabled.
 	notifier := rc.notifier
 	if rc.config != nil && rc.config.AgentMailEnabled {
-		notifier = integrations.NewAgentMailClient(session.ProjectPath, rc.config.AgentMailThread, rc.config.AgentMailSender)
+		notifier = integrations.NewAgentMailClient(session.ProjectPath, rc.config.AgentMailThread, rc.config.AgentMailSender, rc.config.RequestJournalEnabled)
 	}
 
 	// Step 2: Check agent not blocked

@@ -117,7 +117,6 @@ database contains the request you want to reject.
 		if err != nil {
 			return err
 		}
-		reviewSvc.SetNotifier(buildAgentMailNotifier(project))
 		var result *core.ReviewResult
 		if crossProject {
 			sourceDB, openErr := db.OpenWithOptions(sourceDBPath, db.OpenOptions{

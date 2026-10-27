@@ -200,6 +200,12 @@ Examples:
 		}
 
 		// Step 5: Execute the approved command
+		// Waiting can outlive a notification-policy change. Reload the selected
+		// configuration before choosing the execution notification route.
+		cfg, err = config.Load(config.LoadOptions{ProjectDir: project, ConfigPath: flagConfig})
+		if err != nil {
+			return writeError(cmd, out, "config_failed", command, fmt.Errorf("loading execution config: %w", err))
+		}
 		exitCode, err := runApprovedRequest(cmd.Context(), out, dbConn, cfg, project, request.ID)
 		if err != nil {
 			cmd.SilenceErrors = true // The execution response already contains it.
@@ -311,7 +317,7 @@ func runSafeCommand(cmd *cobra.Command, out *output.Writer, command, cwd, projec
 }
 
 func runApprovedRequest(ctx context.Context, out *output.Writer, dbConn *db.DB, cfg config.Config, project, requestID string) (int, error) {
-	executor := core.NewExecutor(dbConn, nil).WithNotifier(buildAgentMailNotifier(project))
+	executor := core.NewExecutor(dbConn, nil).WithNotifier(buildAgentMailNotifier(project, cfg))
 
 	execResult, execErr := executor.ExecuteApprovedRequest(ctx, core.ExecuteOptions{
 		RequestID:         requestID,
@@ -444,6 +450,7 @@ func toRequestCreatorConfig(cfg config.Config) *core.RequestCreatorConfig {
 		AgentMailEnabled:           cfg.Integrations.AgentMailEnabled,
 		AgentMailThread:            cfg.Integrations.AgentMailThread,
 		AgentMailSender:            "",
+		RequestJournalEnabled:      cfg.Notifications.Requests.Enabled,
 	}
 }
 

@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -82,6 +85,62 @@ func TestRequestCommand_RequiresCommand(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "accepts 1 arg") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestRequestCommandsUseExplicitJournalPolicy(t *testing.T) {
+	for _, name := range []string{"request", "run"} {
+		t.Run(name, func(t *testing.T) {
+			resetRequestFlags()
+			resetRunFlags()
+			t.Cleanup(resetRequestFlags)
+			t.Cleanup(resetRunFlags)
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("USERPROFILE", t.TempDir())
+			t.Setenv("SLB_AGENT_MAIL_ENABLED", "true")
+			marker := installAgentMailCapture(t)
+			h := testutil.NewHarness(t)
+			t.Chdir(h.ProjectDir)
+			if err := os.MkdirAll(filepath.Join(h.ProjectDir, ".slb"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(h.ProjectDir, ".slb", "config.toml"), []byte("[notifications.requests]\nenabled = false\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			selected := filepath.Join(t.TempDir(), "selected.toml")
+			configuration := "[general]\napproval_policy = 'same_host'\nenable_dry_run = false\n[notifications.requests]\nenabled = true\n"
+			if err := os.WriteFile(selected, []byte(configuration), 0600); err != nil {
+				t.Fatal(err)
+			}
+			author := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir))
+			root := newTestRequestCmd(h.DBPath)
+			args := []string{name, "git push --force", "--reason", "exercise selected notification policy", "--session-id", author.ID, "-C", h.ProjectDir, "--config", selected, "--json"}
+			if name == "run" {
+				root = newTestRunCmd(h.DBPath)
+				args = append(args, "--yield")
+			}
+			stdout, err := executeCommandCapture(t, root, args...)
+			if err != nil {
+				t.Fatalf("%s: %v (%s)", name, err, stdout)
+			}
+			var result struct {
+				RequestID string `json:"request_id"`
+			}
+			if err := json.Unmarshal([]byte(stdout), &result); err != nil || result.RequestID == "" {
+				t.Fatalf("request missing: %s (%v)", stdout, err)
+			}
+			request, err := h.DB.GetRequest(result.RequestID)
+			if err != nil || request.Status != db.StatusPending || request.ApprovalPolicy != db.ApprovalPolicySameHost || request.Execution != nil {
+				t.Fatalf("request was not committed for same-host review: %+v (%v)", request, err)
+			}
+			page, err := h.DB.ReadRequestEvents(context.Background(), h.ProjectDir, "", 100)
+			if err != nil || len(page.Events) != 1 || page.Events[0].RequestID != result.RequestID {
+				t.Fatalf("durable notification source missing: %+v (%v)", page, err)
+			}
+			if data, err := os.ReadFile(marker); !os.IsNotExist(err) {
+				t.Fatalf("%s sent through legacy transport despite explicit journal policy: %s (%v)", name, data, err)
+			}
+		})
 	}
 }
 

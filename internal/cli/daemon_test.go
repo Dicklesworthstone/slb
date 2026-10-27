@@ -22,6 +22,7 @@ func resetDaemonFlags() {
 	flagOutput = "text"
 	flagJSON = false
 	flagProject = ""
+	flagConfig = ""
 	flagDaemonStartForeground = false
 	flagDaemonStopTimeoutSecs = 10
 	flagDaemonLogsFollow = false
@@ -628,6 +629,37 @@ func TestDaemonLifecycleCommandsResolveProjectOnce(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestDaemonStartUsesSelectedConfig(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix daemon listener")
+	}
+	for _, relative := range []bool{false, true} {
+		t.Run(strconv.FormatBool(relative), func(t *testing.T) {
+			resetDaemonFlags()
+			t.Cleanup(resetDaemonFlags)
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("USERPROFILE", t.TempDir())
+			t.Setenv("SLB_PROJECT", "")
+			h := testutil.NewHarness(t)
+			h.ProjectDir = physicalDaemonTestPath(t, h.ProjectDir)
+			// A dropped explicit config would fail later with a TCP error,
+			// keeping this regression bounded even on the old implementation.
+			h.WriteFile(".slb/config.toml", []byte("[daemon]\ntcp_addr = 'invalid-address'\n"), 0600)
+			selected := h.WriteFile("selected.toml", []byte("[notifications.requests\ninvalid TOML"), 0600)
+			t.Chdir(t.TempDir())
+			if relative {
+				selected = "selected.toml"
+			}
+			root := newTestDaemonLifecycleCommand("start", daemonStartCmd.RunE)
+			flagDaemonStartForeground = true
+			_, err := executeCommandCapture(t, root, "daemon", "start", "-C", h.ProjectDir, "--config", selected, "--json")
+			if err == nil || !strings.Contains(err.Error(), "loading daemon config") || !strings.Contains(err.Error(), "selected.toml") {
+				t.Fatalf("daemon ignored selected config: %v", err)
+			}
+		})
 	}
 }
 

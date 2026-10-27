@@ -160,13 +160,22 @@ slb patterns add --tier dangerous "<pattern>"  # Add runtime pattern
 ## Daemon & TUI
 
 ```bash
-slb daemon start --foreground                  # Start background daemon
+slb daemon start                               # Start background daemon
+slb daemon start --foreground                  # Run daemon in this process
+slb -C /path/to/project --config /path/to/policy.toml daemon start
 slb daemon stop                                # Stop daemon
 slb daemon status                              # Check daemon status
 slb tui                                        # Launch interactive TUI
 slb watch --session-id <id> --json             # Stream events (NDJSON)
 slb watch --session-id <id> --auto-approve-caution  # Auto-approve CAUTION tier
 ```
+
+The daemon retains an explicitly selected configuration when it starts its
+background process. As with other commands, relative config paths resolve from
+the directory selected by `-C`. Pass the same
+`--config` file to requester and reviewer commands when using an explicit policy.
+Restart the daemon with that file after changing notification settings; another
+command's `--config` does not change an already running daemon.
 
 ---
 

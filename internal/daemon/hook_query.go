@@ -126,6 +126,10 @@ type hookPolicy struct {
 type hookPolicyCache struct {
 	mu      sync.Mutex
 	entries map[string]*cachedHookPolicy
+	// The daemon's explicit override applies only to its physical project.
+	// These fields are set before any listener starts and remain immutable.
+	projectPath string
+	configPath  string
 }
 
 // maxCachedHookPolicies bounds the cache for a daemon that answers hooks for
@@ -239,6 +243,18 @@ func (c *hookPolicyCache) policyFor(cwd string) (hookPolicy, error) {
 		return hookPolicy{}, err
 	}
 	opts := config.LoadOptions{ProjectDir: root}
+	if root == c.projectPath {
+		opts.ConfigPath = c.configPath
+	}
+	if opts.ConfigPath != "" {
+		if info, err := os.Stat(opts.ConfigPath); err != nil {
+			c.forget(root)
+			return hookPolicy{}, fmt.Errorf("reading explicit daemon hook config: %w", err)
+		} else if !info.Mode().IsRegular() {
+			c.forget(root)
+			return hookPolicy{}, errors.New("explicit daemon hook config is not a regular file")
+		}
+	}
 	hasState := true
 	if _, err := os.Stat(filepath.Join(root, ".slb")); os.IsNotExist(err) {
 		hasState = false
@@ -281,7 +297,7 @@ func (c *hookPolicyCache) policyFor(cwd string) (hookPolicy, error) {
 		next := *cached
 		next.state, next.custom = state, custom
 		if !customPatternsEqual(custom, cached.custom) {
-			engine, err := core.CompileCommandPolicy(cached.cfg, custom, "")
+			engine, err := core.CompileCommandPolicy(cached.cfg, custom, opts.ConfigPath)
 			if err != nil {
 				c.forget(root)
 				return hookPolicy{}, err
@@ -302,7 +318,7 @@ func (c *hookPolicyCache) policyFor(cwd string) (hookPolicy, error) {
 				return hookPolicy{}, err
 			}
 		}
-		engine, err := core.CompileCommandPolicy(cfg, custom, "")
+		engine, err := core.CompileCommandPolicy(cfg, custom, opts.ConfigPath)
 		if err != nil {
 			c.forget(root)
 			return hookPolicy{}, err

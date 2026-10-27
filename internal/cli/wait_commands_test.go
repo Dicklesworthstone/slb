@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -55,6 +57,83 @@ func TestRequestWaitApprovesWithoutDaemon(t *testing.T) {
 	stored, err := h.DB.GetRequest(id)
 	if err != nil || stored.Status != db.StatusApproved || stored.ApprovalExpiresAt == nil || stored.Execution != nil {
 		t.Fatalf("invalid persisted decision: %+v %v", stored, err)
+	}
+}
+
+func TestWaitingCommandsRefreshNotificationPolicyBeforeExecution(t *testing.T) {
+	for _, name := range []string{"request", "run"} {
+		t.Run(name, func(t *testing.T) {
+			resetRequestFlags()
+			resetRunFlags()
+			t.Cleanup(resetRequestFlags)
+			t.Cleanup(resetRunFlags)
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("USERPROFILE", t.TempDir())
+			t.Setenv("SHELL", "/bin/sh")
+			t.Setenv("SLB_AGENT_MAIL_ENABLED", "true")
+			marker := installAgentMailCapture(t)
+			h := testutil.NewHarness(t)
+			t.Chdir(h.ProjectDir)
+			author := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("waiting-author"), testutil.WithModel("author-model"))
+			reviewer := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("waiting-reviewer"), testutil.WithModel("review-model"))
+			selected := filepath.Join(h.ProjectDir, "selected.toml")
+			policy := "[general]\napproval_policy = 'same_host'\nenable_dry_run = false\nenable_rollback_capture = false\n[patterns.dangerous]\npatterns = ['^printf slb_notification_wait$']\n[notifications.requests]\nenabled = %t\n"
+			if err := os.WriteFile(selected, []byte(fmt.Sprintf(policy, false)), 0600); err != nil {
+				t.Fatal(err)
+			}
+			var requestID string
+			reviewDone := make(chan error, 1)
+			go func() {
+				reviewDone <- func() error {
+					deadline := time.Now().Add(5 * time.Second)
+					for time.Now().Before(deadline) {
+						pending, err := h.DB.ListPendingRequests(h.ProjectDir)
+						if err != nil {
+							return err
+						}
+						if len(pending) == 1 {
+							requestID = pending[0].ID
+							// Publish a complete replacement so the waiter never
+							// observes a transient, partially written TOML file.
+							if err := os.WriteFile(selected+".next", []byte(fmt.Sprintf(policy, true)), 0600); err != nil {
+								return err
+							}
+							if err := os.Rename(selected+".next", selected); err != nil {
+								return err
+							}
+							_, err = h.DB.ApplyReview(&db.Review{RequestID: requestID, ReviewerSessionID: reviewer.ID, Decision: db.DecisionApprove}, reviewer.SessionKey,
+								db.ReviewPolicy{ApprovalPolicy: db.ApprovalPolicySameHost})
+							return err
+						}
+						time.Sleep(10 * time.Millisecond)
+					}
+					return errors.New("request did not arrive for review")
+				}()
+			}()
+			root := newTestRequestCmd(h.DBPath)
+			args := []string{name, "printf slb_notification_wait", "-C", h.ProjectDir, "--config", selected,
+				"--session-id", author.ID, "--reason", "exercise notification policy refresh", "--timeout", "5", "--json"}
+			if name == "request" {
+				args = append(args, "--wait", "--execute")
+			} else {
+				root = newTestRunCmd(h.DBPath)
+			}
+			stdout, err := executeCommandCapture(t, root, args...)
+			if reviewErr := <-reviewDone; reviewErr != nil {
+				t.Fatalf("review failed: %v (%s)", reviewErr, stdout)
+			}
+			if err != nil {
+				t.Fatalf("waiting command failed: %v (%s)", err, stdout)
+			}
+			request, err := h.DB.GetRequest(requestID)
+			if err != nil || request.Status != db.StatusExecuted || request.Execution == nil || request.Execution.Assurance != db.AssuranceSameHost {
+				t.Fatalf("waiting command lost execution evidence: %+v (%v)", request, err)
+			}
+			data, err := os.ReadFile(marker)
+			if err != nil || strings.Count(string(data), "CALL\n") != 1 || strings.Contains(string(data), "[SLB] EXECUTED") {
+				t.Fatalf("execution used admission-time notification policy: %s (%v)", data, err)
+			}
+		})
 	}
 }
 

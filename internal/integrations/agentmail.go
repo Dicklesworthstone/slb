@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
@@ -27,24 +26,23 @@ type AgentMailClient struct {
 	threadID        string
 	sender          string
 	journalDelivery bool
-	configErr       error
 }
 
-// NewAgentMailClient constructs a client.
-func NewAgentMailClient(projectKey, threadID, sender string) *AgentMailClient {
+// NewAgentMailClient uses the caller's effective notification policy. Loading
+// configuration here would discard explicit configuration files and overrides,
+// potentially sending command details through the wrong notification route.
+func NewAgentMailClient(projectKey, threadID, sender string, journalDelivery bool) *AgentMailClient {
 	if threadID == "" {
 		threadID = "SLB-Reviews"
 	}
 	if sender == "" {
 		sender = "SLB-System"
 	}
-	cfg, err := config.Load(config.LoadOptions{ProjectDir: projectKey})
 	return &AgentMailClient{
 		projectKey:      projectKey,
 		threadID:        threadID,
 		sender:          sender,
-		journalDelivery: cfg.Notifications.Requests.Enabled,
-		configErr:       err,
+		journalDelivery: journalDelivery,
 	}
 }
 
@@ -168,9 +166,6 @@ func truncate(s string, max int) string {
 // journal mode the caller has committed the request/review mutation already;
 // returning nil means no synchronous send is needed, NOT confirmed delivery.
 func (c *AgentMailClient) send(subject, body, importance string) error {
-	if c.configErr != nil {
-		return fmt.Errorf("loading notification policy: %w", c.configErr)
-	}
 	if c.journalDelivery {
 		return nil
 	}
