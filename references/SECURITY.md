@@ -118,6 +118,10 @@ are not evidence that an independent person or model approved the action.
 - Returning configuration to `independent` prevents further same-host approval
   and execution, including outstanding approved same-host requests. It does not
   turn their reviews into independent authorization.
+- Tightening conflict resolution from `first_wins` to
+  `any_rejection_blocks` or `human_breaks_tie` also prevents execution of an
+  outstanding approval that contains a rejection. The execution gate rechecks
+  the current conflict policy; an earlier approved status cannot waive it.
 
 These checks prevent accidental evidence reuse through normal SLB operations.
 They do not make mutable local storage tamper-proof against the same OS user.
@@ -184,7 +188,13 @@ For execution of a reviewed request, these checks must pass:
 For emergencies, `emergency-execute` bypasses peer review with explicit
 acknowledgment and logging. The acknowledgment does not authenticate a human;
 a same-UID agent can supply it too. It is a separate unreviewed override, not a
-replacement for the optional peer-review workflow:
+replacement for the optional peer-review workflow.
+
+Its structured output and emergency audit records use
+`execution_mode = "emergency"` and `assurance = "emergency_unreviewed"`, with a
+`review_notice` stating that peer review was bypassed. These labels are the same
+under both approval policies: enabling `same_host` cannot turn emergency
+execution into reviewed execution.
 
 ```bash
 # Interactive (prompts for confirmation)

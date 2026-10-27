@@ -158,7 +158,7 @@ func checkReviewConflictPolicy(reader PolicyReader, request *db.Request, resolut
 	if err != nil {
 		return fmt.Errorf("reading review conflict evidence: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var first string
 	hasRejection := false
 	for rows.Next() {

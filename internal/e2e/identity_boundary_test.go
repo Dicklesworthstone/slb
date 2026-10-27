@@ -3,6 +3,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -229,7 +230,7 @@ func (f *sameHostCLI) assertNotExecuted(request *db.Request) {
 	}
 	stored, err := f.DB.GetRequest(request.ID)
 	if err != nil || stored.Execution != nil ||
-		(stored.Status != db.StatusPending && stored.Status != db.StatusApproved) {
+		(stored.Status != db.StatusPending && stored.Status != db.StatusApproved && stored.Status != db.StatusRejected) {
 		f.T.Fatalf("refusal changed execution state: %+v, %v", stored, err)
 	}
 }
@@ -332,6 +333,128 @@ func TestBuiltCLISameHostReviewIntegration(t *testing.T) {
 		if reviewEvents != 2 || executionEvents < 2 {
 			t.Fatalf("incomplete audit trail: %d review events, %d execution events", reviewEvents, executionEvents)
 		}
+	})
+
+	for _, optOut := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rejection blocks partial quorum after opt out=%t", optOut), func(t *testing.T) {
+			f := newSameHostCLI(t, binary, 2, true)
+			requester := f.session("Requester", "model-a")
+			approver := f.session("Approver", "model-b")
+			// A different model is required for approval, not for stopping a
+			// mistaken command. Rejection must remain available after opt-out.
+			rejector := f.session("Rejector", "model-a")
+			request := f.request(requester)
+			f.approve(request, approver)
+			if optOut {
+				f.json("config", "set", "general.approval_policy", "independent")
+			}
+			result := f.json("reject", request.ID, "--session-id", rejector.ID,
+				"--session-key", rejector.SessionKey, "--reason", "The target has not been checked")
+			if result["new_request_status"] != "rejected" || result["approvals"] != float64(1) ||
+				result["rejections"] != float64(1) || result["approval_policy"] != "same_host" ||
+				result["assurance"] != "same_host" {
+				t.Fatalf("rejection lost its blocking decision or evidence class: %+v", result)
+			}
+			// Changing policy back must not revive a rejected request.
+			f.json("config", "set", "general.approval_policy", "same_host")
+			f.fails("not pending", "approve", request.ID,
+				"--session-id", rejector.ID, "--session-key", rejector.SessionKey)
+			f.fails("not approved", "execute", request.ID, "--session-id", requester.ID)
+			f.assertNotExecuted(request)
+			stored, reviews, err := f.DB.GetRequestWithReviews(request.ID)
+			if err != nil || stored.Status != db.StatusRejected || len(reviews) != 2 {
+				t.Fatalf("rejected decision was not preserved: %+v, %+v, %v", stored, reviews, err)
+			}
+			page, err := f.DB.ReadRequestEvents(context.Background(), f.ProjectDir, "", 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			foundRejection := false
+			for _, event := range page.Events {
+				if event.RequestID == request.ID && event.Review != nil && event.Review.Decision == "reject" {
+					foundRejection = true
+					if event.Review.Assurance != db.AssuranceSameHost || event.Review.ApprovalPolicy != db.ApprovalPolicySameHost {
+						t.Fatalf("rejection audit lost same-host provenance: %+v", event)
+					}
+				}
+			}
+			if !foundRejection {
+				t.Fatal("rejection missing from audit history")
+			}
+		})
+	}
+
+	t.Run("stricter conflict policy rechecks recorded rejections", func(t *testing.T) {
+		f := newSameHostCLI(t, binary, 2, false)
+		f.json("config", "set", "general.conflict_resolution", "first_wins")
+		requester := f.session("Requester", "model-a")
+		firstApprover := f.session("FirstApprover", "model-b")
+		rejector := f.session("Rejector", "model-c")
+		secondApprover := f.session("SecondApprover", "model-d")
+		request := f.request(requester)
+		f.approve(request, firstApprover)
+		f.json("reject", request.ID, "--session-id", rejector.ID, "--session-key", rejector.SessionKey,
+			"--reason", "The target still needs investigation")
+		result := f.approve(request, secondApprover)
+		if result["new_request_status"] != "approved" || result["rejections"] != float64(1) {
+			t.Fatalf("first-wins fixture did not approve with a recorded rejection: %+v", result)
+		}
+		f.json("config", "set", "general.conflict_resolution", "any_rejection_blocks")
+		f.fails("rejection", "execute", request.ID, "--session-id", requester.ID)
+		f.assertNotExecuted(request)
+	})
+
+	t.Run("session credentials and labels do not establish independent reviewers", func(t *testing.T) {
+		f := newSameHostCLI(t, binary, 1, true)
+		requester := f.session("Requester", "model-a")
+		// One process can create both sessions and choose any different agent
+		// and model labels. This is the documented same-UID impersonation limit,
+		// not proof of two principals or independently attested models.
+		reviewer := f.session("ClaimedReviewer", "claimed-model-b")
+		request := f.request(requester)
+		f.fails("session key does not match", "approve", request.ID,
+			"--session-id", reviewer.ID, "--session-key", requester.SessionKey)
+		f.fails("session authentication failed", "session", "resume", "--agent", reviewer.AgentName)
+		var storedDigest string
+		if err := f.DB.QueryRow(`SELECT session_key_digest FROM sessions WHERE id = ?`, reviewer.ID).Scan(&storedDigest); err != nil {
+			t.Fatal(err)
+		}
+		f.fails("session key does not match", "approve", request.ID,
+			"--session-id", reviewer.ID, "--session-key", storedDigest)
+		if approvals, rejections, err := f.DB.CountReviewsByDecision(request.ID); err != nil || approvals != 0 || rejections != 0 {
+			t.Fatalf("invalid reviewer credentials recorded evidence: %d, %d, %v", approvals, rejections, err)
+		}
+		// A process holding a copied reviewer key is indistinguishable from
+		// that reviewer. The accepted vote must advertise only same-host review.
+		copiedCredentials := *reviewer
+		result := f.approve(request, &copiedCredentials)
+		if result["assurance"] != "same_host" || !strings.Contains(fmt.Sprint(result["approval_policy_label"]), label) {
+			t.Fatalf("self-declared reviewer was presented as independently authenticated: %+v", result)
+		}
+		f.json("config", "set", "general.approval_policy", "independent")
+		strongRequest := f.request(requester)
+		f.fails("independent reviewer identity unavailable", "approve", strongRequest.ID,
+			"--session-id", reviewer.ID, "--session-key", reviewer.SessionKey)
+		f.fails("policy", "execute", request.ID, "--session-id", requester.ID)
+		f.assertNotExecuted(request)
+		f.assertNotExecuted(strongRequest)
+		f.json("config", "set", "general.approval_policy", "same_host")
+		result = f.json("execute", request.ID, "--session-id", requester.ID)
+		if result["status"] != "executed" || result["assurance"] != "same_host" {
+			t.Fatalf("returning to same-host policy upgraded the evidence: %+v", result)
+		}
+	})
+
+	t.Run("changed reviewer model invalidates an outstanding review", func(t *testing.T) {
+		f := newSameHostCLI(t, binary, 1, true)
+		requester := f.session("Requester", "model-a")
+		reviewer := f.session("Reviewer", "model-b")
+		request := f.request(requester)
+		f.approve(request, reviewer)
+		f.json("session", "resume", "--agent", reviewer.AgentName, "--session-id", reviewer.ID,
+			"--session-key", reviewer.SessionKey, "--model", "changed-model")
+		f.fails("reviewer identity is missing or changed", "execute", request.ID, "--session-id", requester.ID)
+		f.assertNotExecuted(request)
 	})
 
 	for _, tc := range []struct {
@@ -464,4 +587,178 @@ func TestBuiltCLISameHostReviewIntegration(t *testing.T) {
 			t.Fatal("historical review absent from audit history")
 		}
 	})
+
+	t.Run("interactive emergency acknowledgment keeps JSON stdout clean", func(t *testing.T) {
+		f := newSameHostCLI(t, binary, 1, false)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, binary, "-C", f.ProjectDir, "emergency-execute",
+			"printf 'interactive output\\n'; touch interactive-emergency-marker",
+			"--reason", "Isolated interactive acknowledgment test", "--json")
+		cmd.Dir, cmd.Env = f.ProjectDir, identityCLIEnvironment(f.home)
+		cmd.Stdin = strings.NewReader("EXECUTE\n")
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("acknowledged interactive emergency failed: %v\nstdout: %s\nstderr: %s", err, &stdout, &stderr)
+		}
+		var result map[string]any
+		if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+			t.Fatalf("interactive prompts or command output contaminated JSON: %v\nstdout: %s\nstderr: %s", err, &stdout, &stderr)
+		}
+		if !strings.Contains(stderr.String(), "Type 'EXECUTE' to confirm:") ||
+			!strings.Contains(stderr.String(), "does not authenticate a human") {
+			t.Fatalf("interactive acknowledgment did not show its limits on stderr: %s", &stderr)
+		}
+		if result["executed"] != true || result["exit_code"] != float64(0) || result["assurance"] != "emergency_unreviewed" {
+			t.Fatalf("interactive acknowledgment lost its execution outcome: %+v", result)
+		}
+		if _, err := os.Stat(filepath.Join(f.ProjectDir, "interactive-emergency-marker")); err != nil {
+			t.Fatalf("acknowledged interactive command did not run: %v", err)
+		}
+	})
+
+	t.Run("failed emergency shell start records an attempt without execution", func(t *testing.T) {
+		f := newSameHostCLI(t, binary, 1, false)
+		const command = "touch unstarted-emergency-marker"
+		ack := fmt.Sprintf("%x", sha256.Sum256([]byte(command)))
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, binary, "-C", f.ProjectDir, "emergency-execute", command,
+			"--reason", "Isolated shell startup failure test", "--yes", "--ack", ack, "--json")
+		cmd.Dir = f.ProjectDir
+		for _, entry := range identityCLIEnvironment(f.home) {
+			if !strings.HasPrefix(entry, "SHELL=") {
+				cmd.Env = append(cmd.Env, entry)
+			}
+		}
+		cmd.Env = append(cmd.Env, "SHELL="+filepath.Join(f.ProjectDir, "nonexistent-shell"))
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Run(); err == nil {
+			t.Fatalf("missing shell unexpectedly succeeded\nstdout: %s\nstderr: %s", &stdout, &stderr)
+		}
+		var result map[string]any
+		if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+			t.Fatalf("failed emergency did not return structured outcome: %v\nstdout: %s\nstderr: %s", err, &stdout, &stderr)
+		}
+		attemptedAt, _ := result["attempted_at"].(string)
+		if result["executed"] != false || result["exit_code"] != float64(-1) || attemptedAt == "" ||
+			!strings.Contains(fmt.Sprint(result["error"]), "starting command") || result["assurance"] != "emergency_unreviewed" {
+			t.Fatalf("failed shell start was misreported as execution: %+v", result)
+		}
+		if _, present := result["executed_at"]; present {
+			t.Fatalf("unstarted command has an execution timestamp: %+v", result)
+		}
+		if _, err := os.Stat(filepath.Join(f.ProjectDir, "unstarted-emergency-marker")); !os.IsNotExist(err) {
+			t.Fatalf("unstarted command produced a side effect: %v", err)
+		}
+		logPath, ok := result["log_path"].(string)
+		if !ok || logPath == "" {
+			t.Fatalf("failed attempt omitted its audit log: %+v", result)
+		}
+		if !filepath.IsAbs(logPath) {
+			logPath = filepath.Join(f.ProjectDir, logPath)
+		}
+		auditLog, err := os.ReadFile(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(auditLog)), "\n")
+		var outcome map[string]any
+		if err := json.Unmarshal([]byte(lines[len(lines)-1]), &outcome); err != nil {
+			t.Fatalf("failed attempt lacks a structured audit outcome: %v\n%s", err, auditLog)
+		}
+		if outcome["event"] != "emergency_execution_outcome" || outcome["executed"] != false ||
+			outcome["exit_code"] != float64(-1) || outcome["attempted_at"] != attemptedAt ||
+			outcome["error"] != result["error"] {
+			t.Fatalf("audit outcome misrepresented the failed attempt: %+v", outcome)
+		}
+		if _, present := outcome["executed_at"]; present {
+			t.Fatalf("audit gave an unstarted command an execution timestamp: %+v", outcome)
+		}
+	})
+
+	for _, policy := range []string{"same_host", "independent"} {
+		t.Run("emergency remains an unreviewed override under "+policy, func(t *testing.T) {
+			f := newSameHostCLI(t, binary, 1, false)
+			f.json("config", "set", "general.approval_policy", policy)
+			requester := f.session("Requester", "model-a")
+			reviewer := f.session("Reviewer", "model-b")
+			request := f.request(requester)
+			f.json("reject", request.ID, "--session-id", reviewer.ID, "--session-key", reviewer.SessionKey,
+				"--reason", "Not approved for reviewed execution")
+			f.fails("not approved", "execute", request.ID, "--session-id", requester.ID)
+			before, err := f.DB.ReadRequestEvents(context.Background(), f.ProjectDir, "", 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			const reason = "Isolated test of the explicitly unreviewed emergency path"
+			command := request.Command.Raw
+			ack := fmt.Sprintf("%x", sha256.Sum256([]byte(command)))
+			f.fails("--reason is required", "emergency-execute", command, "--yes", "--ack", ack)
+			f.fails("--ack is required", "emergency-execute", command, "--reason", reason, "--yes")
+			f.fails("does not match", "emergency-execute", command, "--reason", reason,
+				"--yes", "--ack", strings.Repeat("g", 64))
+			f.assertNotExecuted(request)
+
+			result := f.json("emergency-execute", command, "--reason", reason, "--yes", "--ack", ack)
+			attemptedAt, _ := result["attempted_at"].(string)
+			executedAt, _ := result["executed_at"].(string)
+			if result["executed"] != true || attemptedAt == "" || executedAt == "" ||
+				result["exit_code"] != float64(0) || result["execution_mode"] != "emergency" ||
+				result["assurance"] != "emergency_unreviewed" || result["approval_policy"] != policy ||
+				!strings.Contains(fmt.Sprint(result["review_notice"]), "unreviewed") {
+				t.Fatalf("emergency execution was not labeled as unreviewed: %+v", result)
+			}
+			if _, err := os.Stat(filepath.Join(f.ProjectDir, "reviewed-marker")); err != nil {
+				t.Fatalf("acknowledged emergency command did not run: %v", err)
+			}
+			logPath, ok := result["log_path"].(string)
+			if !ok || logPath == "" {
+				t.Fatalf("emergency result omitted its audit log: %+v", result)
+			}
+			if !filepath.IsAbs(logPath) {
+				logPath = filepath.Join(f.ProjectDir, logPath)
+			}
+			auditLog, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			firstLine, _, _ := strings.Cut(string(auditLog), "\n")
+			var event map[string]any
+			if err := json.Unmarshal([]byte(firstLine), &event); err != nil {
+				t.Fatalf("emergency audit header is not structured evidence: %v\n%s", err, firstLine)
+			}
+			if event["event"] != "emergency_execution" || event["phase"] != "attempt" || event["execution_mode"] != "emergency" ||
+				event["assurance"] != "emergency_unreviewed" || event["approval_policy"] != policy ||
+				event["command"] != command || event["hash"] != ack || event["reason"] != reason {
+				t.Fatalf("emergency audit lost its evidence class or command acknowledgment: %+v", event)
+			}
+			// Emergency execution must not invent an approval or make a rejected
+			// request look as though it went through the reviewed execution path.
+			stored, reviews, err := f.DB.GetRequestWithReviews(request.ID)
+			if err != nil || stored.Status != db.StatusRejected || stored.Execution != nil ||
+				len(reviews) != 1 || reviews[0].Decision != db.DecisionReject {
+				t.Fatalf("emergency changed the reviewed request or evidence: %+v, %+v, %v", stored, reviews, err)
+			}
+			after, err := f.DB.ReadRequestEvents(context.Background(), f.ProjectDir, "", 100)
+			if err != nil || len(after.Events) != len(before.Events) {
+				t.Fatalf("emergency invented reviewed-request audit events: before=%d after=%+v err=%v", len(before.Events), after, err)
+			}
+
+			secondCommand := "touch emergency-second-marker"
+			secondAck := fmt.Sprintf("%x", sha256.Sum256([]byte(secondCommand)))
+			second := f.json("emergency-execute", secondCommand, "--reason", "Second isolated emergency",
+				"--yes", "--ack", secondAck)
+			if second["log_path"] == result["log_path"] {
+				t.Fatal("consecutive emergency commands reused an audit log")
+			}
+			preserved, err := os.ReadFile(logPath)
+			if err != nil || !bytes.Equal(preserved, auditLog) {
+				t.Fatalf("later emergency execution overwrote earlier audit evidence: %v", err)
+			}
+		})
+	}
 }

@@ -140,6 +140,80 @@ func TestSameHostExecutionPolicyRevocationIsCheckedAtClaim(t *testing.T) {
 	}
 }
 
+func TestSameHostExecutionRechecksTightenedConflictPolicy(t *testing.T) {
+	for _, resolution := range []ConflictResolution{ConflictAnyRejectionBlocks, ConflictHumanBreaksTie} {
+		for _, safe := range []bool{false, true} {
+			for _, authenticated := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/safe=%t/authenticated=%t", resolution, safe, authenticated), func(t *testing.T) {
+					database, existing, requester := policyExecutionFixture(t)
+					firstWins := "[general]\napproval_policy = 'same_host'\nconflict_resolution = 'first_wins'\n"
+					writeExecutionPolicy(t, existing.ProjectPath, firstWins)
+					request := &db.Request{
+						ProjectPath: existing.ProjectPath, ApprovalPolicy: db.ApprovalPolicySameHost,
+						RequestorSessionID: requester.ID, RequestorAgent: requester.AgentName, RequestorModel: requester.Model,
+						Command:  db.CommandSpec{Raw: "echo conflict-policy", Argv: []string{"echo", "conflict-policy"}, Cwd: existing.ProjectPath},
+						RiskTier: db.RiskTierDangerous, MinApprovals: 2,
+						Justification: db.Justification{Reason: "Check current conflict policy before executing"},
+					}
+					if err := database.CreateRequest(request); err != nil {
+						t.Fatal(err)
+					}
+					reviewConfig := DefaultReviewConfig()
+					reviewConfig.ApprovalPolicy, reviewConfig.ConflictResolution = db.ApprovalPolicySameHost, ConflictFirstWins
+					service := NewReviewService(database, reviewConfig)
+					for i, decision := range []db.Decision{db.DecisionApprove, db.DecisionReject, db.DecisionApprove} {
+						reviewer := &db.Session{AgentName: fmt.Sprintf("conflict-reviewer-%d", i), Model: "review-model", ProjectPath: request.ProjectPath}
+						if err := database.CreateSession(reviewer); err != nil {
+							t.Fatal(err)
+						}
+						if _, err := service.SubmitReview(ReviewOptions{RequestID: request.ID, SessionID: reviewer.ID,
+							SessionKey: reviewer.SessionKey, Decision: decision}); err != nil {
+							t.Fatal(err)
+						}
+					}
+					var err error
+					request, err = database.GetRequest(request.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if request.Status != db.StatusApproved {
+						t.Fatalf("first_wins did not resolve the reviewed request: %s", request.Status)
+					}
+					executor := NewExecutor(database, nil)
+					if allowed, reason := executor.CanExecute(request.ID); !allowed {
+						t.Fatalf("original conflict policy rejected its valid approval: %s", reason)
+					}
+
+					tightened := fmt.Sprintf("[general]\napproval_policy = 'same_host'\nconflict_resolution = '%s'\n", resolution)
+					if safe {
+						tightened += "[patterns.safe]\npatterns = ['^echo conflict-policy$']\n"
+					}
+					writeExecutionPolicy(t, request.ProjectPath, tightened)
+					if allowed, reason := executor.CanExecute(request.ID); allowed || reason == "" {
+						t.Fatalf("current policy ignored the recorded rejection: allowed=%t reason=%q", allowed, reason)
+					}
+					if authenticated {
+						err = database.ClaimRequestExecutionAuthenticated(request, policyExecutionIdentity(requester), requester.SessionKey, ExecutionPolicyGuard(""))
+					} else {
+						err = database.ClaimRequestExecution(request, policyExecutionIdentity(requester), ExecutionPolicyGuard(""))
+					}
+					if !errors.Is(err, ErrApprovalPolicyChanged) {
+						t.Fatalf("claim ignored tightened conflict policy: %v", err)
+					}
+					assertPolicyUnclaimed(t, database, request.ID)
+					if _, err := database.VerifyRequestApproval(request.ID); err != nil {
+						t.Fatalf("policy change rewrote the historical review evidence: %v", err)
+					}
+					writeExecutionPolicy(t, request.ProjectPath, firstWins)
+					if err := database.ClaimRequestExecution(request, policyExecutionIdentity(requester), ExecutionPolicyGuard("")); err != nil {
+						t.Fatalf("restored original policy rejected unchanged evidence: %v", err)
+					}
+				})
+			}
+		}
+	}
+}
+
 func sameHostPolicyText(resolution string, quorum int) string {
 	return fmt.Sprintf("[general]\napproval_policy = 'same_host'\nconflict_resolution = %q\nrequire_different_model = true\n[patterns.dangerous]\npatterns = ['^printf same-host-policy$']\nmin_approvals = %d\ndynamic_quorum = false\n[integrations]\nagent_mail_enabled = false\n", resolution, quorum)
 }

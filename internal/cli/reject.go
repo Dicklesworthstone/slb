@@ -40,8 +40,9 @@ var rejectCmd = &cobra.Command{
 A reason for the rejection is required. This helps the requestor understand
 what was wrong and potentially submit a corrected request.
 
-The rejection is cryptographically signed with your session key to ensure
-authenticity.
+The rejection is signed with your session key and recorded with its evidence
+assurance. A local signature does not authenticate an independent reviewer or
+provide isolation from another process sharing the operating-system account.
 
 For cross-project reviews, use --target-project to specify which project's
 database contains the request you want to reject.

@@ -3,9 +3,13 @@ package cli
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 	"github.com/spf13/cobra"
 )
@@ -158,12 +162,12 @@ func TestEmergencyCommand_ExecutesWithValidAck(t *testing.T) {
 	h := testutil.NewHarness(t)
 	resetEmergencyFlags()
 
-	command := testutil.TruePath()
+	command := "echo emergency-output"
 	hash := sha256.Sum256([]byte(command))
 	commandHash := hex.EncodeToString(hash[:])
 
 	cmd := newTestEmergencyCmd(h.DBPath)
-	_, err := executeCommandCapture(t, cmd, "emergency-execute", command,
+	stdout, err := executeCommandCapture(t, cmd, "emergency-execute", command,
 		"-C", h.ProjectDir,
 		"-r", "Test emergency execution",
 		"-y",
@@ -174,6 +178,87 @@ func TestEmergencyCommand_ExecutesWithValidAck(t *testing.T) {
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	var result struct {
+		emergencyEvidence
+		LogPath string `json:"log_path"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("command output polluted emergency JSON: %v: %s", err, stdout)
+	}
+	if result.Assurance != db.AssuranceEmergency || result.ExecutionMode != "emergency" || result.ApprovalPolicy != db.ApprovalPolicyIndependent {
+		t.Fatalf("emergency override was mislabeled: %s", stdout)
+	}
+	log, err := os.ReadFile(result.LogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, commandOutput, ok := strings.Cut(string(log), "\n")
+	if !ok || !strings.Contains(commandOutput, "emergency-output") {
+		t.Fatalf("missing command output in log: %s", log)
+	}
+	var evidence struct {
+		emergencyEvidence
+		Event  string `json:"event"`
+		Reason string `json:"reason"`
+		Hash   string `json:"hash"`
+	}
+	if err := json.Unmarshal([]byte(header), &evidence); err != nil {
+		t.Fatalf("missing structured emergency audit evidence: %v: %s", err, log)
+	}
+	if evidence.Event != "emergency_execution" || evidence.Assurance != db.AssuranceEmergency ||
+		evidence.ReviewNotice != emergencyReviewNotice || evidence.Hash != commandHash || evidence.Reason != "Test emergency execution" {
+		t.Fatalf("wrong emergency audit evidence: %s", header)
+	}
+}
+
+func TestEmergencyCommand_RecordsCommandFailure(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetEmergencyFlags()
+	command := "exit 23"
+	hash := sha256.Sum256([]byte(command))
+	cmd := newTestEmergencyCmd(h.DBPath)
+	stdout, err := executeCommandCapture(t, cmd, "emergency-execute", command,
+		"-C", h.ProjectDir, "-r", "Test failed emergency", "-y", "--ack", hex.EncodeToString(hash[:]),
+		"--log-dir", h.ProjectDir+"/.slb/logs", "-j")
+	var exitErr commandExitError
+	if !errors.As(err, &exitErr) || exitErr.code != 23 {
+		t.Fatalf("failed emergency must return child failure: %v (%s)", err, stdout)
+	}
+	var result struct {
+		Assurance db.ReviewAssurance `json:"assurance"`
+		ExitCode  int                `json:"exit_code"`
+		Error     string             `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Assurance != db.AssuranceEmergency || result.ExitCode != 23 || result.Error == "" {
+		t.Fatalf("failed emergency reported success or lost assurance: %s", stdout)
+	}
+}
+
+func TestEmergencyCommand_RejectsInvalidContextBeforeExecution(t *testing.T) {
+	for _, tc := range []struct {
+		name, reason, timeout, want string
+	}{
+		{"blank reason", " \n\t ", "1", "--reason is required"},
+		{"zero timeout", "test", "0", "--timeout must be greater than zero"},
+		{"negative timeout", "test", "-1", "--timeout must be greater than zero"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := testutil.NewHarness(t)
+			resetEmergencyFlags()
+			command := "echo should-not-run"
+			hash := sha256.Sum256([]byte(command))
+			cmd := newTestEmergencyCmd(h.DBPath)
+			stdout, err := executeCommandCapture(t, cmd, "emergency-execute", command,
+				"-C", h.ProjectDir, "-r", tc.reason, "--timeout", tc.timeout, "-y", "--ack", hex.EncodeToString(hash[:]),
+				"--log-dir", h.ProjectDir+"/.slb/logs", "-j")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("invalid emergency context was accepted: %v (%s)", err, stdout)
+			}
+		})
 	}
 }
 

@@ -48,6 +48,7 @@ const (
 	AssuranceLegacyLocal   ReviewAssurance = "legacy_local"
 	AssuranceLegacyUnknown ReviewAssurance = "legacy_unknown"
 	AssurancePolicyAuto    ReviewAssurance = "policy_auto"
+	AssuranceEmergency     ReviewAssurance = "emergency_unreviewed"
 )
 
 // RiskTier represents the risk classification of a command.
