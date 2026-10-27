@@ -3,12 +3,15 @@ package daemon
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -21,6 +24,193 @@ import (
 	blockedalerts "github.com/Dicklesworthstone/slb/internal/notifications"
 	"github.com/charmbracelet/log"
 )
+
+type gitHistoryCheckpoint struct {
+	ProjectPath  string `json:"project_path"`
+	Cursor       string `json:"cursor"`
+	LastSequence int64  `json:"last_sequence"`
+}
+
+func awaitGitHistory(t *testing.T, repository, project, cursor string) gitHistoryCheckpoint {
+	t.Helper()
+	ref := fmt.Sprintf("refs/slb/history/%x", sha256.Sum256([]byte(project)))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		command := exec.CommandContext(ctx, "git", "-C", repository, "show", ref+":checkpoint.json")
+		if data, err := command.Output(); err == nil {
+			var checkpoint gitHistoryCheckpoint
+			if json.Unmarshal(data, &checkpoint) == nil && checkpoint.ProjectPath == project && checkpoint.Cursor == cursor {
+				return checkpoint
+			}
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("daemon did not export the committed journal cursor")
+		case <-ticker.C:
+		}
+	}
+}
+
+func TestProjectServicesGitHistoryReplayAndScope(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is required")
+	}
+	t.Setenv("HOME", t.TempDir())
+	project := t.TempDir()
+	database, err := db.OpenAndMigrate(filepath.Join(project, ".slb", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	request := serviceRequest(t, database, project)
+	foreign := serviceRequest(t, database, t.TempDir())
+	page, err := database.ReadRequestEvents(context.Background(), project, "", 100)
+	if err != nil || len(page.Events) != 1 {
+		t.Fatalf("reading project journal: %+v %v", page, err)
+	}
+	cfg := config.DefaultConfig()
+	cfg.Daemon.UseFileWatcher = false
+	cfg.Notifications.DesktopEnabled = false
+	cfg.History.GitRepoPath = "history"
+	cfg.History.AutoGitCommit = true
+	listener, _ := deliveryServer(t)
+	start := func() func() {
+		t.Helper()
+		stop, err := startProjectServices(context.Background(), database, project, "", cfg, []*IPCServer{listener}, log.New(io.Discard))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return stop
+	}
+	stop := start()
+	defer stop()
+	repository := filepath.Join(project, "history")
+	awaitGitHistory(t, repository, project, page.Cursor)
+	stop()
+	ref := fmt.Sprintf("refs/slb/history/%x", sha256.Sum256([]byte(project)))
+	readEvent := func(sequence int64) []byte {
+		t.Helper()
+		data, err := exec.Command("git", "-C", repository, "show", fmt.Sprintf("%s:events/%020d.json", ref, sequence)).Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	original := readEvent(page.Events[0].Sequence)
+	if strings.Contains(string(original), foreign.ID) || strings.Contains(string(original), request.Command.Raw) {
+		t.Fatal("automatic export leaked a different project or raw command")
+	}
+	if _, err := database.CancelRequest(request.ID, request.RequestorSessionID); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := database.ReadRequestEvents(context.Background(), project, "", 100)
+	if err != nil || len(updated.Events) != 2 {
+		t.Fatalf("reading offline cancellation: %+v %v", updated, err)
+	}
+	stopAgain := start()
+	defer stopAgain()
+	awaitGitHistory(t, repository, project, updated.Cursor)
+	stopAgain()
+	if string(readEvent(page.Events[0].Sequence)) != string(original) {
+		t.Fatal("restart rewrote historical event state")
+	}
+	var exported db.RequestEvent
+	if err := json.Unmarshal(readEvent(updated.Events[1].Sequence), &exported); err != nil {
+		t.Fatal(err)
+	}
+	if exported.State.Status != string(db.StatusCancelled) || exported.State.ApprovalPolicy != request.ApprovalPolicy.Normalized() {
+		t.Fatalf("offline event lost original status or policy: %+v", exported)
+	}
+}
+
+type gitHistoryLogObserver chan string
+
+func (o gitHistoryLogObserver) Write(data []byte) (int, error) {
+	select {
+	case o <- string(data):
+	default:
+	}
+	return len(data), nil
+}
+
+func TestProjectServicesGitHistoryFailureDoesNotDisableNotary(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is required")
+	}
+	t.Setenv("HOME", t.TempDir())
+	project := t.TempDir()
+	database, err := db.OpenAndMigrate(filepath.Join(project, ".slb", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	request := serviceRequest(t, database, project)
+	page, err := database.ReadRequestEvents(context.Background(), project, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := filepath.Join(t.TempDir(), "history")
+	if err := os.WriteFile(repository, []byte("ordinary file; cannot be a Git repository"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.DefaultConfig()
+	cfg.Daemon.UseFileWatcher = false
+	cfg.Notifications.DesktopEnabled = false
+	cfg.History.GitRepoPath = repository
+	logs := make(gitHistoryLogObserver, 20)
+	listener, _ := deliveryServer(t)
+	stop, err := startProjectServices(context.Background(), database, project, "", cfg, []*IPCServer{listener}, log.New(logs))
+	if err != nil {
+		t.Fatal("optional Git destination disabled the daemon", err)
+	}
+	defer stop()
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case line := <-logs:
+			if strings.Contains(line, "Git request history synchronization failed") {
+				goto observed
+			}
+		case <-timer.C:
+			t.Fatal("unavailable Git destination was not reported")
+		}
+	}
+observed:
+	if listener.verifier == nil || listener.pendingCount.Load() != 1 {
+		t.Fatal("Git export failure disabled request services")
+	}
+	stored, err := database.GetRequest(request.ID)
+	if err != nil || stored.Status != db.StatusPending {
+		t.Fatalf("export failure rewrote request state: %+v %v", stored, err)
+	}
+	if err := os.Rename(repository, repository+".original"); err != nil {
+		t.Fatal(err)
+	}
+	awaitGitHistory(t, repository, project, page.Cursor)
+}
+
+func TestRequestHistoryRequiresExplicitEnablement(t *testing.T) {
+	for _, cfg := range []config.HistoryConfig{
+		{AutoGitCommit: true},
+		{GitRepoPath: filepath.Join(t.TempDir(), "disabled"), AutoGitCommit: false},
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		runRequestHistory(ctx, nil, t.TempDir(), cfg, log.New(io.Discard))
+		if ctx.Err() != nil {
+			t.Error("disabled history started an automatic worker")
+		}
+		cancel()
+		if cfg.GitRepoPath != "" {
+			if _, err := os.Stat(cfg.GitRepoPath); !os.IsNotExist(err) {
+				t.Fatalf("disabled history wrote a repository: %v", err)
+			}
+		}
+	}
+}
 
 func serviceRequest(t *testing.T, database *db.DB, project string) *db.Request {
 	t.Helper()

@@ -266,6 +266,7 @@ command binding, quorum and expiry when it claims the request.
 ```bash
 slb history --tier critical --status executed  # Filter history
 slb history -q "rm -rf"                        # Full-text search
+slb history sync --limit 100 --timeout 30s --json # Export request-event metadata to local Git
 slb show <request-id> --with-reviews           # Detailed view
 slb outcome record <request-id> --problems     # Record feedback
 slb outcome stats                              # Execution statistics
@@ -298,6 +299,34 @@ command changes external state. Inspect the command log, recorded PID and actual
 system state before deciding what to do. Even a failed or cancelled command can
 have performed part of its work. SLB returns an error when terminal persistence
 fails while preserving the observed child outcome in that invocation's output.
+
+### Local Git export
+
+`history sync` exports one page from the selected project's immutable request
+journal. Configure `history.git_repo_path` first; relative destinations resolve
+against the owning project root. The command accepts `--limit` from 1 to 1000
+(default 100) and a positive `--timeout` (default `30s`). It honors `--project`,
+`--db` and `--config`, requires an existing source database, and works without a
+daemon or with `history.auto_git_commit=false`.
+
+Output contains `repository`, `ref`, `commit`, `events`, `last_sequence`, `cursor`
+and `has_more`. Repeat while `has_more` is true. Each project's dedicated
+`refs/slb/history/<project-hash>` ref contains event JSON and a checkpoint committed
+together. No-op retries leave the commit unchanged. A checkpoint from a different
+journal, or a corrupt checkpoint, is refused without silently resetting it.
+
+With a configured path and `history.auto_git_commit=true`, the project daemon
+exports new events and replays missed events after a restart. Use the same explicit
+configuration when starting the daemon; restart it after changing export settings.
+The default path is empty, so automatic Git export is off by default. Failed
+exports are retried without changing request, review or execution outcomes.
+
+This copies policy/assurance and status/outcome metadata, excluding raw commands,
+free-form evidence, attachments, keys, signatures and execution receipts. It does
+not include the separate emergency or blocked-hook ledgers. SQLite remains the
+authoritative store; Git history grants no execution permission. SLB leaves the
+user's HEAD, index, worktree and author configuration unchanged and never pushes
+to a remote. See [configuration and recovery details](../README.md#local-git-journal-export).
 
 ---
 

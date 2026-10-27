@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/audit"
 	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/db"
+	slbgit "github.com/Dicklesworthstone/slb/internal/git"
 	blockedalerts "github.com/Dicklesworthstone/slb/internal/notifications"
 	"github.com/charmbracelet/log"
 )
@@ -84,7 +86,7 @@ func startProjectServices(parent context.Context, database *db.DB, project, conf
 		}
 	}
 	var workers sync.WaitGroup
-	workers.Add(4)
+	workers.Add(5)
 	go func() {
 		defer workers.Done()
 		runRequestStateMonitor(ctx, database, project, servers, watcher, logger)
@@ -123,6 +125,10 @@ func startProjectServices(parent context.Context, database *db.DB, project, conf
 			lastError = err.Error()
 		})
 	}()
+	go func() {
+		defer workers.Done()
+		runRequestHistory(ctx, database, project, cfg.History, logger)
+	}()
 	var once sync.Once
 	return func() {
 		once.Do(func() {
@@ -134,4 +140,43 @@ func startProjectServices(parent context.Context, database *db.DB, project, conf
 			workers.Wait()
 		})
 	}, nil
+}
+
+// Git history is an optional projection of already committed journal events.
+// Its failures must not change an authorization or execution outcome. The Git
+// commit itself stores the cursor, so a later daemon can replay after downtime.
+func runRequestHistory(ctx context.Context, database *db.DB, project string, cfg config.HistoryConfig, logger *log.Logger) {
+	if !cfg.AutoGitCommit || strings.TrimSpace(cfg.GitRepoPath) == "" {
+		return
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	lastError := ""
+	for ctx.Err() == nil {
+		attempt, cancel := context.WithTimeout(ctx, 30*time.Second)
+		report, err := slbgit.SyncRequestHistory(attempt, database, cfg.GitRepoPath, project, db.DefaultRequestEventLimit)
+		cancel()
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			if err.Error() != lastError {
+				logger.Warn("Git request history synchronization failed; journal retained", "error", err)
+			}
+			lastError = err.Error()
+		} else {
+			if report.Events > 0 || lastError != "" {
+				logger.Info("Git request history synchronized", "events", report.Events, "ref", report.Ref)
+			}
+			lastError = ""
+			if report.HasMore {
+				continue
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }

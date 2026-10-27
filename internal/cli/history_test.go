@@ -1,13 +1,18 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
+	slbgit "github.com/Dicklesworthstone/slb/internal/git"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 	"github.com/spf13/cobra"
 )
@@ -24,6 +29,7 @@ func newTestHistoryCmd(dbPath string) *cobra.Command {
 	root.PersistentFlags().StringVarP(&flagOutput, "output", "o", "text", "output format")
 	root.PersistentFlags().BoolVarP(&flagJSON, "json", "j", false, "json output")
 	root.PersistentFlags().StringVarP(&flagProject, "project", "C", "", "project directory")
+	root.PersistentFlags().StringVar(&flagConfig, "config", "", "selected config")
 
 	// Create a fresh historyCmd to avoid flag pollution between tests
 	histCmd := &cobra.Command{
@@ -37,6 +43,7 @@ func newTestHistoryCmd(dbPath string) *cobra.Command {
 	histCmd.Flags().StringVar(&flagHistoryTier, "tier", "", "filter by risk tier")
 	histCmd.Flags().StringVar(&flagHistorySince, "since", "", "filter by date")
 	histCmd.Flags().IntVar(&flagHistoryLimit, "limit", 50, "max results")
+	histCmd.AddCommand(newHistorySyncCmd())
 
 	root.AddCommand(histCmd)
 
@@ -45,6 +52,7 @@ func newTestHistoryCmd(dbPath string) *cobra.Command {
 
 func resetHistoryFlags() {
 	flagDB = ""
+	flagConfig = ""
 	flagOutput = "text"
 	flagJSON = false
 	flagProject = ""
@@ -54,6 +62,129 @@ func resetHistoryFlags() {
 	flagHistoryTier = ""
 	flagHistorySince = ""
 	flagHistoryLimit = 50
+}
+
+func TestHistorySyncCommandReplaysScopedMetadata(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is required")
+	}
+	resetHistoryFlags()
+	t.Cleanup(resetHistoryFlags)
+	t.Setenv("HOME", t.TempDir())
+	h := testutil.NewHarness(t)
+	h.WriteFile(".slb/config.toml", []byte("[history]\ngit_repo_path = 'audit-history'\nauto_git_commit = false\n"), 0600)
+	session := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir))
+	first := testutil.MakeRequest(t, h.DB, session, func(r *db.Request) {
+		r.ApprovalPolicy = db.ApprovalPolicySameHost
+		r.Command.Raw = "echo raw-evidence-canary"
+		r.Command.ContainsSensitive = true
+		r.Justification.Reason = "private-justification-canary"
+	})
+	other := testutil.MakeSession(t, h.DB, testutil.WithProject(t.TempDir()))
+	foreign := testutil.MakeRequest(t, h.DB, other)
+	testutil.MakeRequest(t, h.DB, session)
+	page, err := h.DB.ReadRequestEvents(context.Background(), h.ProjectDir, "", 100)
+	if err != nil || len(page.Events) != 2 {
+		t.Fatalf("reading fixture journal: %+v %v", page, err)
+	}
+	var previousCommit string
+	for i := 0; i < 3; i++ {
+		cmd := newTestHistoryCmd(h.DBPath)
+		text, err := executeCommandCapture(t, cmd, "history", "sync", "-C", h.ProjectDir, "--limit", "1", "--json")
+		if err != nil {
+			t.Fatalf("explicit sync failed with auto export disabled: %v (%s)", err, text)
+		}
+		var result slbgit.HistorySyncResult
+		if err := json.Unmarshal([]byte(text), &result); err != nil {
+			t.Fatal(err)
+		}
+		expectedRepository, err := filepath.EvalSymlinks(filepath.Join(h.ProjectDir, "audit-history"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Repository != expectedRepository || result.Ref == "" || result.Commit == "" {
+			t.Fatalf("missing export destination: %+v", result)
+		}
+		if i < 2 {
+			event := page.Events[i]
+			if result.Events != 1 || result.HasMore != (i == 0) || result.Cursor != event.Cursor || result.LastSequence != event.Sequence {
+				t.Fatalf("sync skipped or mis-scoped events: %+v", result)
+			}
+			show := exec.Command("git", "-C", result.Repository, "show", fmt.Sprintf("%s:events/%020d.json", result.Ref, event.Sequence))
+			data, err := show.Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var exported db.RequestEvent
+			if err := json.Unmarshal(data, &exported); err != nil {
+				t.Fatal(err)
+			}
+			if exported.Cursor != event.Cursor || exported.State.ApprovalPolicy != event.State.ApprovalPolicy || exported.RequestID == foreign.ID {
+				t.Fatalf("history changed original scope or policy: %+v", exported)
+			}
+			for _, excluded := range []string{"raw-evidence-canary", "private-justification-canary", session.SessionKey} {
+				if excluded != "" && strings.Contains(string(data), excluded) {
+					t.Fatal("Git metadata exposed private request evidence")
+				}
+			}
+		} else if result.Events != 0 || result.HasMore || result.Commit != previousCommit {
+			t.Fatalf("no-op sync rewrote history: %+v", result)
+		}
+		previousCommit = result.Commit
+	}
+	stored, err := h.DB.GetRequest(first.ID)
+	if err != nil || stored.Status != db.StatusPending || stored.ApprovalPolicy != db.ApprovalPolicySameHost {
+		t.Fatalf("export changed authorization state: %+v %v", stored, err)
+	}
+}
+
+func TestHistorySyncCommandRefusesInvalidSetup(t *testing.T) {
+	for _, scenario := range []string{"unconfigured", "missing config", "directory config", "bad config", "missing database", "bad limit", "bad timeout", "bad destination"} {
+		t.Run(scenario, func(t *testing.T) {
+			resetHistoryFlags()
+			t.Cleanup(resetHistoryFlags)
+			t.Setenv("HOME", t.TempDir())
+			h := testutil.NewHarness(t)
+			cfg := "[history]\ngit_repo_path = 'audit-history'\n"
+			if scenario == "unconfigured" {
+				cfg = "[history]\ngit_repo_path = ''\n"
+			}
+			h.WriteFile(".slb/config.toml", []byte(cfg), 0600)
+			args := []string{"history", "sync", "-C", h.ProjectDir, "--json"}
+			databasePath := h.DBPath
+			switch scenario {
+			case "missing config":
+				args = append(args, "--config", filepath.Join(h.ProjectDir, "missing.toml"))
+			case "directory config":
+				args = append(args, "--config", h.ProjectDir)
+			case "bad config":
+				h.WriteFile("bad.toml", []byte("invalid TOML ["), 0600)
+				args = append(args, "--config", filepath.Join(h.ProjectDir, "bad.toml"))
+			case "missing database":
+				databasePath = filepath.Join(h.ProjectDir, "missing.db")
+			case "bad limit":
+				args = append(args, "--limit", "0")
+			case "bad timeout":
+				args = append(args, "--timeout", "0s")
+			case "bad destination":
+				h.WriteFile("audit-history", []byte("preserve this ordinary file"), 0600)
+			}
+			cmd := newTestHistoryCmd(databasePath)
+			if text, err := executeCommandCapture(t, cmd, args...); err == nil {
+				t.Fatalf("invalid history setup succeeded: %s", text)
+			}
+			if scenario == "missing database" {
+				if _, err := os.Stat(databasePath); !os.IsNotExist(err) {
+					t.Fatalf("history created a new source database: %v", err)
+				}
+			}
+			if scenario != "bad destination" {
+				if _, err := os.Stat(filepath.Join(h.ProjectDir, "audit-history")); !os.IsNotExist(err) {
+					t.Fatalf("refused setup wrote a Git destination: %v", err)
+				}
+			}
+		})
+	}
 }
 
 func TestHistoryCommand_ListsRequests(t *testing.T) {

@@ -10,14 +10,208 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
+	slbgit "github.com/Dicklesworthstone/slb/internal/git"
 	"github.com/Dicklesworthstone/slb/internal/notifications"
 )
+
+// The same immutable journal feeds local Git history regardless of whether a
+// mutation came from the CLI, detached execution or a later daemon restart.
+func TestBuiltCLIGitHistoryIntegration(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is required")
+	}
+	binary := buildIdentityBoundaryCLI(t)
+	f := newSameHostCLI(t, binary, 1, false)
+	project, err := filepath.EvalSymlinks(f.ProjectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.ProjectDir = project
+	home, err := os.MkdirTemp("", "slbh-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	f.home = home
+	const policy = `[general]
+approval_policy = "same_host"
+require_different_model = false
+enable_dry_run = false
+enable_rollback_capture = false
+[patterns.dangerous]
+min_approvals = 1
+[integrations]
+agent_mail_enabled = false
+[notifications]
+desktop_enabled = false
+`
+	f.WriteFile(".slb/config.toml", []byte(policy+"[history]\ngit_repo_path = ''\nauto_git_commit = false\n"), 0600)
+	repository := filepath.Join(t.TempDir(), "audit")
+	selected := filepath.Join(f.ProjectDir, "selected history.toml")
+	writeSelected := func(automatic bool) {
+		t.Helper()
+		text := policy + fmt.Sprintf("[history]\ngit_repo_path = %q\nauto_git_commit = %t\n", repository, automatic)
+		if err := os.WriteFile(selected, []byte(text), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeSelected(false)
+	requester := f.session("Requester", "model-a")
+	reviewer := f.session("Reviewer", "model-b")
+	create := func(command string) string {
+		t.Helper()
+		result := f.json("--config", selected, "request", command, "--session-id", requester.ID,
+			"--reason", "history-private-reason-canary", "--expected-effect", "Create an isolated fixture marker")
+		id, ok := result["request_id"].(string)
+		if !ok || result["status"] != "pending" {
+			t.Fatalf("request did not enter review: %+v", result)
+		}
+		return id
+	}
+	journal := func() *db.RequestEventPage {
+		t.Helper()
+		page, err := f.DB.ReadRequestEvents(context.Background(), f.ProjectDir, "", 100)
+		if err != nil || page.HasMore {
+			t.Fatalf("reading fixture journal: %+v %v", page, err)
+		}
+		return page
+	}
+	requestID := create("touch history-private-command-canary")
+	before := journal()
+	f.fails("cannot review your own request", "--config", selected, "approve", requestID,
+		"--session-id", requester.ID, "--session-key", requester.SessionKey)
+	if journal().Cursor != before.Cursor {
+		t.Fatal("refused review wrote a lifecycle event")
+	}
+	f.json("--config", selected, "approve", requestID, "--session-id", reviewer.ID, "--session-key", reviewer.SessionKey)
+	f.json("--config", selected, "execute", requestID, "--session-id", requester.ID, "--background")
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		request, err := f.DB.GetRequest(requestID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if request.Status == db.StatusExecuted {
+			break
+		}
+		if time.Now().After(deadline) || request.Status != db.StatusExecuting {
+			t.Fatalf("background fixture did not complete: %+v", request)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(repository); !os.IsNotExist(err) {
+		t.Fatalf("disabled automatic export wrote a repository: %v", err)
+	}
+	syncPage := func(limit string) slbgit.HistorySyncResult {
+		t.Helper()
+		stdout, stderr, err := f.run("--config", selected, "history", "sync", "--limit", limit, "--json")
+		if err != nil {
+			t.Fatalf("manual history synchronization: %v %s %s", err, stdout, stderr)
+		}
+		var result slbgit.HistorySyncResult
+		if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	var result slbgit.HistorySyncResult
+	exported := 0
+	for i := 0; i < 100; i++ {
+		result = syncPage("1")
+		exported += result.Events
+		if !result.HasMore {
+			break
+		}
+	}
+	if expected := journal(); exported != len(expected.Events) || result.Cursor != expected.Cursor {
+		t.Fatalf("manual pagination lost lifecycle events: %+v", result)
+	}
+	if repeated := syncPage("100"); repeated.Events != 0 || repeated.Commit != result.Commit {
+		t.Fatalf("unchanged manual sync created duplicate history: %+v", repeated)
+	}
+
+	running := false
+	t.Cleanup(func() {
+		if running {
+			_, stderr, err := f.run("daemon", "stop")
+			if err != nil {
+				t.Errorf("stopping history fixture daemon: %v %s", err, stderr)
+			}
+		}
+	})
+	start := func() {
+		t.Helper()
+		f.json("--config", selected, "daemon", "start")
+		running = true
+	}
+	stop := func() {
+		t.Helper()
+		f.json("daemon", "stop")
+		running = false
+	}
+	waitForExport := func(cursor string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		for ctx.Err() == nil {
+			data, err := exec.CommandContext(ctx, "git", "-C", repository, "show", result.Ref+":checkpoint.json").Output()
+			var checkpoint struct {
+				Cursor string `json:"cursor"`
+			}
+			if err == nil && json.Unmarshal(data, &checkpoint) == nil && checkpoint.Cursor == cursor {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatal("daemon did not export the selected project's journal")
+	}
+	writeSelected(true)
+	start()
+	pending := create("touch history-live-command-canary")
+	f.json("cancel", pending, "--session-id", requester.ID)
+	waitForExport(journal().Cursor)
+	stop()
+	create("touch history-offline-command-canary")
+	expected := journal()
+	start()
+	waitForExport(expected.Cursor)
+	stop()
+	if repeated := syncPage("100"); repeated.Events != 0 || repeated.Cursor != expected.Cursor {
+		t.Fatalf("restart left unexported or duplicate events: %+v", repeated)
+	}
+	var sawApproval, sawExecution bool
+	for _, event := range expected.Events {
+		data, err := exec.Command("git", "-C", repository, "show", fmt.Sprintf("%s:events/%020d.json", result.Ref, event.Sequence)).Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var copy db.RequestEvent
+		if err := json.Unmarshal(data, &copy); err != nil || !reflect.DeepEqual(copy, event) {
+			t.Fatalf("export changed immutable journal evidence: %+v (%v)", copy, err)
+		}
+		for _, excluded := range []string{"history-private-command-canary", "history-private-reason-canary", requester.SessionKey, reviewer.SessionKey} {
+			if strings.Contains(string(data), excluded) {
+				t.Fatal("Git history exposed private command or credential material")
+			}
+		}
+		if event.Review != nil {
+			sawApproval = sawApproval || event.Review.Decision == "approve" && event.Review.Assurance == db.AssuranceSameHost
+		}
+		if event.State.Status == "executed" {
+			sawExecution = event.State.ExecutionAssurance == db.AssuranceSameHost && event.State.ExecutionApprovalPolicy == db.ApprovalPolicySameHost
+		}
+	}
+	if !sawApproval || !sawExecution {
+		t.Fatalf("audit history lacks original approval/execution labels: approval=%t execution=%t", sawApproval, sawExecution)
+	}
+}
 
 // Exercise the real CLI and detached daemon/worker processes. The selected
 // file deliberately conflicts with project defaults: one effective policy must

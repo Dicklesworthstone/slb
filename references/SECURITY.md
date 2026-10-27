@@ -170,6 +170,22 @@ are not evidence that an independent person or model approved the action.
 These checks prevent accidental evidence reuse through normal SLB operations.
 They do not make mutable local storage tamper-proof against the same OS user.
 
+### Local Git history
+
+Optional Git export copies committed request-journal metadata with its original
+policy, review/execution assurance and historical-baseline labels. It does not
+export raw commands, free-form evidence, attachments, session keys, signatures
+or execution receipts. Separate emergency and blocked-hook ledgers are outside
+this export. The source SQLite journal remains authoritative.
+
+Events and their cursor are committed together on a dedicated project ref;
+resume checks bind that cursor to the source journal, project and recorded event.
+These checks support replay after interruptions. Local Git storage remains
+mutable by the same OS user and provides neither independent reviewer identity
+nor execution authorization. Export failures never turn a rejected review or
+failed execution into success. No remote push occurs, and the default empty
+destination disables automatic export.
+
 ### Project scope and delegated review
 
 CLI project discovery, hooks, and daemon lifecycle operations select the nearest

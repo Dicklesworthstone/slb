@@ -1446,6 +1446,60 @@ slb show <request-id>
 slb show <request-id> --with-reviews --with-execution --with-attachments
 ```
 
+### Local Git Journal Export
+
+SLB can copy the selected project's durable request-event metadata to a local
+Git repository. Configure the destination explicitly:
+
+```toml
+[history]
+git_repo_path = "/path/to/slb-audit"
+auto_git_commit = true
+```
+
+The default destination is empty, so no Git export runs by default. Relative
+destinations resolve from the owning project root. A new destination is
+initialized as its own repository; an existing destination must be an exact
+repository root, including a bare repository. SLB refuses to accidentally use
+an ancestor repository.
+
+With a configured destination and `auto_git_commit = true`, the project daemon
+replays committed events at startup and exports new events while running. It
+also catches up after downtime. Start the daemon with the same `--config` when
+using an explicit policy file. Restart it after changing the history destination
+or automatic-export setting. Export failures are logged and retried; the source
+journal remains available and request, review and execution outcomes are unchanged.
+
+Manual export works without a daemon and with automatic export disabled:
+
+```bash
+slb history sync --limit 100 --timeout 30s --json
+slb --config /path/to/policy.toml history sync --json
+```
+
+Each invocation exports one page of up to `--limit` events (1–1000; default 100).
+Repeat while `has_more` is true. Output includes `repository`, `ref`, `commit`,
+`events`, `last_sequence`, `cursor` and `has_more`. The default timeout is 30
+seconds. The source database must already exist; synchronization does not create
+or migrate it.
+
+Each project uses a dedicated `refs/slb/history/<project-hash>` ref containing
+`events/<sequence>.json` and `checkpoint.json`. Events and their resume checkpoint
+are published in the same Git commit. Retries resume from that checkpoint, and
+concurrent exporters compare the previous ref before publishing. A repeated sync
+with no new events creates no additional commit. Use the returned ref with
+`git log` or `git show` to inspect the export; HEAD, staged files, the working tree
+and author configuration remain unchanged. SLB does not push to a remote.
+
+The export preserves the journal's original policy, review/execution assurance,
+status, outcome and historical-baseline labels. It excludes raw commands,
+free-form evidence, attachments, session keys, signatures and execution receipts.
+SQLite remains the authoritative store: this metadata copy is neither a complete
+database backup nor independent authorization. Separate emergency and blocked-hook
+ledgers are outside this export. A corrupt checkpoint or a different source
+journal is refused instead of silently resetting the cursor; reconcile the source
+or select a fresh destination before resuming.
+
 ## Agent Mail Integration
 
 SLB can tell reviewers about requests through MCP Agent Mail. There are two
