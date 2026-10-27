@@ -792,6 +792,173 @@ func TestBuiltCLISameHostReviewIntegration(t *testing.T) {
 	}
 }
 
+func TestBuiltCLIDaemonlessAdmissionRecovery(t *testing.T) {
+	binary := buildIdentityBoundaryCLI(t)
+
+	t.Run("request timeout preserves configured seconds", func(t *testing.T) {
+		f := newSameHostCLI(t, binary, 1, false)
+		f.json("config", "set", "general.request_timeout", "2")
+		requester := f.session("Requester", "model-a")
+		request := f.request(requester)
+		if request.ExpiresAt == nil {
+			t.Fatal("request has no configured expiration")
+		}
+		// Persistence rounds created_at to seconds, so allow its subsecond
+		// precision loss while rejecting a two-second limit rounded to a minute.
+		lifetime := request.ExpiresAt.Sub(request.CreatedAt)
+		if lifetime < time.Second || lifetime > 3*time.Second {
+			t.Fatalf("configured two-second request lifetime became %v", lifetime)
+		}
+	})
+
+	for _, tc := range []struct {
+		action string
+		status db.RequestStatus
+	}{
+		{"auto_reject", db.StatusTimeout},
+		{"escalate", db.StatusEscalated},
+		{"auto_approve_warn", db.StatusEscalated},
+	} {
+		t.Run("expired capacity uses "+tc.action+" without a daemon", func(t *testing.T) {
+			f := newSameHostCLI(t, binary, 1, false)
+			f.json("config", "set", "general.timeout_action", tc.action)
+			f.json("config", "set", "rate_limits.max_pending_per_session", "1")
+			f.json("config", "set", "rate_limits.max_requests_per_minute", "100")
+			f.json("config", "set", "rate_limits.rate_limit_action", "queue")
+			requester := f.session("Requester", "model-a")
+			otherRequester := f.session("OtherRequester", "model-b")
+			expired := f.request(requester)
+			unrelated := f.request(otherRequester)
+			_, err := f.DB.Exec(`UPDATE requests SET expires_at = ? WHERE id IN (?, ?)`,
+				time.Now().Add(-time.Minute).UTC().Format(time.RFC3339), expired.ID, unrelated.ID)
+			testutil.RequireNoError(t, err, "age both pending requests beyond their review windows")
+			// No status waiter or daemon is present to advance the expired row.
+			// Admission must apply its timeout policy, without manufacturing a
+			// dangerous approval or processing another requester's queue.
+			result := f.json("request", "touch queued-marker", "--session-id", requester.ID,
+				"--reason", "Admit after an earlier request expired", "--queue-timeout", "1s")
+			if result["status"] != "pending" || result["request_id"] == expired.ID || result["approval_policy"] != "same_host" {
+				t.Fatalf("expired capacity did not admit a fresh same-host request: %+v", result)
+			}
+			stored, err := f.DB.GetRequest(expired.ID)
+			if err != nil || stored.Status != tc.status || stored.Execution != nil || stored.ApprovalExpiresAt != nil {
+				t.Fatalf("admission did not apply %s without granting approval: %+v, %v", tc.action, stored, err)
+			}
+			untouched, err := f.DB.GetRequest(unrelated.ID)
+			if err != nil || untouched.Status != db.StatusPending || untouched.ResolvedAt != nil || untouched.Execution != nil {
+				t.Fatalf("admission changed another requester's expired request: %+v, %v", untouched, err)
+			}
+			if pending, err := f.DB.CountPendingBySession(requester.ID); err != nil || pending != 1 {
+				t.Fatalf("admission exceeded the pending limit: count=%d err=%v", pending, err)
+			}
+			for _, name := range []string{"reviewed-marker", "queued-marker"} {
+				if _, err := os.Stat(filepath.Join(f.ProjectDir, name)); !os.IsNotExist(err) {
+					t.Fatalf("queue admission executed %s without review: %v", name, err)
+				}
+			}
+		})
+	}
+
+	t.Run("expired capacity does not reset the per-minute quota", func(t *testing.T) {
+		f := newSameHostCLI(t, binary, 1, false)
+		f.json("config", "set", "rate_limits.max_pending_per_session", "1")
+		f.json("config", "set", "rate_limits.max_requests_per_minute", "1")
+		f.json("config", "set", "rate_limits.rate_limit_action", "queue")
+		requester := f.session("Requester", "model-a")
+		expired := f.request(requester)
+		_, err := f.DB.Exec(`UPDATE requests SET expires_at = ? WHERE id = ?`,
+			time.Now().Add(-time.Minute).UTC().Format(time.RFC3339), expired.ID)
+		testutil.RequireNoError(t, err, "expire the pending capacity without aging its admission")
+		stdout, stderr, err := f.run("request", "touch quota-marker", "--session-id", requester.ID,
+			"--reason", "Recent admission must still consume its per-minute slot", "--queue-timeout", "100ms", "--json")
+		if err == nil {
+			t.Fatalf("expiration silently reset the per-minute quota\nstdout: %s\nstderr: %s", stdout, stderr)
+		}
+		var result map[string]any
+		if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+			t.Fatalf("quota failure did not return structured evidence: %v\n%s", err, stdout)
+		}
+		limit, ok := result["rate_limit"].(map[string]any)
+		if !ok || result["code"] != "queue_timeout" || result["created"] != false || result["executed"] != false ||
+			limit["pending"] != float64(0) || limit["recent"] != float64(1) || limit["max_per_minute"] != float64(1) {
+			t.Fatalf("expiration lost the separate quota counters: %+v", result)
+		}
+		stored, err := f.DB.GetRequest(expired.ID)
+		if err != nil || stored.Status != db.StatusEscalated || stored.Execution != nil {
+			t.Fatalf("quota rejection erased the expiration decision: %+v, %v", stored, err)
+		}
+		var count int
+		if err := f.DB.QueryRow(`SELECT COUNT(*) FROM requests WHERE requestor_session_id = ?`, requester.ID).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("quota refusal created a phantom request: count=%d err=%v", count, err)
+		}
+		if _, err := os.Stat(filepath.Join(f.ProjectDir, "quota-marker")); !os.IsNotExist(err) {
+			t.Fatalf("quota refusal ran the requested command: %v", err)
+		}
+	})
+}
+
+func TestBuiltCLISharedDatabaseReviewScope(t *testing.T) {
+	binary := buildIdentityBoundaryCLI(t)
+	f := newSameHostCLI(t, binary, 1, true)
+	f.json("config", "set", "general.cross_project_reviews", "false")
+	requester := f.session("Requester", "model-a")
+	foreignProject := t.TempDir()
+	foreign := f.json("session", "start", "--agent", "ForeignReviewer", "--model", "model-b",
+		"--program", "e2e", "-C", foreignProject, "--db", f.DBPath)
+	foreignID, _ := foreign["session_id"].(string)
+	foreignKey, _ := foreign["session_key"].(string)
+	if foreignID == "" || foreignKey == "" || foreign["project_path"] != foreignProject {
+		t.Fatalf("foreign-project session fixture is invalid: %+v", foreign)
+	}
+	request := f.request(requester)
+	before, err := f.DB.ReadRequestEvents(context.Background(), f.ProjectDir, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, decision := range []string{"approve", "reject"} {
+		args := []string{decision, request.ID, "--session-id", foreignID, "--session-key", foreignKey, "--db", f.DBPath}
+		if decision == "reject" {
+			args = append(args, "--reason", "Foreign project must not decide this request")
+		}
+		f.fails("another project", args...)
+	}
+	f.assertNotExecuted(request)
+	if approvals, rejections, err := f.DB.CountReviewsByDecision(request.ID); err != nil || approvals != 0 || rejections != 0 {
+		t.Fatalf("ordinary shared-DB review wrote foreign-project evidence: approvals=%d rejections=%d err=%v", approvals, rejections, err)
+	}
+	after, err := f.DB.ReadRequestEvents(context.Background(), f.ProjectDir, "", 100)
+	if err != nil || len(after.Events) != len(before.Events) {
+		t.Fatalf("rejected foreign-project review changed audit history: before=%d after=%+v err=%v", len(before.Events), after, err)
+	}
+	// Explicit delegation still needs the target project's policy, even when
+	// the source session and target request happen to share one physical DB.
+	f.fails("not authorized", "approve", request.ID, "--session-id", foreignID, "--session-key", foreignKey,
+		"-C", foreignProject, "--db", f.DBPath, "--target-project", f.ProjectDir)
+	f.json("config", "set", "general.cross_project_reviews", "true")
+	f.json("config", "set", "general.review_pool", "ForeignReviewer")
+	f.fails("another project", "approve", request.ID, "--session-id", foreignID, "--session-key", foreignKey, "--db", f.DBPath)
+	result := f.json("approve", request.ID, "--session-id", foreignID, "--session-key", foreignKey,
+		"-C", foreignProject, "--db", f.DBPath, "--target-project", f.ProjectDir)
+	if result["new_request_status"] != "approved" || result["approval_policy"] != "same_host" || result["assurance"] != "same_host" {
+		t.Fatalf("authorized delegation did not preserve same-host assurance: %+v", result)
+	}
+	_, reviews, err := f.DB.GetRequestWithReviews(request.ID)
+	if err != nil || len(reviews) != 1 || reviews[0].ReviewerSessionID == foreignID || reviews[0].Assurance != db.AssuranceSameHost {
+		t.Fatalf("delegation did not record distinct same-host provenance: %+v, %v", reviews, err)
+	}
+	provenance, err := f.DB.GetSession(reviews[0].ReviewerSessionID)
+	if err != nil || provenance.ProjectPath != f.ProjectDir || provenance.IsActive() {
+		t.Fatalf("delegated provenance became active target-project capacity: %+v, %v", provenance, err)
+	}
+	result = f.json("execute", request.ID, "--session-id", requester.ID)
+	if result["status"] != "executed" || result["assurance"] != "same_host" {
+		t.Fatalf("explicit same-host delegation could not complete the reviewed path: %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(f.ProjectDir, "reviewed-marker")); err != nil {
+		t.Fatalf("delegated reviewed command did not execute: %v", err)
+	}
+}
+
 // These are distinct executable entry points: they must retain the request's
 // policy through waiting and detached process handoffs, including their logs.
 func TestBuiltCLISameHostExecutionEntryPoints(t *testing.T) {

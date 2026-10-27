@@ -109,7 +109,7 @@ func verifyReviewEvidenceTx(tx *sql.Tx, request *Request, now time.Time) (review
 	rows, err := tx.Query(`
 		SELECT r.reviewer_session_id, r.reviewer_agent, r.reviewer_model,
 			r.decision, r.signature, r.signature_timestamp,
-			s.session_key_digest, s.agent_name, s.model,
+			s.session_key_digest, s.agent_name, s.model, s.project_path, s.program, s.ended_at,
 			r.approval_policy, r.assurance, r.command_hash, r.request_binding, r.signature_version
 		FROM reviews r LEFT JOIN sessions s ON s.id = r.reviewer_session_id
 		WHERE r.request_id = ? ORDER BY r.rowid
@@ -121,14 +121,23 @@ func verifyReviewEvidenceTx(tx *sql.Tx, request *Request, now time.Time) (review
 	seenAgents := make(map[string]bool)
 	for rows.Next() {
 		var sessionID, agent, model, decision, signature, timestamp string
-		var digest, sessionAgent, sessionModel sql.NullString
+		var digest, sessionAgent, sessionModel, sessionProject, sessionProgram, sessionEnded sql.NullString
 		review := Review{RequestID: request.ID}
-		if err := rows.Scan(&sessionID, &agent, &model, &decision, &signature, &timestamp, &digest, &sessionAgent, &sessionModel,
+		if err := rows.Scan(&sessionID, &agent, &model, &decision, &signature, &timestamp, &digest, &sessionAgent, &sessionModel, &sessionProject, &sessionProgram, &sessionEnded,
 			&review.ApprovalPolicy, &review.Assurance, &review.CommandHash, &review.RequestBinding, &review.SignatureVersion); err != nil {
 			return proof, fmt.Errorf("reading approval evidence: %w", err)
 		}
 		if !sessionAgent.Valid || agent == "" || sessionAgent.String != agent || sessionModel.String != model {
 			return deny("reviewer identity is missing or changed for session %s", sessionID)
+		}
+		// Delegated reviews have an ended provenance session in the target
+		// project. A foreign local session is never equivalent, even when a
+		// shared database or older binary previously admitted its signature.
+		if !sessionProject.Valid || sessionProject.String != request.ProjectPath {
+			return deny("reviewer session %s belongs to another project", sessionID)
+		}
+		if _, err := ValidateReviewSessionProvenance(sessionID, sessionProgram.String, sessionEnded.Valid); err != nil {
+			return deny("invalid cross-project provenance for reviewer session %s", sessionID)
 		}
 		if decoded, err := hex.DecodeString(digest.String); err != nil || len(decoded) != sha256.Size {
 			return deny("invalid signing key for reviewer session %s", sessionID)

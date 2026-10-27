@@ -200,7 +200,7 @@ func (rs *ReviewService) submitReview(opts ReviewOptions, delegated *db.Delegate
 	}
 	outcome, err := rs.db.ApplyReview(review, opts.SessionKey, db.ReviewPolicy{
 		ApprovalPolicy:          rs.config.ApprovalPolicy,
-		PolicyCheck:             ReviewPolicyGuard(rs.config.ConfigPath),
+		PolicyCheck:             ReviewPolicyGuard(rs.config.ConfigPath, delegated),
 		ConflictResolution:      string(rs.config.ConflictResolution),
 		TrustedSelfApprove:      rs.config.TrustedSelfApprove,
 		TrustedSelfApproveDelay: rs.config.TrustedSelfApproveDelay,
@@ -234,7 +234,7 @@ func (rs *ReviewService) submitReview(opts ReviewOptions, delegated *db.Delegate
 // ReviewPolicyGuard reloads the target's current opt-in after the DB obtains its
 // writer reservation. A service created before opt-out cannot commit a stale
 // same-host approval. Rejections remain available after opt-out.
-func ReviewPolicyGuard(configPath string) func(*db.Request) error {
+func ReviewPolicyGuard(configPath string, delegated *db.DelegatedReviewerIdentity) func(*db.Request) error {
 	return func(request *db.Request) error {
 		if request == nil {
 			return errors.New("request is required for review policy check")
@@ -256,8 +256,23 @@ func ReviewPolicyGuard(configPath string) func(*db.Request) error {
 			return fmt.Errorf("%w: request approval policy is %q, current policy is %q; submit a new request",
 				db.ErrReviewPolicyMismatch, request.ApprovalPolicy.Normalized(), cfg.General.ApprovalPolicy)
 		}
+		if delegated != nil && !crossProjectReviewerAllowed(cfg.General, delegated.AgentName) {
+			return ErrCrossProjectReviewDenied
+		}
 		return nil
 	}
+}
+
+func crossProjectReviewerAllowed(cfg config.GeneralConfig, agent string) bool {
+	if !cfg.CrossProjectReviews {
+		return false
+	}
+	for _, allowed := range cfg.ReviewPool {
+		if allowed == agent {
+			return true
+		}
+	}
+	return false
 }
 
 // isTrustedSelfApprove checks if an agent is in the trusted self-approve list.

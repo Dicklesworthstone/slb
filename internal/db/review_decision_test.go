@@ -46,6 +46,30 @@ func applyFixtureReview(database *DB, request *Request, session *Session, decisi
 	return database.ApplyReview(&Review{RequestID: request.ID, ReviewerSessionID: session.ID, Decision: decision}, session.SessionKey, policy)
 }
 
+func TestSameHostReviewRejectsNonstandardDelegationProvenance(t *testing.T) {
+	for _, fixture := range []struct{ name, id, program string }{
+		{"marker without reserved ID", "ordinary-session", "cross-project-review"},
+		{"malformed reserved ID", "xpr-not-a-digest", "test"},
+		{"reserved ID on local session", "xpr-00112233445566778899aabbccddeeff", "test"},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			database, request, _ := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+			session := &Session{ID: fixture.id, AgentName: "unrecognized-delegation", Model: "other-model", Program: fixture.program, ProjectPath: request.ProjectPath}
+			if err := database.CreateSession(session); err != nil {
+				t.Fatal(err)
+			}
+			result, err := applyFixtureReview(database, request, session, DecisionApprove, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost})
+			if result != nil || !errors.Is(err, ErrInvalidApprovalProof) {
+				t.Fatalf("nonstandard provenance admitted a local approval: %+v %v", result, err)
+			}
+			approvals, rejections, err := database.CountReviewsByDecision(request.ID)
+			if err != nil || approvals+rejections != 0 {
+				t.Fatalf("failed provenance validation persisted a vote: %d/%d %v", approvals, rejections, err)
+			}
+		})
+	}
+}
+
 // Even possession of every local HMAC key must not establish independent
 // identity. Exercise the public DB boundary, not a mock identity checker.
 func TestIndependentIdentityFailsClosed(t *testing.T) {
@@ -661,6 +685,30 @@ func TestSameHostReviewIntegrationSelfAndModelRestrictions(t *testing.T) {
 	}
 }
 
+func TestSameHostReviewRejectsForeignSessionProject(t *testing.T) {
+	for _, decision := range []Decision{DecisionApprove, DecisionReject} {
+		t.Run(string(decision), func(t *testing.T) {
+			database, request, _ := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+			foreign := &Session{AgentName: "foreign-reviewer", Model: "foreign-model", ProjectPath: t.TempDir()}
+			if err := database.CreateSession(foreign); err != nil {
+				t.Fatal(err)
+			}
+			out, err := applyFixtureReview(database, request, foreign, decision, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost})
+			if out != nil || !errors.Is(err, ErrReviewSessionProjectMismatch) {
+				t.Fatalf("foreign session submitted a local %s: %+v %v", decision, out, err)
+			}
+			stored, err := database.GetRequest(request.ID)
+			if err != nil || stored.Status != StatusPending {
+				t.Fatalf("foreign review changed request status: %+v %v", stored, err)
+			}
+			approvals, rejections, err := database.CountReviewsByDecision(request.ID)
+			if err != nil || approvals+rejections != 0 {
+				t.Fatalf("foreign review was persisted: %d/%d %v", approvals, rejections, err)
+			}
+		})
+	}
+}
+
 func TestSameHostReviewIntegrationSignedSubmission(t *testing.T) {
 	for _, mode := range []string{"valid", "wrong key", "invalid signature", "stale", "future", "legacy signature"} {
 		t.Run(mode, func(t *testing.T) {
@@ -716,6 +764,7 @@ func TestSameHostExecutionIntegrationRechecksEvidence(t *testing.T) {
 		{"signature downgrade", `UPDATE reviews SET signature_version = 1`},
 		{"missing command binding", `UPDATE reviews SET command_hash = ''`},
 		{"changed requester", `UPDATE requests SET requestor_agent = 'SomeoneElse'`},
+		{"foreign reviewer project", `UPDATE sessions SET project_path = '/foreign-project' WHERE id IN (SELECT reviewer_session_id FROM reviews)`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)

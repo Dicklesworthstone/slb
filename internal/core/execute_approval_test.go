@@ -92,7 +92,13 @@ func TestExecutorProofCheckDoesNotConsumeApproval(t *testing.T) {
 func TestExecutorProofCheckRejectsReplacedSnapshot(t *testing.T) {
 	db.SimulateIndependentIdentityForTest(t)
 	database, request, _ := executorApprovalFixture(t)
-	if _, err := database.Exec(`UPDATE requests SET project_path = ? WHERE id = ?`, filepath.Join(request.ProjectPath, "other"), request.ID); err != nil {
+	otherProject := filepath.Join(request.ProjectPath, "other")
+	// Keep the stored proof internally consistent so this specifically
+	// exercises replacement of the caller's request snapshot.
+	if _, err := database.Exec(`UPDATE sessions SET project_path = ? WHERE project_path = ?`, otherProject, request.ProjectPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`UPDATE requests SET project_path = ? WHERE id = ?`, otherProject, request.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := NewExecutor(database, nil).verifyApprovalSnapshot(request); !errors.Is(err, db.ErrInvalidTransition) {

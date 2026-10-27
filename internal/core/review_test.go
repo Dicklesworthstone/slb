@@ -2,6 +2,7 @@ package core
 
 import (
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -1528,29 +1529,31 @@ func TestGetReviewStatus_Errors(t *testing.T) {
 
 func TestSubmitCrossProjectReviewAuthorization(t *testing.T) {
 	db.SimulateIndependentIdentityForTest(t)
+	sourceProject, targetProject := t.TempDir(), t.TempDir()
 	source, err := db.Open(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer source.Close()
-	target, err := db.Open(":memory:")
+	target, err := db.Open(filepath.Join(targetProject, ".slb", "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer target.Close()
+	writeExecutionPolicy(t, targetProject, "[general]\ncross_project_reviews = true\nreview_pool = ['Reviewer']\n[integrations]\nagent_mail_enabled = false\n")
 
-	reviewer := &db.Session{AgentName: "Reviewer", Program: "codex-cli", Model: "model-b", ProjectPath: "/source"}
+	reviewer := &db.Session{AgentName: "Reviewer", Program: "codex-cli", Model: "model-b", ProjectPath: sourceProject}
 	if err := source.CreateSession(reviewer); err != nil {
 		t.Fatal(err)
 	}
-	requestor := &db.Session{AgentName: "Requestor", Program: "claude-code", Model: "model-a", ProjectPath: "/target"}
+	requestor := &db.Session{AgentName: "Requestor", Program: "claude-code", Model: "model-a", ProjectPath: targetProject}
 	if err := target.CreateSession(requestor); err != nil {
 		t.Fatal(err)
 	}
 	request := &db.Request{
-		ProjectPath: "/target", RequestorSessionID: requestor.ID,
+		ProjectPath: targetProject, RequestorSessionID: requestor.ID,
 		RequestorAgent: requestor.AgentName, RequestorModel: requestor.Model,
-		Command:  db.CommandSpec{Raw: "rm -rf ./build", Cwd: "/target", Shell: true},
+		Command:  db.CommandSpec{Raw: "rm -rf ./build", Cwd: targetProject, Shell: true},
 		RiskTier: db.RiskTierDangerous, Status: db.StatusPending, MinApprovals: 1,
 		Justification: db.Justification{Reason: "test delegated review"},
 	}
@@ -1563,7 +1566,7 @@ func TestSubmitCrossProjectReviewAuthorization(t *testing.T) {
 	}
 
 	disabled := NewReviewService(target, DefaultReviewConfig())
-	if _, err := disabled.SubmitCrossProjectReview(source, "/source", opts); !errors.Is(err, ErrCrossProjectReviewDenied) {
+	if _, err := disabled.SubmitCrossProjectReview(source, sourceProject, opts); !errors.Is(err, ErrCrossProjectReviewDenied) {
 		t.Fatalf("disabled cross-project review accepted: %v", err)
 	}
 
@@ -1571,7 +1574,7 @@ func TestSubmitCrossProjectReviewAuthorization(t *testing.T) {
 	cfg.CrossProjectReviews = true
 	cfg.ReviewPool = []string{"SomeoneElse"}
 	service := NewReviewService(target, cfg)
-	if _, err := service.SubmitCrossProjectReview(source, "/source", opts); !errors.Is(err, ErrCrossProjectReviewDenied) {
+	if _, err := service.SubmitCrossProjectReview(source, sourceProject, opts); !errors.Is(err, ErrCrossProjectReviewDenied) {
 		t.Fatalf("reviewer outside target allowlist accepted: %v", err)
 	}
 
@@ -1579,11 +1582,11 @@ func TestSubmitCrossProjectReviewAuthorization(t *testing.T) {
 	service = NewReviewService(target, cfg)
 	badKey := opts
 	badKey.SessionKey = "not-the-session-key"
-	if _, err := service.SubmitCrossProjectReview(source, "/source", badKey); !errors.Is(err, ErrSessionKeyMismatch) {
+	if _, err := service.SubmitCrossProjectReview(source, sourceProject, badKey); !errors.Is(err, ErrSessionKeyMismatch) {
 		t.Fatalf("invalid source key accepted: %v", err)
 	}
 
-	result, err := service.SubmitCrossProjectReview(source, "/source", opts)
+	result, err := service.SubmitCrossProjectReview(source, sourceProject, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1601,7 +1604,7 @@ func TestSubmitCrossProjectReviewAuthorization(t *testing.T) {
 	if provenance.SessionKey == reviewer.SessionKey {
 		t.Fatal("target provenance copied the source session credential")
 	}
-	active, err := target.ListActiveSessions("/target")
+	active, err := target.ListActiveSessions(targetProject)
 	if err != nil || len(active) != 1 || active[0].ID != requestor.ID {
 		t.Fatalf("target active sessions polluted by delegation: %+v err=%v", active, err)
 	}

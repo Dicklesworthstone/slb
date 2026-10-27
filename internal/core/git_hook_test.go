@@ -251,6 +251,33 @@ func TestCreateGitHookRequestCannotBorrowAllowlist(t *testing.T) {
 	}
 }
 
+func TestCreateGitHookRequestResolvesExpiredCapacity(t *testing.T) {
+	creator, session, notifier := creatorAdmissionFixture(t, RateLimitActionReject)
+	creator.config.RequestTimeout = 2 * time.Second
+	intent := GitHookIntent{Operation: "pre-commit", ProjectPath: session.ProjectPath,
+		Snapshot: strings.Repeat("b", 64), Evidence: "disposable Git snapshot"}
+	first, err := creator.CreateGitHookRequest(context.Background(), intent, session.ID, "first review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lifetime := first.ExpiresAt.Sub(first.CreatedAt); lifetime < time.Second || lifetime > 2*time.Second {
+		t.Fatalf("native Git did not retain the configured deadline: %v", lifetime)
+	}
+	writeExecutionPolicy(t, session.ProjectPath, "[general]\ntimeout_action = 'auto_reject'\n")
+	if _, err := creator.db.Exec(`UPDATE requests SET expires_at = ? WHERE id = ?`, time.Now().UTC().Add(-time.Second).Format(time.RFC3339), first.ID); err != nil {
+		t.Fatal(err)
+	}
+	intent.Snapshot = strings.Repeat("c", 64)
+	second, err := creator.CreateGitHookRequest(context.Background(), intent, session.ID, "second review")
+	if err != nil || second.Status != db.StatusPending || second.Command.Hash == first.Command.Hash || notifier.calls.Load() != 2 {
+		t.Fatalf("native Git did not recover expired capacity: %+v %v", second, err)
+	}
+	stored, err := creator.db.GetRequest(first.ID)
+	if err != nil || stored.Status != db.StatusTimeout || stored.Execution != nil || stored.ApprovalExpiresAt != nil {
+		t.Fatalf("native Git expired request was not denied: %+v %v", stored, err)
+	}
+}
+
 func TestGitRebaseAuthorizationGates(t *testing.T) {
 	db.SimulateIndependentIdentityForTest(t)
 	for _, kind := range []string{"success-and-replay", "stale-ref-state", "wrong-operation", "critical-quorum", "safe-allowlist", "expired"} {

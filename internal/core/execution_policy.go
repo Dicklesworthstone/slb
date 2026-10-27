@@ -142,6 +142,9 @@ func CheckExecutionPolicy(reader PolicyReader, request *db.Request, configPath s
 	if err := checkReviewConflictPolicy(reader, request, cfg.General.ConflictResolution); err != nil {
 		return err
 	}
+	if err := checkCrossProjectReviewPolicy(reader, request, cfg.General); err != nil {
+		return err
+	}
 	available, err := CountPolicyReviewers(reader, request.ProjectPath, request.RequestorSessionID, request.RequestorAgent)
 	if err != nil {
 		return err
@@ -178,6 +181,35 @@ func checkReviewConflictPolicy(reader PolicyReader, request *db.Request, resolut
 		return fmt.Errorf("%w: current conflict policy %q does not permit these rejection votes", ErrApprovalPolicyChanged, resolution)
 	}
 	return nil
+}
+
+// Delegated votes remain same-host evidence, but they also depend on the
+// target project's current opt-in and reviewer allowlist. Check the session
+// namespace covered by the signature, not a self-reported program label.
+// Rejections do not grant permission and must remain effective after opt-out.
+func checkCrossProjectReviewPolicy(reader PolicyReader, request *db.Request, cfg config.GeneralConfig) error {
+	rows, err := reader.Query(`SELECT r.reviewer_session_id, r.reviewer_agent, s.program, s.ended_at
+		FROM reviews r LEFT JOIN sessions s ON s.id = r.reviewer_session_id
+		WHERE r.request_id = ? AND r.decision = 'approve'`, request.ID)
+	if err != nil {
+		return fmt.Errorf("reading cross-project approval evidence: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var sessionID, agent string
+		var program, ended sql.NullString
+		if err := rows.Scan(&sessionID, &agent, &program, &ended); err != nil {
+			return fmt.Errorf("reading cross-project approval: %w", err)
+		}
+		delegated, err := db.ValidateReviewSessionProvenance(sessionID, program.String, ended.Valid)
+		if err != nil {
+			return fmt.Errorf("%w: invalid cross-project provenance for reviewer session %s", db.ErrInvalidApprovalProof, sessionID)
+		}
+		if delegated && !crossProjectReviewerAllowed(cfg, agent) {
+			return fmt.Errorf("%w: cross-project approval from %q is no longer permitted by the target policy", ErrApprovalPolicyChanged, agent)
+		}
+	}
+	return rows.Err()
 }
 
 // A change in assurance requires a new request and new reviews. In particular,

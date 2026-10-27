@@ -73,7 +73,7 @@ func submitInteractiveReview(opts Options, id, commandHash string, approvalPolic
 	policy.ExpectedCommandHash = commandHash
 	policy.ExpectedProjectPath = target.ProjectPath
 	policy.ExpectedApprovalPolicy = approvalPolicy.Normalized()
-	policy.PolicyCheck = core.ReviewPolicyGuard(opts.ConfigPath)
+	policy.PolicyCheck = core.ReviewPolicyGuard(opts.ConfigPath, nil)
 	review := &db.Review{RequestID: id, ReviewerSessionID: opts.SessionID, Decision: decision, Comments: comments}
 	outcome, err := database.ApplyReview(review, opts.SessionKey, policy)
 	if err != nil {

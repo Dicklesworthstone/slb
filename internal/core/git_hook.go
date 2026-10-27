@@ -91,6 +91,9 @@ func (rc *RequestCreator) CreateGitHookRequest(ctx context.Context, intent GitHo
 	if rc.isAgentBlocked(session.AgentName) {
 		return nil, ErrAgentBlocked
 	}
+	if err := rc.advanceExpiredCapacity(ctx, session.ID, intent.ProjectPath); err != nil {
+		return nil, err
+	}
 	available, err := CountPolicyReviewers(rc.db, intent.ProjectPath, session.ID, session.AgentName)
 	if err != nil {
 		return nil, err
@@ -150,6 +153,9 @@ func (intent GitHookIntent) checkPolicy(reader PolicyReader, request *db.Request
 		}
 	}
 	if err := checkReviewConflictPolicy(reader, request, cfg.General.ConflictResolution); err != nil {
+		return err
+	}
+	if err := checkCrossProjectReviewPolicy(reader, request, cfg.General); err != nil {
 		return err
 	}
 	tier := intent.effectiveTier(engine)

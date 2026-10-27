@@ -7,19 +7,21 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
 var (
-	ErrReviewNotPending         = errors.New("request is not pending")
-	ErrReviewExpired            = errors.New("request has expired")
-	ErrReviewSessionInactive    = errors.New("session is no longer active")
-	ErrReviewSessionKeyMismatch = errors.New("session key does not match session")
-	ErrReviewDifferentModel     = errors.New("different model required for approval")
-	ErrReviewInvalidDecision    = errors.New("invalid decision (must be approve or reject)")
-	ErrReviewTargetChanged      = errors.New("request changed since it was displayed; reload before reviewing")
-	ErrReviewDelegationMismatch = errors.New("cross-project reviewer identity mismatch")
-	ErrReviewPolicyMismatch     = errors.New("approval policy differs from this request; submit a new request under the intended policy")
+	ErrReviewNotPending             = errors.New("request is not pending")
+	ErrReviewExpired                = errors.New("request has expired")
+	ErrReviewSessionInactive        = errors.New("session is no longer active")
+	ErrReviewSessionKeyMismatch     = errors.New("session key does not match session")
+	ErrReviewSessionProjectMismatch = errors.New("reviewer session belongs to another project; use an explicitly authorized cross-project review")
+	ErrReviewDifferentModel         = errors.New("different model required for approval")
+	ErrReviewInvalidDecision        = errors.New("invalid decision (must be approve or reject)")
+	ErrReviewTargetChanged          = errors.New("request changed since it was displayed; reload before reviewing")
+	ErrReviewDelegationMismatch     = errors.New("cross-project reviewer identity mismatch")
+	ErrReviewPolicyMismatch         = errors.New("approval policy differs from this request; submit a new request under the intended policy")
 	// The local backend has no external reviewer authenticator. Session keys,
 	// agent names and model labels cannot establish independent principals.
 	ErrIndependentIdentityUnavailable = errors.New("independent reviewer identity unavailable: local sessions cannot authorize approvals; use an external identity and execution boundary")
@@ -168,8 +170,9 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 			ended.Valid = true
 		} else {
 			var digest sql.NullString
-			err = tx.QueryRow(`SELECT agent_name, COALESCE(model, ''), session_key_digest, ended_at FROM sessions WHERE id = ?`,
-				accepted.ReviewerSessionID).Scan(&agent, &model, &digest, &ended)
+			var project string
+			err = tx.QueryRow(`SELECT agent_name, COALESCE(model, ''), session_key_digest, ended_at, project_path FROM sessions WHERE id = ?`,
+				accepted.ReviewerSessionID).Scan(&agent, &model, &digest, &ended, &project)
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrSessionNotFound
 			}
@@ -181,6 +184,12 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 			}
 			if !SessionKeyMatches(digest.String, sessionKey) {
 				return ErrReviewSessionKeyMismatch
+			}
+			// A shared database can hold sessions for several projects. Merely
+			// finding a valid credential here does not authorize a foreign vote;
+			// that must use the explicitly authorized delegated-review path.
+			if project != request.ProjectPath {
+				return ErrReviewSessionProjectMismatch
 			}
 			storedDigest = digest.String
 		}
@@ -307,12 +316,12 @@ func (db *DB) ensureDelegatedReviewerTx(tx *sql.Tx, targetProject, sessionKey st
 	if err != nil {
 		return "", "", "", "", fmt.Errorf("recording delegated reviewer identity: %w", err)
 	}
-	var project string
+	var project, program string
 	var ended, digest sql.NullString
 	err = tx.QueryRow(`
-		SELECT agent_name, COALESCE(model, ''), session_key_digest, project_path, ended_at
+		SELECT agent_name, COALESCE(model, ''), session_key_digest, project_path, ended_at, COALESCE(program, '')
 		FROM sessions WHERE id = ?
-	`, id).Scan(&agent, &model, &digest, &project, &ended)
+	`, id).Scan(&agent, &model, &digest, &project, &ended, &program)
 	if err != nil {
 		return "", "", "", "", fmt.Errorf("reading delegated reviewer identity: %w", err)
 	}
@@ -320,7 +329,31 @@ func (db *DB) ensureDelegatedReviewerTx(tx *sql.Tx, targetProject, sessionKey st
 		!SessionKeyMatches(digest.String, delegationKey) {
 		return "", "", "", "", ErrReviewDelegationMismatch
 	}
+	if delegated, err := ValidateReviewSessionProvenance(id, program, ended.Valid); err != nil || !delegated {
+		return "", "", "", "", ErrReviewDelegationMismatch
+	}
 	return id, agent, model, digest.String, nil
+}
+
+// ValidateReviewSessionProvenance recognizes the reserved session namespace
+// used by delegated reviews. Version 2 signatures bind that session ID, so a
+// mutable program label cannot relabel delegated evidence as local evidence.
+// Ordinary sessions return false. Incomplete or colliding provenance fails
+// closed; valid delegation still requires the target's current review policy.
+func ValidateReviewSessionProvenance(id, program string, ended bool) (bool, error) {
+	reserved := strings.HasPrefix(id, "xpr-")
+	if !reserved && program != "cross-project-review" {
+		return false, nil
+	}
+	if !reserved || program != "cross-project-review" || !ended {
+		return false, ErrReviewDelegationMismatch
+	}
+	suffix := strings.TrimPrefix(id, "xpr-")
+	decoded, err := hex.DecodeString(suffix)
+	if err != nil || len(decoded) != 16 || hex.EncodeToString(decoded) != suffix {
+		return false, ErrReviewDelegationMismatch
+	}
+	return true, nil
 }
 
 func deriveDelegatedReviewKey(sourceSessionKey, targetProject, sourceProject, sourceSessionID string) string {
