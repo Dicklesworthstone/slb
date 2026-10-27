@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,6 +43,40 @@ func takeQueuedResult(t *testing.T, done <-chan queuedRequestResult) queuedReque
 		t.Fatal("queue did not react to capacity/session change")
 		return queuedRequestResult{}
 	}
+}
+
+// The second preflight quota check can only be reached after the first full
+// queue result passed through the retry loop. Pause at the existing clock seam
+// so tests change capacity/cancellation at a known retry, not after a sleep.
+func pauseQueuedRetry(t *testing.T, creator *RequestCreator, opts CreateRequestOptions, ctx context.Context) (<-chan queuedRequestResult, func()) {
+	t.Helper()
+	creator.config.EnableDryRun = true
+	paused, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	resume := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(resume)
+	checks := 0
+	creator.rateLimiter.now = func() time.Time {
+		checks++
+		if checks == 2 {
+			close(paused)
+			<-release
+		}
+		return time.Now()
+	}
+	done := make(chan queuedRequestResult, 1)
+	go func() {
+		result, err := creator.CreateRequestContext(ctx, opts)
+		done <- queuedRequestResult{result, err}
+	}()
+	select {
+	case <-paused:
+	case result := <-done:
+		t.Fatalf("request returned before observing a full queue and retrying: %+v", result)
+	case <-time.After(5 * time.Second):
+		t.Fatal("request did not reach its second quota check")
+	}
+	return done, resume
 }
 
 func TestRequestQueueWaitsWithoutPersistingOrHoldingWriter(t *testing.T) {
@@ -82,7 +117,7 @@ func TestRequestQueueWaitsWithoutPersistingOrHoldingWriter(t *testing.T) {
 }
 
 func TestRequestQueueCancellationHasNoPhantomRequest(t *testing.T) {
-	for _, name := range []string{"cancel", "deadline", "pre-cancelled"} {
+	for _, name := range []string{"cancel", "deadline-before-attempt", "pre-cancelled"} {
 		t.Run(name, func(t *testing.T) {
 			creator, session, notifier := creatorAdmissionFixture(t, RateLimitActionQueue)
 			if _, err := creator.CreateRequest(creatorAdmissionOptions(session)); err != nil {
@@ -95,28 +130,126 @@ func TestRequestQueueCancellationHasNoPhantomRequest(t *testing.T) {
 			if name == "pre-cancelled" {
 				cancel()
 				finished.result, finished.err = creator.CreateRequestContext(ctx, creatorAdmissionOptions(session))
-			} else if name == "deadline" {
-				deadlineCtx, stop := context.WithTimeout(ctx, 60*time.Millisecond)
+			} else if name == "deadline-before-attempt" {
+				// A deadline may expire before any quota is observed. Exercise
+				// that case explicitly instead of assuming a 60ms timer permits
+				// one database attempt on every host.
+				deadlineCtx, stop := context.WithDeadline(ctx, time.Now().Add(-time.Second))
 				defer stop()
 				finished.result, finished.err = creator.CreateRequestContext(deadlineCtx, creatorAdmissionOptions(session))
 				want = context.DeadlineExceeded
 			} else {
-				done := awaitQueuedAttempt(t, creator, creatorAdmissionOptions(session), ctx)
+				done, resume := pauseQueuedRetry(t, creator, creatorAdmissionOptions(session), ctx)
 				cancel()
+				resume()
 				finished = takeQueuedResult(t, done)
 			}
 			if finished.result != nil || !errors.Is(finished.err, want) || strings.Contains(finished.err.Error(), "PANIC") {
 				t.Fatalf("invalid cancellation: %+v", finished)
 			}
 			var limit *RateLimitError
-			if name != "pre-cancelled" && !errors.As(finished.err, &limit) {
+			if name == "cancel" && !errors.As(finished.err, &limit) {
 				t.Fatalf("lost quota reason: %v", finished.err)
+			}
+			if name != "cancel" && errors.As(finished.err, &limit) {
+				t.Fatalf("cancellation before admission invented a quota failure: %v", finished.err)
 			}
 			count, err := creator.db.CountPendingBySession(session.ID)
 			if err != nil || count != 1 || notifier.calls.Load() != 1 {
 				t.Fatal("cancelled waiter persisted or notified")
 			}
 		})
+	}
+}
+
+func TestRequestQueueCancellationDuringRetryPreservesLimit(t *testing.T) {
+	creator, session, notifier := creatorAdmissionFixture(t, RateLimitActionQueue)
+	seed, err := creator.CreateRequest(creatorAdmissionOptions(session))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done, resume := pauseQueuedRetry(t, creator, creatorAdmissionOptions(session), ctx)
+	// Free capacity while the retry is paused. It now reaches context-aware
+	// DB admission rather than returning a second quota failure. Skip preview
+	// tools so cancellation is returned by the real DB BeginTx boundary.
+	if _, err := creator.db.Exec(`UPDATE requests SET status = ? WHERE id = ?`, string(db.StatusCancelled), seed.Request.ID); err != nil {
+		t.Fatal(err)
+	}
+	creator.config.EnableDryRun = false
+	cancel()
+	resume()
+	finished := takeQueuedResult(t, done)
+	var limit *RateLimitError
+	if finished.result != nil || !errors.Is(finished.err, context.Canceled) || !errors.As(finished.err, &limit) {
+		t.Fatalf("retry cancellation lost its observed quota: result=%+v err=%v", finished.result, finished.err)
+	}
+	if limit.SessionID != session.ID || limit.Pending != 1 || limit.MaxPending != 1 || !strings.Contains(finished.err.Error(), "beginning request admission") {
+		t.Fatalf("retry cancellation lost original DB context or quota details: %v", finished.err)
+	}
+	var count int
+	if err := creator.db.QueryRow(`SELECT COUNT(*) FROM requests`).Scan(&count); err != nil || count != 1 || notifier.calls.Load() != 1 {
+		t.Fatalf("cancelled retry persisted or notified: count=%d notices=%d err=%v", count, notifier.calls.Load(), err)
+	}
+}
+
+func TestRequestQueueCancellationDoesNotMaskStorageFailure(t *testing.T) {
+	creator, session, notifier := creatorAdmissionFixture(t, RateLimitActionQueue)
+	if _, err := creator.CreateRequest(creatorAdmissionOptions(session)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done, resume := pauseQueuedRetry(t, creator, creatorAdmissionOptions(session), ctx)
+	// The next non-context DB read must report the closed store even though
+	// the caller cancels at the same synchronization point.
+	if err := creator.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	resume()
+	finished := takeQueuedResult(t, done)
+	var limit *RateLimitError
+	if finished.result != nil || finished.err == nil || !strings.Contains(finished.err.Error(), "database is closed") ||
+		errors.Is(finished.err, context.Canceled) || errors.As(finished.err, &limit) || notifier.calls.Load() != 1 {
+		t.Fatalf("cancellation replaced or retried a storage failure: %+v", finished)
+	}
+}
+
+type cancellingQueueNotifier struct {
+	*admissionNotifier
+	cancel context.CancelFunc
+}
+
+func (n *cancellingQueueNotifier) NotifyNewRequest(request *db.Request) error {
+	err := n.admissionNotifier.NotifyNewRequest(request)
+	n.cancel()
+	return err
+}
+
+func TestRequestQueueCommittedRequestWinsOverCancellation(t *testing.T) {
+	creator, session, notifier := creatorAdmissionFixture(t, RateLimitActionQueue)
+	seed, err := creator.CreateRequest(creatorAdmissionOptions(session))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	creator.notifier = &cancellingQueueNotifier{admissionNotifier: notifier, cancel: cancel}
+	done, resume := pauseQueuedRetry(t, creator, creatorAdmissionOptions(session), ctx)
+	if _, err := creator.db.Exec(`UPDATE requests SET status = ? WHERE id = ?`, string(db.StatusCancelled), seed.Request.ID); err != nil {
+		t.Fatal(err)
+	}
+	creator.config.EnableDryRun = false
+	resume()
+	finished := takeQueuedResult(t, done)
+	if finished.err != nil || finished.result == nil || !finished.result.Queued || ctx.Err() != context.Canceled {
+		t.Fatalf("post-commit cancellation hid a durable request: %+v", finished)
+	}
+	stored, err := creator.db.GetRequest(finished.result.Request.ID)
+	if err != nil || stored.Status != db.StatusPending || stored.ID == seed.Request.ID || notifier.calls.Load() != 2 {
+		t.Fatalf("successful queued request was not committed/notified: %+v %v", stored, err)
 	}
 }
 

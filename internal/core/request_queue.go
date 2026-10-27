@@ -46,6 +46,13 @@ func (rc *RequestCreator) CreateRequestContext(ctx context.Context, opts CreateR
 			}
 			return result, nil
 		}
+		// Cancellation can arrive inside a retry's DB/preflight work, not
+		// only while waiting on the timer. Retain the observed quota and the
+		// original operation error, without replacing an unrelated storage or
+		// identity failure that happens concurrently with cancellation.
+		if ctxErr := ctx.Err(); queue && lastLimit != nil && ctxErr != nil && errors.Is(err, ctxErr) {
+			return nil, requestAdmissionWaitError(err, lastLimit)
+		}
 		var limit *RateLimitError
 		if !queue || !errors.As(err, &limit) {
 			return nil, err
