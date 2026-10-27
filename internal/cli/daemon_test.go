@@ -519,11 +519,20 @@ func TestFollowFile_PermissionDenied(t *testing.T) {
 	}
 	defer os.Chmod(testFile, 0644) // Cleanup
 
+	// Probe permission enforcement before calling the follower: when a
+	// privileged process can read the file, followFile intentionally never
+	// returns at EOF, so a skip after that call would be unreachable.
+	if file, err := os.Open(testFile); err == nil {
+		if err := file.Close(); err != nil {
+			t.Fatalf("closing permission probe: %v", err)
+		}
+		t.Skip("filesystem permits reading mode-0000 file; permission-denied fixture unavailable")
+	}
+
 	var buf strings.Builder
 	err := followFile(testFile, &buf)
 	if err == nil {
-		// On some systems (containers with root), this might succeed
-		t.Skip("permission denied test skipped (likely running as root)")
+		t.Fatal("expected error for unreadable file")
 	}
 	if !strings.Contains(err.Error(), "opening") {
 		t.Errorf("expected error about opening file, got: %v", err)
