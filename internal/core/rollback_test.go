@@ -513,6 +513,10 @@ func TestRollbackFilesystemRestorePreservesHistoricalCaptures(t *testing.T) {
 			if variant == "empty" && data.Filesystem.TotalBytes != 0 {
 				t.Fatalf("expected a zero-payload capture: %+v", data.Filesystem)
 			}
+			data.Version, data.CommandHash = 1, ""
+			if err := writeRollbackMetadata(data.RollbackPath, data); err != nil {
+				t.Fatal(err)
+			}
 			if err := os.Rename(tree, filepath.Join(project, "retained-tree")); err != nil {
 				t.Fatal(err)
 			}
@@ -1303,7 +1307,7 @@ func TestLoadRollbackData_Errors(t *testing.T) {
 
 	t.Run("valid JSON loads successfully", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		metadata := `{"kind":"filesystem","request_id":"test-123"}`
+		metadata := `{"version":1,"kind":"filesystem","request_id":"test-123"}`
 		if err := os.WriteFile(filepath.Join(tmpDir, "metadata.json"), []byte(metadata), 0644); err != nil {
 			t.Fatalf("write file: %v", err)
 		}
@@ -1318,11 +1322,101 @@ func TestLoadRollbackData_Errors(t *testing.T) {
 		if data.RequestID != "test-123" {
 			t.Errorf("expected request_id test-123, got %q", data.RequestID)
 		}
-		// RollbackPath should be set to tmpDir since it was empty
-		if data.RollbackPath != tmpDir {
-			t.Errorf("expected RollbackPath %q, got %q", tmpDir, data.RollbackPath)
+		selected, err := filepath.EvalSymlinks(tmpDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if data.RollbackPath != selected {
+			t.Errorf("expected selected RollbackPath %q, got %q", selected, data.RollbackPath)
 		}
 	})
+}
+
+func TestLoadRollbackDataUsesSelectedDirectory(t *testing.T) {
+	project := t.TempDir()
+	target := filepath.Join(project, "item")
+	if err := os.WriteFile(target, []byte("snapshot-one"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	request := &db.Request{ID: "selected-directory", ProjectPath: project,
+		Command: db.CommandSpec{Raw: "rm item", Cwd: project, Shell: true}}
+	first, err := CaptureRollbackState(context.Background(), request, RollbackCaptureOptions{MaxSizeBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := first.RollbackPath
+	if err := os.WriteFile(target, []byte("snapshot-two"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := CaptureRollbackState(context.Background(), request, RollbackCaptureOptions{MaxSizeBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A copied metadata file must not redirect the selected capture to a
+	// different archive, even when both captures have the same request ID.
+	first.RollbackPath = second.RollbackPath
+	if err := writeRollbackMetadata(selected, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("current work"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadRollbackData(selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RestoreRollbackState(context.Background(), loaded, RollbackRestoreOptions{Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "snapshot-one" {
+		t.Fatalf("metadata redirected restoration away from the selected archive: %q %v", got, err)
+	}
+}
+
+func TestLoadRollbackDataRejectsInvalidMetadataSource(t *testing.T) {
+	for _, scenario := range []string{"missing version", "future version", "directory", "symlink", "oversized"} {
+		t.Run(scenario, func(t *testing.T) {
+			base := t.TempDir()
+			path := filepath.Join(base, rollbackMetadataFilename)
+			switch scenario {
+			case "missing version", "future version":
+				version := 0
+				if scenario == "future version" {
+					version = 999
+				}
+				if err := writeRollbackMetadata(base, &RollbackData{Version: version, RequestID: "unsupported", Kind: rollbackKindFilesystem}); err != nil {
+					t.Fatal(err)
+				}
+			case "directory":
+				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				other := t.TempDir()
+				if err := writeRollbackMetadata(other, &RollbackData{Version: 1, RequestID: "other", Kind: rollbackKindFilesystem}); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(filepath.Join(other, rollbackMetadataFilename), path); err != nil {
+					t.Skipf("symlink unavailable: %v", err)
+				}
+			case "oversized":
+				file, err := os.Create(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := file.Truncate(maxRollbackMetadataBytes + 1); err != nil {
+					_ = file.Close()
+					t.Fatal(err)
+				}
+				if err := file.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if data, err := LoadRollbackData(base); err == nil || data != nil {
+				t.Fatalf("invalid metadata source was accepted: %+v %v", data, err)
+			}
+		})
+	}
 }
 
 func TestRestoreRollbackState_Errors(t *testing.T) {
@@ -2387,9 +2481,35 @@ func TestWriteTarGz(t *testing.T) {
 }
 
 func TestWriteRollbackMetadata(t *testing.T) {
+	t.Run("oversized metadata preserves existing destination", func(t *testing.T) {
+		base := t.TempDir()
+		path := filepath.Join(base, rollbackMetadataFilename)
+		original := []byte("existing recovery metadata")
+		if err := os.WriteFile(path, original, 0600); err != nil {
+			t.Fatal(err)
+		}
+		// Empty targets can exceed the metadata budget while consuming no
+		// file-payload budget. A capture must never report such data usable.
+		roots := make([]FilesystemRoot, maxRollbackMetadataBytes/512+1)
+		for i := range roots {
+			roots[i] = FilesystemRoot{ID: strconv.Itoa(i), Path: "/" + strings.Repeat("x", 512) + "/" + strconv.Itoa(i)}
+		}
+		data := &RollbackData{Version: rollbackDataVersion, CommandHash: strings.Repeat("a", 64),
+			Kind: rollbackKindFilesystem, RequestID: "many-empty-targets", RollbackPath: base,
+			Filesystem: &FilesystemRollbackData{TarGz: rollbackFilesystemTarGz, Roots: roots}}
+		if err := writeRollbackMetadata(base, data); err == nil || !strings.Contains(err.Error(), "metadata exceeds") {
+			t.Fatalf("oversized metadata was not refused: %v", err)
+		}
+		if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, original) {
+			t.Fatalf("refused metadata write changed the existing destination: %q %v", got, err)
+		}
+	})
+
 	t.Run("writes valid metadata file", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		data := &RollbackData{
+			Version:      rollbackDataVersion,
+			CommandHash:  strings.Repeat("a", 64),
 			Kind:         rollbackKindFilesystem,
 			RequestID:    "test-123",
 			ProjectPath:  "/test/project",

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/core"
@@ -30,7 +31,8 @@ var rollbackCmd = &cobra.Command{
 	Long: `Rollback the effects of an executed command using captured state.
 
 Request-based rollback requires a completed, failed, or timed-out execution
-and state captured before execution (--capture-rollback flag).
+and state captured before execution (--capture-rollback flag). Select the
+request's project with -C; its snapshot must match the recorded operation.
 
 Git recovery snapshots survive git clean -fdx inside the repository's Git
 directory. Use --list to discover them even when .slb/state.db is missing.
@@ -92,6 +94,9 @@ Examples:
 		if err != nil {
 			return fmt.Errorf("getting request: %w", err)
 		}
+		if err := checkRollbackProject(request.ProjectPath); err != nil {
+			return err
+		}
 
 		// A timed-out command can have modified files before cancellation too.
 		if request.Status != db.StatusExecuted && request.Status != db.StatusExecutionFailed && request.Status != db.StatusTimedOut {
@@ -114,6 +119,9 @@ Examples:
 		rollbackData, err := core.LoadRollbackData(request.Rollback.Path)
 		if err != nil {
 			return fmt.Errorf("loading rollback data: %w", err)
+		}
+		if err := rollbackData.ValidateRequest(request); err != nil {
+			return fmt.Errorf("validating rollback data: %w", err)
 		}
 
 		if err := core.RestoreRollbackState(cmd.Context(), rollbackData, core.RollbackRestoreOptions{Force: flagRollbackForce}); err != nil {
@@ -155,6 +163,30 @@ Examples:
 
 		return nil
 	},
+}
+
+func checkRollbackProject(recorded string) error {
+	if !filepath.IsAbs(recorded) {
+		return fmt.Errorf("rollback request project is not absolute")
+	}
+	selected, err := projectPath()
+	if err != nil {
+		return fmt.Errorf("selecting rollback project: %w", err)
+	}
+	selectedInfo, err := os.Stat(selected)
+	if err != nil {
+		return fmt.Errorf("reading selected rollback project: %w", err)
+	}
+	recordedInfo, err := os.Stat(recorded)
+	if err != nil {
+		return fmt.Errorf("reading request rollback project: %w", err)
+	}
+	// Equivalent aliases may select the same physical project, but must never
+	// rewrite the literal identity retained by the request or snapshot.
+	if !selectedInfo.IsDir() || !recordedInfo.IsDir() || !os.SameFile(selectedInfo, recordedInfo) {
+		return fmt.Errorf("rollback request belongs to a different project; select its project with -C")
+	}
+	return nil
 }
 
 func runSnapshotRollback(cmd *cobra.Command, from string, list bool) error {

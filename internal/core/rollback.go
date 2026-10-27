@@ -27,10 +27,11 @@ import (
 )
 
 const (
-	rollbackDataVersion          = 1
+	rollbackDataVersion          = 2
 	defaultRollbackRetention     = 30 * 24 * time.Hour
 	defaultRollbackCmdTimeout    = 30 * time.Second
 	rollbackMetadataFilename     = "metadata.json"
+	maxRollbackMetadataBytes     = 4 << 20
 	rollbackFilesystemTarGz      = "files.tar.gz"
 	rollbackKindFilesystem       = "filesystem"
 	rollbackKindGit              = "git"
@@ -67,6 +68,7 @@ type RollbackData struct {
 	ProjectPath  string    `json:"project_path"`
 	CommandRaw   string    `json:"command_raw"`
 	CommandCwd   string    `json:"command_cwd"`
+	CommandHash  string    `json:"command_hash,omitempty"`
 	RollbackPath string    `json:"rollback_path"`
 	Kind         string    `json:"kind"`
 
@@ -168,6 +170,7 @@ func CaptureRollbackState(ctx context.Context, req *db.Request, opts RollbackCap
 		ProjectPath:  req.ProjectPath,
 		CommandRaw:   req.Command.Raw,
 		CommandCwd:   req.Command.Cwd,
+		CommandHash:  db.ComputeCommandHash(req.Command),
 		RollbackPath: rollbackDir,
 		Kind:         kind,
 	}
@@ -206,18 +209,78 @@ func LoadRollbackData(rollbackDir string) (*RollbackData, error) {
 	if strings.TrimSpace(rollbackDir) == "" {
 		return nil, fmt.Errorf("rollback dir is required")
 	}
-	b, err := os.ReadFile(filepath.Join(rollbackDir, rollbackMetadataFilename))
+	base, err := filepath.Abs(rollbackDir)
+	if err != nil {
+		return nil, err
+	}
+	base, err = filepath.EvalSymlinks(base)
+	if err != nil {
+		return nil, err
+	}
+	path := filepath.Join(base, rollbackMetadataFilename)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading rollback metadata: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxRollbackMetadataBytes {
+		return nil, fmt.Errorf("rollback metadata is not a bounded regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("opening rollback metadata: %w", err)
+	}
+	defer func() { _ = file.Close() }()
+	opened, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !opened.Mode().IsRegular() || opened.Size() > maxRollbackMetadataBytes || !os.SameFile(info, opened) {
+		return nil, fmt.Errorf("rollback metadata changed while opening")
+	}
+	b, err := io.ReadAll(io.LimitReader(file, maxRollbackMetadataBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading rollback metadata: %w", err)
+	}
+	if len(b) > maxRollbackMetadataBytes {
+		return nil, fmt.Errorf("rollback metadata exceeds size limit")
 	}
 	var data RollbackData
 	if err := json.Unmarshal(b, &data); err != nil {
 		return nil, fmt.Errorf("parsing rollback metadata: %w", err)
 	}
-	if data.RollbackPath == "" {
-		data.RollbackPath = rollbackDir
+	if data.Version != 1 && data.Version != rollbackDataVersion {
+		return nil, fmt.Errorf("unsupported rollback metadata version: %d", data.Version)
 	}
+	if data.Version == rollbackDataVersion {
+		digest, err := hex.DecodeString(data.CommandHash)
+		if err != nil || len(digest) != sha256.Size || strings.ToLower(data.CommandHash) != data.CommandHash {
+			return nil, fmt.Errorf("rollback metadata command binding is missing or invalid")
+		}
+	}
+	// The selected directory is authoritative. Copied metadata must not
+	// redirect restoration to another capture's archive or patch contents.
+	data.RollbackPath = base
 	return &data, nil
+}
+
+// ValidateRequest binds request-based recovery to the captured operation.
+// Historical version 1 captures retain their original identity fields;
+// reading them does not manufacture version 2's full command binding.
+func (data *RollbackData) ValidateRequest(request *db.Request) error {
+	if data == nil || request == nil {
+		return fmt.Errorf("rollback snapshot and request are required")
+	}
+	if (data.Version != 1 && data.Version != rollbackDataVersion) || data.RequestID == "" || data.RequestID != request.ID ||
+		data.ProjectPath == "" || data.ProjectPath != request.ProjectPath ||
+		data.CommandRaw == "" || data.CommandRaw != request.Command.Raw || data.CommandCwd != request.Command.Cwd {
+		return fmt.Errorf("rollback snapshot does not match the request identity")
+	}
+	hash := db.ComputeCommandHash(request.Command)
+	if request.Command.Hash == "" || request.Command.Hash != hash ||
+		(data.Version == rollbackDataVersion && data.CommandHash == "") || (data.CommandHash != "" && data.CommandHash != hash) {
+		return fmt.Errorf("rollback snapshot does not match the request command binding")
+	}
+	return nil
 }
 
 func RestoreRollbackState(ctx context.Context, data *RollbackData, opts RollbackRestoreOptions) error {
@@ -313,6 +376,9 @@ func writeRollbackMetadata(dir string, data *RollbackData) error {
 	b, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal rollback metadata: %w", err)
+	}
+	if len(b) > maxRollbackMetadataBytes {
+		return fmt.Errorf("rollback metadata exceeds %d-byte size limit", maxRollbackMetadataBytes)
 	}
 	if err := os.WriteFile(filepath.Join(dir, rollbackMetadataFilename), b, 0600); err != nil {
 		return fmt.Errorf("writing rollback metadata: %w", err)

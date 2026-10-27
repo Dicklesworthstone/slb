@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -83,59 +82,14 @@ func ListGitRollbackSnapshots(ctx context.Context, cwd string) ([]GitRollbackSna
 }
 
 func loadGitRecoverySnapshot(snapshot string) (*RollbackData, error) {
-	if strings.TrimSpace(snapshot) == "" {
-		return nil, fmt.Errorf("snapshot directory is required")
-	}
-	base, err := filepath.Abs(snapshot)
+	data, err := LoadRollbackData(snapshot)
 	if err != nil {
 		return nil, err
 	}
-	base, err = filepath.EvalSymlinks(base)
-	if err != nil {
-		return nil, err
-	}
-	path := filepath.Join(base, rollbackMetadataFilename)
-	if err := ensureNoSymlinkParents(base, path); err != nil {
-		return nil, err
-	}
-	const maxMetadataBytes = 4 << 20
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() || info.Size() > maxMetadataBytes {
-		return nil, fmt.Errorf("snapshot metadata is not a bounded regular file")
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	stat, err := file.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !stat.Mode().IsRegular() || stat.Size() > maxMetadataBytes {
-		return nil, fmt.Errorf("snapshot metadata is not a bounded regular file")
-	}
-	encoded, err := io.ReadAll(io.LimitReader(file, maxMetadataBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(encoded) > maxMetadataBytes {
-		return nil, fmt.Errorf("snapshot metadata exceeds size limit")
-	}
-	var data RollbackData
-	if err := json.Unmarshal(encoded, &data); err != nil {
-		return nil, fmt.Errorf("decoding snapshot metadata: %w", err)
-	}
-	if data.Version != rollbackDataVersion || data.Kind != rollbackKindGit || data.Git == nil || data.RequestID == "" {
+	if data.Kind != rollbackKindGit || data.Git == nil || data.RequestID == "" {
 		return nil, fmt.Errorf("snapshot is not a supported Git recovery capture")
 	}
-	// The selected directory is authoritative. Metadata copied from another
-	// location must not redirect recovery to different archive contents.
-	data.RollbackPath = base
-	return &data, nil
+	return data, nil
 }
 
 // RestoreGitRollbackSnapshot is the explicit recovery path when request state

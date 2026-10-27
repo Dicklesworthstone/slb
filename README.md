@@ -782,6 +782,22 @@ slb rollback <request-id>           # Restore captured state
 slb rollback <request-id> --force   # Force overwrite
 ```
 
+Request-based rollback requires the request's selected project (`-C` when
+needed). Equivalent filesystem aliases are accepted without changing stored
+project identity. Before restoration, the snapshot must match the request ID,
+project, raw command and working directory. New metadata version 2 also binds
+the complete command hash, including argv and shell mode. Historical version 1
+metadata keeps its original identity checks and is not rewritten into stronger
+evidence. `--force` does not bypass project, identity or version checks.
+
+Both capture and recovery enforce a 4 MiB metadata limit. Recovery reads a
+bounded regular metadata file and uses the selected snapshot directory for its
+archive and patches; a copied metadata path cannot select another capture.
+These are local consistency checks, not reviewer authentication or a new
+execution authorization. A failed restoration does not mark the request as
+rolled back. Explicit Git `--from` recovery retains its separate database-free
+workflow and required `--force` acknowledgement.
+
 Filesystem recovery validates the complete archive and all destination paths
 before changing live files. Damaged gzip data, incomplete payloads, unsupported
 entries, conflicting roots and symlinked destination ancestors are refused;
