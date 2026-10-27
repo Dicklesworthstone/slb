@@ -1,4 +1,4 @@
 package db
 
 // SchemaVersion is the latest schema migration version.
-const SchemaVersion = 7
+const SchemaVersion = 8

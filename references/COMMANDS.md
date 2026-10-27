@@ -75,6 +75,57 @@ slb rollback <request-id>                      # Rollback if captured
 slb rollback <request-id> --force              # Force overwrite
 ```
 
+### Emergency execution
+
+`emergency-execute` is an explicit **unreviewed override**. It requires a reason
+and either an interactive `EXECUTE` confirmation or `--yes --ack`. Neither
+confirmation authenticates a human. It supplies no peer review and cannot
+create authorization evidence for the `independent` or `same_host` policies.
+
+```bash
+# Review the command, working directory and reason interactively.
+slb emergency-execute "printf 'recovery check\n'" --reason "Diagnose recovery environment"
+
+# Non-interactive acknowledgment retains the raw-command SHA-256 format.
+COMMAND="printf 'recovery check\n'"
+HASH=$(printf '%s' "$COMMAND" | sha256sum | cut -d' ' -f1)
+slb emergency-execute "$COMMAND" --reason "Diagnose recovery environment" \
+  --yes --ack "$HASH" --timeout 60 --json
+```
+
+The raw acknowledgment hash can be provided in full or as its first eight or
+more characters. The JSON `hash` retains this raw-command value. The separate
+`command_hash` binds the command specification, including its working directory
+and shell mode. This binding is recorded for audit; it is not an approval token.
+
+Before launching the command, SLB commits a separate emergency execution intent
+and flushes a uniquely created private log. It records an actual child PID after
+startup and the observed outcome on completion. Output and log records use
+`execution_mode: "emergency"`; all emergency records retain the fixed
+`assurance: "emergency_unreviewed"`. The ledger's `configured_approval_policy`
+records context only. Output retains `approval_policy` for that context, with
+`approval_policy_bypassed: true` and an explicit `BYPASSED` policy label. The
+configured policy did not authorize this command.
+
+Structured output includes `emergency_id`, `status`, `executed`, `exit_code`,
+`output`, `log_path`, both hashes, the local actor label, reason and observed
+timestamps. `attempted_at` aliases the recorded intent time; `executed_at`
+aliases an observed, recorded process start and is absent for a failed start.
+Each log begins with an `emergency_execution` event and `phase: "attempt"`,
+then appends an `emergency_execution_outcome` after the process attempt.
+A command that exits nonzero also makes SLB exit nonzero with the
+child's exit code. A command that never starts has `executed: false` and
+`exit_code: -1`; its ledger has no invented child exit status. `--timeout`
+bounds preparation and execution; the default is 300 seconds. Zero, negative
+and overflowing values are rejected. Caller cancellation cancels and reaps the child.
+
+`--capture-rollback` requests capture when enabled by configuration. A capture
+error stops the override; an unsupported command type warns that no snapshot is
+available. A returned `rollback_path` identifies the captured artifact. An
+emergency ID is not a reviewed request ID and cannot be passed to request-based
+`slb rollback`. Git snapshots support the explicit `rollback --from <path>
+--force` recovery mode.
+
 ---
 
 ## Pattern Management
@@ -123,7 +174,35 @@ slb history -q "rm -rf"                        # Full-text search
 slb show <request-id> --with-reviews           # Detailed view
 slb outcome record <request-id> --problems     # Record feedback
 slb outcome stats                              # Execution statistics
+
+# Separate unreviewed overrides, scoped to the selected project/database
+slb audit emergency --json
+slb audit emergency --id <emergency-id> --json
+slb audit emergency --status incomplete --json
+slb audit emergency --since 2026-10-01 --jsonl
 ```
+
+`audit emergency` reads the separate emergency ledger, not reviewed request
+history or the hook's blocked-command JSONL directory. It supports `--id`,
+`--status`, `--actor`, `--query`, `--since`, `--before` and `--limit`. Time filters
+use the recorded intent time; `--since` is inclusive and `--before` is exclusive.
+Use `--project` and, when needed, `--db` to select the store. The blocked-hook
+`audit --directory` option does not select an emergency ledger.
+
+| Emergency status | Meaning |
+|------------------|---------|
+| `incomplete` | No terminal outcome was recorded. The child may have started, finished, or still be running. |
+| `succeeded` | A child start and zero exit were durably recorded. |
+| `failed` | Execution or its required startup/evidence recording failed; inspect the error and observed exit. |
+| `timed_out` | The execution attempt exceeded its deadline. |
+| `cancelled` | The attempt was cancelled. |
+
+An `incomplete` record is **not permission to retry**. A crash can occur between
+process start and its startup record, and a terminal write can fail after the
+command changes external state. Inspect the command log, recorded PID and actual
+system state before deciding what to do. Even a failed or cancelled command can
+have performed part of its work. SLB returns an error when terminal persistence
+fails while preserving the observed child outcome in that invocation's output.
 
 ---
 
@@ -153,6 +232,11 @@ slb request "terraform destroy" --reason "..." --attach-cmd "terraform plan -des
 | `4` | Permission denied |
 | `5` | Timeout |
 | `6` | Rate limited |
+
+Execution commands, including `emergency-execute`, preserve an observed child's
+nonzero exit code. A missing/invalid child status or an infrastructure failure
+returns a general error; the numeric table above is not a substitute for the
+structured execution outcome.
 
 ---
 

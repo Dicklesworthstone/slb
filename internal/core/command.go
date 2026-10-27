@@ -35,6 +35,17 @@ func RunCommand(ctx context.Context, spec *db.CommandSpec, logPath string, strea
 	return runCommand(ctx, spec, logPath, stream, nil)
 }
 
+// RunCommandWithStartObserver runs the same command lifecycle as RunCommand,
+// while allowing a durable supervisor to record the actual child PID. The
+// observer runs after process start; its failure cancels and reaps the child,
+// but cannot undo side effects already performed before that failure.
+func RunCommandWithStartObserver(ctx context.Context, spec *db.CommandSpec, logPath string, stream io.Writer, onStarted func(int) error) (*CommandResult, error) {
+	if onStarted == nil {
+		return nil, errors.New("command startup observer is required")
+	}
+	return runCommand(ctx, spec, logPath, stream, onStarted)
+}
+
 // onStarted is for a supervising caller, after os/exec successfully starts the
 // command. A failed acknowledgment cancels and reaps the command; it cannot
 // undo side effects already performed before the acknowledgment was lost.

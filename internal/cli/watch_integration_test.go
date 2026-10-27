@@ -426,3 +426,33 @@ func TestWatchRemoteDisconnectDoesNotSwitchToLocalDatabase(t *testing.T) {
 		t.Fatal("remote watch could apply local auto-approval decisions")
 	}
 }
+
+func TestWatchPollingUpgradesExistingVersionSevenDatabase(t *testing.T) {
+	h := testutil.NewHarness(t)
+	requester := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir))
+	request := testutil.MakeRequest(t, h.DB, requester, func(r *db.Request) { r.ApprovalPolicy = db.ApprovalPolicySameHost })
+	// This disposable fixture has no emergency records. Remove only the new
+	// ledger and its migration marker to model the previously published schema.
+	watchPolicySQL(t, h.DB, `DROP TABLE emergency_executions`)
+	watchPolicySQL(t, h.DB, `DELETE FROM schema_migrations WHERE version = 8`)
+	if version, err := h.DB.GetSchemaVersion(); err != nil || version != 7 {
+		t.Fatalf("fixture is not version seven: %d %v", version, err)
+	}
+	oldAuto, oldInterval := flagWatchAutoApproveCaution, flagWatchPollInterval
+	flagWatchAutoApproveCaution, flagWatchPollInterval = false, time.Millisecond
+	defer func() { flagWatchAutoApproveCaution, flagWatchPollInterval = oldAuto, oldInterval }()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	var buf bytes.Buffer
+	if err := runWatchPolling(ctx, &buf, newWatchState(h.ProjectDir)); err != nil {
+		t.Fatal(err)
+	}
+	if version, err := h.DB.GetSchemaVersion(); err != nil || version != db.SchemaVersion {
+		t.Fatalf("watch skipped existing-database migrations: %d %v", version, err)
+	}
+	events := decodeWatchEvents(t, buf.String())
+	if len(events) != 1 || events[0].RequestID != request.ID || events[0].Status != db.StatusPending ||
+		events[0].ApprovalPolicy != db.ApprovalPolicySameHost || events[0].ExecutionAssurance != "" {
+		t.Fatalf("schema upgrade changed the workflow category or invented execution evidence: %s", buf.String())
+	}
+}

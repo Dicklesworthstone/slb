@@ -19,7 +19,7 @@ func newAuditCommand() *cobra.Command {
 	var directory string
 	command := &cobra.Command{
 		Use:   "audit",
-		Short: "Search and retain blocked-command audit records",
+		Short: "Inspect hook decisions and unreviewed emergency execution records",
 		Long: `Inspect denied and confirmation-required hook decisions, including offline hooks.
 
 Records are private JSONL files under ~/.slb/audit/blocked. Commands are
@@ -27,7 +27,9 @@ redacted before storage; hashes identify the exact command and working directory
 These records describe attempted commands, not proof that a command executed.
 Use slb events for durable request, review and execution history with the
 recorded approval policy and evidence assurance.
-Use query --jsonl to export a single JSONL stream. Retention is explicit.`,
+Use query --jsonl to export a single JSONL stream. Retention is explicit.
+Use emergency to inspect the selected project's separate unreviewed execution
+ledger, including attempts with no durably recorded terminal outcome.`,
 	}
 	command.PersistentFlags().StringVar(&directory, "directory", "", "audit directory (default ~/.slb/audit/blocked)")
 	resolveDirectory := func() (string, error) {
@@ -117,6 +119,7 @@ Use query --jsonl to export a single JSONL stream. Retention is explicit.`,
 	prune.Flags().StringVar(&cutoff, "before", "", "required exclusive cutoff (RFC3339 or YYYY-MM-DD)")
 	prune.Flags().BoolVar(&dryRun, "dry-run", false, "report matching records without deleting them")
 	command.AddCommand(prune)
+	command.AddCommand(newEmergencyAuditCommand())
 	return command
 }
 

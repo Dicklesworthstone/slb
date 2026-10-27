@@ -223,6 +223,11 @@ ALTER TABLE reviews ADD COLUMN request_binding TEXT NOT NULL DEFAULT '';
 ALTER TABLE reviews ADD COLUMN signature_version INTEGER NOT NULL DEFAULT 1;
 ` + sameHostRequestEventsSchema,
 	},
+	{
+		Version: 8,
+		Name:    "unreviewed_emergency_execution_ledger",
+		Up:      emergencyExecutionSchema,
+	},
 }
 
 // ApplyMigrations applies any pending migrations in order.

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -74,6 +75,70 @@ func TestExecutionOutcomeNeverFabricatesSuccess(t *testing.T) {
 				if !errors.As(err, &exitErr) || exitErr.ExitCode() != 7 {
 					t.Fatalf("child exit code not preserved through error: %v", err)
 				}
+			}
+		})
+	}
+}
+
+func TestEmergencyOutcomeNeverPromotesOrFabricatesSuccess(t *testing.T) {
+	now := time.Now().UTC()
+	code, pid := 0, 123
+	complete := &db.EmergencyExecution{
+		ID: "emergency-record", Status: db.EmergencyStatusSucceeded,
+		ConfiguredApprovalPolicy: db.ApprovalPolicySameHost,
+		Assurance:                db.AssuranceEmergencyUnreviewed, RecordedAt: now,
+		StartedAt: &now, CompletedAt: &now, PID: &pid, ExitCode: &code,
+	}
+	incomplete := *complete
+	incomplete.Status, incomplete.CompletedAt, incomplete.ExitCode = db.EmergencyStatusIncomplete, nil, nil
+	missingStart := *complete
+	missingStart.StartedAt, missingStart.PID = nil, nil
+	failedPersistence := errors.New("could not record terminal outcome")
+	for _, tc := range []struct {
+		name    string
+		record  *db.EmergencyExecution
+		result  *core.CommandResult
+		err     error
+		wantErr bool
+	}{
+		{"durable-success", complete, &core.CommandResult{ExitCode: 0}, nil, false},
+		{"no-record", nil, nil, nil, true},
+		{"missing-child", complete, nil, nil, true},
+		{"missing-start", &missingStart, &core.CommandResult{ExitCode: 0}, nil, true},
+		{"incomplete", &incomplete, &core.CommandResult{ExitCode: 0}, nil, true},
+		{"failed-persistence", &incomplete, &core.CommandResult{ExitCode: 0}, failedPersistence, true},
+		{"child-failure", &incomplete, &core.CommandResult{ExitCode: 7}, nil, true},
+		{"timeout-not-recorded", &incomplete, &core.CommandResult{ExitCode: -1}, context.DeadlineExceeded, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			view, err := emergencyOutcomeFor(tc.record, tc.result, tc.err)
+			if (err != nil) != tc.wantErr || view.Assurance != db.AssuranceEmergency || view.ExecutionMode != "emergency" ||
+				!view.ApprovalPolicyBypassed || !strings.Contains(view.ApprovalPolicyLabel, "BYPASSED") {
+				t.Fatalf("incorrect override outcome: %+v %v", view, err)
+			}
+			if tc.err != nil && !errors.Is(err, tc.err) {
+				t.Fatalf("observed failure was discarded: %v", err)
+			}
+			if view.Executed != (tc.result != nil) || (tc.result == nil && view.ExitCode != -1) {
+				t.Fatalf("unknown child outcome became success: %+v", view)
+			}
+			if tc.name == "timeout-not-recorded" && (!view.TimedOut || view.Status != "incomplete") {
+				t.Fatalf("timeout observation or incomplete persistence state lost: %+v", view)
+			}
+			encoded, err := json.Marshal(view)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]any
+			if err := json.Unmarshal(encoded, &fields); err != nil {
+				t.Fatal(err)
+			}
+			configured := db.ApprovalPolicyIndependent
+			if tc.record != nil {
+				configured = tc.record.ConfiguredApprovalPolicy.Normalized()
+			}
+			if fields["approval_policy"] != string(configured) || fields["approval_policy_bypassed"] != true {
+				t.Fatalf("configured policy lost its bypassed context: %s", encoded)
 			}
 		})
 	}

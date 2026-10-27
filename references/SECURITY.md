@@ -200,26 +200,82 @@ For execution of a reviewed request, these checks must pass:
 ## Emergency Override
 
 For emergencies, `emergency-execute` bypasses peer review with explicit
-acknowledgment and logging. The acknowledgment does not authenticate a human;
-a same-UID agent can supply it too. It is a separate unreviewed override, not a
-replacement for the optional peer-review workflow.
+acknowledgment and a separate execution ledger. The acknowledgment does not
+authenticate a human; a same-UID agent can supply it too. The actor field is a
+local label. This is an **unreviewed override**, with fixed assurance
+`emergency_unreviewed`; neither `independent` nor `same_host` reviews authorized
+it. Creating an override creates no request, approval vote, or synthetic session.
 
-Its structured output and emergency audit records use
-`execution_mode = "emergency"` and `assurance = "emergency_unreviewed"`, with a
-`review_notice` stating that peer review was bypassed. These labels are the same
-under both approval policies: enabling `same_host` cannot turn emergency
-execution into reviewed execution.
+Structured output and log records retain `execution_mode = "emergency"` and
+`assurance = "emergency_unreviewed"` under either configured review policy.
+The `review_notice` states that there was no peer approval or independently
+authenticated authorization. The ledger stores `configured_approval_policy`
+only as historical context. Output preserves that value as `approval_policy`,
+accompanied by `approval_policy_bypassed = true` and a `BYPASSED` policy label;
+it does not mean the policy was satisfied.
 
 ```bash
 # Interactive (prompts for confirmation)
 slb emergency-execute "rm -rf /tmp/broken" --reason "System emergency: disk full"
 
 # Non-interactive (requires hash acknowledgment)
-HASH=$(echo -n "rm -rf /tmp/broken" | sha256sum | cut -d' ' -f1)
-slb emergency-execute "rm -rf /tmp/broken" --reason "Emergency" --yes --ack $HASH
+HASH=$(printf '%s' "rm -rf /tmp/broken" | sha256sum | cut -d' ' -f1)
+slb emergency-execute "rm -rf /tmp/broken" --reason "Emergency" --yes --ack "$HASH"
+
+# Inspect the distinct unreviewed evidence
+slb audit emergency --id <emergency-id> --json
+slb audit emergency --status incomplete --json
 ```
 
-**Safeguards**: Mandatory reason, hash acknowledgment, extensive logging, optional rollback capture.
+### Acknowledgment and command binding
+
+For existing workflows, `--ack` continues accepting SHA-256 of the raw command
+(a full digest or a matching prefix of at least eight characters). That hash
+does not include the working directory. The emergency record separately stores
+the canonical `CommandSpec` hash, which includes the execution working directory
+and shell mode as well as the command. JSON output retains the raw digest as
+`hash` and exposes the canonical binding as `command_hash`.
+
+Both hashes describe the explicit override. Neither establishes reviewer identity
+or supplies transferable authorization. An emergency record cannot satisfy review
+quorum, and its assurance cannot be promoted by changing configuration. The command
+still inherits the caller's environment; a stored command hash does not bind all
+external files, credentials, tools, or services that the command may use.
+
+### Intent, process start and terminal evidence
+
+SLB commits the unreviewed intent to the selected project database and flushes a
+uniquely created private log before starting the override command. Failure to
+record the intent or log preamble prevents launch. The log is created with mode
+`0600` and is never selected solely by a timestamp, so concurrent overrides do
+not truncate each other's evidence. Its first structured event remains
+`emergency_execution` with `phase = "attempt"`; a final
+`emergency_execution_outcome` carries the observed outcome and durable ledger
+status. The `attempted_at` output alias describes the intent, while `executed_at`
+describes a recorded child start and is absent when startup failed.
+
+After the operating system starts the child, SLB records its PID and start time.
+If that write fails, the shared process runner cancels and reaps the child and
+attempts to record the observed failure. The child may already have changed
+external state before its startup write failed. On completion, the ledger records
+`succeeded`, `failed`, `timed_out`, or `cancelled`, including the actual exit status
+when one was observed. Success requires a recorded startup and zero exit; a
+command that never started does not acquire a fabricated zero exit.
+
+A crash or failed terminal write can leave status `incomplete`. This means the
+outcome is unknown. It does not prove that the child never started, remains
+running, or is safe to retry. The absence of a stored PID likewise does not prove
+that no process ran. Inspect the log, process state and actual command effects
+before deciding how to recover; SLB never automatically retries an override.
+The CLI returns an error for failed persistence and retains any observed child
+exit/output in its response without relabeling an incomplete ledger as success.
+
+The ledger is local SQLite evidence with the existing database's durability
+settings. It is not a protected external audit service, tamper-proof storage, or
+a stronger security boundary. Processes sharing its OS identity can alter it.
+Mandatory reasons, acknowledgment, bounded execution, optional rollback capture
+and explicit evidence labels support deliberate operation and investigation;
+they do not replace peer review or independently authenticated authorization.
 
 ---
 

@@ -10,8 +10,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/core"
@@ -30,17 +30,6 @@ var (
 	flagEmergencyLogDir  string
 )
 
-const emergencyReviewNotice = "unreviewed emergency override; no peer approval or independently authenticated authorization"
-
-// emergencyEvidence records the configured policy as context, not as an
-// authorization satisfied by this bypass. No reviewer evidence is manufactured.
-type emergencyEvidence struct {
-	approvalPolicyView
-	ExecutionMode string             `json:"execution_mode"`
-	Assurance     db.ReviewAssurance `json:"assurance"`
-	ReviewNotice  string             `json:"review_notice"`
-}
-
 func init() {
 	emergencyCmd.Flags().StringVarP(&flagEmergencyReason, "reason", "r", "", "reason for emergency execution (required)")
 	emergencyCmd.Flags().BoolVarP(&flagEmergencyYes, "yes", "y", false, "skip interactive confirmation")
@@ -55,16 +44,22 @@ func init() {
 
 var emergencyCmd = &cobra.Command{
 	Use:   "emergency-execute \"<command>\"",
-	Short: "Execute a command without approval (unreviewed emergency override)",
+	Short: "Execute a command with an explicitly unreviewed emergency override",
 	Long: `Execute a command bypassing the normal approval process.
 
 This is an UNREVIEWED OVERRIDE for emergency situations. It requires:
 - A mandatory reason explaining why the bypass is necessary
 - Interactive confirmation OR --yes with --ack containing the command hash
 
-Acknowledgment does not authenticate a human or an independent reviewer.
-The execution is explicitly logged as emergency_unreviewed, even when the
-configured approval policy is same_host or independent.
+Neither confirmation method authenticates a human or supplies peer review.
+The override is recorded separately from approvals, with emergency_unreviewed
+assurance, a unique private log, the actual process start, and its outcome.
+Inspect it with slb audit emergency. A crash can leave an incomplete record;
+inspect the log and process state before retrying.
+
+The --ack hash remains SHA-256 of the raw command for compatibility. The audit
+record separately binds the exact command, working directory, and shell mode
+with command_hash. --timeout bounds preparation and execution and must be positive.
 
 Examples:
   slb emergency-execute "rm -rf /tmp/broken" -r "System emergency"
@@ -76,43 +71,56 @@ To get the command hash for --ack, run:
 	RunE: func(cmd *cobra.Command, args []string) error {
 		command := args[0]
 
-		// Validate required flags
+		if strings.TrimSpace(command) == "" {
+			return fmt.Errorf("command is required for emergency execution")
+		}
 		if strings.TrimSpace(flagEmergencyReason) == "" {
 			return fmt.Errorf("--reason is required for emergency execution")
 		}
 		if flagEmergencyTimeout <= 0 {
 			return fmt.Errorf("--timeout must be greater than zero")
 		}
+		timeout, err := executionTimeoutDuration(flagEmergencyTimeout)
+		if err != nil {
+			return err
+		}
+		if err := cmd.Context().Err(); err != nil {
+			return err
+		}
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("capturing command working directory: %w", err)
+		}
+		project, err := projectPath()
+		if err != nil {
+			return err
+		}
 
-		// Compute command hash
+		// Preserve the documented raw-command acknowledgment, while recording
+		// a separate canonical binding that includes cwd and shell mode.
 		hash := sha256.Sum256([]byte(command))
-		commandHash := hex.EncodeToString(hash[:])
+		rawCommandHash := hex.EncodeToString(hash[:])
+		cmdSpec := db.CommandSpec{Raw: command, Cwd: cwd, Shell: true}
+		cmdSpec.Hash = db.ComputeCommandHash(cmdSpec)
+		confirmation := db.EmergencyConfirmationInteractive
 
-		// Validate confirmation
 		if flagEmergencyYes {
-			// Non-interactive mode requires --ack
 			if flagEmergencyAck == "" {
 				return fmt.Errorf("--ack is required when using --yes")
 			}
-			// Verify hash (allow first 8+ chars)
 			if len(flagEmergencyAck) < 8 {
 				return fmt.Errorf("--ack must be at least 8 characters of the command hash")
 			}
-			if !strings.HasPrefix(commandHash, flagEmergencyAck) {
-				return fmt.Errorf("--ack hash does not match command (expected prefix: %s)", commandHash[:8])
+			if !strings.HasPrefix(rawCommandHash, flagEmergencyAck) {
+				return fmt.Errorf("--ack hash does not match command (expected prefix: %s)", rawCommandHash[:8])
 			}
+			confirmation = db.EmergencyConfirmationHash
 		} else {
-			// Interactive confirmation
-			var prompt io.Writer = os.Stdout
-			if executionOutputStructured() {
-				prompt = os.Stderr
+			if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "=== EMERGENCY EXECUTION ===\n%s\nAcknowledgment does not authenticate a human.\nCommand: %s\nCWD: %s\nReason: %s\nAcknowledgment hash: %s\nCommand binding: %s\nType 'EXECUTE' to confirm: ",
+				emergencyReviewNotice, command, cwd, flagEmergencyReason, rawCommandHash, cmdSpec.Hash); err != nil {
+				return err
 			}
-			if _, err := fmt.Fprintf(prompt, "=== EMERGENCY EXECUTION ===\nCommand: %s\nReason:  %s\nHash:    %s\n\nReview: %s\nAcknowledgment does not authenticate a human. Are you sure?\nType 'EXECUTE' to confirm: ",
-				command, flagEmergencyReason, commandHash, emergencyReviewNotice); err != nil {
-				return fmt.Errorf("writing emergency confirmation: %w", err)
-			}
-
-			reader := bufio.NewReader(os.Stdin)
+			reader := bufio.NewReader(cmd.InOrStdin())
 			input, err := reader.ReadString('\n')
 			if err != nil {
 				return fmt.Errorf("reading confirmation: %w", err)
@@ -124,23 +132,13 @@ To get the command hash for --ack, run:
 			}
 		}
 
-		// Open database for logging
+		// Confirmation identifies a local action, never a reviewer or human
+		// authority. No request, approval, or synthetic session is created.
 		dbConn, err := db.OpenAndMigrate(GetDB())
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}
 		defer dbConn.Close()
-
-		// Get current working directory
-		cwd, err := os.Getwd()
-		if err != nil {
-			cwd = "."
-		}
-
-		project, err := projectPath()
-		if err != nil {
-			return err
-		}
 
 		cfg, err := config.Load(config.LoadOptions{
 			ProjectDir: project,
@@ -149,20 +147,10 @@ To get the command hash for --ack, run:
 		if err != nil {
 			return fmt.Errorf("loading config: %w", err)
 		}
-		evidence := emergencyEvidence{
-			approvalPolicyView: policyView(db.ApprovalPolicy(cfg.General.ApprovalPolicy)),
-			ExecutionMode:      "emergency",
-			Assurance:          db.AssuranceEmergency,
-			ReviewNotice:       emergencyReviewNotice,
-		}
 
-		// Build command spec
-		cmdSpec := &db.CommandSpec{
-			Raw:   command,
-			Cwd:   cwd,
-			Shell: true, // Emergency commands always use shell
-			Hash:  commandHash,
-		}
+		ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
+		defer cancel()
+		id := uuid.NewString()
 
 		var rollbackPath string
 		if flagEmergencyCapture {
@@ -170,157 +158,184 @@ To get the command hash for --ack, run:
 				return fmt.Errorf("rollback capture is disabled by config (general.enable_rollback_capture=false)")
 			}
 			rollbackReq := &db.Request{
-				ID:          uuid.NewString(),
+				ID:          id,
 				ProjectPath: project,
-				Command:     *cmdSpec,
+				Command:     cmdSpec,
 			}
-			data, err := core.CaptureRollbackState(context.Background(), rollbackReq, core.RollbackCaptureOptions{
+			data, err := core.CaptureRollbackState(ctx, rollbackReq, core.RollbackCaptureOptions{
 				MaxSizeBytes: int64(cfg.General.MaxRollbackSizeMB) * 1024 * 1024,
 			})
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "warning: rollback capture failed: %v\n", err)
+				return fmt.Errorf("capturing emergency rollback state: %w", err)
 			} else if data == nil {
-				fmt.Fprintf(os.Stderr, "warning: rollback capture unsupported for this command type\n")
+				fmt.Fprintln(cmd.ErrOrStderr(), "warning: rollback capture unsupported for this command type")
 			} else {
 				rollbackPath = data.RollbackPath
 			}
 		}
 
-		// Create log file
-		logDir := flagEmergencyLogDir
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		logDir, err := filepath.Abs(flagEmergencyLogDir)
+		if err != nil {
+			return fmt.Errorf("resolving log directory: %w", err)
+		}
 		if err := os.MkdirAll(logDir, 0700); err != nil {
 			return fmt.Errorf("creating log dir: %w", err)
 		}
 
-		// Every invocation owns a new log, including concurrent executions in
-		// the same second. Never truncate an earlier emergency's audit evidence.
-		logFile, err := os.CreateTemp(logDir, "emergency_"+time.Now().UTC().Format("20060102-150405")+"_*.log")
+		// Exclusive creation prevents simultaneous overrides from destroying
+		// each other's evidence. The shared runner appends command output.
+		logFile, err := os.CreateTemp(logDir, "emergency-*.log")
 		if err != nil {
 			return fmt.Errorf("creating log file: %w", err)
 		}
-		logPath := logFile.Name()
-		attemptedAt := time.Now().UTC()
-		// Persist the bypass classification before starting any command. JSON
-		// escaping keeps newlines in a command/reason inside this one record.
-		err = json.NewEncoder(logFile).Encode(struct {
-			emergencyEvidence
-			Event   string    `json:"event"`
-			Phase   string    `json:"phase"`
-			Time    time.Time `json:"timestamp"`
-			Actor   string    `json:"actor"`
-			Command string    `json:"command"`
-			Hash    string    `json:"hash"`
-			Reason  string    `json:"reason"`
-			CWD     string    `json:"cwd"`
-		}{evidence, "emergency_execution", "attempt", attemptedAt, GetActor(), command, commandHash, flagEmergencyReason, cwd})
-		if err == nil {
-			err = logFile.Sync()
+		if err := logFile.Close(); err != nil {
+			return fmt.Errorf("closing new emergency log: %w", err)
 		}
-		if err = errors.Join(err, logFile.Close()); err != nil {
-			return fmt.Errorf("recording emergency execution evidence: %w", err)
+		record := &db.EmergencyExecution{
+			ID: id, ProjectPath: project, Command: cmdSpec, RawCommandHash: rawCommandHash,
+			ConfiguredApprovalPolicy: db.ApprovalPolicy(cfg.General.ApprovalPolicy),
+			Actor:                    GetActor(), Reason: flagEmergencyReason, ConfirmationMethod: confirmation,
+			LogPath: logFile.Name(), RollbackPath: rollbackPath,
 		}
-
-		// Execute the command
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(flagEmergencyTimeout)*time.Second)
-		defer cancel()
-
-		var streamWriter io.Writer
+		var stream io.Writer
 		if !executionOutputStructured() {
-			streamWriter = os.Stdout
+			stream = cmd.OutOrStdout()
 		}
-		startedAt := time.Now().UTC()
-		result, err := core.RunCommand(ctx, cmdSpec, logPath, streamWriter)
-
-		// Build output
-		type emergencyResult struct {
-			emergencyEvidence
-			Command      string `json:"command"`
-			Hash         string `json:"hash"`
-			ExitCode     int    `json:"exit_code"`
-			DurationMs   int64  `json:"duration_ms"`
-			LogPath      string `json:"log_path"`
-			RollbackPath string `json:"rollback_path,omitempty"`
-			Reason       string `json:"reason"`
-			Actor        string `json:"actor"`
-			AttemptedAt  string `json:"attempted_at"`
-			Executed     bool   `json:"executed"`
-			ExecutedAt   string `json:"executed_at,omitempty"`
-			Error        string `json:"error,omitempty"`
-		}
-
-		resp := emergencyResult{
-			emergencyEvidence: evidence,
-			Command:           command,
-			Hash:              commandHash,
-			LogPath:           logPath,
-			RollbackPath:      rollbackPath,
-			Reason:            flagEmergencyReason,
-			Actor:             GetActor(),
-			AttemptedAt:       attemptedAt.Format(time.RFC3339),
-			ExitCode:          -1,
-		}
-
-		if result != nil {
-			resp.Executed = true
-			resp.ExecutedAt = startedAt.Format(time.RFC3339)
-			resp.ExitCode = result.ExitCode
-			resp.DurationMs = result.Duration.Milliseconds()
-			if err == nil && result.ExitCode != 0 {
-				err = commandExitError{code: result.ExitCode}
-			}
-		}
-
-		if err != nil {
-			resp.Error = err.Error()
-		}
-		// Keep the actual outcome with the attempt, including a failed process
-		// start. The initial evidence alone never claims a command was started.
-		outcomeLog, logErr := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND, 0600)
-		if logErr == nil {
-			logErr = json.NewEncoder(outcomeLog).Encode(struct {
-				Event string `json:"event"`
-				emergencyResult
-			}{"emergency_execution_outcome", resp})
-			if logErr == nil {
-				logErr = outcomeLog.Sync()
-			}
-			logErr = errors.Join(logErr, outcomeLog.Close())
-		}
-		if logErr != nil {
-			err = errors.Join(err, fmt.Errorf("recording emergency execution outcome: %w", logErr))
-			resp.Error = err.Error()
-		}
+		result, runErr := executeEmergencyOverride(ctx, dbConn, record, stream)
+		resp, runErr := emergencyOutcomeFor(record, result, runErr)
 
 		out := output.New(output.Format(GetOutput()))
+		cmd.SilenceUsage = true
+		cmd.SilenceErrors = true
 		if executionOutputStructured() {
-			if writeErr := out.Write(resp); writeErr != nil {
-				return writeErr
-			}
-			return err
+			return errors.Join(runErr, out.Write(resp))
 		}
-
-		// Human-readable output
-		fmt.Println()
-		fmt.Printf("Review: %s\n", evidence.ReviewNotice)
-		fmt.Printf("Assurance: %s\n", evidence.Assurance)
-		fmt.Printf("Configured policy (bypassed): %s\n", evidence.ApprovalPolicyLabel)
-		if err != nil {
-			fmt.Printf("Emergency execution failed: %s\n", err)
-		} else {
-			fmt.Printf("Emergency execution completed\n")
-			fmt.Printf("Exit code: %d\n", resp.ExitCode)
-			fmt.Printf("Duration: %dms\n", resp.DurationMs)
-		}
-		fmt.Printf("Log: %s\n", resp.LogPath)
+		_, writeErr := fmt.Fprintf(cmd.OutOrStdout(), "\n%s\nEmergency execution: %s\nConfigured policy (bypassed): %s\nStatus: %s\nEvidence assurance: %s\nExit code: %d\nDuration: %dms\nLog: %s\n",
+			emergencyReviewNotice, resp.EmergencyID, resp.ApprovalPolicyLabel, resp.Status, resp.Assurance, resp.ExitCode, resp.DurationMs, resp.LogPath)
 		if resp.RollbackPath != "" {
-			fmt.Printf("Rollback: %s\n", resp.RollbackPath)
+			_, rollbackErr := fmt.Fprintf(cmd.OutOrStdout(), "Rollback: %s\n", resp.RollbackPath)
+			writeErr = errors.Join(writeErr, rollbackErr)
 		}
-		fmt.Println()
-		fmt.Println("Note: This execution was logged for audit purposes.")
-
-		if err != nil {
-			return err
+		if runErr != nil {
+			_, errorWriteErr := fmt.Fprintf(cmd.ErrOrStderr(), "Emergency execution failed: %v\n", runErr)
+			writeErr = errors.Join(writeErr, errorWriteErr)
 		}
-		return nil
+		return errors.Join(runErr, writeErr)
 	},
+}
+
+// executeEmergencyOverride writes a separate unreviewed intent before entering
+// the ordinary process runner. A failed intent or preamble never starts a child;
+// a failed startup observer can only cancel a child that has already started.
+func executeEmergencyOverride(ctx context.Context, conn *db.DB, record *db.EmergencyExecution, stream io.Writer) (*core.CommandResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := conn.CreateEmergencyExecution(record); err != nil {
+		return nil, fmt.Errorf("recording emergency execution intent: %w", err)
+	}
+	var result *core.CommandResult
+	var startupErr error
+	runErr := writeEmergencyEvidence(record)
+	evidenceRecorded := runErr == nil
+	if runErr == nil {
+		result, runErr = core.RunCommandWithStartObserver(ctx, &record.Command, record.LogPath, stream, func(pid int) error {
+			if err := conn.MarkEmergencyExecutionStarted(record.ID, pid); err != nil {
+				startupErr = fmt.Errorf("recording emergency process start: %w", err)
+				return startupErr
+			}
+			return nil
+		})
+	}
+	runErr = emergencyCommandError(result, runErr)
+	status := db.EmergencyStatusSucceeded
+	switch {
+	case startupErr != nil:
+		// The runner cancels the child when its startup cannot be persisted.
+		// Record the infrastructure failure, not an external cancellation.
+		status = db.EmergencyStatusFailed
+	case errors.Is(runErr, context.DeadlineExceeded):
+		status = db.EmergencyStatusTimedOut
+	case errors.Is(runErr, context.Canceled):
+		status = db.EmergencyStatusCancelled
+	case runErr != nil:
+		status = db.EmergencyStatusFailed
+	}
+	outcome := db.EmergencyOutcome{}
+	if result != nil {
+		code, duration := result.ExitCode, result.Duration.Milliseconds()
+		outcome.ExitCode, outcome.DurationMs = &code, &duration
+	}
+	if runErr != nil {
+		outcome.Error = runErr.Error()
+	}
+	if err := conn.CompleteEmergencyExecution(record.ID, status, outcome); err != nil {
+		runErr = errors.Join(runErr, fmt.Errorf("recording emergency execution outcome: %w", err))
+	}
+	// Preserve incomplete when a final write failed. The observed child result
+	// is still returned separately, including any actual nonzero exit status.
+	stored, err := conn.GetEmergencyExecution(record.ID)
+	if err != nil {
+		runErr = errors.Join(runErr, fmt.Errorf("reading emergency execution outcome: %w", err))
+	} else {
+		*record = *stored
+	}
+	// Preserve the upstream standalone log contract as well as the ledger.
+	// Its status comes from durable readback; a failed completion remains
+	// incomplete even when the observed child happened to exit successfully.
+	if evidenceRecorded {
+		view, outcomeErr := emergencyOutcomeFor(record, result, runErr)
+		runErr = outcomeErr
+		if err := writeEmergencyOutcome(record.LogPath, view); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
+	}
+	return result, runErr
+}
+
+func writeEmergencyEvidence(record *db.EmergencyExecution) error {
+	file, err := os.OpenFile(record.LogPath, os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return fmt.Errorf("opening emergency evidence log: %w", err)
+	}
+	evidence := emergencyEvidenceFor(record.ConfiguredApprovalPolicy)
+	err = json.NewEncoder(file).Encode(map[string]any{
+		"event": "emergency_execution", "phase": "attempt", "emergency_id": record.ID,
+		"execution_mode": evidence.ExecutionMode, "assurance": evidence.Assurance,
+		"approval_policy": evidence.ApprovalPolicy, "approval_policy_label": evidence.ApprovalPolicyLabel,
+		"approval_policy_bypassed": true,
+		"review_notice":            emergencyReviewNotice, "command": record.Command.Raw,
+		"command_hash": record.Command.Hash, "raw_command_hash": record.RawCommandHash, "hash": record.RawCommandHash,
+		"cwd": record.Command.Cwd, "project": record.ProjectPath, "actor": record.Actor,
+		"reason": record.Reason, "confirmation_method": record.ConfirmationMethod,
+		"recorded_at": record.RecordedAt, "timestamp": record.RecordedAt, "rollback_path": record.RollbackPath,
+	})
+	if err == nil {
+		err = file.Sync()
+	}
+	if err = errors.Join(err, file.Close()); err != nil {
+		return fmt.Errorf("recording emergency evidence: %w", err)
+	}
+	return nil
+}
+
+func writeEmergencyOutcome(path string, outcome emergencyExecutionOutcome) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return fmt.Errorf("opening emergency outcome log: %w", err)
+	}
+	err = json.NewEncoder(file).Encode(struct {
+		Event string `json:"event"`
+		emergencyExecutionOutcome
+	}{"emergency_execution_outcome", outcome})
+	if err == nil {
+		err = file.Sync()
+	}
+	if err = errors.Join(err, file.Close()); err != nil {
+		return fmt.Errorf("recording emergency execution outcome log: %w", err)
+	}
+	return nil
 }
