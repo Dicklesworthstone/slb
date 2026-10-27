@@ -742,6 +742,18 @@ max_requests_per_minute = 10     # Rate limit per session
 rate_limit_action = "reject"     # reject | queue | warn
 ```
 
+Queue mode waits for capacity before creating a request. Use `--queue-timeout`
+to bound that wait separately from `--timeout`, which bounds waiting for a
+review decision. `general.request_timeout` is measured in seconds without
+rounding to minutes, and the new request receives its full lifetime after
+admission preparation.
+
+Admission also resolves the requester's expired pending work without requiring
+a daemon. It applies the current timeout policy and records the resulting
+timeout or escalation; it never treats expiration as a peer approval. Pending
+capacity can then be reused, while the per-minute request count remains intact.
+Other requesters' work is unaffected, and invalid policy stops admission.
+
 ### Dynamic Quorum
 
 Scale approval requirements based on active reviewers:

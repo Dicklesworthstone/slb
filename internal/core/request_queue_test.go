@@ -3,10 +3,13 @@ package core
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
@@ -43,7 +46,7 @@ func takeQueuedResult(t *testing.T, done <-chan queuedRequestResult) queuedReque
 
 func TestRequestQueueWaitsWithoutPersistingOrHoldingWriter(t *testing.T) {
 	creator, session, notifier := creatorAdmissionFixture(t, RateLimitActionQueue)
-	creator.config.RequestTimeoutMinutes = 1
+	creator.config.RequestTimeout = time.Minute
 	seed, err := creator.CreateRequest(creatorAdmissionOptions(session))
 	if err != nil {
 		t.Fatal(err)
@@ -204,12 +207,136 @@ func TestRequestQueueDelayAndLifetimeBounds(t *testing.T) {
 	if creator.requestLifetime() != db.DefaultRequestTimeout {
 		t.Fatal("missing config has no bounded fallback")
 	}
-	creator.config = &RequestCreatorConfig{RequestTimeoutMinutes: 2}
-	if creator.requestLifetime() != 2*time.Minute {
+	creator.config = &RequestCreatorConfig{RequestTimeout: 2 * time.Second}
+	if creator.requestLifetime() != 2*time.Second {
 		t.Fatal("configured lifetime ignored")
 	}
-	creator.config.RequestTimeoutMinutes = -1
+	creator.config.RequestTimeout = -1
 	if creator.requestLifetime() != db.DefaultRequestTimeout {
 		t.Fatal("invalid lifetime became unbounded")
+	}
+}
+
+func TestRequestAdmissionResolvesExpiredCapacityWithCurrentPolicy(t *testing.T) {
+	for _, action := range []string{"escalate", "auto_reject", "auto_approve_warn"} {
+		t.Run(action, func(t *testing.T) {
+			creator, session, notifier := creatorAdmissionFixture(t, RateLimitActionReject)
+			seed, err := creator.CreateRequest(creatorAdmissionOptions(session))
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeExecutionPolicy(t, session.ProjectPath, "[general]\ntimeout_action = '"+action+"'\n")
+			if _, err := creator.db.Exec(`UPDATE requests SET expires_at = ? WHERE id = ?`, time.Now().UTC().Add(-time.Second).Format(time.RFC3339), seed.Request.ID); err != nil {
+				t.Fatal(err)
+			}
+			// Another requester's expired work must not be swept by this admission.
+			otherSession := &db.Session{AgentName: "other-requester", Model: "other-model", ProjectPath: session.ProjectPath}
+			if err := creator.db.CreateSession(otherSession); err != nil {
+				t.Fatal(err)
+			}
+			other := *seed.Request
+			other.ID, other.RequestorSessionID, other.RequestorAgent, other.RequestorModel = "", otherSession.ID, otherSession.AgentName, otherSession.Model
+			past := time.Now().UTC().Add(-time.Second)
+			other.ExpiresAt = &past
+			if err := creator.db.CreateRequest(&other); err != nil {
+				t.Fatal(err)
+			}
+			result, err := creator.CreateRequestContext(context.Background(), creatorAdmissionOptions(session))
+			if err != nil {
+				t.Fatalf("expired pending row blocked daemonless admission: %v", err)
+			}
+			want := db.StatusEscalated
+			if action == "auto_reject" {
+				want = db.StatusTimeout
+			}
+			resolved, err := creator.db.GetRequest(seed.Request.ID)
+			if err != nil || resolved.Status != want || resolved.ResolvedAt == nil || resolved.Execution != nil || resolved.ApprovalExpiresAt != nil {
+				t.Fatalf("expiry did not preserve deny/escalate policy: %+v, %v", resolved, err)
+			}
+			untouched, err := creator.db.GetRequest(other.ID)
+			if err != nil || untouched.Status != db.StatusPending || untouched.ResolvedAt != nil {
+				t.Fatalf("changed another requester's work: %+v, %v", untouched, err)
+			}
+			if result.Request.Status != db.StatusPending || result.Request.ID == seed.Request.ID || result.RateLimit.RemainingPending != 0 || result.RateLimit.RemainingPerMinute != 8 || notifier.calls.Load() != 2 {
+				t.Fatalf("admission reset quota, reused request, or notified incorrectly: %+v", result)
+			}
+			var votes int
+			if err := creator.db.QueryRow(`SELECT COUNT(*) FROM reviews`).Scan(&votes); err != nil || votes != 0 {
+				t.Fatalf("expiry manufactured review evidence: %d %v", votes, err)
+			}
+		})
+	}
+}
+
+func TestRequestAdmissionExpiredCapacityFailsClosedOnPolicyError(t *testing.T) {
+	creator, session, notifier := creatorAdmissionFixture(t, RateLimitActionQueue)
+	seed, err := creator.CreateRequest(creatorAdmissionOptions(session))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := creator.db.Exec(`UPDATE requests SET expires_at = ? WHERE id = ?`, time.Now().UTC().Add(-time.Second).Format(time.RFC3339), seed.Request.ID); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutionPolicy(t, session.ProjectPath, "[general]\ntimeout_action = 'invalid'\n")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result, err := creator.CreateRequestContext(ctx, creatorAdmissionOptions(session))
+	if result != nil || err == nil || errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "loading command policy") {
+		t.Fatalf("policy failure was ignored or retried as capacity: %+v, %v", result, err)
+	}
+	stored, err := creator.db.GetRequest(seed.Request.ID)
+	if err != nil || stored.Status != db.StatusPending || stored.ResolvedAt != nil || notifier.calls.Load() != 1 {
+		t.Fatalf("broken policy changed pending evidence: %+v, %v", stored, err)
+	}
+	var count int
+	if err := creator.db.QueryRow(`SELECT COUNT(*) FROM requests`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("failed admission created a request: %d %v", count, err)
+	}
+}
+
+func TestRequestQueueAdvancesExpiryWithoutAnotherProcess(t *testing.T) {
+	creator, session, _ := creatorAdmissionFixture(t, RateLimitActionQueue)
+	creator.config.RequestTimeout = 2 * time.Second
+	seed, err := creator.CreateRequest(creatorAdmissionOptions(session))
+	if err != nil {
+		t.Fatal(err)
+	}
+	creator.config.RequestTimeout = time.Minute
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	finished := takeQueuedResult(t, awaitQueuedAttempt(t, creator, creatorAdmissionOptions(session), ctx))
+	if finished.err != nil || !finished.result.Queued || finished.result.Request.Status != db.StatusPending {
+		t.Fatalf("queue failed to resolve its own expired blocker: %+v", finished)
+	}
+	stored, err := creator.db.GetRequest(seed.Request.ID)
+	if err != nil || stored.Status != db.StatusEscalated || stored.Execution != nil {
+		t.Fatalf("expired blocker did not escalate: %+v %v", stored, err)
+	}
+}
+
+func TestRequestAdmissionExpiredCapacityUsesExplicitConfig(t *testing.T) {
+	creator, session, _ := creatorAdmissionFixture(t, RateLimitActionReject)
+	seed, err := creator.CreateRequest(creatorAdmissionOptions(session))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := creator.db.Exec(`UPDATE requests SET expires_at = ? WHERE id = ?`, time.Now().UTC().Add(-time.Second).Format(time.RFC3339), seed.Request.ID); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "explicit.toml")
+	if err := os.WriteFile(configPath, []byte("[general]\ntimeout_action = 'auto_reject'\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := LoadCommandPolicy(creator.db, config.LoadOptions{ProjectDir: session.ProjectPath, ConfigPath: configPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	creator.patternEngine = engine
+	if _, err := creator.CreateRequest(creatorAdmissionOptions(session)); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := creator.db.GetRequest(seed.Request.ID)
+	if err != nil || stored.Status != db.StatusTimeout {
+		t.Fatalf("admission ignored explicit timeout policy: %+v, %v", stored, err)
 	}
 }

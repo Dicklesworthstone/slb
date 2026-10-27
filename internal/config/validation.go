@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Validate checks the configuration for semantic errors.
@@ -17,6 +18,8 @@ func Validate(cfg Config) error {
 	}
 	if cfg.General.RequestTimeoutSecs <= 0 {
 		errs = append(errs, "general.request_timeout must be > 0 seconds")
+	} else if int64(cfg.General.RequestTimeoutSecs) > int64((1<<63-1)/time.Second) {
+		errs = append(errs, "general.request_timeout exceeds the maximum representable duration")
 	}
 	if cfg.General.DifferentModelTimeoutSecs < 0 {
 		errs = append(errs, "general.different_model_timeout cannot be negative")

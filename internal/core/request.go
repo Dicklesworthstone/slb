@@ -96,8 +96,9 @@ type RequestCreatorConfig struct {
 	DynamicQuorumEnabled bool
 	// DynamicQuorumFloor is the minimum approvals even with dynamic quorum.
 	DynamicQuorumFloor int
-	// RequestTimeoutMinutes is the default timeout for pending requests.
-	RequestTimeoutMinutes int
+	// RequestTimeout is the lifetime of a pending request. Keep the configured
+	// precision: rounding seconds to minutes can delay expiry and stall queues.
+	RequestTimeout time.Duration
 	// ApprovalTTLMinutes is the default TTL for approvals (dangerous tier).
 	ApprovalTTLMinutes int
 	// ApprovalTTLCriticalMinutes is the TTL for critical tier approvals.
@@ -118,7 +119,7 @@ func DefaultRequestCreatorConfig() *RequestCreatorConfig {
 		BlockedAgents:              []string{},
 		DynamicQuorumEnabled:       false,
 		DynamicQuorumFloor:         1,
-		RequestTimeoutMinutes:      30,
+		RequestTimeout:             30 * time.Minute,
 		ApprovalTTLMinutes:         30,
 		ApprovalTTLCriticalMinutes: 10,
 		AgentMailEnabled:           true,
@@ -228,6 +229,13 @@ func (rc *RequestCreator) createRequestOnce(ctx context.Context, opts CreateRequ
 			SkipReason:     "Command is classified as safe and does not require approval",
 			Classification: classification,
 		}, nil
+	}
+
+	// Expired requests still occupy a pending slot until their policy makes a
+	// durable decision. Resolve this requester's expired work even without a
+	// daemon; the atomic admission below still decides who gets the free slot.
+	if err := rc.advanceExpiredCapacity(ctx, session.ID, projectPath); err != nil {
+		return nil, err
 	}
 
 	// Commands deliberately submitted to SLB default to dangerous when the

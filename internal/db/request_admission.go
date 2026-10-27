@@ -38,6 +38,34 @@ type RequestAdmissionLimitError struct{ Stats RequestAdmissionStats }
 
 func (e *RequestAdmissionLimitError) Error() string { return "request admission rate limit exceeded" }
 
+// ListExpiredPendingRequestIDs returns advisory candidates for the normal
+// pending resolver. Expiry alone never releases a quota slot; the resolver
+// must commit a policy decision before AdmitRequest recounts pending work.
+// Scope by both session and project so admission cannot sweep another agent's
+// or another project's decisions in a shared database.
+func (db *DB) ListExpiredPendingRequestIDs(ctx context.Context, sessionID, project string, now time.Time) ([]string, error) {
+	if sessionID == "" || project == "" {
+		return nil, errors.New("session and project are required for expired request lookup")
+	}
+	rows, err := db.conn.QueryContext(ctx, `SELECT id FROM requests
+		WHERE requestor_session_id = ? AND project_path = ? AND status = 'pending'
+		  AND expires_at IS NOT NULL AND julianday(expires_at) <= julianday(?)
+		ORDER BY created_at, id`, sessionID, project, now.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // AdmitRequest checks identity, counters and the reset watermark, then inserts
 // the request under ONE SQLite writer reservation. A process-local mutex or a
 // read-then-CreateRequest sequence cannot enforce quotas across CLI processes.

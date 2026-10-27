@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/db"
@@ -211,8 +212,8 @@ func TestToRequestCreatorConfig(t *testing.T) {
 
 	result := toRequestCreatorConfig(cfg)
 
-	if result.RequestTimeoutMinutes != 30 {
-		t.Errorf("expected RequestTimeoutMinutes=30, got %d", result.RequestTimeoutMinutes)
+	if result.RequestTimeout != 30*time.Minute {
+		t.Errorf("expected RequestTimeout=30m, got %v", result.RequestTimeout)
 	}
 	if result.ApprovalTTLMinutes != 60 {
 		t.Errorf("expected ApprovalTTLMinutes=60, got %d", result.ApprovalTTLMinutes)
@@ -262,9 +263,9 @@ func TestToRequestCreatorConfig_ZeroTimeout(t *testing.T) {
 
 	result := toRequestCreatorConfig(cfg)
 
-	// Should default to 30 for zero/negative timeout
-	if result.RequestTimeoutMinutes != 30 {
-		t.Errorf("expected RequestTimeoutMinutes=30 for zero timeout, got %d", result.RequestTimeoutMinutes)
+	// Invalid programmatic input retains a bounded fallback; config.Load rejects it.
+	if result.RequestTimeout != 30*time.Minute {
+		t.Errorf("expected RequestTimeout=30m for zero timeout, got %v", result.RequestTimeout)
 	}
 }
 
@@ -274,9 +275,8 @@ func TestToRequestCreatorConfig_NegativeTimeout(t *testing.T) {
 
 	result := toRequestCreatorConfig(cfg)
 
-	// Should default to 30 for negative timeout
-	if result.RequestTimeoutMinutes != 30 {
-		t.Errorf("expected RequestTimeoutMinutes=30 for negative timeout, got %d", result.RequestTimeoutMinutes)
+	if result.RequestTimeout != 30*time.Minute {
+		t.Errorf("expected RequestTimeout=30m for negative timeout, got %v", result.RequestTimeout)
 	}
 }
 

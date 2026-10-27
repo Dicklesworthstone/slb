@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -429,9 +428,9 @@ func toRateLimitConfig(cfg config.Config) core.RateLimitConfig {
 }
 
 func toRequestCreatorConfig(cfg config.Config) *core.RequestCreatorConfig {
-	timeoutMinutes := int(math.Ceil(float64(cfg.General.RequestTimeoutSecs) / 60.0))
-	if timeoutMinutes <= 0 {
-		timeoutMinutes = 30
+	timeout := db.DefaultRequestTimeout
+	if seconds := int64(cfg.General.RequestTimeoutSecs); seconds > 0 && seconds <= int64((1<<63-1)/time.Second) {
+		timeout = time.Duration(seconds) * time.Second
 	}
 	return &core.RequestCreatorConfig{
 		ApprovalPolicy:             db.ApprovalPolicy(cfg.General.ApprovalPolicy),
@@ -439,7 +438,7 @@ func toRequestCreatorConfig(cfg config.Config) *core.RequestCreatorConfig {
 		BlockedAgents:              cfg.Agents.Blocked,
 		DynamicQuorumEnabled:       false,
 		DynamicQuorumFloor:         1,
-		RequestTimeoutMinutes:      timeoutMinutes,
+		RequestTimeout:             timeout,
 		ApprovalTTLMinutes:         cfg.General.ApprovalTTLMins,
 		ApprovalTTLCriticalMinutes: cfg.General.ApprovalTTLCriticalMins,
 		AgentMailEnabled:           cfg.Integrations.AgentMailEnabled,

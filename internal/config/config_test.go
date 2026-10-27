@@ -4,8 +4,10 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/viper"
 )
@@ -85,6 +87,29 @@ func TestValidate_Errors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "config validation failed") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRequestTimeoutPreservesRepresentableSeconds(t *testing.T) {
+	for _, seconds := range []int{1, 2, 59, 61} {
+		cfg := DefaultConfig()
+		cfg.General.RequestTimeoutSecs = seconds
+		if err := Validate(cfg); err != nil {
+			t.Fatalf("valid seconds deadline %d was rejected: %v", seconds, err)
+		}
+	}
+	if strconv.IntSize < 64 {
+		return // An int on these platforms cannot exceed time.Duration's second range.
+	}
+	maxSeconds := int64((1<<63 - 1) / time.Second)
+	cfg := DefaultConfig()
+	cfg.General.RequestTimeoutSecs = int(maxSeconds)
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("representable upper bound rejected: %v", err)
+	}
+	cfg.General.RequestTimeoutSecs++
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "request_timeout") {
+		t.Fatalf("overflowing request lifetime accepted: %v", err)
 	}
 }
 

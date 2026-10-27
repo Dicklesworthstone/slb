@@ -72,13 +72,32 @@ func requestAdmissionWaitError(cause error, limit *RateLimitError) error {
 }
 
 func (rc *RequestCreator) requestLifetime() time.Duration {
-	if rc.config != nil && rc.config.RequestTimeoutMinutes > 0 {
-		minutes := int64(rc.config.RequestTimeoutMinutes)
-		if minutes <= int64((1<<63-1)/time.Minute) {
-			return time.Duration(minutes) * time.Minute
-		}
+	if rc.config != nil && rc.config.RequestTimeout > 0 {
+		return rc.config.RequestTimeout
 	}
 	return db.DefaultRequestTimeout
+}
+
+// advanceExpiredCapacity never treats an expired row as permission to skip a
+// quota. It uses the same transactional timeout resolver as waiters and the
+// daemon, so current timeout policy, peer decisions and audit events survive.
+// Close the listing before resolving: SQLite may have only one connection.
+func (rc *RequestCreator) advanceExpiredCapacity(ctx context.Context, sessionID, project string) error {
+	ids, err := rc.db.ListExpiredPendingRequestIDs(ctx, sessionID, project, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("finding expired request capacity: %w", err)
+	}
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, err := AdvancePendingRequest(ctx, rc.db, id, PendingOptions{
+			ConfigPath: rc.patternEngine.PolicyConfigPath(), ExpiredOnly: true,
+		}); err != nil {
+			return fmt.Errorf("resolving expired request %s before admission: %w", id, err)
+		}
+	}
+	return nil
 }
 
 // Bounded exponential backoff with jitter avoids a synchronized writer stampede.
