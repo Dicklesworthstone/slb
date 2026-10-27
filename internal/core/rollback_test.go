@@ -1496,12 +1496,17 @@ func TestWriteRollbackMetadata(t *testing.T) {
 	})
 
 	t.Run("fails for invalid directory", func(t *testing.T) {
+		// Use a file as the parent so the path is invalid on every host.
+		parent := filepath.Join(t.TempDir(), "not-a-directory")
+		if err := os.WriteFile(parent, []byte("fixture"), 0600); err != nil {
+			t.Fatal(err)
+		}
 		data := &RollbackData{
 			Kind:      rollbackKindFilesystem,
 			RequestID: "test-123",
 		}
 
-		err := writeRollbackMetadata("/nonexistent/path", data)
+		err := writeRollbackMetadata(filepath.Join(parent, "rollback"), data)
 		if err == nil {
 			t.Error("expected error for invalid directory")
 		}

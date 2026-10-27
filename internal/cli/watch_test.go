@@ -1125,8 +1125,13 @@ func TestAutoApproveCaution_InvalidDatabase(t *testing.T) {
 	origDB := flagDB
 	defer func() { flagDB = origDB }()
 
-	// Point to a non-existent database path
-	flagDB = "/nonexistent/path/to/database.db"
+	// A missing directory may be created by db.Open, especially as root.
+	// A regular file cannot contain a database, regardless of host permissions.
+	parent := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(parent, []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	flagDB = filepath.Join(parent, "database.db")
 
 	ctx := context.Background()
 	err := autoApproveCaution(ctx, "req-123")
