@@ -1,11 +1,110 @@
 package core
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
 // These run through ClassifyCommand with a real working directory, the shape
 // hooks and the daemon use (ResolvePathsInCommand only runs with a cwd).
+
+func TestShellFileRedirectionsCannotBorrowSafeClassification(t *testing.T) {
+	engine := NewPatternEngine()
+	cwd := t.TempDir()
+	marker := filepath.Join(cwd, "important.sql")
+	const original = "valuable contents\n"
+	if err := os.WriteFile(marker, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	target := shellQuote(marker)
+	for _, command := range []string{
+		"git stash > " + target,
+		"git stash >> " + target,
+		"git stash 2> " + target,
+		"git stash &> " + target,
+		"git stash &>> " + target,
+		"git stash >| " + target,
+		"git stash <> " + target,
+		"git stash >& " + target,
+		"> " + target + " git stash",
+		"git stash {fd}> " + target,
+		": > " + target,
+		"> " + target,
+		`git stash > "$OUTPUT"`,
+		`git stash >& "$fd"`,
+		"rm -f cache.log > " + target,
+		"npm cache clean > " + target,
+		"git stash > /dev/null > " + target,
+		"git stash > " + target + " > /dev/null",
+		"true | git stash > " + target,
+		"(git stash > " + target + ")",
+		"sh -c " + shellQuote("git stash > "+target),
+		"eval " + shellQuote("git stash > "+target),
+		"printf '%s' " + shellQuote("git stash > "+target) + " | sh",
+		"printf '%s' \"$(git stash > " + target + ")\"",
+	} {
+		t.Run(command, func(t *testing.T) {
+			got := engine.ClassifyCommand(command, cwd)
+			if got.Tier != RiskTierCaution || !got.NeedsApproval || got.IsSafe {
+				t.Fatalf("file write escaped the caution gate: %#v", got)
+			}
+			if got.ParseError || got.Opaque {
+				t.Fatalf("valid file redirection was mislabeled as invalid or opaque code: %#v", got)
+			}
+		})
+	}
+	if contents, err := os.ReadFile(marker); err != nil || string(contents) != original {
+		t.Fatalf("static classification changed the redirection target: contents=%q err=%v", contents, err)
+	}
+}
+
+func TestShellFileRedirectionsPreserveOtherEffects(t *testing.T) {
+	engine := NewPatternEngine()
+	cwd := t.TempDir()
+	for _, command := range []string{
+		"git stash >/dev/null",
+		"git stash >>'/dev/null'",
+		`git stash &>"/dev/null"`,
+		"git stash >&/dev/null",
+		"git stash 2>&1",
+		"git stash 2>&-",
+		"git stash 2>&1-",
+		"git stash 3<&0",
+		"git stash < input.txt",
+		"npm cache clean '> important.sql'",
+	} {
+		t.Run(command, func(t *testing.T) {
+			got := engine.ClassifyCommand(command, cwd)
+			if !got.IsSafe || got.NeedsApproval || got.ParseError || got.Opaque {
+				t.Fatalf("non-writing redirection or literal operator lost SAFE classification: %#v", got)
+			}
+		})
+	}
+	for command, tier := range map[string]RiskTier{
+		"git reset --hard > important.sql":      RiskTierDangerous,
+		"git push --force > important.sql":      RiskTierCritical,
+		"git stash >$(rm -rf /srv)":             RiskTierCritical,
+		"git stash 2>important.sql > /dev/null": RiskTierCaution,
+	} {
+		if got := engine.ClassifyCommand(command, cwd); got.Tier != tier || !got.NeedsApproval {
+			t.Errorf("%q: got %#v, want %s", command, got, tier)
+		}
+	}
+	// An operator in direct argv is data, while the same shell-form text
+	// performs the write. Do not manufacture a shell effect from display text.
+	if err := engine.AddPattern(RiskTier(RiskSafe), `^printf `, "test literal argv", "human"); err != nil {
+		t.Fatal(err)
+	}
+	spec := CommandSpec{Raw: "printf harmless > important.sql", Argv: []string{"printf", "%s", ">", "important.sql"}, Cwd: cwd}
+	if got := engine.ClassifyCommandSpec(spec); !got.IsSafe || got.NeedsApproval {
+		t.Fatalf("literal argv became a redirection: %#v", got)
+	}
+	spec.Shell = true
+	if got := engine.ClassifyCommandSpec(spec); got.Tier != RiskTierCaution || got.IsSafe || !got.NeedsApproval {
+		t.Fatalf("configured SAFE rule hid a shell write: %#v", got)
+	}
+}
 
 func TestExecutionFeedsClassifyStaticPayloads(t *testing.T) {
 	engine := NewPatternEngine()

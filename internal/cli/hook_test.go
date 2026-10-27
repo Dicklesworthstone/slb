@@ -1280,6 +1280,8 @@ func TestNativeHookGuardProtocolAndFallback(t *testing.T) {
 		wantAudit bool
 	}{
 		{"safe", "git stash", "allow", false},
+		{"file redirection", "git stash > important.sql", "deny", true},
+		{"discard redirection", "git stash >/dev/null 2>&1", "allow", false},
 		{"caution stays in SLB", "rm build.cache", "deny", true},
 		{"dangerous", "rm -rf node_modules", "deny", true},
 		{"invalid command", 42, "ask", false},

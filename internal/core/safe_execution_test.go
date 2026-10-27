@@ -13,7 +13,7 @@ import (
 )
 
 func TestSafeExecutionReloadsPolicyAndSession(t *testing.T) {
-	for _, change := range []string{"unchanged", "removed-safe", "malformed-config", "custom-rule", "ended-session", "blocked-agent", "wrong-project", "missing-session", "missing-config", "cancelled", "unmatched-segment", "unbound-cwd"} {
+	for _, change := range []string{"unchanged", "removed-safe", "malformed-config", "custom-rule", "ended-session", "blocked-agent", "wrong-project", "missing-session", "missing-config", "cancelled", "unmatched-segment", "file-redirection", "unbound-cwd"} {
 		t.Run(change, func(t *testing.T) {
 			database, request, session := policyExecutionFixture(t)
 			project := request.ProjectPath
@@ -64,6 +64,9 @@ func TestSafeExecutionReloadsPolicyAndSession(t *testing.T) {
 				want = context.Canceled
 			case "unmatched-segment":
 				spec.Raw, spec.Shell = "printf safe-run-probe && unknown-command", true
+				want = ErrApprovalPolicyChanged
+			case "file-redirection":
+				spec.Raw, spec.Shell = "printf safe-run-probe > important.sql", true
 				want = ErrApprovalPolicyChanged
 			case "unbound-cwd":
 				spec.Cwd = ""

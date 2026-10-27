@@ -574,6 +574,15 @@ The pattern matching engine is the core of `slb`'s command classification system
    - CAUTION → DANGEROUS
    - DANGEROUS → CRITICAL
 
+Shell redirections that create, truncate or append to a file receive at least
+CAUTION, even when the invoked program matches a SAFE rule. For example,
+`git stash > important.sql` can truncate the file before Git starts. The current
+CAUTION policy therefore applies; stronger DANGEROUS or CRITICAL matches remain.
+This check also follows nested shell programs and considers every redirection,
+including a file target later superseded by `/dev/null`. Literal `/dev/null`,
+file-descriptor duplication/closing and input-only redirects retain their normal
+classification. Classification never executes the command or inspects its files.
+
 ### Fallback Detection
 
 For commands that wrap SQL (e.g., `psql -c "..."`, `mysql -e "..."`), pattern matching may not catch embedded statements. The engine includes fallback detection:

@@ -250,20 +250,27 @@ func (e *PatternEngine) matchPatterns(cmd string, patterns []*Pattern) *Pattern 
 	return nil
 }
 
-// finalizeClassification applies the parse-error upgrade and then the opaque
-// floor: code whose content cannot be determined statically is never "no
-// pattern" or SAFE.
+// finalizeClassification applies the parse-error upgrade and then the effect
+// floors: opaque code and file-writing shell redirections can never borrow
+// a SAFE program rule or escape as "no pattern". Stronger risk matches remain.
 func (e *PatternEngine) finalizeClassification(res *MatchResult, normalized *NormalizedCommand) *MatchResult {
 	res = e.applyParseUpgrade(res, normalized.ParseError)
 	res.Opaque = normalized.Opaque
-	if !normalized.Opaque || (res.Tier != "" && res.Tier != RiskTier(RiskSafe)) {
+	if res.Tier != "" && res.Tier != RiskTier(RiskSafe) {
+		return res
+	}
+	switch {
+	case normalized.Opaque:
+		res.MatchedPattern = "unresolved_execution"
+	case normalized.WritesFiles:
+		res.MatchedPattern = "file_write_redirection"
+	default:
 		return res
 	}
 	res.Tier = RiskTierCaution
 	res.MinApprovals = tierApprovals(res.Tier)
 	res.NeedsApproval = true
 	res.IsSafe = false
-	res.MatchedPattern = "unresolved_execution"
 	return res
 }
 

@@ -1007,17 +1007,22 @@ func TestClassifyCommand_RedirectionsAndQuotedOperatorsDoNotHideArguments(t *tes
 			t.Errorf("rm -f 1&>/dev/null a.log (cwd %q): tier=%q safe=%v, want %q like rm -f 1 a.log", dir, got.Tier, got.IsSafe, want.Tier)
 		}
 	}
-	for _, cmd := range []string{
-		"echo hi > out.txt",
-		"go test ./... 2>&1 | tail -20",
-		"cat < in.txt",
-		`grep -q x <<< "$v"`,
-		"echo a >&2",
-		"ls 2>/dev/null",
+	for _, tc := range []struct {
+		command       string
+		needsApproval bool
+	}{
+		// Output redirection can truncate a valuable file before the benign
+		// program starts. Discarding output and input-only forms cannot.
+		{"echo hi > out.txt", true},
+		{"go test ./... 2>&1 | tail -20", false},
+		{"cat < in.txt", false},
+		{`grep -q x <<< "$v"`, false},
+		{"echo a >&2", false},
+		{"ls 2>/dev/null", false},
 	} {
-		result := engine.ClassifyCommand(cmd, cwd)
-		if result.NeedsApproval {
-			t.Errorf("%s: tier=%q (pattern %q), want no approval", cmd, result.Tier, result.MatchedPattern)
+		result := engine.ClassifyCommand(tc.command, cwd)
+		if result.NeedsApproval != tc.needsApproval {
+			t.Errorf("%s: tier=%q (pattern %q), needs approval=%v, want %v", tc.command, result.Tier, result.MatchedPattern, result.NeedsApproval, tc.needsApproval)
 		}
 	}
 }
@@ -1701,7 +1706,7 @@ func TestClassifyRedirectedSubshell(t *testing.T) {
 		"(ls) 2>/dev/null >&2":                "",
 		"(cd /tmp && ls) > out.txt":           RiskTierCaution, // file write stays conservative
 		"(rm -rf ./x) > out.txt":              RiskTierCritical,
-		"(echo a >b)":                         "",
+		"(echo a >b)":                         RiskTierCaution,
 		"(cat) <<< 'x'":                       RiskTierCaution,
 		"(rm -rf /etc)x":                      RiskTierCaution,
 	})

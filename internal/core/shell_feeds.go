@@ -20,6 +20,8 @@ import (
 //     classified recursively, anything else is opaque;
 //   - a shell -c operand or eval argument built by expansion
 //     (`sh -c "$(printf ...)"`): classified when statically known, else opaque.
+//   - a file-writing redirection, including one attached to a simple command:
+//     `git stash > important.sql` truncates the file before git even starts.
 //
 // Opaque commands classify as at least CAUTION (see finalizeClassification).
 // All evaluation is static: nothing is executed and no environment is read.
@@ -70,25 +72,26 @@ type stdinFeed struct {
 func (f *stdinFeed) present() bool { return f != nil && (f.producer != nil || f.redirect != nil) }
 
 type feedAnalysis struct {
-	raw      string
-	depth    int
-	literals literalVariables
-	aliases  map[string][]string // static alias bodies defined anywhere in the script
-	segments []string
-	opaque   bool
-	parseErr bool
+	raw         string
+	depth       int
+	literals    literalVariables
+	aliases     map[string][]string // static alias bodies defined anywhere in the script
+	segments    []string
+	opaque      bool
+	parseErr    bool
+	writesFiles bool
 }
 
-// analyzeExecutionFeeds returns extra segments to classify and whether some
-// executed code could not be determined statically.
-func analyzeExecutionFeeds(raw string, depth int) (segments []string, opaque, parseErr bool) {
+// analyzeExecutionFeeds returns extra segments to classify, whether some
+// executed code could not be determined statically, and shell file writes.
+func analyzeExecutionFeeds(raw string, depth int) (segments []string, opaque, parseErr, writesFiles bool) {
 	if depth >= maxCommandNesting || len(raw) > 1<<20 || strings.IndexByte(raw, 0) >= 0 {
-		return nil, false, true
+		return nil, false, true, false
 	}
 	file, err := syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(raw), "")
 	if err != nil {
 		// The line-oriented normalizer reports its own parse errors.
-		return nil, false, false
+		return nil, false, false, false
 	}
 	a := &feedAnalysis{raw: raw, depth: depth, literals: collectLiteralVariables(file, raw)}
 	// Writing these arrays defines an alias body or rebinds a command name to
@@ -101,7 +104,7 @@ func analyzeExecutionFeeds(raw string, depth int) (segments []string, opaque, pa
 	for _, stmt := range file.Stmts {
 		a.visitStmt(stmt, nil)
 	}
-	return a.segments, a.opaque, a.parseErr
+	return a.segments, a.opaque, a.parseErr, a.writesFiles
 }
 
 func (a *feedAnalysis) addPayload(payload string) {
@@ -112,6 +115,34 @@ func (a *feedAnalysis) addPayload(payload string) {
 	a.segments = append(a.segments, inner.Segments...)
 	a.opaque = a.opaque || inner.Opaque
 	a.parseErr = a.parseErr || inner.ParseError
+	a.writesFiles = a.writesFiles || inner.WritesFiles
+}
+
+// redirectionWritesFiles recognizes the shell's own write effect, which is
+// independent of the invoked program and occurs even if that program fails.
+// Do not inspect paths on disk or resolve dynamic targets during classification.
+// Literal /dev/null and descriptor duplication, closing and moving are the only
+// output exceptions. Input-only redirections do not create a write effect.
+func redirectionWritesFiles(redirect *syntax.Redirect) bool {
+	switch redirect.Op {
+	case syntax.RdrOut, syntax.AppOut, syntax.RdrAll, syntax.AppAll, syntax.ClbOut, syntax.RdrInOut:
+		target, literal := staticWordValue(redirect.Word)
+		return !literal || target != "/dev/null"
+	case syntax.DplOut:
+		// Bash also accepts >&file for redirecting both output streams. An
+		// unknown target cannot be assumed to name a file descriptor.
+		target, literal := staticWordValue(redirect.Word)
+		if !literal {
+			return true
+		}
+		if target == "/dev/null" || target == "-" {
+			return false
+		}
+		fd := strings.TrimSuffix(target, "-")
+		return fd == "" || strings.Trim(fd, "0123456789") != ""
+	default:
+		return false
+	}
 }
 
 // stdinRedirect returns the last redirection of fd 0, which is what the
@@ -138,8 +169,10 @@ func (a *feedAnalysis) visitStmt(stmt *syntax.Stmt, inherited *stdinFeed) {
 	if r := stdinRedirect(stmt.Redirs); r != nil {
 		feed = &stdinFeed{redirect: r}
 	}
-	// Redirection words can contain substitutions.
+	// Every redirection takes effect, including an earlier target superseded
+	// by a later one. Its word can also contain executable substitutions.
 	for _, r := range stmt.Redirs {
+		a.writesFiles = a.writesFiles || redirectionWritesFiles(r)
 		a.visitNested(r, feed)
 	}
 	switch cmd := stmt.Cmd.(type) {

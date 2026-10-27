@@ -31,6 +31,10 @@ type NormalizedCommand struct {
 	// computed command word, or a shell/interpreter reading an unknown or
 	// non-shell program from stdin. It raises the tier to at least CAUTION.
 	Opaque bool
+	// WritesFiles indicates a shell redirection that may create or modify a
+	// file other than literal /dev/null. A SAFE rule for the program cannot
+	// authorize this separate effect performed by the shell.
+	WritesFiles bool
 }
 
 // Command wrapper prefixes to strip
@@ -421,8 +425,8 @@ func normalizeWithFeeds(cmd string, depth int) *NormalizedCommand {
 	if strings.TrimSpace(cmd) == "" {
 		return result
 	}
-	segments, opaque, parseErr := analyzeExecutionFeeds(strings.TrimSpace(cmd), depth)
-	if len(segments) == 0 && !opaque && !parseErr {
+	segments, opaque, parseErr, writesFiles := analyzeExecutionFeeds(strings.TrimSpace(cmd), depth)
+	if len(segments) == 0 && !opaque && !parseErr && !writesFiles {
 		return result
 	}
 	seen := make(map[string]bool, len(result.Segments))
@@ -437,6 +441,7 @@ func normalizeWithFeeds(cmd string, depth int) *NormalizedCommand {
 	}
 	result.Opaque = result.Opaque || opaque
 	result.ParseError = result.ParseError || parseErr
+	result.WritesFiles = result.WritesFiles || writesFiles
 	result.IsCompound = len(result.Segments) > 1
 	if result.Primary == "" && len(result.Segments) > 0 {
 		result.Primary = result.Segments[0]
