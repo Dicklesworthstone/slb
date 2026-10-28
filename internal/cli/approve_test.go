@@ -203,6 +203,9 @@ func TestApproveCommand_ApprovesRequest(t *testing.T) {
 	if result["new_request_status"] != string(db.StatusApproved) {
 		t.Errorf("expected new_request_status=approved, got %v", result["new_request_status"])
 	}
+	if result["request_status"] != string(db.StatusApproved) {
+		t.Errorf("missing committed request status: %v", result["request_status"])
+	}
 }
 
 func TestApproveCommand_WithComments(t *testing.T) {

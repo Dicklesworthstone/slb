@@ -523,14 +523,15 @@ func (m *DetailModel) renderFooter() string {
 
 // Eligibility is only a UI hint. ApplyReview revalidates under a write lock.
 func (m *DetailModel) canApprove() bool {
-	return m.canReject() && (!m.Request.RequireDifferentModel || db.ModelsDiffer(m.Request.RequestorModel, m.Session.Model))
+	return m.canReject() && (m.Request.Status == db.StatusPending || m.Request.Status == db.StatusEscalated) &&
+		(!m.Request.RequireDifferentModel || db.ModelsDiffer(m.Request.RequestorModel, m.Session.Model))
 }
 
 func (m *DetailModel) canReject() bool {
 	if m.SnapshotError != "" || m.ReviewPending || m.Request == nil || m.Session == nil || !m.Session.IsActive() {
 		return false
 	}
-	if m.Request.Status != db.StatusPending && m.Request.Status != db.StatusEscalated {
+	if m.Request.Status != db.StatusPending && m.Request.Status != db.StatusEscalated && m.Request.Status != db.StatusApproved {
 		return false
 	}
 	if m.Request.Status == db.StatusPending && m.Request.ExpiresAt != nil && !time.Now().Before(*m.Request.ExpiresAt) {

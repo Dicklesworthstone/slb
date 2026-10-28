@@ -183,6 +183,12 @@ or the `trusted_self_approve` setting. Names and model labels remain self-report
 `slb run` provides the same workflow while waiting and executing automatically
 after review.
 
+Another eligible reviewer can still record an objection after quorum is reached,
+until SLB commits the execution or authorization claim. The current
+[conflict policy](#conflict-resolution) determines whether that objection rejects,
+escalates, or leaves the request approved. A negative vote never grants a new
+approval or renews an existing deadline.
+
 ## Commands Reference
 
 ### Session Management
@@ -213,7 +219,7 @@ slb cancel <request-id>                        # Cancel own request
 ```bash
 slb review <request-id>                        # Show full details
 slb approve <request-id> --session-id <id> --session-key <key>  # Review under the request's policy
-slb reject <request-id> --session-id <id> --reason "..."
+slb reject <request-id> --session-id <id> --session-key <key> --reason "..."
 ```
 
 ### Execution
@@ -652,6 +658,8 @@ stateDiagram-v2
     ESCALATED --> REJECTED: Rejected
     ESCALATED --> CANCELLED: Requester withdraws
     APPROVED --> CANCELLED: Requester withdraws
+    APPROVED --> REJECTED: Signed rejection blocks
+    APPROVED --> ESCALATED: Conflicting signed review
     APPROVED --> EXECUTING: Verified atomic claim
     EXECUTING --> EXECUTED: Success
     EXECUTING --> EXECUTION_FAILED: Failure
@@ -691,6 +699,16 @@ Approvals have a time-to-live to prevent stale approvals:
 - **CRITICAL requests**: 10 minutes (stricter by default)
 
 If an approval expires before execution, submit a new request for review.
+
+The decisive review loads the current TTL after obtaining the database writer
+reservation and reauthenticating any delegated reviewer. Execution also applies
+the current TTL to the original approval time: the effective deadline is the
+earlier of that result and the recorded approval expiry. Shortening the TTL can
+therefore revoke an outstanding approval; lengthening it cannot extend the
+recorded grant. SLB repeats this check during the atomic execution claim, even if
+a SAFE rule now matches the command. These checks do not rewrite review history.
+A reviewed request with a missing or invalid approval timestamp must be submitted
+again for fresh review.
 
 ## Execution Verification
 
@@ -946,6 +964,34 @@ When approvals and rejections conflict:
 conflict_resolution = "any_rejection_blocks"  # Default
 # Options: any_rejection_blocks | first_wins | human_breaks_tie
 ```
+
+Both approvals and rejections use the current conflict settings when the vote is
+committed. An eligible reviewer who has not already voted may reject an approved
+request until its execution or authorization claim is committed:
+
+| Current policy | Effect of a later rejection on an approved request |
+|----------------|---------------------------------------------------|
+| `any_rejection_blocks` | Changes the request to `rejected` |
+| `human_breaks_tie` | Changes the request to `escalated` |
+| `first_wins` | Keeps an earlier affirmative decision `approved`, with its original approval timestamp and expiry |
+
+The vote and claim compete for the same database writer reservation. A rejection
+that commits first is considered by the claim; once the claim commits, further
+review is refused. This boundary precedes process startup and also applies to
+native Git authorization. A reviewer cannot replace a previous vote, and further
+approvals cannot refresh an already approved request.
+
+An expired approval may still receive an objection, but that objection cannot
+revive it. Changing conflict settings and then submitting a negative vote cannot
+newly approve a pending or escalated request; resolving it to approved requires
+a fresh affirmative review. Opting out of same-host approval does not prevent
+an otherwise eligible reviewer from rejecting an outstanding request, and the
+review retains the request's original assurance category.
+
+CLI JSON always includes `request_status` alongside the vote's `decision` and
+`assurance`. The change-only fields still indicate whether this vote changed the
+request's state. CLI, TUI, and review notifications distinguish a recorded vote
+from the resulting request status, including a nondecisive `first_wins` rejection.
 
 ### Different Model Requirement
 

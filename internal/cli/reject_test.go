@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,7 +32,7 @@ func newTestRejectCmd(dbPath string) *cobra.Command {
 	// --session-id); the session is passed via the long --session-id flag.
 	reject := &cobra.Command{
 		Use:   "reject <request-id>",
-		Short: "Reject a pending request",
+		Short: rejectCmd.Short,
 		Args:  cobra.ExactArgs(1),
 		RunE:  rejectCmd.RunE,
 	}
@@ -184,6 +185,82 @@ func TestRejectCommand_RejectsRequest(t *testing.T) {
 	}
 	if result["new_request_status"] != string(db.StatusRejected) {
 		t.Errorf("expected new_request_status=rejected, got %v", result["new_request_status"])
+	}
+	if result["request_status"] != string(db.StatusRejected) {
+		t.Errorf("missing committed request status: %v", result["request_status"])
+	}
+}
+
+func TestRejectCommandReportsCommittedStatusAfterApproval(t *testing.T) {
+	for _, tc := range []struct {
+		resolution string
+		want       db.RequestStatus
+	}{
+		{"any_rejection_blocks", db.StatusRejected},
+		{"human_breaks_tie", db.StatusEscalated},
+		{"first_wins", db.StatusApproved},
+	} {
+		for _, format := range []string{"json", "text"} {
+			t.Run(tc.resolution+"/"+format, func(t *testing.T) {
+				h := testutil.NewHarness(t)
+				resetRejectFlags()
+				t.Cleanup(resetRejectFlags)
+				if err := os.MkdirAll(filepath.Join(h.ProjectDir, ".slb"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				cfg := fmt.Sprintf("[general]\napproval_policy = 'same_host'\nconflict_resolution = '%s'\n[integrations]\nagent_mail_enabled = false\n", tc.resolution)
+				if err := os.WriteFile(filepath.Join(h.ProjectDir, ".slb", "config.toml"), []byte(cfg), 0600); err != nil {
+					t.Fatal(err)
+				}
+				author := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("author"), testutil.WithModel("model-a"))
+				approver := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("approver"), testutil.WithModel("model-b"))
+				objector := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("objector"), testutil.WithModel("model-c"))
+				target := &db.Request{ProjectPath: h.ProjectDir, RequestorSessionID: author.ID, RequestorAgent: author.AgentName,
+					RequestorModel: author.Model, Command: db.CommandSpec{Raw: "echo reviewed", Cwd: h.ProjectDir, Shell: true},
+					Status: db.StatusPending, RiskTier: db.RiskTierDangerous, MinApprovals: 1, RequireDifferentModel: true,
+					ApprovalPolicy: db.ApprovalPolicySameHost, Justification: db.Justification{Reason: "verify late review output"}}
+				if err := h.DB.CreateRequest(target); err != nil {
+					t.Fatal(err)
+				}
+				approved, err := h.DB.ApplyReview(&db.Review{RequestID: target.ID, ReviewerSessionID: approver.ID, Decision: db.DecisionApprove},
+					approver.SessionKey, db.ReviewPolicy{ApprovalPolicy: db.ApprovalPolicySameHost, ConflictResolution: tc.resolution})
+				if err != nil || approved == nil || approved.Request.Status != db.StatusApproved {
+					t.Fatalf("initial approval failed: %+v %v", approved, err)
+				}
+				baseline, err := h.DB.GetRequest(target.ID)
+				if err != nil || baseline.ApprovalExpiresAt == nil {
+					t.Fatalf("reading persisted approval deadline: %+v %v", baseline, err)
+				}
+				cmd := newTestRejectCmd(h.DBPath)
+				args := []string{"reject", target.ID, "--session-id", objector.ID, "-k", objector.SessionKey,
+					"-r", "target still in use", "-C", h.ProjectDir, "-o", format}
+				stdout, err := executeCommandCapture(t, cmd, args...)
+				if err != nil {
+					t.Fatalf("late rejection failed: %v\n%s", err, stdout)
+				}
+				if format == "json" {
+					var result map[string]any
+					if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+						t.Fatal(err)
+					}
+					if result["decision"] != "reject" || result["request_status"] != string(tc.want) || result["assurance"] != string(db.AssuranceSameHost) ||
+						result["request_status_changed"] != (tc.want != db.StatusApproved) {
+						t.Fatalf("rejection output confused vote and request outcome: %s", stdout)
+					}
+					if tc.want == db.StatusApproved {
+						if _, exists := result["new_request_status"]; exists {
+							t.Fatal("nondecisive rejection fabricated a status change")
+						}
+					}
+				} else if !strings.Contains(stdout, "Rejection recorded for request "+target.ID) || !strings.Contains(stdout, "Request status: "+string(tc.want)) {
+					t.Fatalf("human output concealed the committed state: %s", stdout)
+				}
+				stored, err := h.DB.GetRequest(target.ID)
+				if err != nil || stored == nil || stored.Status != tc.want || stored.ApprovalExpiresAt == nil || !stored.ApprovalExpiresAt.Equal(*baseline.ApprovalExpiresAt) {
+					t.Fatalf("rejection changed the original deadline or lost state: %+v %v", stored, err)
+				}
+			})
+		}
 	}
 }
 

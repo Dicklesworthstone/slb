@@ -71,6 +71,63 @@ func TestLegacySensitiveCommandNeverFallsBackToRaw(t *testing.T) {
 	}
 }
 
+func TestReviewNotificationReportsCommittedStatus(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell transport fixture")
+	}
+	t.Setenv("HOME", t.TempDir())
+	bin, output := t.TempDir(), t.TempDir()
+	bodyPath := filepath.Join(output, "body")
+	t.Setenv("SLB_TEST_MAIL_BODY", bodyPath)
+	script := "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n" +
+		"  if [ \"$1\" = '--body-md' ]; then\n    shift\n    printf '%s' \"$1\" > \"$SLB_TEST_MAIL_BODY\"\n    exit 0\n  fi\n  shift\ndone\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(bin, "mcp-agent-mail"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	client := NewAgentMailClient(t.TempDir(), "fixture", "fixture", false)
+	for _, tc := range []struct {
+		decision db.Decision
+		status   db.RequestStatus
+	}{
+		{db.DecisionApprove, db.StatusPending},
+		{db.DecisionApprove, db.StatusApproved},
+		{db.DecisionReject, db.StatusApproved},
+		{db.DecisionReject, db.StatusRejected},
+		{db.DecisionReject, db.StatusEscalated},
+	} {
+		t.Run(string(tc.decision)+"/"+string(tc.status), func(t *testing.T) {
+			request := &db.Request{ID: "review-fixture", Status: tc.status, ApprovalPolicy: db.ApprovalPolicySameHost,
+				Command: db.CommandSpec{Raw: "secret=must-not-leak", ContainsSensitive: true}}
+			review := &db.Review{Decision: tc.decision, ReviewerAgent: "peer", Assurance: db.AssuranceSameHost}
+			var err error
+			prefix := "Rejection recorded for request "
+			if tc.decision == db.DecisionApprove {
+				prefix = "Approval recorded for request "
+				err = client.NotifyRequestApproved(request, review)
+			} else {
+				err = client.NotifyRequestRejected(request, review)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := os.ReadFile(bodyPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, expected := range []string{prefix + request.ID, "Request status: " + string(tc.status) + ".\n",
+				"Review policy: " + db.ApprovalPolicySameHost.Label(), "Evidence: same_host."} {
+				if !strings.Contains(string(body), expected) {
+					t.Fatalf("review notice lost %q: %s", expected, body)
+				}
+			}
+			if strings.Contains(string(body), "must-not-leak") {
+				t.Fatal("review notification leaked a sensitive command")
+			}
+		})
+	}
+}
+
 func TestExecutionNotificationPreservesReceiptProvenance(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell transport fixture")

@@ -95,7 +95,7 @@ func TestDetailRejectRequiresReasonAndSubmissionCallback(t *testing.T) {
 }
 
 func TestDetailReviewEligibility(t *testing.T) {
-	for _, name := range []string{"active", "escalated", "expired", "ended", "same-agent", "duplicate-agent", "different-model", "missing-reviewer-model", "missing-requester-model", "equivalent-model", "optional-unknown-model", "busy", "read-only"} {
+	for _, name := range []string{"active", "escalated", "approved", "approved-expired", "executing", "expired", "ended", "same-agent", "duplicate-agent", "different-model", "missing-reviewer-model", "missing-requester-model", "equivalent-model", "optional-unknown-model", "busy", "read-only"} {
 		t.Run(name, func(t *testing.T) {
 			m := submissionDetail()
 			approve, reject := true, true
@@ -104,6 +104,16 @@ func TestDetailReviewEligibility(t *testing.T) {
 			case "escalated":
 				m.Request.Status = db.StatusEscalated
 				m.Request.ExpiresAt = &past
+			case "approved", "approved-expired":
+				m.Request.Status = db.StatusApproved
+				m.Request.ExpiresAt = &past
+				approve = false
+				if name == "approved-expired" {
+					m.Request.ApprovalExpiresAt = &past
+				}
+			case "executing":
+				m.Request.Status = db.StatusExecuting
+				approve, reject = false, false
 			case "expired":
 				m.Request.ExpiresAt = &past
 				approve, reject = false, false
@@ -145,6 +155,86 @@ func TestDetailReviewEligibility(t *testing.T) {
 				t.Fatalf("eligibility approval=%v rejection=%v", m.canApprove(), m.canReject())
 			}
 		})
+	}
+}
+
+func TestDetailApprovedRejectionPreservesReviewerRestrictions(t *testing.T) {
+	for _, restriction := range []string{"self", "duplicate", "ended", "read-only"} {
+		t.Run(restriction, func(t *testing.T) {
+			m := submissionDetail()
+			m.Request.Status = db.StatusApproved
+			switch restriction {
+			case "self":
+				m.Session.AgentName = m.Request.RequestorAgent
+			case "duplicate":
+				m.Reviews = []db.Review{{ReviewerSessionID: "prior-session", ReviewerAgent: m.Session.AgentName}}
+			case "ended":
+				ended := time.Now()
+				m.Session.EndedAt = &ended
+			case "read-only":
+				m.Session = nil
+			}
+			if m.canReject() || m.canApprove() {
+				t.Fatal("approved status bypassed reviewer restrictions")
+			}
+		})
+	}
+}
+
+func TestDetailApprovedRejectionShowsCommittedStatus(t *testing.T) {
+	for _, status := range []db.RequestStatus{db.StatusApproved, db.StatusRejected, db.StatusEscalated} {
+		t.Run(string(status), func(t *testing.T) {
+			m := submissionDetail()
+			m.Request.Status = db.StatusApproved
+			m.Request.ApprovalPolicy = db.ApprovalPolicySameHost
+			m.Request.MinApprovals = 1
+			m.OnReject = func(id, reason string) tea.Cmd {
+				return func() tea.Msg {
+					committed := *m.Request
+					committed.Status = status
+					return ReviewSubmittedMsg{RequestID: id, Decision: db.DecisionReject, Recorded: true,
+						Request: &committed, Approvals: 1, Rejections: 1,
+						Review: &db.Review{ID: "objection", RequestID: id, ReviewerSessionID: m.Session.ID,
+							ReviewerAgent: m.Session.AgentName, Decision: db.DecisionReject, Assurance: db.AssuranceSameHost}}
+				}
+			}
+			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+			if m.Mode != DetailModeView {
+				t.Fatal("approved request exposed an additional approval")
+			}
+			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("target still in use")})
+			_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+			if !m.ReviewPending {
+				t.Fatal("approved request did not submit its rejection")
+			}
+			for _, msg := range runSubmissionCmd(cmd) {
+				m.Update(msg)
+			}
+			if m.Request.Status != status || !strings.Contains(m.ReviewFeedback, "Request: "+string(status)) ||
+				!strings.Contains(m.ReviewFeedback, db.ApprovalPolicySameHost.Label()) || m.canReject() {
+				t.Fatalf("review feedback lost committed state or permits a duplicate vote: %s", m.ReviewFeedback)
+			}
+		})
+	}
+}
+
+func TestDetailOpenLateRejectionStopsAfterExecutionClaim(t *testing.T) {
+	m := submissionDetail()
+	m.Request.Status = db.StatusApproved
+	m.OnReject = func(id, reason string) tea.Cmd {
+		t.Fatal("stale rejection form dispatched after execution claim")
+		return nil
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("target still in use")})
+	claimed := *m.Request
+	claimed.Status = db.StatusExecuting
+	m.ApplySnapshot(&claimed, nil, m.Session, nil)
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	runSubmissionCmd(cmd)
+	if m.ReviewPending || m.canReject() || m.rejectForm.reasonInput.Value() != "target still in use" {
+		t.Fatal("claimed request accepted a rejection or erased the typed reason")
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -855,6 +856,304 @@ func TestBuiltCLISameHostReviewIntegration(t *testing.T) {
 			preserved, err := os.ReadFile(logPath)
 			if err != nil || !bytes.Equal(preserved, auditLog) {
 				t.Fatalf("later emergency execution overwrote earlier audit evidence: %v", err)
+			}
+		})
+	}
+}
+
+// These production CLI cases exercise reconsideration after quorum without
+// turning a negative review or a configuration change into fresh authorization.
+func TestBuiltCLISameHostApprovalReconsideration(t *testing.T) {
+	binary := buildIdentityBoundaryCLI(t)
+
+	for _, optOut := range []bool{false, true} {
+		t.Run(fmt.Sprintf("approved request accepts a veto after opt out=%t", optOut), func(t *testing.T) {
+			f := newSameHostCLI(t, binary, 1, true)
+			requester := f.session("Requester", "model-a")
+			approver := f.session("Approver", "model-b")
+			rejector := f.session("Rejector", "model-c")
+			request := f.request(requester)
+			approved := f.approve(request, approver)
+			before, originalVotes, err := f.DB.GetRequestWithReviews(request.ID)
+			if err != nil || approved["request_status"] != "approved" || before.Status != db.StatusApproved ||
+				before.ResolvedAt == nil || before.ApprovalExpiresAt == nil || len(originalVotes) != 1 {
+				t.Fatalf("CLI approval did not establish reviewed authorization: %+v %+v %v", approved, before, err)
+			}
+			f.fails("not pending", "approve", request.ID, "--session-id", rejector.ID, "--session-key", rejector.SessionKey)
+			f.fails("cannot review your own request", "reject", request.ID, "--session-id", requester.ID,
+				"--session-key", requester.SessionKey, "--reason", "Self-review is still forbidden")
+			if optOut {
+				f.json("config", "set", "general.approval_policy", "independent")
+			}
+			result := f.json("reject", request.ID, "--session-id", rejector.ID, "--session-key", rejector.SessionKey,
+				"--reason", "A second peer found an unsafe assumption before execution")
+			if result["decision"] != "reject" || result["request_status"] != "rejected" ||
+				result["new_request_status"] != "rejected" || result["request_status_changed"] != true ||
+				result["approvals"] != float64(1) || result["rejections"] != float64(1) ||
+				result["approval_policy"] != "same_host" || result["assurance"] != "same_host" {
+				t.Fatalf("late rejection misreported its decision or assurance: %+v", result)
+			}
+			stored, votes, err := f.DB.GetRequestWithReviews(request.ID)
+			if err != nil || stored.Status != db.StatusRejected || stored.Execution != nil || len(votes) != 2 {
+				t.Fatalf("late veto did not revoke unclaimed approval: %+v %+v %v", stored, votes, err)
+			}
+			preserved := false
+			for _, vote := range votes {
+				if vote.ID == originalVotes[0].ID {
+					preserved = reflect.DeepEqual(vote, originalVotes[0])
+				}
+				if vote.ApprovalPolicy != db.ApprovalPolicySameHost || vote.Assurance != db.AssuranceSameHost || vote.SignatureVersion != 2 {
+					t.Fatalf("late rejection changed evidence strength or binding: %+v", vote)
+				}
+			}
+			if !preserved {
+				t.Fatal("late rejection rewrote original affirmative evidence")
+			}
+			f.json("config", "set", "general.approval_policy", "same_host")
+			f.fails("not approved", "execute", request.ID, "--session-id", requester.ID)
+			f.assertNotExecuted(request)
+		})
+	}
+
+	t.Run("first wins records a late rejection without renewing approval", func(t *testing.T) {
+		f := newSameHostCLI(t, binary, 1, true)
+		f.json("config", "set", "general.conflict_resolution", "first_wins")
+		f.json("config", "set", "general.approval_ttl_minutes", "2")
+		requester := f.session("Requester", "model-a")
+		approver := f.session("Approver", "model-b")
+		rejector := f.session("Rejector", "model-c")
+		request := f.request(requester)
+		f.approve(request, approver)
+		before, err := f.DB.GetRequest(request.ID)
+		if err != nil || before.Status != db.StatusApproved || before.ResolvedAt == nil || before.ApprovalExpiresAt == nil {
+			t.Fatalf("missing original approval lifetime: %+v %v", before, err)
+		}
+		journal, err := f.DB.ReadRequestEvents(context.Background(), f.ProjectDir, "", 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.json("config", "set", "general.approval_ttl_minutes", "120")
+		result := f.json("reject", request.ID, "--session-id", rejector.ID, "--session-key", rejector.SessionKey,
+			"--reason", "Record dissent without silently renewing the first approval")
+		if result["decision"] != "reject" || result["request_status"] != "approved" || result["request_status_changed"] != false ||
+			result["approvals"] != float64(1) || result["rejections"] != float64(1) ||
+			result["approval_policy"] != "same_host" || result["assurance"] != "same_host" {
+			t.Fatalf("first-wins rejection falsely reported revocation or assurance: %+v", result)
+		}
+		stored, votes, err := f.DB.GetRequestWithReviews(request.ID)
+		if err != nil || stored.Status != db.StatusApproved || stored.Execution != nil || len(votes) != 2 ||
+			stored.ResolvedAt == nil || stored.ApprovalExpiresAt == nil ||
+			!stored.ResolvedAt.Equal(*before.ResolvedAt) || !stored.ApprovalExpiresAt.Equal(*before.ApprovalExpiresAt) {
+			t.Fatalf("negative review changed the existing approval lifetime: before=%+v after=%+v votes=%+v err=%v", before, stored, votes, err)
+		}
+		after, err := f.DB.ReadRequestEvents(context.Background(), f.ProjectDir, "", 100)
+		if err != nil || len(after.Events) != len(journal.Events)+1 ||
+			!reflect.DeepEqual(after.Events[:len(journal.Events)], journal.Events) {
+			t.Fatalf("dissent rewrote history or invented a fresh approval event: before=%+v after=%+v err=%v", journal, after, err)
+		}
+		last := after.Events[len(after.Events)-1]
+		if last.Review == nil || last.Review.Decision != "reject" || last.State.Status != "approved" ||
+			last.Review.Assurance != db.AssuranceSameHost || last.State.ApprovalPolicy != db.ApprovalPolicySameHost {
+			t.Fatalf("dissent audit misrepresented the resulting authorization: %+v", last)
+		}
+		f.json("config", "set", "general.conflict_resolution", "any_rejection_blocks")
+		f.fails("rejection", "execute", request.ID, "--session-id", requester.ID)
+		f.assertNotExecuted(request)
+	})
+
+	t.Run("negative reviews cannot reapprove an escalated request", func(t *testing.T) {
+		f := newSameHostCLI(t, binary, 1, false)
+		f.json("config", "set", "general.conflict_resolution", "human_breaks_tie")
+		requester := f.session("Requester", "model-a")
+		approver := f.session("Approver", "model-b")
+		firstRejector := f.session("FirstRejector", "model-c")
+		secondRejector := f.session("SecondRejector", "model-d")
+		freshApprover := f.session("FreshApprover", "model-e")
+		request := f.request(requester)
+		f.approve(request, approver)
+		approved, err := f.DB.GetRequest(request.ID)
+		if err != nil || approved.ApprovalExpiresAt == nil {
+			t.Fatalf("missing original approval deadline: %+v %v", approved, err)
+		}
+		first := f.json("reject", request.ID, "--session-id", firstRejector.ID, "--session-key", firstRejector.SessionKey,
+			"--reason", "Require a fresh resolution of conflicting reviews")
+		before, err := f.DB.GetRequest(request.ID)
+		if err != nil || first["request_status"] != "escalated" || before.Status != db.StatusEscalated ||
+			before.ResolvedAt == nil || before.ApprovalExpiresAt == nil || before.Execution != nil ||
+			!before.ApprovalExpiresAt.Equal(*approved.ApprovalExpiresAt) {
+			t.Fatalf("late dissent did not escalate the approval: %+v %+v %v", first, before, err)
+		}
+		f.json("config", "set", "general.conflict_resolution", "first_wins")
+		second := f.json("reject", request.ID, "--session-id", secondRejector.ID, "--session-key", secondRejector.SessionKey,
+			"--reason", "Another negative review must not refresh older affirmative evidence")
+		stored, votes, err := f.DB.GetRequestWithReviews(request.ID)
+		if err != nil || second["request_status"] != "escalated" || second["request_status_changed"] != false ||
+			second["approvals"] != float64(1) || second["rejections"] != float64(2) ||
+			stored.Status != db.StatusEscalated || stored.ApprovalExpiresAt == nil || stored.Execution != nil || len(votes) != 3 ||
+			!stored.ApprovalExpiresAt.Equal(*before.ApprovalExpiresAt) ||
+			stored.ResolvedAt == nil || !stored.ResolvedAt.Equal(*before.ResolvedAt) {
+			t.Fatalf("a negative review silently reauthorized the request: %+v %+v %+v %v", second, stored, votes, err)
+		}
+		f.fails("not approved", "execute", request.ID, "--session-id", requester.ID)
+		if _, err := os.Stat(filepath.Join(f.ProjectDir, "reviewed-marker")); !os.IsNotExist(err) {
+			t.Fatalf("escalated request executed: %v", err)
+		}
+		fresh := f.approve(request, freshApprover)
+		if fresh["request_status"] != "approved" || fresh["approvals"] != float64(2) || fresh["rejections"] != float64(2) {
+			t.Fatalf("fresh affirmative review did not apply current policy: %+v", fresh)
+		}
+		f.json("execute", request.ID, "--session-id", requester.ID)
+		f.assertExecuted(request.ID)
+	})
+
+	t.Run("rejection after execution claim or terminal completion is refused", func(t *testing.T) {
+		f := newSameHostCLI(t, binary, 1, true)
+		requester := f.session("Requester", "model-a")
+		approver := f.session("Approver", "model-b")
+		rejector := f.session("Rejector", "model-c")
+		created := f.json("request", "sh -c 'touch started-marker; while [ ! -f release-marker ]; do sleep 0.02; done; touch reviewed-marker'",
+			"--session-id", requester.ID, "--reason", "Hold the actual claimed command until the rejection check finishes",
+			"--safety", "Only disposable markers in the isolated test project")
+		id, ok := created["request_id"].(string)
+		if !ok || id == "" {
+			t.Fatalf("missing controlled command request: %+v", created)
+		}
+		request, err := f.DB.GetRequest(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.approve(request, approver)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		type executionResult struct {
+			stdout, stderr string
+			err            error
+		}
+		finished := make(chan executionResult, 1)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			stdout, stderr, err := f.runContext(ctx, "execute", id, "--session-id", requester.ID, "--timeout", "10", "--json")
+			finished <- executionResult{stdout: stdout, stderr: stderr, err: err}
+		}()
+		t.Cleanup(func() {
+			// Release the real child before cancelling its CLI supervisor.
+			_ = os.WriteFile(filepath.Join(f.ProjectDir, "release-marker"), []byte("release"), 0600)
+			select {
+			case <-done:
+			case <-time.After(12 * time.Second):
+				cancel()
+				<-done
+			}
+			cancel()
+		})
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+	waitForClaim:
+		for {
+			stored, err := f.DB.GetRequest(id)
+			_, markerErr := os.Stat(filepath.Join(f.ProjectDir, "started-marker"))
+			if err == nil && stored.Status == db.StatusExecuting && markerErr == nil {
+				break waitForClaim
+			}
+			select {
+			case <-ticker.C:
+			case <-done:
+				t.Fatalf("controlled command ended before the claim check: %+v", <-finished)
+			case <-ctx.Done():
+				t.Fatal("controlled command never reached its execution claim")
+			}
+		}
+		refused := func(status db.RequestStatus) {
+			t.Helper()
+			before, votes, err := f.DB.GetRequestWithReviews(id)
+			if err != nil || before.Status != status || len(votes) != 1 {
+				t.Fatalf("unexpected execution fence before rejection: %+v %+v %v", before, votes, err)
+			}
+			journal, err := f.DB.ReadRequestEvents(context.Background(), f.ProjectDir, "", 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.fails("not pending", "reject", id, "--session-id", rejector.ID, "--session-key", rejector.SessionKey,
+				"--reason", "Too late to change the claimed command")
+			after, afterVotes, err := f.DB.GetRequestWithReviews(id)
+			if err != nil || !reflect.DeepEqual(after, before) || !reflect.DeepEqual(afterVotes, votes) {
+				t.Fatalf("refused rejection changed claimed evidence: %+v %+v %v", after, afterVotes, err)
+			}
+			afterJournal, err := f.DB.ReadRequestEvents(context.Background(), f.ProjectDir, "", 100)
+			if err != nil || !reflect.DeepEqual(afterJournal.Events, journal.Events) {
+				t.Fatalf("refused rejection added audit evidence: %+v %v", afterJournal, err)
+			}
+		}
+		refused(db.StatusExecuting)
+		f.WriteFile("release-marker", []byte("release"), 0600)
+		result := <-finished
+		var output map[string]any
+		if result.err != nil || json.Unmarshal([]byte(result.stdout), &output) != nil || output["status"] != "executed" || output["assurance"] != "same_host" {
+			t.Fatalf("controlled reviewed command did not complete: %+v", result)
+		}
+		f.assertExecuted(id)
+		refused(db.StatusExecuted)
+	})
+
+	for _, tc := range []struct {
+		name                       string
+		initialMinutes, newMinutes int
+		ageStoredExpiry            bool
+		want                       string
+	}{
+		{"current TTL tightens an existing approval", 30, 1, false, "approval has expired under current TTL"},
+		{"increasing TTL cannot revive the stored deadline", 1, 120, true, "expired"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSameHostCLI(t, binary, 1, true)
+			f.json("config", "set", "general.approval_ttl_minutes", fmt.Sprint(tc.initialMinutes))
+			requester := f.session("Requester", "model-a")
+			reviewer := f.session("Reviewer", "model-b")
+			request := f.request(requester)
+			// Age creation before signing: CreatedAt is part of the v2 binding.
+			if _, err := f.DB.Exec("UPDATE requests SET created_at = ? WHERE id = ?", request.CreatedAt.Add(-3*time.Minute).Format(time.RFC3339), request.ID); err != nil {
+				t.Fatal(err)
+			}
+			f.approve(request, reviewer)
+			approved, err := f.DB.VerifyRequestApproval(request.ID)
+			if err != nil || approved.ResolvedAt == nil || approved.ApprovalExpiresAt == nil {
+				t.Fatalf("production CLI did not create valid approval evidence: %+v %v", approved, err)
+			}
+			// Replay elapsed time from actual CLI-written timestamps without a
+			// minute-long sleep; leave the original future deadline intact when
+			// testing the current-policy cap, and never rewrite signed evidence.
+			resolvedAt := approved.ResolvedAt.Add(-2 * time.Minute)
+			expiresAt := *approved.ApprovalExpiresAt
+			if tc.ageStoredExpiry {
+				expiresAt = expiresAt.Add(-2 * time.Minute)
+			}
+			if _, err := f.DB.Exec("UPDATE requests SET resolved_at = ?, approval_expires_at = ? WHERE id = ?",
+				resolvedAt.Format(time.RFC3339), expiresAt.Format(time.RFC3339), request.ID); err != nil {
+				t.Fatal(err)
+			}
+			before, votes, err := f.DB.GetRequestWithReviews(request.ID)
+			if err != nil || before.ResolvedAt == nil || before.ResolvedAt.Before(before.CreatedAt) || len(votes) != 1 {
+				t.Fatalf("elapsed-time fixture lost its original resolution anchor: %+v %+v %v", before, votes, err)
+			}
+			if !tc.ageStoredExpiry {
+				if _, err := f.DB.VerifyRequestApproval(request.ID); err != nil || !before.ApprovalExpiresAt.After(time.Now()) {
+					t.Fatalf("stored approval must still verify before policy tightens: %v", err)
+				}
+			}
+			journal, err := f.DB.ReadRequestEvents(context.Background(), f.ProjectDir, "", 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.json("config", "set", "general.approval_ttl_minutes", fmt.Sprint(tc.newMinutes))
+			f.fails(tc.want, "execute", request.ID, "--session-id", requester.ID)
+			f.assertNotExecuted(request)
+			after, afterVotes, err := f.DB.GetRequestWithReviews(request.ID)
+			if err != nil || !reflect.DeepEqual(after, before) || !reflect.DeepEqual(afterVotes, votes) {
+				t.Fatalf("TTL refusal rewrote approval or signatures: before=%+v after=%+v votes=%+v %v", before, after, afterVotes, err)
+			}
+			afterJournal, err := f.DB.ReadRequestEvents(context.Background(), f.ProjectDir, "", 100)
+			if err != nil || !reflect.DeepEqual(afterJournal.Events, journal.Events) {
+				t.Fatalf("TTL refusal rewrote review history: %+v %v", afterJournal, err)
 			}
 		})
 	}

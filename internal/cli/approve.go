@@ -161,6 +161,7 @@ database contains the request you want to approve.
 			Assurance            db.ReviewAssurance `json:"assurance"`
 			ReviewID             string             `json:"review_id"`
 			RequestID            string             `json:"request_id"`
+			RequestStatus        db.RequestStatus   `json:"request_status"`
 			Decision             string             `json:"decision"`
 			Approvals            int                `json:"approvals"`
 			Rejections           int                `json:"rejections"`
@@ -174,6 +175,7 @@ database contains the request you want to approve.
 			Assurance:            result.Review.Assurance,
 			ReviewID:             result.Review.ID,
 			RequestID:            requestID,
+			RequestStatus:        result.RequestStatus,
 			Decision:             string(result.Review.Decision),
 			Approvals:            result.Approvals,
 			Rejections:           result.Rejections,
@@ -194,8 +196,9 @@ database contains the request you want to approve.
 		if result.Review.ApprovalPolicy == db.ApprovalPolicySameHost {
 			fmt.Printf("Same-host review accepted for request %s\n", requestID)
 		} else {
-			fmt.Printf("Approved request %s\n", requestID)
+			fmt.Printf("Approval recorded for request %s\n", requestID)
 		}
+		fmt.Printf("Request status: %s\n", resp.RequestStatus)
 		fmt.Printf("Approval policy: %s\n", resp.ApprovalPolicyLabel)
 		fmt.Printf("Evidence assurance: %s\n", resp.Assurance)
 		fmt.Printf("Review ID: %s\n", resp.ReviewID)
@@ -220,8 +223,8 @@ func buildConfiguredReviewService(database *db.DB, requestID string) (*core.Revi
 	if err != nil {
 		return nil, fmt.Errorf("loading request policy: %w", err)
 	}
-	// A selected file is required even for rejection, which intentionally
-	// does not run the approval guard. Missing it must not select default
+	// A selected file is required even for rejection, which uses its current
+	// conflict controls. Missing it must not select default
 	// notification destinations or silently change the review configuration.
 	if flagConfig != "" {
 		info, err := os.Stat(flagConfig)

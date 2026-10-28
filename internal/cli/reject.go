@@ -34,8 +34,14 @@ func init() {
 
 var rejectCmd = &cobra.Command{
 	Use:   "reject <request-id>",
-	Short: "Reject a pending request",
-	Long: `Reject a command request, preventing it from being executed.
+	Short: "Record a rejection before execution is claimed",
+	Long: `Record a signed rejection of a command request.
+
+An eligible reviewer who has not already voted can reject an approved request
+until SLB commits its execution or authorization claim. The current conflict
+policy determines the resulting request status: the default blocks execution,
+human_breaks_tie escalates a disagreement, and first_wins can retain approval.
+A rejection never renews an approval or grants new execution authority.
 
 A reason for the rejection is required. This helps the requestor understand
 what was wrong and potentially submit a corrected request.
@@ -147,6 +153,7 @@ database contains the request you want to reject.
 			Assurance            db.ReviewAssurance `json:"assurance"`
 			ReviewID             string             `json:"review_id"`
 			RequestID            string             `json:"request_id"`
+			RequestStatus        db.RequestStatus   `json:"request_status"`
 			Decision             string             `json:"decision"`
 			Reason               string             `json:"reason"`
 			Approvals            int                `json:"approvals"`
@@ -161,6 +168,7 @@ database contains the request you want to reject.
 			Assurance:            result.Review.Assurance,
 			ReviewID:             result.Review.ID,
 			RequestID:            requestID,
+			RequestStatus:        result.RequestStatus,
 			Decision:             string(result.Review.Decision),
 			Reason:               flagRejectReason,
 			Approvals:            result.Approvals,
@@ -179,7 +187,8 @@ database contains the request you want to reject.
 		}
 
 		// Human-readable output
-		fmt.Printf("Rejected request %s\n", requestID)
+		fmt.Printf("Rejection recorded for request %s\n", requestID)
+		fmt.Printf("Request status: %s\n", resp.RequestStatus)
 		fmt.Printf("Approval policy: %s\n", resp.ApprovalPolicyLabel)
 		fmt.Printf("Evidence assurance: %s\n", resp.Assurance)
 		fmt.Printf("Review ID: %s\n", resp.ReviewID)

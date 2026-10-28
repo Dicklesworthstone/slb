@@ -125,12 +125,32 @@ are not evidence that an independent person or model approved the action.
 - Returning configuration to `independent` prevents further same-host approval
   and execution, including outstanding approved same-host requests. It does not
   turn their reviews into independent authorization.
-- Approval submission reloads the current opt-in after acquiring the database
-  writer reservation, including for a long-lived review service. An open TUI
-  form is bound to the policy it displayed. Rejection remains available after
-  opting out. Configuration files are freshly read; they are not part of the
-  SQLite transaction and this is not protection against a concurrent malicious
-  process changing them.
+- Review submission resolves one current settings snapshot after acquiring the
+  database writer reservation and reauthenticating any delegated source. This
+  refreshes approval mode, conflict resolution, TTLs, and trusted-review controls
+  for long-lived services and both vote types. Request bindings and source
+  authentication remain fixed; an open TUI form is bound to the policy it
+  displayed. Rejection remains available after opting out, without granting new
+  cross-project reviewer eligibility. Configuration files are freshly read;
+  they are not part of the SQLite transaction and this is not protection against
+  a concurrent malicious process changing them.
+- A distinct eligible reviewer may submit a signed rejection after quorum until
+  the execution or native authorization claim commits. Session authentication,
+  request binding, self-review restrictions, duplicate-vote checks, signatures,
+  and evidence categories still apply. Current conflict policy rejects the
+  request by default, escalates it under `human_breaks_tie`, or preserves an
+  earlier affirmative `first_wins` decision with its exact original approval
+  timestamp and expiry. A negative vote never newly approves a pending or
+  escalated request or renews an expired approval. The vote and claim use the
+  same writer reservation; consumed claims refuse further review.
+- Execution caps the remaining grant at the earlier of its recorded expiry and
+  its original approval time plus the current TTL for the recorded risk tier.
+  A shorter TTL can revoke an outstanding approval; a longer TTL cannot extend
+  it. This applies before the SAFE shortcut and during the final atomic claim,
+  without changing the signed reviews or recorded deadlines. Reviewed approvals
+  with missing or inconsistent timestamps fail closed and require a new request.
+  Zero-review CAUTION admissions may use their creation time when no later
+  resolution timestamp exists.
 - Tightening conflict resolution from `first_wins` to
   `any_rejection_blocks` or `human_breaks_tie` also prevents execution of an
   outstanding approval that contains a rejection. The execution gate rechecks

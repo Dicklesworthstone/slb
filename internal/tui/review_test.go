@@ -91,6 +91,54 @@ func TestInteractiveSameHostReviewPolicyAndEvidence(t *testing.T) {
 	}
 }
 
+func TestInteractiveLateRejectionUsesCurrentPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		resolution string
+		policy     db.ApprovalPolicy
+		want       db.RequestStatus
+	}{
+		{"default veto", "any_rejection_blocks", db.ApprovalPolicySameHost, db.StatusRejected},
+		{"opted out", "any_rejection_blocks", db.ApprovalPolicyIndependent, db.StatusRejected},
+		{"human tie", "human_breaks_tie", db.ApprovalPolicySameHost, db.StatusEscalated},
+		{"first wins", "first_wins", db.ApprovalPolicySameHost, db.StatusApproved},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database, target, _, opts := interactiveReviewFixture(t, 1, db.ApprovalPolicySameHost)
+			approved := submitInteractiveReview(opts, target.ID, target.Command.Hash, target.ApprovalPolicy, db.DecisionApprove, "checked")
+			if approved.Err != nil || !approved.Recorded || approved.Request == nil || approved.Request.Status != db.StatusApproved {
+				t.Fatalf("initial approval failed: %+v", approved)
+			}
+			baseline, err := database.GetRequest(target.ID)
+			if err != nil || baseline.ApprovalExpiresAt == nil || baseline.ResolvedAt == nil {
+				t.Fatalf("reading persisted approval timestamps: %+v %v", baseline, err)
+			}
+			objector := &db.Session{AgentName: "objector", Model: "model-c", ProjectPath: target.ProjectPath}
+			if err := database.CreateSession(objector); err != nil {
+				t.Fatal(err)
+			}
+			opts.SessionID, opts.SessionKey = objector.ID, objector.SessionKey
+			contents := "[general]\napproval_policy = '" + string(tc.policy) + "'\nconflict_resolution = '" + tc.resolution + "'\n[integrations]\nagent_mail_enabled = false\n"
+			if err := os.WriteFile(opts.ConfigPath, []byte(contents), 0600); err != nil {
+				t.Fatal(err)
+			}
+			result := submitInteractiveReview(opts, target.ID, target.Command.Hash, target.ApprovalPolicy, db.DecisionReject, "target still in use")
+			if result.Err != nil || !result.Recorded || result.Request == nil || result.Request.Status != tc.want || result.Approvals != 1 || result.Rejections != 1 {
+				t.Fatalf("late UI rejection lost the committed outcome: %+v", result)
+			}
+			if result.Review.Assurance != db.AssuranceSameHost || !db.VerifyReviewEvidenceSignature(result.Review, objector.SessionKey) {
+				t.Fatal("late UI rejection lost its signed same-host evidence")
+			}
+			if result.Request.ApprovalExpiresAt == nil || !result.Request.ApprovalExpiresAt.Equal(*baseline.ApprovalExpiresAt) {
+				t.Fatal("late UI rejection rewrote the original approval deadline")
+			}
+			if tc.want == db.StatusApproved && (result.Request.ResolvedAt == nil || !result.Request.ResolvedAt.Equal(*baseline.ResolvedAt)) {
+				t.Fatal("nondecisive rejection changed the approval timestamp")
+			}
+		})
+	}
+}
+
 func TestInteractiveReviewAndRefreshStayInSelectedDatabase(t *testing.T) {
 	for _, decision := range []db.Decision{db.DecisionApprove, db.DecisionReject} {
 		t.Run(string(decision), func(t *testing.T) {
