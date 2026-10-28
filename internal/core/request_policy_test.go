@@ -55,7 +55,13 @@ min_approvals = 5
 					t.Fatalf("%s: wrong stored requirements: tier=%s minimum=%d model=%t", tc.command,
 						stored.RiskTier, stored.MinApprovals, stored.RequireDifferentModel)
 				}
-				if err := CheckExecutionPolicy(database, stored, ""); err != nil {
+				// Pending requests have no execution grant yet. Compare the
+				// policy requirements without asserting approval or expiry.
+				available, err := CountPolicyReviewers(database, stored.ProjectPath, stored.RequestorSessionID, stored.RequestorAgent)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := engine.checkRequestPolicy(stored, available); err != nil {
 					t.Fatalf("request policy disagrees with execution policy: %v", err)
 				}
 			}
@@ -100,7 +106,11 @@ dynamic_quorum_floor = 1
 		if result.Request.ProjectPath != existing.ProjectPath || result.Request.MinApprovals != minimum {
 			t.Fatalf("wrong project-local quorum: %+v", result.Request)
 		}
-		if err := CheckExecutionPolicy(database, result.Request, ""); err != nil {
+		available, err := CountPolicyReviewers(database, result.Request.ProjectPath, result.Request.RequestorSessionID, result.Request.RequestorAgent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := engine.checkRequestPolicy(result.Request, available); err != nil {
 			t.Fatalf("creation/execution quorum disagreement: %v", err)
 		}
 	}

@@ -97,6 +97,12 @@ func backgroundExecutionFixture(t *testing.T, script string, policies ...db.Appr
 			t.Fatal(err)
 		}
 	}
+	if policy != db.ApprovalPolicySameHost {
+		resolvedAt := time.Now().UTC()
+		if _, err := conn.Exec("UPDATE requests SET resolved_at = ? WHERE id = ?", resolvedAt.Format(time.RFC3339), request.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return conn, background.Job{Version: background.Version, RequestID: request.ID, SessionID: requester.ID, CommandHash: request.Command.Hash,
 		ApprovalPolicy: policy,
 		Database:       conn.Path(), Project: project, LogDir: filepath.Join(project, ".slb", "logs"), TimeoutSeconds: 10}

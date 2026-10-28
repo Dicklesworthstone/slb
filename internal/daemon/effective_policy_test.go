@@ -44,6 +44,10 @@ func notaryPolicyFixture(t *testing.T) (*db.DB, *db.Request, *db.Session) {
 	if err := database.CreateReview(review); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := database.Exec("UPDATE requests SET resolved_at = ? WHERE id = ?", now.Format(time.RFC3339), request.ID); err != nil {
+		t.Fatal(err)
+	}
+	request.ResolvedAt = &now
 	return database, request, requester
 }
 

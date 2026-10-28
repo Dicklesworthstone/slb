@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/db"
@@ -129,6 +130,9 @@ func CheckExecutionPolicy(reader PolicyReader, request *db.Request, configPath s
 	if err := checkApprovalPolicy(request, cfg.General.ApprovalPolicy); err != nil {
 		return err
 	}
+	if err := checkCurrentApprovalTTL(request, cfg.General, time.Now().UTC()); err != nil {
+		return err
+	}
 	// Blocking a requester revokes permission to execute their outstanding
 	// approvals too. Check the same freshly loaded policy as the classifier,
 	// before its SAFE shortcut or quorum calculation. The final atomic claim
@@ -149,7 +153,49 @@ func CheckExecutionPolicy(reader PolicyReader, request *db.Request, configPath s
 	if err != nil {
 		return err
 	}
-	return engine.checkRequestPolicy(request, available)
+	if err := engine.checkRequestPolicy(request, available); err != nil {
+		return err
+	}
+	// The remaining policy reads and classification can also take time. A SAFE
+	// match cannot skip the original expiry or the current, possibly shorter TTL.
+	return checkCurrentApprovalTTL(request, cfg.General, time.Now().UTC())
+}
+
+// Current policy can shorten an outstanding grant, never extend its persisted
+// deadline. This is an execution constraint, not a rewrite of approval history.
+// Reviewed approvals need their actual resolution time. Only zero-review
+// CAUTION admissions can use creation time when no later timer resolved them.
+func checkCurrentApprovalTTL(request *db.Request, cfg config.GeneralConfig, now time.Time) error {
+	if request == nil {
+		return errors.New("request is required for approval TTL check")
+	}
+	minutes := cfg.ApprovalTTLMins
+	if request.RiskTier == db.RiskTierCritical {
+		minutes = cfg.ApprovalTTLCriticalMins
+	}
+	ttl, err := pendingDuration(minutes, time.Minute)
+	if err != nil || ttl <= 0 {
+		return fmt.Errorf("%w: approval TTL must be positive and representable", ErrApprovalPolicyChanged)
+	}
+	automatic := request.RiskTier == db.RiskTierCaution && request.MinApprovals == 0 && !request.RequireDifferentModel
+	anchor := request.ResolvedAt
+	if anchor == nil && automatic {
+		anchor = &request.CreatedAt
+	}
+	if anchor == nil || anchor.IsZero() || request.CreatedAt.IsZero() || anchor.Before(request.CreatedAt) || anchor.After(now) {
+		return fmt.Errorf("%w: approval time is missing or invalid; submit a new request", ErrApprovalPolicyChanged)
+	}
+	if request.ApprovalExpiresAt == nil && !automatic {
+		return fmt.Errorf("%w: approval expiry is missing; submit a new request", ErrApprovalPolicyChanged)
+	}
+	deadline := anchor.Add(ttl)
+	if request.ApprovalExpiresAt != nil && request.ApprovalExpiresAt.Before(deadline) {
+		deadline = *request.ApprovalExpiresAt
+	}
+	if !now.Before(deadline) {
+		return fmt.Errorf("%w: approval has expired under current TTL", ErrApprovalPolicyChanged)
+	}
+	return nil
 }
 
 // A first-wins decision can contain a later rejection while still satisfying

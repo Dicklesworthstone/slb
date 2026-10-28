@@ -66,6 +66,13 @@ func createTestRequest(t *testing.T, database *db.DB, id, sessionID string, stat
 	if err := database.CreateRequest(request); err != nil {
 		t.Fatal(err)
 	}
+	if status == db.StatusApproved {
+		resolvedAt := time.Now().UTC()
+		if _, err := database.Exec("UPDATE requests SET resolved_at = ? WHERE id = ?", resolvedAt.Format(time.RFC3339), request.ID); err != nil {
+			t.Fatal(err)
+		}
+		request.ResolvedAt = &resolvedAt
+	}
 	return request
 }
 

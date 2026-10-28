@@ -46,6 +46,12 @@ func commandSpecExecutionFixture(t *testing.T, spec db.CommandSpec) (*db.DB, *db
 	if err := database.CreateReview(review); err != nil {
 		t.Fatal(err)
 	}
+	// This fixture represents a completed review with an original decision
+	// time, which execution must retain as its current-policy TTL anchor.
+	if _, err := database.Exec(`UPDATE requests SET resolved_at = ? WHERE id = ?`, now.Format(time.RFC3339Nano), request.ID); err != nil {
+		t.Fatal(err)
+	}
+	request.ResolvedAt = &now
 	return database, request, session
 }
 

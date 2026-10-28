@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,6 +53,12 @@ func policyExecutionFixture(t *testing.T) (*db.DB, *db.Request, *db.Session) {
 	if err := database.CreateReview(review); err != nil {
 		t.Fatal(err)
 	}
+	// Model a resolved approval, not merely a forged status bit. The current
+	// TTL constraint needs the original approval time even for legacy fixtures.
+	if _, err := database.Exec(`UPDATE requests SET resolved_at = ? WHERE id = ?`, now.Format(time.RFC3339Nano), request.ID); err != nil {
+		t.Fatal(err)
+	}
+	request.ResolvedAt = &now
 	return database, request, requester
 }
 
@@ -110,12 +118,15 @@ func TestSameHostExecutionPolicyRevocationIsCheckedAtClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	reviewOptions := ReviewOptions{RequestID: request.ID, SessionID: reviewer.ID, SessionKey: reviewer.SessionKey, Decision: db.DecisionApprove}
-	if _, err := NewReviewService(database, DefaultReviewConfig()).SubmitReview(reviewOptions); err == nil {
-		t.Fatal("default review service accepted same-host request without opt-in")
+	service := NewReviewService(database, DefaultReviewConfig())
+	writeExecutionPolicy(t, request.ProjectPath, "[general]\napproval_policy = 'independent'\n")
+	if _, err := service.SubmitReview(reviewOptions); !errors.Is(err, db.ErrReviewPolicyMismatch) {
+		t.Fatalf("current independent policy accepted a same-host request: %v", err)
 	}
-	reviewConfig := DefaultReviewConfig()
-	reviewConfig.ApprovalPolicy = db.ApprovalPolicySameHost
-	result, err := NewReviewService(database, reviewConfig).SubmitReview(reviewOptions)
+	// Current explicit opt-in is authoritative even for a service whose
+	// original snapshot predates it. The request remains separately bound.
+	writeExecutionPolicy(t, request.ProjectPath, "[general]\napproval_policy = 'same_host'\n")
+	result, err := service.SubmitReview(reviewOptions)
 	if err != nil || result == nil || !VerifyReview(result.Review, reviewer.SessionKey) {
 		t.Fatalf("same-host review failed signature verification: %+v %v", result, err)
 	}
@@ -568,5 +579,159 @@ func TestExecutionPolicyValidRequestExecutesOnce(t *testing.T) {
 	}
 	if _, err := executor.ExecuteApprovedRequest(context.Background(), opts); !errors.Is(err, ErrAlreadyExecuted) {
 		t.Fatalf("execution replay allowed: %v", err)
+	}
+}
+
+func TestExecutionCurrentTTLCannotExtendHistoricalApproval(t *testing.T) {
+	for _, tier := range []db.RiskTier{db.RiskTierDangerous, db.RiskTierCritical} {
+		for _, safe := range []bool{false, true} {
+			for _, authenticated := range []bool{false, true} {
+				for _, shorten := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/safe=%t/authenticated=%t/shorten=%t", tier, safe, authenticated, shorten), func(t *testing.T) {
+						database, request, author, peers := sameHostPolicyFixture(t, 1)
+						// Creation time is signed. Age it before the real review,
+						// then advance only its resolution clock to model elapsed time.
+						created := time.Now().UTC().Add(-5 * time.Minute).Truncate(time.Second)
+						if _, err := database.Exec(`UPDATE requests SET created_at = ?, risk_tier = ? WHERE id = ?`, created.Format(time.RFC3339Nano), tier, request.ID); err != nil {
+							t.Fatal(err)
+						}
+						writeExecutionPolicy(t, request.ProjectPath, sameHostReviewSettingsText("first_wins", 30, 10, 1))
+						applySameHostFixtureReview(t, database, request, peers[0], db.DecisionApprove)
+						anchor := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Second)
+						if _, err := database.Exec(`UPDATE requests SET resolved_at = ? WHERE id = ?`, anchor.Format(time.RFC3339Nano), request.ID); err != nil {
+							t.Fatal(err)
+						}
+						approved, err := database.VerifyRequestApproval(request.ID)
+						if err != nil {
+							t.Fatalf("original signed approval is invalid: %v", err)
+						}
+						if err := CheckExecutionPolicy(database, approved, ""); err != nil {
+							t.Fatalf("original approval policy rejected valid evidence: %v", err)
+						}
+
+						minutes := 1
+						if !shorten {
+							// A larger current TTL cannot revive the persisted grant
+							// after its original deadline has passed.
+							minutes = 60
+							expired := time.Now().UTC().Add(-time.Second)
+							if _, err := database.Exec(`UPDATE requests SET approval_expires_at = ? WHERE id = ?`, expired.Format(time.RFC3339Nano), request.ID); err != nil {
+								t.Fatal(err)
+							}
+						}
+						before, reviewsBefore, err := database.GetRequestWithReviews(request.ID)
+						if err != nil {
+							t.Fatal(err)
+						}
+						var eventsBefore int
+						if err := database.QueryRow(`SELECT COUNT(*) FROM request_events WHERE request_id = ?`, request.ID).Scan(&eventsBefore); err != nil {
+							t.Fatal(err)
+						}
+						policy := sameHostReviewSettingsText("first_wins", minutes, minutes, 1)
+						if safe {
+							policy += "[patterns.safe]\npatterns = ['^printf same-host-policy$']\n"
+						}
+						writeExecutionPolicy(t, request.ProjectPath, policy)
+						if err := CheckExecutionPolicy(database, before, ""); !errors.Is(err, ErrApprovalPolicyChanged) || !strings.Contains(err.Error(), "approval has expired under current TTL") {
+							t.Fatalf("current TTL or original deadline was ignored: %v", err)
+						}
+						// The claim must re-read policy even when the caller holds
+						// a proof that passed before configuration changed.
+						if authenticated {
+							err = database.ClaimRequestExecutionAuthenticated(approved, policyExecutionIdentity(author), author.SessionKey, ExecutionPolicyGuard(""))
+						} else {
+							err = database.ClaimRequestExecution(approved, policyExecutionIdentity(author), ExecutionPolicyGuard(""))
+						}
+						wantErr := ErrApprovalPolicyChanged
+						if !shorten {
+							wantErr = db.ErrInvalidApprovalProof
+						}
+						if !errors.Is(err, wantErr) {
+							t.Fatalf("claim did not revalidate the deadline: got %v, want %v", err, wantErr)
+						}
+						after, reviewsAfter, err := database.GetRequestWithReviews(request.ID)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(reviewsBefore, reviewsAfter) {
+							t.Fatalf("refused execution changed historical evidence: before=%+v after=%+v", before, after)
+						}
+						var eventsAfter int
+						if err := database.QueryRow(`SELECT COUNT(*) FROM request_events WHERE request_id = ?`, request.ID).Scan(&eventsAfter); err != nil {
+							t.Fatal(err)
+						}
+						if eventsAfter != eventsBefore {
+							t.Fatalf("refused execution changed committed audit events: got %d, want %d", eventsAfter, eventsBefore)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestCurrentApprovalTTLValidatesOriginalAnchor(t *testing.T) {
+	now := time.Date(2026, time.October, 27, 12, 0, 0, 0, time.UTC)
+	for _, problem := range []string{"missing anchor", "zero anchor", "future anchor", "before creation", "missing creation", "missing expiry", "zero TTL", "overflow TTL"} {
+		t.Run(problem, func(t *testing.T) {
+			anchor, expiry := now.Add(-time.Minute), now.Add(time.Hour)
+			request := &db.Request{
+				RiskTier: db.RiskTierDangerous, MinApprovals: 1, CreatedAt: now.Add(-2 * time.Minute),
+				ResolvedAt: &anchor, ApprovalExpiresAt: &expiry,
+			}
+			cfg := config.DefaultConfig().General
+			switch problem {
+			case "missing anchor":
+				request.ResolvedAt = nil
+			case "zero anchor":
+				anchor = time.Time{}
+			case "future anchor":
+				anchor = now.Add(time.Second)
+			case "before creation":
+				anchor = now.Add(-3 * time.Minute)
+			case "missing creation":
+				request.CreatedAt = time.Time{}
+			case "missing expiry":
+				request.ApprovalExpiresAt = nil
+			case "zero TTL":
+				cfg.ApprovalTTLMins = 0
+			case "overflow TTL":
+				cfg.ApprovalTTLMins = int(^uint(0) >> 1)
+			}
+			if err := checkCurrentApprovalTTL(request, cfg, now); !errors.Is(err, ErrApprovalPolicyChanged) {
+				t.Fatalf("invalid approval anchor or TTL accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestCurrentApprovalTTLAutoApprovalAnchors(t *testing.T) {
+	now := time.Date(2026, time.October, 27, 12, 0, 0, 0, time.UTC)
+	for _, scenario := range []string{"initial admission", "expired initial admission", "delayed timer", "model requires review", "stored deadline wins"} {
+		t.Run(scenario, func(t *testing.T) {
+			request := &db.Request{RiskTier: db.RiskTierCaution, CreatedAt: now.Add(-30 * time.Second)}
+			cfg := config.DefaultConfig().General
+			cfg.ApprovalTTLMins = 1
+			wantAllowed := true
+			switch scenario {
+			case "expired initial admission":
+				request.CreatedAt = now.Add(-2 * time.Minute)
+				wantAllowed = false
+			case "delayed timer":
+				request.CreatedAt = now.Add(-10 * time.Minute)
+				resolved := now.Add(-30 * time.Second)
+				request.ResolvedAt = &resolved
+			case "model requires review":
+				request.RequireDifferentModel = true
+				wantAllowed = false
+			case "stored deadline wins":
+				expired := now.Add(-time.Second)
+				request.ApprovalExpiresAt = &expired
+				wantAllowed = false
+			}
+			if err := checkCurrentApprovalTTL(request, cfg, now); (err == nil) != wantAllowed {
+				t.Fatalf("automatic approval anchor: allowed=%t, want %t: %v", err == nil, wantAllowed, err)
+			}
+		})
 	}
 }

@@ -487,15 +487,15 @@ func TestSameHostReviewRechecksPolicyAfterWriterReservation(t *testing.T) {
 	go func() {
 		_, err := other.ApplyReview(review, sessions[1].SessionKey, ReviewPolicy{
 			ApprovalPolicy: ApprovalPolicySameHost,
-			PolicyCheck: func(current *Request) error {
+			ResolveSettings: func(current *Request, decision Decision) (ReviewSettings, error) {
 				close(checked)
-				if current.ID != request.ID || current.ApprovalPolicy != ApprovalPolicySameHost {
-					return fmt.Errorf("policy guard received a different request")
+				if current.ID != request.ID || current.ApprovalPolicy != ApprovalPolicySameHost || decision != DecisionApprove {
+					return ReviewSettings{}, fmt.Errorf("policy resolver received a different request or decision")
 				}
 				if revoked.Load() {
-					return ErrReviewPolicyMismatch
+					return ReviewSettings{}, ErrReviewPolicyMismatch
 				}
-				return nil
+				return ReviewSettings{ApprovalPolicy: ApprovalPolicySameHost}, nil
 			},
 		})
 		result <- err
@@ -537,16 +537,19 @@ func TestSameHostReviewAllowsRejectionAfterOptOut(t *testing.T) {
 	checked := false
 	out, err := applyFixtureReview(database, request, sessions[1], DecisionReject, ReviewPolicy{
 		ApprovalPolicy: ApprovalPolicyIndependent, ExpectedApprovalPolicy: ApprovalPolicySameHost,
-		PolicyCheck: func(*Request) error {
+		ResolveSettings: func(_ *Request, decision Decision) (ReviewSettings, error) {
 			checked = true
-			return ErrReviewPolicyMismatch
+			if decision != DecisionReject {
+				return ReviewSettings{}, ErrReviewPolicyMismatch
+			}
+			return ReviewSettings{ApprovalPolicy: ApprovalPolicyIndependent}, nil
 		},
 	})
 	if err != nil || out == nil || out.Request.Status != StatusRejected {
 		t.Fatalf("opt-out prevented rejection of a same-host request: %+v %v", out, err)
 	}
-	if checked {
-		t.Fatal("rejection unexpectedly required current approval authorization")
+	if !checked {
+		t.Fatal("rejection did not load the current conflict settings")
 	}
 	if out.Review.ApprovalPolicy != ApprovalPolicySameHost || out.Review.Assurance != AssuranceSameHost {
 		t.Fatalf("rejection lost its original same-host policy and assurance: %+v", out.Review)
@@ -1226,5 +1229,577 @@ func TestSessionReplacementPreservesHistoricalV1Evidence(t *testing.T) {
 	}
 	if _, err := database.VerifyRequestApproval(request.ID); !errors.Is(err, ErrIndependentIdentityUnavailable) {
 		t.Fatalf("historical identity replacement authorized default local evidence: %v", err)
+	}
+}
+
+func lateRejectionFixture(t *testing.T) (*DB, *Request, []*Session, *Review) {
+	t.Helper()
+	database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+	if _, err := database.Exec(`UPDATE requests SET require_different_model = 1 WHERE id = ?`, request.ID); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := applyFixtureReview(database, request, sessions[1], DecisionApprove,
+		ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost, ApprovalTTL: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err = database.GetRequest(request.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior, err := database.GetReview(outcome.Review.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return database, request, sessions, prior
+}
+
+func lateRejectionEventCount(t *testing.T, database *DB) int {
+	t.Helper()
+	var count int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM request_events`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func TestLateRejectionConflictPoliciesPreserveEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		mode string
+		want RequestStatus
+	}{
+		{"any_rejection_blocks", StatusRejected},
+		{"human_breaks_tie", StatusEscalated},
+		{"first_wins", StatusApproved},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			database, before, sessions, prior := lateRejectionFixture(t)
+			events := lateRejectionEventCount(t, database)
+			outcome, err := applyFixtureReview(database, before, sessions[2], DecisionReject, ReviewPolicy{
+				ApprovalPolicy: ApprovalPolicySameHost, ConflictResolution: tc.mode, ApprovalTTL: time.Hour,
+			})
+			if err != nil || outcome == nil || outcome.Request.Status != tc.want || outcome.Approvals != 1 || outcome.Rejections != 1 {
+				t.Fatalf("late rejection did not honor conflict policy: %+v %v", outcome, err)
+			}
+			if outcome.Review.ApprovalPolicy != ApprovalPolicySameHost || outcome.Review.Assurance != AssuranceSameHost ||
+				outcome.Review.CommandHash != before.Command.Hash || !VerifyReviewEvidenceSignature(outcome.Review, sessions[2].SessionKey) {
+				t.Fatalf("late rejection lost signed same-host evidence: %+v", outcome.Review)
+			}
+			after, err := database.GetRequest(before.ID)
+			if err != nil || !reflect.DeepEqual(after.ApprovalExpiresAt, before.ApprovalExpiresAt) {
+				t.Fatalf("late rejection rewrote the old approval deadline: %+v %v", after, err)
+			}
+			oldVote, err := database.GetReview(prior.ID)
+			if err != nil || !reflect.DeepEqual(oldVote, prior) {
+				t.Fatalf("late rejection rewrote the prior signed approval: %+v %v", oldVote, err)
+			}
+			wantEvents := events + 2 // Signed veto and status transition share one commit.
+			if tc.want == StatusApproved {
+				wantEvents = events + 1
+				if outcome.StatusChanged || !reflect.DeepEqual(after, before) {
+					t.Fatalf("first_wins renewed or changed the old approval: before=%+v after=%+v", before, after)
+				}
+			} else if !outcome.StatusChanged || after.ResolvedAt == nil || after.ResolvedAt.Before(*before.ResolvedAt) {
+				t.Fatalf("veto transition lost its resolution timestamp: %+v", after)
+			}
+			if got := lateRejectionEventCount(t, database); got != wantEvents {
+				t.Fatalf("late rejection journal has %d events, want %d", got, wantEvents)
+			}
+			_, err = database.VerifyRequestApproval(before.ID)
+			if (err == nil) != (tc.want == StatusApproved) {
+				t.Fatalf("execution proof disagrees with committed veto status: %v", err)
+			}
+		})
+	}
+}
+
+func TestLateRejectionFirstWinsDoesNotRenewExpiredApproval(t *testing.T) {
+	database, request, sessions, _ := lateRejectionFixture(t)
+	past := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
+	if _, err := database.Exec(`UPDATE requests SET expires_at = ?, approval_expires_at = ? WHERE id = ?`, past, past, request.ID); err != nil {
+		t.Fatal(err)
+	}
+	before, err := database.GetRequest(request.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := applyFixtureReview(database, request, sessions[2], DecisionReject, ReviewPolicy{
+		ApprovalPolicy: ApprovalPolicySameHost, ConflictResolution: "first_wins", ApprovalTTL: time.Hour,
+	})
+	if err != nil || outcome == nil || outcome.StatusChanged {
+		t.Fatalf("expired approval could not retain an objection without renewal: %+v %v", outcome, err)
+	}
+	after, err := database.GetRequest(request.ID)
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("negative vote renewed expired request state: before=%+v after=%+v err=%v", before, after, err)
+	}
+	if _, err := database.VerifyRequestApproval(request.ID); !errors.Is(err, ErrInvalidApprovalProof) {
+		t.Fatalf("negative vote made expired evidence executable: %v", err)
+	}
+}
+
+func TestLateRejectionCanVetoAutomaticApproval(t *testing.T) {
+	for _, mode := range []string{"any_rejection_blocks", "first_wins", "human_breaks_tie"} {
+		t.Run(mode, func(t *testing.T) {
+			database, request, sessions := reviewDecisionFixture(t, 0, ApprovalPolicySameHost)
+			if _, err := database.Exec(`UPDATE requests SET risk_tier = 'caution' WHERE id = ?`, request.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := database.UpdateRequestStatus(request.ID, StatusApproved); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.VerifyRequestApproval(request.ID); err != nil {
+				t.Fatalf("automatic-approval fixture is not executable: %v", err)
+			}
+			outcome, err := applyFixtureReview(database, request, sessions[1], DecisionReject,
+				ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost, ConflictResolution: mode})
+			if err != nil || outcome == nil || outcome.Request.Status != StatusRejected || outcome.Approvals != 0 || outcome.Request.ApprovalExpiresAt != nil {
+				t.Fatalf("first actual vote did not veto automatic approval: %+v %v", outcome, err)
+			}
+		})
+	}
+}
+
+func TestLateRejectionNeverCreatesApprovalAfterConflictChange(t *testing.T) {
+	database, request, sessions, _ := lateRejectionFixture(t)
+	veto, err := applyFixtureReview(database, request, sessions[2], DecisionReject,
+		ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost, ConflictResolution: "human_breaks_tie"})
+	if err != nil || veto.Request.Status != StatusEscalated {
+		t.Fatalf("initial veto did not escalate: %+v %v", veto, err)
+	}
+	before, err := database.GetRequest(request.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := ReviewPolicy{ResolveSettings: func(_ *Request, _ Decision) (ReviewSettings, error) {
+		return ReviewSettings{ApprovalPolicy: ApprovalPolicySameHost, ConflictResolution: "first_wins", ApprovalTTL: time.Hour}, nil
+	}}
+	outcome, err := applyFixtureReview(database, request, sessions[3], DecisionReject, policy)
+	if err != nil || outcome == nil || outcome.StatusChanged || outcome.Request.Status != StatusEscalated {
+		t.Fatalf("negative vote newly authorized old approval evidence: %+v %v", outcome, err)
+	}
+	after, err := database.GetRequest(request.ID)
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("negative vote changed escalation or old deadline: %+v %v", after, err)
+	}
+	if _, err := database.VerifyRequestApproval(request.ID); !errors.Is(err, ErrInvalidApprovalProof) {
+		t.Fatalf("escalated old grant became executable: %v", err)
+	}
+	// Resolving the conflict requires an affirmative review under current policy.
+	outcome, err = applyFixtureReview(database, request, sessions[4], DecisionApprove, policy)
+	if err != nil || outcome == nil || outcome.Request.Status != StatusApproved || !outcome.StatusChanged {
+		t.Fatalf("fresh affirmative review could not resolve conflict: %+v %v", outcome, err)
+	}
+}
+
+func TestLateRejectionPreservesReviewerRestrictions(t *testing.T) {
+	for _, name := range []string{"wrong key", "self", "already reviewed", "restarted reviewer", "ended", "foreign project", "another approval", "same model veto"} {
+		t.Run(name, func(t *testing.T) {
+			database, request, sessions, _ := lateRejectionFixture(t)
+			reviewer, decision, want := sessions[2], DecisionReject, ErrReviewSessionKeyMismatch
+			key := reviewer.SessionKey
+			switch name {
+			case "wrong key":
+				key = strings.Repeat("fd", 32)
+			case "self":
+				reviewer, want = sessions[0], ErrSelfReview
+				key = reviewer.SessionKey
+			case "already reviewed":
+				reviewer, want = sessions[1], ErrReviewExists
+				key = reviewer.SessionKey
+			case "restarted reviewer":
+				if err := database.EndSession(sessions[1].ID); err != nil {
+					t.Fatal(err)
+				}
+				reviewer = &Session{AgentName: sessions[1].AgentName, Program: "test", Model: "different-model", ProjectPath: request.ProjectPath}
+				if err := database.CreateSession(reviewer); err != nil {
+					t.Fatal(err)
+				}
+				key, want = reviewer.SessionKey, ErrReviewExists
+			case "ended":
+				if err := database.EndSession(reviewer.ID); err != nil {
+					t.Fatal(err)
+				}
+				want = ErrReviewSessionInactive
+			case "foreign project":
+				if _, err := database.Exec(`UPDATE sessions SET project_path = ? WHERE id = ?`, t.TempDir(), reviewer.ID); err != nil {
+					t.Fatal(err)
+				}
+				want = ErrReviewSessionProjectMismatch
+			case "another approval":
+				decision, want = DecisionApprove, ErrReviewNotPending
+			case "same model veto":
+				if _, err := database.Exec(`UPDATE sessions SET model = ? WHERE id = ?`, request.RequestorModel, reviewer.ID); err != nil {
+					t.Fatal(err)
+				}
+				want = nil
+			}
+			events := lateRejectionEventCount(t, database)
+			review := &Review{RequestID: request.ID, ReviewerSessionID: reviewer.ID, Decision: decision}
+			outcome, err := database.ApplyReview(review, key, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost})
+			if want == nil {
+				if err != nil || outcome == nil || outcome.Request.Status != StatusRejected {
+					t.Fatalf("model-diversity restriction prevented a veto: %+v %v", outcome, err)
+				}
+				return
+			}
+			if outcome != nil || !errors.Is(err, want) || review.ID != "" || review.Signature != "" {
+				t.Fatalf("ineligible late vote was not refused intact: %+v %+v %v", outcome, review, err)
+			}
+			after, votes, err := database.GetRequestWithReviews(request.ID)
+			if err != nil || !reflect.DeepEqual(after, request) || len(votes) != 1 || lateRejectionEventCount(t, database) != events {
+				t.Fatalf("refused late vote changed request, reviews or journal: %+v %+v %v", after, votes, err)
+			}
+		})
+	}
+}
+
+func TestLateRejectionDoesNotReopenExecutingOrTerminalRequests(t *testing.T) {
+	for _, status := range []RequestStatus{StatusExecuting, StatusExecuted, StatusExecutionFailed, StatusTimedOut, StatusTimeout, StatusCancelled, StatusRejected} {
+		for _, decision := range []Decision{DecisionApprove, DecisionReject} {
+			t.Run(string(status)+"/"+string(decision), func(t *testing.T) {
+				database, request, sessions, _ := lateRejectionFixture(t)
+				if _, err := database.Exec(`UPDATE requests SET status = ? WHERE id = ?`, string(status), request.ID); err != nil {
+					t.Fatal(err)
+				}
+				before, err := database.GetRequest(request.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				events := lateRejectionEventCount(t, database)
+				outcome, err := applyFixtureReview(database, request, sessions[2], decision, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost})
+				if outcome != nil || !errors.Is(err, ErrReviewNotPending) {
+					t.Fatalf("closed request admitted a late vote: %+v %v", outcome, err)
+				}
+				after, votes, err := database.GetRequestWithReviews(request.ID)
+				if err != nil || !reflect.DeepEqual(before, after) || len(votes) != 1 || lateRejectionEventCount(t, database) != events {
+					t.Fatalf("closed request or its evidence changed: %+v %+v %v", after, votes, err)
+				}
+			})
+		}
+	}
+}
+
+func TestLateRejectionAndExecutionClaimHaveOneWinner(t *testing.T) {
+	for _, order := range []string{"rejection first", "claim first", "concurrent"} {
+		t.Run(order, func(t *testing.T) {
+			database, request, sessions, _ := lateRejectionFixture(t)
+			other, err := OpenWithOptions(filepath.Join(request.ProjectPath, "state.db"), OpenOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = other.Close() })
+			now := time.Now().UTC()
+			execution := &Execution{ExecutedAt: &now, ExecutedBySessionID: sessions[0].ID,
+				ExecutedByAgent: sessions[0].AgentName, ExecutedByModel: sessions[0].Model,
+				LogPath: filepath.Join(request.ProjectPath, "one-claim.log")}
+			var claimErr, rejectErr error
+			claim := func() { claimErr = other.ClaimRequestExecution(request, execution) }
+			reject := func() {
+				_, rejectErr = applyFixtureReview(database, request, sessions[2], DecisionReject, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost})
+			}
+			switch order {
+			case "rejection first":
+				reject()
+				claim()
+			case "claim first":
+				claim()
+				reject()
+			default:
+				start := make(chan struct{})
+				var workers sync.WaitGroup
+				workers.Add(2)
+				go func() { defer workers.Done(); <-start; claim() }()
+				go func() { defer workers.Done(); <-start; reject() }()
+				close(start)
+				workers.Wait()
+			}
+			if (claimErr == nil) == (rejectErr == nil) {
+				t.Fatalf("claim and veto did not have exactly one winner: claim=%v reject=%v", claimErr, rejectErr)
+			}
+			after, votes, err := database.GetRequestWithReviews(request.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rejectErr == nil {
+				if !errors.Is(claimErr, ErrInvalidTransition) || after.Status != StatusRejected || len(votes) != 2 || after.Execution != nil {
+					t.Fatalf("veto did not block the stale approved execution snapshot: %+v %v", after, claimErr)
+				}
+			} else if !errors.Is(rejectErr, ErrReviewNotPending) || after.Status != StatusExecuting || len(votes) != 1 ||
+				after.Execution == nil || after.Execution.LogPath != execution.LogPath || after.Execution.Assurance != AssuranceSameHost {
+				t.Fatalf("late veto altered a consumed execution claim: %+v %v", after, rejectErr)
+			}
+		})
+	}
+}
+
+func TestLateRejectionAuditFailureRollsBackVoteAndResolution(t *testing.T) {
+	database, before, sessions, prior := lateRejectionFixture(t)
+	events := lateRejectionEventCount(t, database)
+	if _, err := database.Exec(`CREATE TRIGGER reject_late_veto_event BEFORE INSERT ON request_events
+		WHEN new.kind = 'request_status_changed' BEGIN SELECT RAISE(ABORT, 'journal unavailable'); END`); err != nil {
+		t.Fatal(err)
+	}
+	review := &Review{RequestID: before.ID, ReviewerSessionID: sessions[2].ID, Decision: DecisionReject}
+	outcome, err := database.ApplyReview(review, sessions[2].SessionKey, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost})
+	if err == nil || outcome != nil || review.ID != "" || review.Signature != "" {
+		t.Fatalf("journal failure did not fail the veto atomically: %+v %+v %v", outcome, review, err)
+	}
+	after, votes, err := database.GetRequestWithReviews(before.ID)
+	if err != nil || !reflect.DeepEqual(before, after) || len(votes) != 1 || !reflect.DeepEqual(votes[0], prior) || lateRejectionEventCount(t, database) != events {
+		t.Fatalf("journal failure left a partial veto: %+v %+v %v", after, votes, err)
+	}
+}
+
+func TestResolveReviewCannotRenewAnApprovedGrant(t *testing.T) {
+	database, before, _, _ := lateRejectionFixture(t)
+	events := lateRejectionEventCount(t, database)
+	err := database.Transaction(func(tx *sql.Tx) error {
+		current, err := database.GetRequestTx(tx, before.ID)
+		if err != nil {
+			return err
+		}
+		return database.ResolveReviewTx(tx, current, StatusApproved, time.Hour, time.Now().UTC())
+	})
+	if !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("resolver renewed an already-approved grant: %v", err)
+	}
+	after, err := database.GetRequest(before.ID)
+	if err != nil || !reflect.DeepEqual(before, after) || lateRejectionEventCount(t, database) != events {
+		t.Fatalf("rejected renewal changed approval history: %+v %v", after, err)
+	}
+}
+
+func TestReviewSettingsReplaceStaleDecisionControls(t *testing.T) {
+	database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+	called := false
+	outcome, err := applyFixtureReview(database, request, sessions[1], DecisionApprove, ReviewPolicy{
+		ApprovalPolicy: ApprovalPolicyIndependent, ConflictResolution: "obsolete", ApprovalTTL: -time.Second,
+		ResolveSettings: func(current *Request, decision Decision) (ReviewSettings, error) {
+			called = true
+			if current.ID != request.ID || decision != DecisionApprove {
+				return ReviewSettings{}, errors.New("wrong resolver context")
+			}
+			return ReviewSettings{ApprovalPolicy: ApprovalPolicySameHost, ApprovalTTL: 2 * time.Minute}, nil
+		},
+	})
+	if err != nil || !called || outcome == nil || outcome.Request.Status != StatusApproved || outcome.Request.ApprovalExpiresAt == nil {
+		t.Fatalf("fresh settings did not replace stale decision controls: %+v %v", outcome, err)
+	}
+	if ttl := outcome.Request.ApprovalExpiresAt.Sub(*outcome.Request.ResolvedAt); ttl != 2*time.Minute {
+		t.Fatalf("fresh approval TTL was not used: %v", ttl)
+	}
+}
+
+func TestReviewSettingsRejectInvalidResolvedControls(t *testing.T) {
+	for _, name := range []string{"mode", "conflict", "approval TTL", "critical TTL", "self delay", "resolver error"} {
+		for _, decision := range []Decision{DecisionApprove, DecisionReject} {
+			t.Run(name+"/"+string(decision), func(t *testing.T) {
+				database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+				events := lateRejectionEventCount(t, database)
+				settings := ReviewSettings{ApprovalPolicy: ApprovalPolicySameHost}
+				var failure error
+				switch name {
+				case "mode":
+					settings.ApprovalPolicy = "unknown"
+				case "conflict":
+					settings.ConflictResolution = "ignore_all"
+				case "approval TTL":
+					settings.ApprovalTTL = -time.Second
+				case "critical TTL":
+					settings.CriticalApprovalTTL = -time.Second
+				case "self delay":
+					settings.TrustedSelfApproveDelay = -time.Second
+				case "resolver error":
+					failure = errors.New("current config unavailable")
+				}
+				review := &Review{RequestID: request.ID, ReviewerSessionID: sessions[1].ID, Decision: decision}
+				outcome, err := database.ApplyReview(review, sessions[1].SessionKey, ReviewPolicy{
+					ApprovalPolicy: ApprovalPolicySameHost,
+					ResolveSettings: func(_ *Request, got Decision) (ReviewSettings, error) {
+						if got != decision {
+							return ReviewSettings{}, errors.New("resolver received the wrong decision")
+						}
+						return settings, failure
+					},
+				})
+				if err == nil || outcome != nil || review.ID != "" || review.Signature != "" {
+					t.Fatalf("invalid resolved settings changed the vote: %+v %+v %v", outcome, review, err)
+				}
+				stored, votes, err := database.GetRequestWithReviews(request.ID)
+				if err != nil || stored.Status != StatusPending || stored.ApprovalExpiresAt != nil || len(votes) != 0 || lateRejectionEventCount(t, database) != events {
+					t.Fatalf("invalid settings changed request evidence: %+v %+v %v", stored, votes, err)
+				}
+			})
+		}
+	}
+}
+
+func TestReviewSettingsCannotEnableIndependentAuthorityOrRelabelRequests(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		request, resolved ApprovalPolicy
+		want              error
+	}{
+		{"independent still unavailable", ApprovalPolicyIndependent, ApprovalPolicyIndependent, ErrIndependentIdentityUnavailable},
+		{"local evidence cannot become independent", ApprovalPolicySameHost, ApprovalPolicyIndependent, ErrIndependentIdentityUnavailable},
+		{"old request is not opted in retroactively", ApprovalPolicyIndependent, ApprovalPolicySameHost, ErrReviewPolicyMismatch},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database, request, sessions := reviewDecisionFixture(t, 1, tc.request)
+			called := false
+			outcome, err := applyFixtureReview(database, request, sessions[1], DecisionApprove, ReviewPolicy{
+				ApprovalPolicy: ApprovalPolicySameHost,
+				ResolveSettings: func(_ *Request, _ Decision) (ReviewSettings, error) {
+					called = true
+					return ReviewSettings{ApprovalPolicy: tc.resolved}, nil
+				},
+			})
+			if !called || outcome != nil || !errors.Is(err, tc.want) {
+				t.Fatalf("resolver bypassed assurance authority: %+v %v", outcome, err)
+			}
+			stored, votes, err := database.GetRequestWithReviews(request.ID)
+			if err != nil || stored.ApprovalPolicy != tc.request || stored.Status != StatusPending || len(votes) != 0 {
+				t.Fatalf("resolver relabeled old request evidence: %+v %+v %v", stored, votes, err)
+			}
+		})
+	}
+	// Low-level callers without a resolver retain the independent default.
+	database, request, sessions := reviewDecisionFixture(t, 1)
+	if _, err := applyFixtureReview(database, request, sessions[1], DecisionApprove, ReviewPolicy{}); !errors.Is(err, ErrIndependentIdentityUnavailable) {
+		t.Fatalf("omitting the resolver enabled default local approvals: %v", err)
+	}
+}
+
+func TestReviewSettingsCannotChangeRequestOrDelegationBindings(t *testing.T) {
+	database, before, sessions, _ := lateRejectionFixture(t)
+	identity := &DelegatedReviewerIdentity{SourceProjectPath: t.TempDir(), SourceSessionID: sessions[2].ID,
+		AgentName: sessions[2].AgentName, Model: sessions[2].Model}
+	outcome, err := applyFixtureReview(database, before, sessions[2], DecisionReject, ReviewPolicy{
+		ExpectedCommandHash: before.Command.Hash, ExpectedProjectPath: before.ProjectPath, ExpectedApprovalPolicy: ApprovalPolicySameHost,
+		DelegatedReviewer: identity, DelegatedSourceCheck: func(*sql.Tx) error { return nil },
+		ResolveSettings: func(view *Request, _ Decision) (ReviewSettings, error) {
+			view.ID, view.ProjectPath, view.RequestorSessionID = "different-request", "different-project", sessions[2].ID
+			view.Command.Raw, view.Command.Hash, view.Command.Argv[0] = "changed", "changed", "changed"
+			view.Status, view.ApprovalPolicy, view.MinApprovals = StatusPending, ApprovalPolicyIndependent, 0
+			*view.ApprovalExpiresAt = time.Now().Add(time.Hour)
+			*view.ResolvedAt = time.Now().Add(time.Hour)
+			identity.AgentName, identity.SourceProjectPath = "changed-reviewer", before.ProjectPath
+			return ReviewSettings{ApprovalPolicy: ApprovalPolicySameHost, ConflictResolution: "first_wins", ApprovalTTL: time.Hour}, nil
+		},
+	})
+	if err != nil || outcome == nil || outcome.StatusChanged || !reflect.DeepEqual(outcome.Request, before) ||
+		outcome.Review.ReviewerAgent != sessions[2].AgentName || outcome.Review.ApprovalPolicy != ApprovalPolicySameHost {
+		t.Fatalf("resolver replaced signed-review request or delegation context: %+v %v", outcome, err)
+	}
+	if _, err := database.VerifyRequestApproval(before.ID); err != nil {
+		t.Fatalf("resolver damaged preserved signed evidence: %v", err)
+	}
+}
+
+func TestReviewSettingsCannotOverrideDisplayedBindingsOrExpiry(t *testing.T) {
+	for _, name := range []string{"displayed command", "expired request", "expires during resolution"} {
+		t.Run(name, func(t *testing.T) {
+			database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+			deadline := time.Now().UTC().Add(-time.Minute)
+			if name == "expires during resolution" {
+				deadline = time.Now().UTC().Add(30 * time.Millisecond)
+			}
+			if _, err := database.Exec(`UPDATE requests SET expires_at = ? WHERE id = ?`, deadline.Format(time.RFC3339Nano), request.ID); err != nil {
+				t.Fatal(err)
+			}
+			called := false
+			policy := ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost,
+				ResolveSettings: func(view *Request, _ Decision) (ReviewSettings, error) {
+					called = true
+					if name == "expires during resolution" {
+						time.Sleep(time.Until(deadline) + 20*time.Millisecond)
+					}
+					*view.ExpiresAt = time.Now().Add(time.Hour)
+					return ReviewSettings{ApprovalPolicy: ApprovalPolicySameHost}, nil
+				}}
+			want := ErrReviewExpired
+			if name == "displayed command" {
+				policy.ExpectedCommandHash, want = "different-command", ErrReviewTargetChanged
+			}
+			outcome, err := applyFixtureReview(database, request, sessions[1], DecisionApprove, policy)
+			if outcome != nil || !errors.Is(err, want) || called == (name == "displayed command") {
+				t.Fatalf("resolver bypassed view binding or current expiry: %+v called=%t err=%v", outcome, called, err)
+			}
+			stored, votes, err := database.GetRequestWithReviews(request.ID)
+			if err != nil || stored.Status != StatusPending || stored.ExpiresAt == nil || !stored.ExpiresAt.Equal(deadline) || len(votes) != 0 {
+				t.Fatalf("resolver changed the authoritative deadline: %+v %+v %v", stored, votes, err)
+			}
+		})
+	}
+}
+
+func TestReviewSettingsAreResolvedAfterDelegatedSourceWait(t *testing.T) {
+	for _, decision := range []Decision{DecisionApprove, DecisionReject} {
+		t.Run(string(decision), func(t *testing.T) {
+			database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
+			if decision == DecisionReject {
+				if _, err := applyFixtureReview(database, request, sessions[1], DecisionApprove, ReviewPolicy{ApprovalPolicy: ApprovalPolicySameHost}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			sourceEntered, releaseSource := make(chan struct{}), make(chan struct{})
+			settingsRead := make(chan struct{})
+			var changed atomic.Bool
+			result := make(chan error, 1)
+			go func() {
+				_, err := applyFixtureReview(database, request, sessions[2], decision, ReviewPolicy{
+					ApprovalPolicy: ApprovalPolicySameHost, ConflictResolution: "first_wins",
+					DelegatedReviewer: &DelegatedReviewerIdentity{SourceProjectPath: request.ProjectPath + "-source", SourceSessionID: sessions[2].ID,
+						AgentName: sessions[2].AgentName, Model: sessions[2].Model},
+					DelegatedSourceCheck: func(*sql.Tx) error {
+						close(sourceEntered)
+						<-releaseSource
+						return nil
+					},
+					ResolveSettings: func(_ *Request, got Decision) (ReviewSettings, error) {
+						close(settingsRead)
+						if got != decision || !changed.Load() {
+							return ReviewSettings{}, errors.New("settings were sampled before the source wait finished")
+						}
+						return ReviewSettings{ApprovalPolicy: ApprovalPolicyIndependent, ConflictResolution: "any_rejection_blocks"}, nil
+					},
+				})
+				result <- err
+			}()
+			select {
+			case <-sourceEntered:
+			case <-time.After(10 * time.Second):
+				close(releaseSource)
+				t.Fatal("review did not reach its current-source check")
+			}
+			select {
+			case <-settingsRead:
+				t.Error("settings were loaded while the source check was still blocked")
+			default:
+			}
+			changed.Store(true)
+			close(releaseSource)
+			var err error
+			select {
+			case err = <-result:
+			case <-time.After(10 * time.Second):
+				t.Fatal("review did not finish after source observation")
+			}
+			stored, votes, readErr := database.GetRequestWithReviews(request.ID)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			switch decision {
+			case DecisionApprove:
+				if !errors.Is(err, ErrIndependentIdentityUnavailable) || stored.Status != StatusPending || len(votes) != 0 {
+					t.Fatalf("source wait retained stale opt-in: %+v %+v %v", stored, votes, err)
+				}
+			case DecisionReject:
+				if err != nil || stored.Status != StatusRejected || len(votes) != 2 || votes[1].Assurance != AssuranceSameHost {
+					t.Fatalf("source wait retained stale conflict policy or relabeled rejection: %+v %+v %v", stored, votes, err)
+				}
+			}
+		})
 	}
 }

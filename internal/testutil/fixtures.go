@@ -187,8 +187,8 @@ func ApproveRequest(t *testing.T, database *db.DB, req *db.Request) []*db.Sessio
 		RequireNoError(t, database.CreateReview(review), "create review")
 		reviewers = append(reviewers, reviewer)
 	}
-	_, err := database.Exec(`UPDATE requests SET status = ?, approval_expires_at = ? WHERE id = ?`,
-		string(db.StatusApproved), now.Add(time.Hour).Format(time.RFC3339), req.ID)
+	_, err := database.Exec(`UPDATE requests SET status = ?, resolved_at = ?, approval_expires_at = ? WHERE id = ?`,
+		string(db.StatusApproved), now.Format(time.RFC3339), now.Add(time.Hour).Format(time.RFC3339), req.ID)
 	RequireNoError(t, err, "approve request")
 	return reviewers
 }

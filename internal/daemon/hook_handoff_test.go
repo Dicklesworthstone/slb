@@ -57,6 +57,10 @@ func hookApprovalFixtureForPaths(t *testing.T, databaseRoot, projectPath, cwd st
 		Signature: db.ComputeReviewSignature(reviewer.SessionKey, req.ID, db.DecisionApprove, signedAt)}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := conn.Exec("UPDATE requests SET resolved_at = ? WHERE id = ?", signedAt.Format(time.RFC3339), req.ID); err != nil {
+		t.Fatal(err)
+	}
+	req.ResolvedAt = &signedAt
 	return conn, req, HookQueryParams{Command: req.Command.Raw, SessionID: session.ID, CWD: cwd, ExecutionHandoff: true}
 }
 

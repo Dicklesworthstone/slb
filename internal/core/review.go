@@ -98,6 +98,8 @@ func DefaultReviewConfig() ReviewConfig {
 type ReviewResult struct {
 	// Review is the created review.
 	Review *db.Review
+	// RequestStatus always describes the state committed with this vote.
+	RequestStatus db.RequestStatus
 	// RequestStatusChanged indicates if the request status was updated.
 	RequestStatusChanged bool
 	// NewRequestStatus is the new request status (if changed).
@@ -243,7 +245,7 @@ func (rs *ReviewService) submitReview(opts ReviewOptions, delegated *db.Delegate
 	}
 	outcome, err := rs.db.ApplyReview(review, opts.SessionKey, db.ReviewPolicy{
 		ApprovalPolicy:          rs.config.ApprovalPolicy,
-		PolicyCheck:             ReviewPolicyGuard(rs.config.ConfigPath, delegated),
+		ResolveSettings:         ReviewPolicyResolver(rs.config.ConfigPath, delegated),
 		ConflictResolution:      string(rs.config.ConflictResolution),
 		TrustedSelfApprove:      rs.config.TrustedSelfApprove,
 		TrustedSelfApproveDelay: rs.config.TrustedSelfApproveDelay,
@@ -260,6 +262,7 @@ func (rs *ReviewService) submitReview(opts ReviewOptions, delegated *db.Delegate
 	}
 	result := &ReviewResult{
 		Review: outcome.Review, Approvals: outcome.Approvals, Rejections: outcome.Rejections,
+		RequestStatus:        outcome.Request.Status,
 		RequestStatusChanged: outcome.StatusChanged,
 	}
 	if outcome.StatusChanged {
@@ -275,35 +278,59 @@ func (rs *ReviewService) submitReview(opts ReviewOptions, delegated *db.Delegate
 	return result, nil
 }
 
-// ReviewPolicyGuard reloads the target's current opt-in after the DB obtains its
-// writer reservation. A service created before opt-out cannot commit a stale
-// same-host approval. Rejections remain available after opt-out.
-func ReviewPolicyGuard(configPath string, delegated *db.DelegatedReviewerIdentity) func(*db.Request) error {
-	return func(request *db.Request) error {
+// ReviewPolicyResolver loads one current target policy after the DB obtains its
+// writer reservation and finishes any delegated source read. Decision controls
+// are fresh for both votes; opting out of approval does not prevent rejection.
+// Configuration files are not part of the SQLite transaction.
+func ReviewPolicyResolver(configPath string, delegated *db.DelegatedReviewerIdentity) func(*db.Request, db.Decision) (db.ReviewSettings, error) {
+	return func(request *db.Request, decision db.Decision) (db.ReviewSettings, error) {
+		var settings db.ReviewSettings
 		if request == nil {
-			return errors.New("request is required for review policy check")
+			return settings, errors.New("request is required for review policy check")
+		}
+		if decision != db.DecisionApprove && decision != db.DecisionReject {
+			return settings, ErrInvalidDecision
 		}
 		if configPath != "" {
 			info, err := os.Stat(configPath)
 			if err != nil {
-				return fmt.Errorf("reading explicit review config: %w", err)
+				return settings, fmt.Errorf("reading explicit review config: %w", err)
 			}
 			if !info.Mode().IsRegular() {
-				return errors.New("explicit review config is not a regular file")
+				return settings, errors.New("explicit review config is not a regular file")
 			}
 		}
 		cfg, err := config.Load(config.LoadOptions{ProjectDir: request.ProjectPath, ConfigPath: configPath})
 		if err != nil {
-			return fmt.Errorf("loading current review policy: %w", err)
+			return settings, fmt.Errorf("loading current review policy: %w", err)
 		}
-		if request.ApprovalPolicy.Normalized() != db.ApprovalPolicy(cfg.General.ApprovalPolicy) {
-			return fmt.Errorf("%w: request approval policy is %q, current policy is %q; submit a new request",
+		if decision == db.DecisionApprove && request.ApprovalPolicy.Normalized() != db.ApprovalPolicy(cfg.General.ApprovalPolicy) {
+			return settings, fmt.Errorf("%w: request approval policy is %q, current policy is %q; submit a new request",
 				db.ErrReviewPolicyMismatch, request.ApprovalPolicy.Normalized(), cfg.General.ApprovalPolicy)
 		}
-		if delegated != nil && !crossProjectReviewerAllowed(cfg.General, delegated.AgentName) {
-			return ErrCrossProjectReviewDenied
+		if decision == db.DecisionApprove && delegated != nil && !crossProjectReviewerAllowed(cfg.General, delegated.AgentName) {
+			return settings, ErrCrossProjectReviewDenied
 		}
-		return nil
+		settings.ApprovalPolicy = db.ApprovalPolicy(cfg.General.ApprovalPolicy)
+		settings.ConflictResolution = cfg.General.ConflictResolution
+		settings.TrustedSelfApprove = append([]string(nil), cfg.Agents.TrustedSelfApprove...)
+		for _, value := range []struct {
+			name   string
+			value  int
+			unit   time.Duration
+			target *time.Duration
+		}{
+			{"trusted self-approve delay", cfg.Agents.TrustedSelfApproveDelaySecs, time.Second, &settings.TrustedSelfApproveDelay},
+			{"approval TTL", cfg.General.ApprovalTTLMins, time.Minute, &settings.ApprovalTTL},
+			{"critical approval TTL", cfg.General.ApprovalTTLCriticalMins, time.Minute, &settings.CriticalApprovalTTL},
+		} {
+			converted, err := pendingDuration(value.value, value.unit)
+			if err != nil {
+				return db.ReviewSettings{}, fmt.Errorf("invalid %s: %w", value.name, err)
+			}
+			*value.target = converted
+		}
+		return settings, nil
 	}
 }
 
@@ -378,8 +405,12 @@ func VerifyReview(review *db.Review, sessionKey string) bool {
 	return db.VerifyReviewEvidenceSignature(review, sessionKey)
 }
 
-// CanReview checks if a session can submit a review for a request.
-func (rs *ReviewService) CanReview(sessionID, requestID string) (bool, string) {
+// CanReview is advisory eligibility for the selected decision. The transactional
+// writer still authenticates the session and rechecks all current conditions.
+func (rs *ReviewService) CanReview(sessionID, requestID string, decision db.Decision) (bool, string) {
+	if decision != db.DecisionApprove && decision != db.DecisionReject {
+		return false, ErrInvalidDecision.Error()
+	}
 	// Get session
 	session, err := rs.db.GetSession(sessionID)
 	if err != nil {
@@ -394,7 +425,7 @@ func (rs *ReviewService) CanReview(sessionID, requestID string) (bool, string) {
 	if err != nil {
 		return false, fmt.Sprintf("request not found: %v", err)
 	}
-	if !CanApprove(request.Status) {
+	if !CanApprove(request.Status) && !(request.Status == db.StatusApproved && decision == db.DecisionReject) {
 		return false, fmt.Sprintf("request cannot be reviewed (status: %s)", request.Status)
 	}
 	if request.Status == db.StatusPending && request.ExpiresAt != nil && !time.Now().Before(*request.ExpiresAt) {
@@ -410,6 +441,9 @@ func (rs *ReviewService) CanReview(sessionID, requestID string) (bool, string) {
 		if time.Since(request.CreatedAt) < delay {
 			return false, fmt.Sprintf("trusted self-approve requires %v delay", delay)
 		}
+	}
+	if decision == db.DecisionApprove && request.RequireDifferentModel && !db.ModelsDiffer(request.RequestorModel, session.Model) {
+		return false, ErrRequireDiffModel.Error()
 	}
 
 	// Check already reviewed (the write path also checks the stable agent name).

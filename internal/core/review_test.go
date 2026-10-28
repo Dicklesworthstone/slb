@@ -798,7 +798,7 @@ func TestCanReview(t *testing.T) {
 		defer dbConn.Close()
 
 		rs := NewReviewService(dbConn, DefaultReviewConfig())
-		can, reason := rs.CanReview("nonexistent-session", req.ID)
+		can, reason := rs.CanReview("nonexistent-session", req.ID, db.DecisionApprove)
 		if can {
 			t.Error("Expected can=false for nonexistent session")
 		}
@@ -812,7 +812,7 @@ func TestCanReview(t *testing.T) {
 		defer dbConn.Close()
 
 		rs := NewReviewService(dbConn, DefaultReviewConfig())
-		can, reason := rs.CanReview(sess.ID, "nonexistent-request")
+		can, reason := rs.CanReview(sess.ID, "nonexistent-request", db.DecisionApprove)
 		if can {
 			t.Error("Expected can=false for nonexistent request")
 		}
@@ -842,7 +842,7 @@ func TestCanReview(t *testing.T) {
 		}
 
 		rs := NewReviewService(dbConn, DefaultReviewConfig())
-		can, reason := rs.CanReview(reviewerSess.ID, req.ID)
+		can, reason := rs.CanReview(reviewerSess.ID, req.ID, db.DecisionApprove)
 		if can {
 			t.Error("Expected can=false for non-pending request")
 		}
@@ -856,7 +856,7 @@ func TestCanReview(t *testing.T) {
 		defer dbConn.Close()
 
 		rs := NewReviewService(dbConn, DefaultReviewConfig())
-		can, reason := rs.CanReview(sess.ID, req.ID)
+		can, reason := rs.CanReview(sess.ID, req.ID, db.DecisionApprove)
 		if can {
 			t.Error("Expected can=false for self-review without trust")
 		}
@@ -874,7 +874,7 @@ func TestCanReview(t *testing.T) {
 			TrustedSelfApproveDelay: 5 * time.Minute,
 		}
 		rs := NewReviewService(dbConn, config)
-		can, reason := rs.CanReview(sess.ID, req.ID)
+		can, reason := rs.CanReview(sess.ID, req.ID, db.DecisionApprove)
 		if can {
 			t.Error("Expected can=false for self-review without delay")
 		}
@@ -913,7 +913,7 @@ func TestCanReview(t *testing.T) {
 		}
 
 		rs := NewReviewService(dbConn, DefaultReviewConfig())
-		can, reason := rs.CanReview(reviewerSess.ID, req.ID)
+		can, reason := rs.CanReview(reviewerSess.ID, req.ID, db.DecisionApprove)
 		if can {
 			t.Error("Expected can=false for already reviewed")
 		}
@@ -938,7 +938,7 @@ func TestCanReview(t *testing.T) {
 		}
 
 		rs := NewReviewService(dbConn, DefaultReviewConfig())
-		can, reason := rs.CanReview(reviewerSess.ID, req.ID)
+		can, reason := rs.CanReview(reviewerSess.ID, req.ID, db.DecisionApprove)
 		if !can {
 			t.Errorf("Expected can=true, got reason: %s", reason)
 		}
@@ -1100,6 +1100,7 @@ func TestSubmitReview_SelfReview(t *testing.T) {
 		config := ReviewConfig{
 			TrustedSelfApprove:      []string{sess.AgentName},
 			TrustedSelfApproveDelay: 5 * time.Minute,
+			ConfigPath:              writeExecutionPolicy(t, t.TempDir(), "[agents]\ntrusted_self_approve = ['BlueSnow']\ntrusted_self_approve_delay_seconds = 300\n"),
 		}
 		rs := NewReviewService(dbConn, config)
 
@@ -1132,6 +1133,7 @@ func TestSubmitReview_SelfReview(t *testing.T) {
 		config := ReviewConfig{
 			TrustedSelfApprove:      []string{sess.AgentName},
 			TrustedSelfApproveDelay: 5 * time.Minute,
+			ConfigPath:              writeExecutionPolicy(t, t.TempDir(), "[agents]\ntrusted_self_approve = ['BlueSnow']\ntrusted_self_approve_delay_seconds = 300\n"),
 		}
 		rs := NewReviewService(dbConn, config)
 
@@ -1468,7 +1470,7 @@ func TestCanReview_AdditionalCases(t *testing.T) {
 	rs := NewReviewService(dbConn, DefaultReviewConfig())
 
 	t.Run("empty session_id returns false", func(t *testing.T) {
-		canReview, msg := rs.CanReview("", "req-id")
+		canReview, msg := rs.CanReview("", "req-id", db.DecisionApprove)
 		if canReview {
 			t.Errorf("expected canReview=false for empty session_id, got true")
 		}
@@ -1478,7 +1480,7 @@ func TestCanReview_AdditionalCases(t *testing.T) {
 	})
 
 	t.Run("empty request_id returns false", func(t *testing.T) {
-		canReview, msg := rs.CanReview("session-id", "")
+		canReview, msg := rs.CanReview("session-id", "", db.DecisionApprove)
 		if canReview {
 			t.Errorf("expected canReview=false for empty request_id, got true")
 		}
@@ -1488,12 +1490,54 @@ func TestCanReview_AdditionalCases(t *testing.T) {
 	})
 
 	t.Run("session not found returns false", func(t *testing.T) {
-		canReview, msg := rs.CanReview("nonexistent", "req-id")
+		canReview, msg := rs.CanReview("nonexistent", "req-id", db.DecisionApprove)
 		if canReview {
 			t.Errorf("expected canReview=false for nonexistent session, got true")
 		}
 		if msg == "" {
 			t.Error("expected message for nonexistent session")
+		}
+	})
+}
+
+func TestCanReviewDecisionAndModel(t *testing.T) {
+	for _, status := range []db.RequestStatus{db.StatusPending, db.StatusEscalated, db.StatusApproved, db.StatusExecuting, db.StatusRejected} {
+		for _, decision := range []db.Decision{db.DecisionApprove, db.DecisionReject, "invalid"} {
+			t.Run(string(status)+"/"+string(decision), func(t *testing.T) {
+				database, request, sessions := atomicReviewFixture(t, 1)
+				if _, err := database.Exec(`UPDATE requests SET status = ?, approval_policy = 'same_host', require_different_model = 1 WHERE id = ?`, status, request.ID); err != nil {
+					t.Fatal(err)
+				}
+				service := NewReviewService(database, DefaultReviewConfig())
+				want := (status == db.StatusPending || status == db.StatusEscalated) && decision == db.DecisionApprove ||
+					(status == db.StatusPending || status == db.StatusEscalated || status == db.StatusApproved) && decision == db.DecisionReject
+				if allowed, reason := service.CanReview(sessions[1].ID, request.ID, decision); allowed != want || (!allowed && reason == "") {
+					t.Fatalf("decision eligibility = %t (%q), want %t", allowed, reason, want)
+				}
+				if allowed, _ := service.CanReview(sessions[0].ID, request.ID, decision); allowed {
+					t.Fatal("same-host requester could review its own request")
+				}
+				// Model diversity constrains affirmative authorization, not a veto.
+				if _, err := database.Exec(`UPDATE sessions SET model = ? WHERE id = ?`, request.RequestorModel, sessions[1].ID); err != nil {
+					t.Fatal(err)
+				}
+				if allowed, reason := service.CanReview(sessions[1].ID, request.ID, decision); allowed != (want && decision == db.DecisionReject) {
+					t.Fatalf("same-model eligibility = %t (%q) for %s", allowed, reason, decision)
+				}
+			})
+		}
+	}
+	t.Run("expired approval still accepts only a veto", func(t *testing.T) {
+		database, request, sessions := atomicReviewFixture(t, 1)
+		if _, err := database.Exec(`UPDATE requests SET status = 'approved', expires_at = '2000-01-01T00:00:00Z', approval_expires_at = '2000-01-01T00:00:00Z' WHERE id = ?`, request.ID); err != nil {
+			t.Fatal(err)
+		}
+		service := NewReviewService(database, DefaultReviewConfig())
+		if allowed, reason := service.CanReview(sessions[1].ID, request.ID, db.DecisionReject); !allowed {
+			t.Fatalf("expired grant prevented a negative vote: %s", reason)
+		}
+		if allowed, _ := service.CanReview(sessions[1].ID, request.ID, db.DecisionApprove); allowed {
+			t.Fatal("expired grant could be renewed by another approval")
 		}
 	})
 }

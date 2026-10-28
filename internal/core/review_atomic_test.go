@@ -1,6 +1,7 @@
 package core
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -13,6 +14,260 @@ import (
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/integrations"
 )
+
+func sameHostReviewSettingsText(resolution string, normal, critical, quorum int) string {
+	return fmt.Sprintf("[general]\napproval_policy = 'same_host'\nconflict_resolution = %q\napproval_ttl_minutes = %d\napproval_ttl_critical_minutes = %d\nrequire_different_model = true\n[patterns.dangerous]\npatterns = ['^printf same-host-policy$']\nmin_approvals = %d\ndynamic_quorum = false\n[integrations]\nagent_mail_enabled = false\n", resolution, normal, critical, quorum)
+}
+
+func TestReviewServiceReloadsApprovalDeadlines(t *testing.T) {
+	for _, tier := range []db.RiskTier{db.RiskTierDangerous, db.RiskTierCritical} {
+		for _, explicit := range []bool{false, true} {
+			for _, current := range []struct{ normal, critical int }{{3, 1}, {60, 20}} {
+				t.Run(fmt.Sprintf("%s/explicit=%t/ttl=%d", tier, explicit, current.normal), func(t *testing.T) {
+					database, request, _, peers := sameHostPolicyFixture(t, 1)
+					if _, err := database.Exec(`UPDATE requests SET risk_tier = ? WHERE id = ?`, tier, request.ID); err != nil {
+						t.Fatal(err)
+					}
+					path := writeExecutionPolicy(t, request.ProjectPath, sameHostReviewSettingsText("first_wins", 30, 10, 1))
+					options := DefaultReviewConfig()
+					options.ApprovalPolicy = db.ApprovalPolicySameHost
+					if explicit {
+						path = filepath.Join(t.TempDir(), "selected.toml")
+						options.ConfigPath = path
+						if err := os.WriteFile(path, []byte(sameHostReviewSettingsText("first_wins", 30, 10, 1)), 0600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					service := NewReviewService(database, options)
+					if err := os.WriteFile(path, []byte(sameHostReviewSettingsText("first_wins", current.normal, current.critical, 1)), 0600); err != nil {
+						t.Fatal(err)
+					}
+					result, err := service.SubmitReview(ReviewOptions{RequestID: request.ID, SessionID: peers[0].ID, SessionKey: peers[0].SessionKey, Decision: db.DecisionApprove})
+					if err != nil || result == nil || result.RequestStatus != db.StatusApproved || !result.RequestStatusChanged {
+						t.Fatalf("fresh policy approval failed: %+v %v", result, err)
+					}
+					stored, err := database.GetRequest(request.ID)
+					if err != nil || stored.ResolvedAt == nil || stored.ApprovalExpiresAt == nil {
+						t.Fatalf("missing committed deadline: %+v %v", stored, err)
+					}
+					minutes := current.normal
+					if tier == db.RiskTierCritical {
+						minutes = current.critical
+					}
+					wantExpiry := stored.ResolvedAt.Add(time.Duration(minutes) * time.Minute).Truncate(time.Second)
+					if !stored.ApprovalExpiresAt.Equal(wantExpiry) {
+						t.Fatalf("used cached TTL: got expiry %s, want %s (%d minutes)", stored.ApprovalExpiresAt, wantExpiry, minutes)
+					}
+					if !db.VerifyReviewEvidenceSignature(result.Review, peers[0].SessionKey) || result.Review.Assurance != db.AssuranceSameHost {
+						t.Fatal("fresh decision controls changed signed same-host assurance")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestReviewServiceReloadsRejectionConflictPolicy(t *testing.T) {
+	for _, current := range []struct {
+		resolution string
+		status     db.RequestStatus
+	}{
+		{"any_rejection_blocks", db.StatusRejected},
+		{"human_breaks_tie", db.StatusEscalated},
+		{"first_wins", db.StatusPending},
+	} {
+		t.Run(current.resolution, func(t *testing.T) {
+			database, request, _, peers := sameHostPolicyFixture(t, 2)
+			options := DefaultReviewConfig()
+			options.ApprovalPolicy, options.ConflictResolution = db.ApprovalPolicySameHost, ConflictFirstWins
+			service := NewReviewService(database, options)
+			first, err := service.SubmitReview(ReviewOptions{RequestID: request.ID, SessionID: peers[0].ID, SessionKey: peers[0].SessionKey, Decision: db.DecisionApprove})
+			if err != nil || first.RequestStatus != db.StatusPending || first.NewRequestStatus != "" {
+				t.Fatalf("partial quorum did not report its committed state: %+v %v", first, err)
+			}
+			writeExecutionPolicy(t, request.ProjectPath, sameHostReviewSettingsText(current.resolution, 3, 1, 2))
+			result, err := service.SubmitReview(ReviewOptions{RequestID: request.ID, SessionID: peers[1].ID, SessionKey: peers[1].SessionKey, Decision: db.DecisionReject})
+			if err != nil || result == nil || result.RequestStatus != current.status || result.Approvals != 1 || result.Rejections != 1 {
+				t.Fatalf("rejection used stale conflict policy: %+v %v", result, err)
+			}
+			changed := current.status != db.StatusPending
+			if result.RequestStatusChanged != changed || (!changed && result.NewRequestStatus != "") {
+				t.Fatalf("incorrect status-change report: %+v", result)
+			}
+		})
+	}
+}
+
+func TestReviewPolicyResolverWaitsForTargetWriter(t *testing.T) {
+	database, request, _, peers := sameHostPolicyFixture(t, 1)
+	contender, err := db.OpenWithOptions(database.Path(), db.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = contender.Close() })
+	writer, err := database.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writer.Rollback() }()
+	if _, err := writer.Exec(`UPDATE requests SET id = id WHERE id = ?`, request.ID); err != nil {
+		t.Fatal(err)
+	}
+	started, resolved := make(chan struct{}), make(chan struct{})
+	finished := make(chan error, 1)
+	resolver := ReviewPolicyResolver("", nil)
+	go func() {
+		close(started)
+		_, err := contender.ApplyReview(&db.Review{RequestID: request.ID, ReviewerSessionID: peers[0].ID, Decision: db.DecisionApprove}, peers[0].SessionKey, db.ReviewPolicy{
+			ApprovalPolicy: db.ApprovalPolicySameHost, ApprovalTTL: 30 * time.Minute,
+			ResolveSettings: func(current *db.Request, decision db.Decision) (db.ReviewSettings, error) {
+				close(resolved)
+				return resolver(current, decision)
+			},
+		})
+		finished <- err
+	}()
+	<-started
+	select {
+	case <-resolved:
+		t.Error("policy was read before the writer reservation")
+	case <-time.After(50 * time.Millisecond):
+	}
+	writeExecutionPolicy(t, request.ProjectPath, sameHostReviewSettingsText("any_rejection_blocks", 1, 1, 1))
+	if err := writer.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("review did not finish after writer release")
+	}
+	stored, err := database.GetRequest(request.ID)
+	if err != nil || stored.ResolvedAt == nil || stored.ApprovalExpiresAt == nil || !stored.ApprovalExpiresAt.Equal(stored.ResolvedAt.Add(time.Minute).Truncate(time.Second)) {
+		t.Fatalf("writer-waiting review used an old deadline: %+v %v", stored, err)
+	}
+}
+
+func TestDelegatedReviewRefreshesPolicyAfterSourceWait(t *testing.T) {
+	for _, decision := range []db.Decision{db.DecisionApprove, db.DecisionReject} {
+		t.Run(string(decision), func(t *testing.T) {
+			sourceProject, targetProject := t.TempDir(), t.TempDir()
+			source, err := db.Open(filepath.Join(sourceProject, "source.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = source.Close() })
+			target, err := db.Open(filepath.Join(targetProject, "target.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = target.Close() })
+			reviewer, request, service := delegatedReviewFixture(t, source, target, sourceProject, targetProject)
+			policy := func(conflict string, minutes int) string {
+				return fmt.Sprintf("[general]\napproval_policy = 'same_host'\nconflict_resolution = %q\napproval_ttl_minutes = %d\ncross_project_reviews = true\nreview_pool = ['Reviewer']\n[integrations]\nagent_mail_enabled = false\n", conflict, minutes)
+			}
+			writeExecutionPolicy(t, targetProject, policy("first_wins", 30))
+			service.config.ConflictResolution = ConflictFirstWins
+			if _, err := target.Exec(`UPDATE requests SET min_approvals = 2 WHERE id = ?`, request.ID); err != nil {
+				t.Fatal(err)
+			}
+			peer := &db.Session{AgentName: "EarlierReviewer", Model: "earlier-model", ProjectPath: targetProject}
+			if err := target.CreateSession(peer); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.SubmitReview(ReviewOptions{RequestID: request.ID, SessionID: peer.ID, SessionKey: peer.SessionKey, Decision: db.DecisionApprove}); err != nil {
+				t.Fatal(err)
+			}
+			reading, release := make(chan struct{}), make(chan struct{})
+			defer func() {
+				select {
+				case <-release:
+				default:
+					close(release)
+				}
+			}()
+			finished := make(chan error, 1)
+			go func() {
+				_, err := service.submitCrossProjectReview(sourceProject, ReviewOptions{RequestID: request.ID, SessionID: reviewer.ID, SessionKey: reviewer.SessionKey, Decision: decision}, func(tx *sql.Tx) (*db.Session, error) {
+					session, err := source.AuthenticateSession(reviewer.ID, reviewer.SessionKey)
+					if tx != nil {
+						close(reading)
+						<-release
+					}
+					return session, err
+				})
+				finished <- err
+			}()
+			select {
+			case <-reading:
+			case <-time.After(5 * time.Second):
+				t.Fatal("review did not reach its current source check")
+			}
+			writeExecutionPolicy(t, targetProject, policy("any_rejection_blocks", 1))
+			close(release)
+			select {
+			case err := <-finished:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("review did not finish after source read release")
+			}
+			stored, err := target.GetRequest(request.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decision == db.DecisionReject {
+				if stored.Status != db.StatusRejected || stored.ApprovalExpiresAt != nil {
+					t.Fatalf("source-waiting rejection used stale conflict policy: %+v", stored)
+				}
+			} else if stored.Status != db.StatusApproved || stored.ResolvedAt == nil || stored.ApprovalExpiresAt == nil || !stored.ApprovalExpiresAt.Equal(stored.ResolvedAt.Add(time.Minute).Truncate(time.Second)) {
+				t.Fatalf("source-waiting approval used stale TTL: %+v", stored)
+			}
+		})
+	}
+}
+
+func TestReviewServiceCurrentPolicyErrorsLeaveNoVote(t *testing.T) {
+	for _, problem := range []string{"invalid TOML", "unknown policy", "overflow TTL", "missing explicit file", "directory"} {
+		for _, decision := range []db.Decision{db.DecisionApprove, db.DecisionReject} {
+			t.Run(problem+"/"+string(decision), func(t *testing.T) {
+				database, request, _, peers := sameHostPolicyFixture(t, 1)
+				options := DefaultReviewConfig()
+				options.ApprovalPolicy = db.ApprovalPolicySameHost
+				options.ConfigPath = filepath.Join(t.TempDir(), "selected.toml")
+				text := sameHostReviewSettingsText("first_wins", 30, 10, 1)
+				switch problem {
+				case "invalid TOML":
+					text = "[general\ninvalid"
+				case "unknown policy":
+					text = "[general]\napproval_policy = 'unknown'\n"
+				case "overflow TTL":
+					text = "[general]\napproval_policy = 'same_host'\napproval_ttl_minutes = 9223372036854775807\n"
+				case "directory":
+					options.ConfigPath = t.TempDir()
+				}
+				if problem != "missing explicit file" && problem != "directory" {
+					if err := os.WriteFile(options.ConfigPath, []byte(text), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				service := NewReviewService(database, options)
+				outcome, err := service.SubmitReview(ReviewOptions{RequestID: request.ID, SessionID: peers[0].ID, SessionKey: peers[0].SessionKey, Decision: decision})
+				if err == nil || outcome != nil {
+					t.Fatalf("bad current policy admitted a vote: %+v %v", outcome, err)
+				}
+				stored, reviews, err := database.GetRequestWithReviews(request.ID)
+				if err != nil || stored.Status != db.StatusPending || stored.ResolvedAt != nil || stored.ApprovalExpiresAt != nil || len(reviews) != 0 {
+					t.Fatalf("failed policy load changed evidence: %+v %+v %v", stored, reviews, err)
+				}
+			})
+		}
+	}
+}
 
 type committedReviewNotifier struct {
 	integrations.NoopNotifier
@@ -58,6 +313,7 @@ func TestReviewServiceNotifiesCommittedApprovalAndTTL(t *testing.T) {
 	database, request, sessions := atomicReviewFixture(t, 2)
 	cfg := DefaultReviewConfig()
 	cfg.ApprovalTTL = 2 * time.Minute
+	writeExecutionPolicy(t, request.ProjectPath, "[general]\napproval_ttl_minutes = 2\n")
 	service := NewReviewService(database, cfg)
 	notifier := &committedReviewNotifier{}
 	service.SetNotifier(notifier)
@@ -128,6 +384,7 @@ func TestReviewServiceFirstDecisionCannotBypassQuorum(t *testing.T) {
 	database, request, sessions := atomicReviewFixture(t, 2)
 	cfg := DefaultReviewConfig()
 	cfg.ConflictResolution = ConflictFirstWins
+	writeExecutionPolicy(t, request.ProjectPath, "[general]\nconflict_resolution = 'first_wins'\n")
 	service := NewReviewService(database, cfg)
 	for i := 1; i <= 2; i++ {
 		result, err := service.SubmitReview(ReviewOptions{RequestID: request.ID, SessionID: sessions[i].ID, SessionKey: sessions[i].SessionKey, Decision: db.DecisionApprove})

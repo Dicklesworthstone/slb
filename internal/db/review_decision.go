@@ -39,6 +39,18 @@ type DelegatedReviewerIdentity struct {
 	Model             string
 }
 
+// ReviewSettings contains only the current controls for deciding a review.
+// Resolving these settings cannot replace request bindings, reviewer provenance,
+// or the checks that authenticate the review's source.
+type ReviewSettings struct {
+	ApprovalPolicy          ApprovalPolicy
+	ConflictResolution      string
+	TrustedSelfApprove      []string
+	TrustedSelfApproveDelay time.Duration
+	ApprovalTTL             time.Duration
+	CriticalApprovalTTL     time.Duration
+}
+
 // ReviewPolicy is the policy applied while committing a review. Zero TTLs use
 // finite defaults; negative durations and unknown conflict modes are rejected.
 // The caller loads this policy from the target project's configuration.
@@ -65,11 +77,12 @@ type ReviewPolicy struct {
 	// through tx; separate source DBs remain separate read snapshots.
 	// The callback must not mutate either store or open another writer.
 	DelegatedSourceCheck func(*sql.Tx) error
-	// PolicyCheck reloads current project policy after the writer reservation
-	// is acquired. It applies to approvals only: opting out must not prevent
-	// rejection of an outstanding request. The callback must not mutate the
+	// ResolveSettings reloads current decision controls after the writer
+	// reservation and delegated source check, for approvals and rejections.
+	// Only approval requires the current assurance mode to match the request;
+	// opting out must not prevent rejection. The callback must not mutate the
 	// request or access this database while its transaction is open.
-	PolicyCheck func(*Request) error
+	ResolveSettings func(*Request, Decision) (ReviewSettings, error)
 }
 
 // ReviewOutcome describes only committed state. Notifications must use Request,
@@ -96,15 +109,25 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 	if review.Decision != DecisionApprove && review.Decision != DecisionReject {
 		return nil, ErrReviewInvalidDecision
 	}
-	if review.Decision == DecisionApprove && policy.ApprovalPolicy.Normalized() == ApprovalPolicyIndependent && !independentIdentityAttested() {
+	if review.Decision == DecisionApprove && policy.ResolveSettings == nil &&
+		policy.ApprovalPolicy.Normalized() == ApprovalPolicyIndependent && !independentIdentityAttested() {
 		// Fail closed for every approval entry point (CLI, TUI, RPC and
 		// cross-project delegation). Neither trusted_self_approve nor an
 		// authenticated HMAC session proves an independent reviewer. Explicit
 		// same-host review uses a distinct request and evidence category.
 		return nil, ErrIndependentIdentityUnavailable
 	}
-	if err := policy.validate(); err != nil {
+	if err := policy.validateBindings(); err != nil {
 		return nil, err
+	}
+	if policy.ResolveSettings == nil {
+		if err := policy.validate(); err != nil {
+			return nil, err
+		}
+	}
+	if policy.DelegatedReviewer != nil {
+		identity := *policy.DelegatedReviewer
+		policy.DelegatedReviewer = &identity
 	}
 	// Do not change the caller's review object when the transaction rolls back.
 	accepted := *review
@@ -131,18 +154,10 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 		if !request.ApprovalPolicy.Valid() {
 			return fmt.Errorf("unknown request approval policy %q", request.ApprovalPolicy)
 		}
-		if accepted.Decision == DecisionApprove && request.ApprovalPolicy.Normalized() != policy.ApprovalPolicy.Normalized() {
-			return ErrReviewPolicyMismatch
-		}
 		if (policy.ExpectedCommandHash != "" && request.Command.Hash != policy.ExpectedCommandHash) ||
 			(policy.ExpectedProjectPath != "" && request.ProjectPath != policy.ExpectedProjectPath) ||
 			(policy.ExpectedApprovalPolicy != "" && request.ApprovalPolicy.Normalized() != policy.ExpectedApprovalPolicy.Normalized()) {
 			return ErrReviewTargetChanged
-		}
-		if accepted.Decision == DecisionApprove && policy.PolicyCheck != nil {
-			if err := policy.PolicyCheck(request); err != nil {
-				return fmt.Errorf("checking current review policy: %w", err)
-			}
 		}
 		delegated := policy.DelegatedReviewer
 		if delegated != nil {
@@ -153,10 +168,52 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 				return fmt.Errorf("checking current delegated reviewer: %w", err)
 			}
 		}
+		if policy.ResolveSettings != nil {
+			// Keep the authoritative command and deadline storage separate from
+			// the resolver's view. Only its six returned controls are adopted.
+			view := *request
+			if request.Command.Argv != nil {
+				view.Command.Argv = append([]string{}, request.Command.Argv...)
+			}
+			if request.ExpiresAt != nil {
+				value := *request.ExpiresAt
+				view.ExpiresAt = &value
+			}
+			if request.ApprovalExpiresAt != nil {
+				value := *request.ApprovalExpiresAt
+				view.ApprovalExpiresAt = &value
+			}
+			if request.ResolvedAt != nil {
+				value := *request.ResolvedAt
+				view.ResolvedAt = &value
+			}
+			settings, err := policy.ResolveSettings(&view, accepted.Decision)
+			if err != nil {
+				return fmt.Errorf("resolving current review settings: %w", err)
+			}
+			policy.ApprovalPolicy = settings.ApprovalPolicy
+			policy.ConflictResolution = settings.ConflictResolution
+			policy.TrustedSelfApprove = append([]string(nil), settings.TrustedSelfApprove...)
+			policy.TrustedSelfApproveDelay = settings.TrustedSelfApproveDelay
+			policy.ApprovalTTL = settings.ApprovalTTL
+			policy.CriticalApprovalTTL = settings.CriticalApprovalTTL
+		}
+		if err := policy.validate(); err != nil {
+			return err
+		}
+		if accepted.Decision == DecisionApprove {
+			if policy.ApprovalPolicy.Normalized() == ApprovalPolicyIndependent && !independentIdentityAttested() {
+				return ErrIndependentIdentityUnavailable
+			}
+			if request.ApprovalPolicy.Normalized() != policy.ApprovalPolicy.Normalized() {
+				return ErrReviewPolicyMismatch
+			}
+		}
 		// Source reads can wait too. Check expiry and timestamp the vote only
 		// after every current-identity and policy observation has completed.
 		now := time.Now().UTC()
-		if request.Status != StatusPending && request.Status != StatusEscalated {
+		if request.Status != StatusPending && request.Status != StatusEscalated &&
+			!(request.Status == StatusApproved && accepted.Decision == DecisionReject) {
 			return fmt.Errorf("%w: status is %s", ErrReviewNotPending, request.Status)
 		}
 		// Escalation explicitly reopens human review after a pending timeout.
@@ -290,6 +347,12 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 			return err
 		}
 		status := policy.resolvedStatus(request.MinApprovals, approvals, rejections, Decision(first))
+		if accepted.Decision == DecisionReject && request.Status != StatusApproved && status == StatusApproved {
+			// A changed conflict policy may make older approvals sufficient, but
+			// a negative vote cannot create or renew execution authority. Require
+			// a fresh affirmative review to resolve a non-approved request.
+			status = ""
+		}
 		outcome = &ReviewOutcome{Request: request, Review: &accepted, Approvals: approvals, Rejections: rejections}
 		if status != "" && status != request.Status {
 			if err := db.ResolveReviewTx(tx, request, status, policy.approvalTTL(request.RiskTier), now); err != nil {
@@ -401,11 +464,11 @@ func deriveDelegatedReviewKey(sourceSessionKey, targetProject, sourceProject, so
 }
 
 func (p ReviewPolicy) validate() error {
+	if err := p.validateBindings(); err != nil {
+		return err
+	}
 	if !p.ApprovalPolicy.Valid() {
 		return fmt.Errorf("unknown approval policy %q", p.ApprovalPolicy)
-	}
-	if !p.ExpectedApprovalPolicy.Valid() {
-		return fmt.Errorf("unknown expected approval policy %q", p.ExpectedApprovalPolicy)
 	}
 	switch p.ConflictResolution {
 	case "", "any_rejection_blocks", "first_wins", "human_breaks_tie":
@@ -414,6 +477,13 @@ func (p ReviewPolicy) validate() error {
 	}
 	if p.ApprovalTTL < 0 || p.CriticalApprovalTTL < 0 || p.TrustedSelfApproveDelay < 0 {
 		return fmt.Errorf("review policy durations must not be negative")
+	}
+	return nil
+}
+
+func (p ReviewPolicy) validateBindings() error {
+	if !p.ExpectedApprovalPolicy.Valid() {
+		return fmt.Errorf("unknown expected approval policy %q", p.ExpectedApprovalPolicy)
 	}
 	if p.DelegatedReviewer != nil {
 		d := p.DelegatedReviewer
@@ -473,14 +543,19 @@ func (p ReviewPolicy) resolvedStatus(quorum, approvals, rejections int, first De
 
 // ResolveReviewTx persists approval state and its expiry together. It must be
 // called in the same transaction that validated and wrote the decisive review.
-// It also supports pending -> escalated for human_breaks_tie, which the general
-// execution state machine intentionally does not offer.
+// It also supports review-only transitions to escalated and a late veto of an
+// unclaimed approval, which the general execution state machine does not offer.
 func (db *DB) ResolveReviewTx(tx *sql.Tx, request *Request, status RequestStatus, ttl time.Duration, now time.Time) error {
-	if request == nil || (request.Status != StatusPending && request.Status != StatusEscalated) ||
+	if request == nil || (request.Status != StatusPending && request.Status != StatusEscalated && request.Status != StatusApproved) ||
 		(status != StatusApproved && status != StatusRejected && status != StatusEscalated) {
 		return ErrInvalidTransition
 	}
-	var expiry *time.Time
+	if request.Status == StatusApproved && status == StatusApproved {
+		return ErrInvalidTransition
+	}
+	// A veto preserves the historical approval deadline. Status prevents its
+	// use; deleting the deadline would lose evidence of the previous grant.
+	expiry := request.ApprovalExpiresAt
 	if status == StatusApproved {
 		if ttl <= 0 {
 			return fmt.Errorf("approval TTL must be positive")

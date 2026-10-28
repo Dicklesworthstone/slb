@@ -93,7 +93,8 @@ func approveNativeCLIRequest(t *testing.T, database *db.DB, id string, reviewer 
 	if err := database.CreateReview(review); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.Exec("UPDATE requests SET status = 'approved', approval_expires_at = ? WHERE id = ?", now.Add(time.Hour).Format(time.RFC3339), id); err != nil {
+	if _, err := database.Exec("UPDATE requests SET status = 'approved', resolved_at = ?, approval_expires_at = ? WHERE id = ?",
+		now.Format(time.RFC3339), now.Add(time.Hour).Format(time.RFC3339), id); err != nil {
 		t.Fatal(err)
 	}
 }
