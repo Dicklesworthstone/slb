@@ -202,24 +202,13 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 	return result, false
 }
 
-// walkCaseSyntax includes parameter-slice arithmetic. The pinned syntax.Walk
-// traverses ParamExp.Index/Repl/Exp but omits Slice.Offset and Slice.Length,
-// which can also contain command substitutions (including in case selectors).
+// walkCaseSyntax walks every node, including parameter-slice arithmetic:
+// since mvdan.cc/sh v3.13, syntax.Walk itself visits ParamExp.Slice.Offset and
+// Slice.Length, which can contain command substitutions (including in case
+// selectors). A second, manual slice recursion would visit them twice.
+// TestWalkCaseSyntaxVisitsSliceOnce guards both directions.
 func walkCaseSyntax(root syntax.Node, visit func(syntax.Node) bool) {
-	syntax.Walk(root, func(node syntax.Node) bool {
-		if !visit(node) {
-			return false
-		}
-		if param, ok := node.(*syntax.ParamExp); ok && param.Slice != nil {
-			if param.Slice.Offset != nil {
-				walkCaseSyntax(param.Slice.Offset, visit)
-			}
-			if param.Slice.Length != nil {
-				walkCaseSyntax(param.Slice.Length, visit)
-			}
-		}
-		return true
-	})
+	syntax.Walk(root, visit)
 }
 
 // hereStringDataConsumers read a here-string as data and cannot execute it.

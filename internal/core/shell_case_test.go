@@ -5,7 +5,38 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"mvdan.cc/sh/v3/syntax"
 )
+
+// TestWalkCaseSyntaxVisitsSliceOnce pins the parser contract walkCaseSyntax
+// relies on: a command substitution in a parameter-slice offset or length is
+// visited exactly once. Zero means syntax.Walk no longer reaches slices (a
+// mvdan.cc/sh below v3.13), so slice commands would go unclassified; two means
+// a manual slice recursion was added back, duplicating segments.
+func TestWalkCaseSyntaxVisitsSliceOnce(t *testing.T) {
+	for _, src := range []string{
+		`echo "${x:$(rm -rf /)}"`,
+		`echo "${x:0:$(rm -rf /)}"`,
+		`case "${x:$(rm -rf /)}" in a) ls;; esac`,
+		`echo "${x:$(case a in a) rm -rf /;; esac)}"`,
+	} {
+		file, err := syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(src), "")
+		if err != nil {
+			t.Fatalf("parse %q: %v", src, err)
+		}
+		visits := 0
+		walkCaseSyntax(file, func(node syntax.Node) bool {
+			if _, ok := node.(*syntax.CmdSubst); ok {
+				visits++
+			}
+			return true
+		})
+		if visits != 1 {
+			t.Errorf("%s: command substitution visited %d times, want 1", src, visits)
+		}
+	}
+}
 
 func TestClassifyCaseStatements(t *testing.T) {
 	engine := NewPatternEngine()
