@@ -336,8 +336,7 @@ func TestHookStatusCommand_NotInstalled(t *testing.T) {
 
 	// Create a temp home to ensure nothing is installed
 	tmpHome := t.TempDir()
-	os.Setenv("HOME", tmpHome)
-	defer os.Unsetenv("HOME")
+	t.Setenv("HOME", tmpHome)
 
 	cmd := newTestHookCmd(h.DBPath)
 	stdout, err := executeCommandCapture(t, cmd, "hook", "status", "--global", "-j")
@@ -368,8 +367,7 @@ func TestHookStatusCommand_PartialInstall(t *testing.T) {
 
 	// Create temp home and generate script only
 	tmpHome := t.TempDir()
-	os.Setenv("HOME", tmpHome)
-	defer os.Unsetenv("HOME")
+	t.Setenv("HOME", tmpHome)
 
 	// Generate script
 	resetHookFlags()
@@ -410,8 +408,7 @@ func TestHookStatusCommand_FullyInstalled(t *testing.T) {
 
 	// Create temp home
 	tmpHome := t.TempDir()
-	os.Setenv("HOME", tmpHome)
-	defer os.Unsetenv("HOME")
+	t.Setenv("HOME", tmpHome)
 
 	// Install hook
 	installCmd := newTestHookCmd(h.DBPath)
@@ -450,8 +447,7 @@ func TestHookInstallCommand_CreatesSettingsFile(t *testing.T) {
 	resetHookFlags()
 
 	tmpHome := t.TempDir()
-	os.Setenv("HOME", tmpHome)
-	defer os.Unsetenv("HOME")
+	t.Setenv("HOME", tmpHome)
 
 	cmd := newTestHookCmd(h.DBPath)
 	stdout, err := executeCommandCapture(t, cmd, "hook", "install", "--global", "-j")
@@ -501,8 +497,7 @@ func TestHookInstallCommand_PreservesExistingHooks(t *testing.T) {
 	resetHookFlags()
 
 	tmpHome := t.TempDir()
-	os.Setenv("HOME", tmpHome)
-	defer os.Unsetenv("HOME")
+	t.Setenv("HOME", tmpHome)
 
 	// Create existing settings with another hook
 	claudeDir := filepath.Join(tmpHome, ".claude")
@@ -553,8 +548,7 @@ func TestHookUninstallCommand_RemovesHook(t *testing.T) {
 	resetHookFlags()
 
 	tmpHome := t.TempDir()
-	os.Setenv("HOME", tmpHome)
-	defer os.Unsetenv("HOME")
+	t.Setenv("HOME", tmpHome)
 
 	// First install
 	installCmd := newTestHookCmd(h.DBPath)
@@ -624,8 +618,7 @@ func TestHookUninstallCommand_NotInstalled(t *testing.T) {
 	resetHookFlags()
 
 	tmpHome := t.TempDir()
-	os.Setenv("HOME", tmpHome)
-	defer os.Unsetenv("HOME")
+	t.Setenv("HOME", tmpHome)
 
 	cmd := newTestHookCmd(h.DBPath)
 	stdout, err := executeCommandCapture(t, cmd, "hook", "uninstall", "--global", "-j")
@@ -648,8 +641,7 @@ func TestHookInstallCommand_Idempotent(t *testing.T) {
 	resetHookFlags()
 
 	tmpHome := t.TempDir()
-	os.Setenv("HOME", tmpHome)
-	defer os.Unsetenv("HOME")
+	t.Setenv("HOME", tmpHome)
 
 	// Install twice
 	cmd1 := newTestHookCmd(h.DBPath)

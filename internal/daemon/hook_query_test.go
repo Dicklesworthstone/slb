@@ -157,7 +157,7 @@ func TestIPCServer_HookQuery_SafeCommand(t *testing.T) {
 }
 
 func TestIPCServer_HookQuery_DangerousCommand(t *testing.T) {
-	t.Parallel()
+	t.Setenv("HOME", t.TempDir())
 
 	socketPath := filepath.Join(shortSocketDir(t), "hq3.sock")
 	srv, err := NewIPCServer(socketPath, newTestLogger())
@@ -221,7 +221,7 @@ func TestIPCServer_HookQuery_DangerousCommand(t *testing.T) {
 }
 
 func TestIPCServer_HookQuery_CriticalCommand(t *testing.T) {
-	t.Parallel()
+	t.Setenv("HOME", t.TempDir())
 
 	socketPath := filepath.Join(shortSocketDir(t), "hq4.sock")
 	srv, err := NewIPCServer(socketPath, newTestLogger())
