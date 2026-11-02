@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
 	_ "modernc.org/sqlite" // Pure Go SQLite driver
 )
 
@@ -175,6 +176,8 @@ func OpenAndMigrate(path string) (*DB, error) {
 // creating it. An uninitialized directory may create its first database, but
 // an existing marker with missing or unreadable state may have lost custom
 // policy and must be repaired or explicitly initialized before ordinary use.
+// slb's per-user directory without state.db is no such marker: the home
+// directory is then uninitialized, as it is when ~/.slb does not exist.
 func ProjectDatabasePath(project string) (string, error) {
 	if project == "" {
 		return "", fmt.Errorf("project directory is required")
@@ -192,6 +195,11 @@ func ProjectDatabasePath(project string) (string, error) {
 	}
 	if !info.IsDir() {
 		return "", fmt.Errorf("project state path %q is not a directory", marker)
+	}
+	if userDir, err := config.IsUserDirWithoutState(marker); err != nil {
+		return "", fmt.Errorf("reading project state directory: %w", err)
+	} else if userDir {
+		return path, nil
 	}
 	info, err = os.Stat(path)
 	if err != nil {

@@ -267,6 +267,11 @@ func (c *hookPolicyCache) policyFor(cwd string) (hookPolicy, error) {
 		hasState = false
 	} else if err != nil {
 		return hookPolicy{}, err
+	} else if userDir, err := config.IsUserDirWithoutState(filepath.Join(root, ".slb")); err != nil {
+		return hookPolicy{}, err
+	} else if userDir {
+		// slb's per-user directory without state.db is not a project.
+		hasState = false
 	}
 	statePath := ""
 	if hasState {

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/charmbracelet/log"
 )
 
@@ -148,7 +149,8 @@ func projectRuntimePath(cwd, extension string) string {
 // returns the absolute path of the directory containing it. Returns the
 // absolute input directory if no .slb/ ancestor is
 // found, so installations without an `slb init` still behave the
-// pre-existing way.
+// pre-existing way. slb's per-user directory without state.db is not a
+// project marker (config.IsUserDirWithoutState), as in PhysicalProjectRootForCWD.
 func ProjectRootForCWD(start string) string {
 	abs, err := filepath.Abs(start)
 	if err != nil {
@@ -156,8 +158,11 @@ func ProjectRootForCWD(start string) string {
 	}
 	dir := abs
 	for {
-		if info, err := os.Stat(filepath.Join(dir, ".slb")); err == nil && info.IsDir() {
-			return dir
+		marker := filepath.Join(dir, ".slb")
+		if info, err := os.Stat(marker); err == nil && info.IsDir() {
+			if userDir, err := config.IsUserDirWithoutState(marker); err != nil || !userDir {
+				return dir
+			}
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
@@ -174,6 +179,9 @@ func ProjectRootForCWD(start string) string {
 // working directory. Resolve aliases before ancestor discovery so an alias into
 // another project's descendant cannot select its lexical parent's policy.
 // Approval records keep their literal paths through ProjectRootForCWD instead.
+// slb's per-user directory (~/.slb) without state.db marks no project, so the
+// walk continues past it; any other .slb directory is the project's marker,
+// and its missing state is refused by the callers.
 func PhysicalProjectRootForCWD(cwd string) (string, error) {
 	if !filepath.IsAbs(cwd) {
 		return "", fmt.Errorf("project working directory must be absolute")
@@ -199,7 +207,13 @@ func PhysicalProjectRootForCWD(cwd string) (string, error) {
 			if !info.IsDir() {
 				return "", fmt.Errorf("project state path %q is not a directory", marker)
 			}
-			return dir, nil
+			userDir, err := config.IsUserDirWithoutState(marker)
+			if err != nil {
+				return "", fmt.Errorf("reading project state directory: %w", err)
+			}
+			if !userDir {
+				return dir, nil
+			}
 		} else if !os.IsNotExist(err) {
 			return "", fmt.Errorf("finding project state directory: %w", err)
 		}

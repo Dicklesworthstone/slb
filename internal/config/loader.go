@@ -284,12 +284,54 @@ func ConfigPaths(projectDir, configOverride string) (string, string) {
 	return userConfigPath(), projectConfigPath(projectDir, configOverride)
 }
 
-func userConfigPath() string {
+// UserDir returns slb's per-user directory, ~/.slb. It holds the user
+// config.toml, daemon.log, history.db, generated hooks and audit records.
+func UserDir() (string, error) {
 	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".slb"), nil
+}
+
+// IsUserDirWithoutState reports whether marker, an existing ".slb" directory,
+// is slb's own per-user directory (UserDir) and holds no state.db. Such a
+// directory marks no project: its daemon.log, config.toml, hooks or audit
+// records must not turn the home directory into an initialized project whose
+// missing database blocks everything beneath it. The directories are compared
+// physically (symlinks followed), so an aliased home matches too. When the
+// user directory cannot be read, marker is not treated as it, and callers keep
+// refusing a marker without state.
+func IsUserDirWithoutState(marker string) (bool, error) {
+	userDir, err := UserDir()
+	if err != nil {
+		return false, nil
+	}
+	userInfo, err := os.Stat(userDir)
+	if err != nil {
+		return false, nil
+	}
+	info, err := os.Stat(marker)
+	if err != nil {
+		return false, err
+	}
+	if !os.SameFile(info, userInfo) {
+		return false, nil
+	}
+	if _, err := os.Lstat(filepath.Join(marker, "state.db")); err == nil {
+		return false, nil
+	} else if !os.IsNotExist(err) {
+		return false, err
+	}
+	return true, nil
+}
+
+func userConfigPath() string {
+	dir, err := UserDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".slb", "config.toml")
+	return filepath.Join(dir, "config.toml")
 }
 
 func projectConfigPath(projectDir, override string) string {

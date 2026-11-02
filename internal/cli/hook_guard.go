@@ -282,8 +282,15 @@ func classifyNativeHookFallback(command, cwd string) (*daemon.HookQueryResult, e
 		return nil, statErr
 	} else if _, markerErr := os.Stat(filepath.Join(root, ".slb")); markerErr == nil {
 		// An initialized project's missing database is unavailable policy, not
-		// permission to discard its custom rules and use defaults.
-		return nil, statErr
+		// permission to discard its custom rules and use defaults. slb's
+		// per-user directory without state.db is not an initialized project.
+		userDir, err := config.IsUserDirWithoutState(filepath.Join(root, ".slb"))
+		if err != nil {
+			return nil, err
+		}
+		if !userDir {
+			return nil, statErr
+		}
 	} else if !os.IsNotExist(markerErr) {
 		return nil, markerErr
 	}

@@ -130,7 +130,10 @@ Default foreground, background, and emergency logs belong to the owning project'
 separate nested project. An existing nested `.slb` marks a project boundary;
 malformed or inaccessible markers and missing policy databases cause an error,
 instead of silently creating another database or using a home history store.
-An explicit `--db` still selects the requested database.
+An explicit `--db` still selects the requested database. The exception is slb's
+own user directory, `~/.slb` (user `config.toml`, `daemon.log`, hooks and audit
+records): it marks a project only when it holds a `state.db`, so until then
+directories under your home are discovered as if it were absent.
 
 Discovery follows filesystem aliases before selecting policy. Existing literal
 project aliases are retained when they identify that same physical root; an alias
