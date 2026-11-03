@@ -19,6 +19,34 @@ from typing import Optional
 SLB_TIMEOUT = 0.05
 
 
+# Both project walks here, _project_root_for_approval and _execution_paths,
+# mirror the rule of Go's daemon.ProjectRootForCWD (PhysicalProjectRootForCWD
+# for physical paths): the nearest .slb marks the project, except slb's own
+# ~/.slb while it holds no state.db.
+def _is_user_dir_without_state(marker: str) -> bool:
+    """Mirror config.IsUserDirWithoutState: slb's own ~/.slb marks no project until it holds state.db.
+
+    The home comes from the variable Go's os.UserHomeDir reads; directories are
+    compared physically, so an aliased home matches. Any error keeps the marker."""
+    home = os.environ.get("USERPROFILE" if os.name == "nt" else "HOME", "")
+    if not home:
+        return False
+    try:
+        user_info = os.stat(os.path.join(home, ".slb"))
+        marker_info = os.stat(marker)
+    except (OSError, ValueError):
+        return False
+    if not os.path.samestat(marker_info, user_info):
+        return False
+    try:
+        os.lstat(os.path.join(marker, "state.db"))
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
 def _project_root_for_approval(start: str) -> str:
     """Preserve the path spelling bound to existing approval records."""
     try:
@@ -26,7 +54,8 @@ def _project_root_for_approval(start: str) -> str:
     except (OSError, ValueError):
         return start
     while True:
-        if os.path.isdir(os.path.join(path, ".slb")):
+        marker = os.path.join(path, ".slb")
+        if os.path.isdir(marker) and not _is_user_dir_without_state(marker):
             return path
         parent = os.path.dirname(path)
         if parent == path:
@@ -228,7 +257,8 @@ def _execution_paths(cwd, database_path):
         else:
             if not os.path.isdir(marker):
                 raise ValueError("invalid project state directory")
-            break
+            if not _is_user_dir_without_state(marker):
+                break
         parent = os.path.dirname(root)
         if parent == root:
             root = physical_cwd

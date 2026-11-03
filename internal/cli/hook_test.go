@@ -3,6 +3,8 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net"
 	"os"
@@ -959,21 +961,13 @@ func TestHookGenerateCommand_SocketPathWalksUpToProjectRoot(t *testing.T) {
 		t.Errorf("regression #3: _project_root_for_socket(%q) = %q, want project root %q", nested, got, root)
 	}
 	// The fallback is the start dir unless the host itself has a .slb
-	// directory somewhere above the temp dir; mirror the walk in Go.
+	// directory somewhere above the temp dir that marks a project; the Go
+	// walk decides, including its rule for a stateless ~/.slb.
 	physicalLoose, err := filepath.EvalSymlinks(loose)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantLoose := physicalLoose
-	for dir := physicalLoose; ; dir = filepath.Dir(dir) {
-		if info, err := os.Stat(filepath.Join(dir, ".slb")); err == nil && info.IsDir() {
-			wantLoose = dir
-			break
-		}
-		if filepath.Dir(dir) == dir {
-			break
-		}
-	}
+	wantLoose := daemon.ProjectRootForCWD(physicalLoose)
 	if len(lines) == 2 && lines[1] != wantLoose {
 		t.Errorf("_project_root_for_socket without .slb in the fixture = %q, want %q", lines[1], wantLoose)
 	}
@@ -1031,6 +1025,97 @@ func TestHookGenerateCommand_SymlinkSocketParity(t *testing.T) {
 	if sockets[4] == sockets[0] {
 		t.Fatal("nested project incorrectly shares its parent socket")
 	}
+}
+
+// A ~/.slb without state.db (daemon.log, config.toml, hooks or audit records
+// only) marks no project for the generated fallback either, as for the Go
+// walk; once it holds state.db the home owns its uninitialized descendants,
+// and any other .slb stays a marker. Each row also names its root, so both
+// sides missing the rule cannot pass.
+func TestHookGenerateCommand_UserDirSocketParity(t *testing.T) {
+	h := testutil.NewHarness(t)
+	resetHookFlags()
+	t.Cleanup(resetHookFlags)
+	scriptDir := t.TempDir()
+	cmd := newTestHookCmd(h.DBPath)
+	if _, err := executeCommandCapture(t, cmd, "hook", "generate", "--output-dir", scriptDir, "-j"); err != nil {
+		t.Fatal(err)
+	}
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for dir := filepath.Dir(home); ; dir = filepath.Dir(dir) {
+		if info, err := os.Stat(filepath.Join(dir, ".slb")); err == nil && info.IsDir() {
+			t.Skipf("ancestor %s contains a .slb directory; the rows below assume none above the fake home", dir)
+		}
+		if filepath.Dir(dir) == dir {
+			break
+		}
+	}
+	work := filepath.Join(home, "work")
+	sub := filepath.Join(work, "sub")
+	foreign := filepath.Join(home, "other")
+	foreignSub := filepath.Join(foreign, "x")
+	for _, dir := range []string{sub, filepath.Join(home, ".slb"), filepath.Join(foreign, ".slb"), foreignSub} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, file := range []string{filepath.Join(home, ".slb", "daemon.log"), filepath.Join(foreign, ".slb", "daemon.log")} {
+		if err := os.WriteFile(file, nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alias := filepath.Join(t.TempDir(), "work-alias")
+	if err := os.Symlink(work, alias); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("creating symlinks requires Windows developer mode or privilege: %v", err)
+		}
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	socketFor := func(root string) string {
+		sum := sha256.Sum256([]byte(root))
+		return filepath.Join(os.TempDir(), "slb-"+hex.EncodeToString(sum[:])[:12]+".sock")
+	}
+	check := func(stage string, rows [][2]string) {
+		t.Helper()
+		paths := make([]string, len(rows))
+		for i, row := range rows {
+			paths[i] = row[0]
+		}
+		stdout := runGeneratedHookPython(t, filepath.Join(scriptDir, "slb_guard.py"),
+			"import json\nprint(json.dumps([g['get_socket_path'](path) for path in sys.argv[2:]]))", paths...)
+		var sockets []string
+		if err := json.Unmarshal([]byte(stdout), &sockets); err != nil || len(sockets) != len(paths) {
+			t.Fatalf("%s: invalid generated socket results: %q, %v", stage, stdout, err)
+		}
+		for i, row := range rows {
+			want := socketFor(row[1])
+			if goSocket := daemon.SocketPathForCWD(row[0]); goSocket != want {
+				t.Errorf("%s: Go socket for %q = %q, want root %q (%q)", stage, row[0], goSocket, row[1], want)
+			}
+			if sockets[i] != want {
+				t.Errorf("%s: Python socket for %q = %q, want root %q (%q)", stage, row[0], sockets[i], row[1], want)
+			}
+		}
+	}
+	check("stateless ~/.slb", [][2]string{
+		{sub, sub},
+		{home, home},
+		{alias, work},
+		{foreignSub, foreign},
+	})
+	if err := os.WriteFile(filepath.Join(home, ".slb", "state.db"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	check("~/.slb with state.db", [][2]string{
+		{sub, home},
+		{home, home},
+		{alias, home},
+		{foreignSub, foreign},
+	})
 }
 
 // Regression for the integration gap caught while reviewing #2/#5:
