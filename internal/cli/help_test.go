@@ -208,14 +208,19 @@ func TestShowQuickReference(t *testing.T) {
 	oldStdout := os.Stdout
 	r, w, _ := os.Pipe()
 	os.Stdout = w
+	var buf bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		io.Copy(&buf, r)
+		close(done)
+	}()
 
 	showQuickReference()
 
 	w.Close()
 	os.Stdout = oldStdout
 
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
+	<-done
 	output := buf.String()
 
 	// Should produce non-empty output
@@ -248,14 +253,19 @@ func TestShowQuickReference_NonUnicode(t *testing.T) {
 	oldStdout := os.Stdout
 	r, w, _ := os.Pipe()
 	os.Stdout = w
+	var buf bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		io.Copy(&buf, r)
+		close(done)
+	}()
 
 	showQuickReference()
 
 	w.Close()
 	os.Stdout = oldStdout
 
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
+	<-done
 	output := buf.String()
 
 	// Should still produce output

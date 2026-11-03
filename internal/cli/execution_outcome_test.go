@@ -200,8 +200,8 @@ func TestRunSafeJSONPreservesOutputAndFailures(t *testing.T) {
 	}
 }
 
-// Output is deliberately tiny, so a synchronous pipe capture cannot fill its
-// buffer. The caller returns normally even on failure, exercising defer-safe
+// The pipe is drained while run executes, so output of any size is captured.
+// The caller returns normally even on failure, exercising defer-safe
 // handler behavior rather than terminating the test process with os.Exit.
 func captureSafeExecution(t *testing.T, run func() (int, error)) (string, int, error) {
 	t.Helper()
@@ -214,14 +214,21 @@ func captureSafeExecution(t *testing.T, run func() (int, error)) (string, int, e
 	previous := os.Stdout
 	os.Stdout = w
 	defer func() { os.Stdout = previous }()
+	var data strings.Builder
+	var readErr error
+	done := make(chan struct{})
+	go func() {
+		_, readErr = io.Copy(&data, r)
+		close(done)
+	}()
 	code, runErr := run()
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
 	os.Stdout = previous
-	data, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatal(err)
+	<-done
+	if readErr != nil {
+		t.Fatal(readErr)
 	}
-	return string(data), code, runErr
+	return data.String(), code, runErr
 }

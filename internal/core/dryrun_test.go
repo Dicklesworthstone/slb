@@ -122,13 +122,21 @@ func TestRunCommand_StreamOptional(t *testing.T) {
 	}
 	os.Stdout = w
 	defer func() { os.Stdout = oldStdout }()
+	var captured bytes.Buffer
+	var readErr error
+	done := make(chan struct{})
+	go func() {
+		_, readErr = io.Copy(&captured, r)
+		close(done)
+	}()
 
 	_, err = RunCommand(context.Background(), spec, logPath, nil)
 	_ = w.Close()
 	os.Stdout = oldStdout
 
-	b, readErr := io.ReadAll(r)
+	<-done
 	_ = r.Close()
+	b := captured.Bytes()
 	if readErr != nil {
 		t.Fatalf("read stdout pipe: %v", readErr)
 	}

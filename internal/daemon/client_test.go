@@ -1102,16 +1102,24 @@ func captureStderr(t *testing.T, fn func()) string {
 		os.Stderr = old
 	}()
 
+	var b strings.Builder
+	var readErr error
+	done := make(chan struct{})
+	go func() {
+		_, readErr = io.Copy(&b, r)
+		close(done)
+	}()
+
 	fn()
 
 	_ = w.Close()
 	os.Stderr = old
 
-	b, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatalf("read stderr: %v", err)
+	<-done
+	if readErr != nil {
+		t.Fatalf("read stderr: %v", readErr)
 	}
-	return string(b)
+	return b.String()
 }
 
 // Helper functions

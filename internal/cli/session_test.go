@@ -28,13 +28,21 @@ func captureStdout(t *testing.T, fn func()) string {
 	}
 	os.Stdout = w
 
+	// Drain while fn runs: reading only afterwards deadlocks once fn's
+	// output fills the pipe buffer.
+	var buf bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		io.Copy(&buf, r)
+		close(done)
+	}()
+
 	fn()
 
 	w.Close()
 	os.Stdout = oldStdout
 
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
+	<-done
 	return buf.String()
 }
 
@@ -662,6 +670,12 @@ func TestSessionTextOutput(t *testing.T) {
 	oldStderr := os.Stderr
 	r, w, _ := os.Pipe()
 	os.Stderr = w
+	var stderrBuf bytes.Buffer
+	stderrDone := make(chan struct{})
+	go func() {
+		io.Copy(&stderrBuf, r)
+		close(stderrDone)
+	}()
 
 	_, err := executeCommandCapture(t, cmd, "session", "start",
 		"-a", "TextAgent",
@@ -674,8 +688,7 @@ func TestSessionTextOutput(t *testing.T) {
 	w.Close()
 	os.Stderr = oldStderr
 
-	var stderrBuf bytes.Buffer
-	io.Copy(&stderrBuf, r)
+	<-stderrDone
 	stderr := stderrBuf.String()
 
 	if err != nil {
@@ -705,14 +718,18 @@ func executeCommandWithStderr(root *cobra.Command, args ...string) (stdout strin
 	oldStderr := os.Stderr
 	r, w, _ := os.Pipe()
 	os.Stderr = w
+	var capturedStderr bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		capturedStderr.ReadFrom(r)
+		close(done)
+	}()
 
 	err = root.Execute()
 
 	w.Close()
 	os.Stderr = oldStderr
-
-	var capturedStderr bytes.Buffer
-	capturedStderr.ReadFrom(r)
+	<-done
 
 	return stdoutBuf.String(), stderrBuf.String() + capturedStderr.String(), err
 }
