@@ -11,11 +11,23 @@ import (
 	"strings"
 )
 
-// TOONBinaryName is the name of the TOON encoder/decoder binary.
-// The toon_rust CLI is installed as "tru" to avoid coreutils "tr".
+// TOONBinaryName is the name older toon_rust installs use for the TOON
+// encoder/decoder ("tru", chosen to avoid coreutils "tr"). It is searched
+// first; see toonBinaryNames.
 const TOONBinaryName = "tru"
 
-// findTOONBinary searches for the tru binary in common locations.
+// toonBinaryNames are the names searched for the toon_rust CLI, in order. The
+// crate is "tru" (cargo install tru), and since toon_rust v0.2.0 the binary it
+// installs is named "toon".
+var toonBinaryNames = []string{TOONBinaryName, "toon"}
+
+// toonInstallHint says how to get the toon_rust CLI. The crate is "tru"; the
+// crates.io crate named toon_rust is a different project.
+const toonInstallHint = `install with: cargo install tru (the toon_rust CLI, binary "toon") or set TOON_TRU_BIN/TOON_BIN`
+
+// findTOONBinary searches for the toon_rust CLI: the environment variables
+// first, then each name in toonBinaryNames on PATH, then each name in the
+// common locations. PATH comes first because it is what the user chose to run.
 func findTOONBinary() (string, error) {
 	if envPath, err := toonBinaryFromEnv(); err != nil {
 		return "", err
@@ -23,31 +35,32 @@ func findTOONBinary() (string, error) {
 		return envPath, nil
 	}
 
-	// Check PATH
-	if path, err := exec.LookPath(TOONBinaryName); err == nil {
-		if isToonRustBinary(path) {
+	for _, name := range toonBinaryNames {
+		if path, err := exec.LookPath(name); err == nil && isToonRustBinary(path) {
 			return path, nil
 		}
 	}
 
-	// Check common locations
 	home, _ := os.UserHomeDir()
-	commonPaths := []string{
-		filepath.Join(home, ".local", "bin", TOONBinaryName),
-		filepath.Join(home, "bin", TOONBinaryName),
-		"/usr/local/bin/" + TOONBinaryName,
+	commonDirs := []string{
+		filepath.Join(home, ".local", "bin"),
+		filepath.Join(home, "bin"),
+		"/usr/local/bin",
 		// Development locations
-		"/data/projects/toon_rust/target/release/" + TOONBinaryName,
-		"/data/projects/toon_rust/target/debug/" + TOONBinaryName,
+		"/data/projects/toon_rust/target/release",
+		"/data/projects/toon_rust/target/debug",
 	}
 
-	for _, path := range commonPaths {
-		if _, err := os.Stat(path); err == nil && isToonRustBinary(path) {
-			return path, nil
+	for _, name := range toonBinaryNames {
+		for _, dir := range commonDirs {
+			path := filepath.Join(dir, name)
+			if _, err := os.Stat(path); err == nil && isToonRustBinary(path) {
+				return path, nil
+			}
 		}
 	}
 
-	return "", fmt.Errorf("tru binary not found; install with: cargo install toon_rust or set TOON_TRU_BIN/TOON_BIN")
+	return "", fmt.Errorf("toon_rust CLI not found (looked for tru and toon); %s", toonInstallHint)
 }
 
 // TOONAvailable returns true if the TOON binary is available.
@@ -69,7 +82,7 @@ func EncodeTOON(data any) (string, error) {
 		return "", fmt.Errorf("JSON marshal failed: %w", err)
 	}
 
-	// Call tru binary to encode
+	// Call the toon_rust CLI to encode
 	cmd := exec.Command(binPath, "-e")
 	cmd.Stdin = bytes.NewReader(jsonBytes)
 
@@ -78,7 +91,7 @@ func EncodeTOON(data any) (string, error) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("tru encode failed: %s: %w", stderr.String(), err)
+		return "", fmt.Errorf("toon_rust encode failed: %s: %w", stderr.String(), err)
 	}
 
 	return stdout.String(), nil
@@ -91,7 +104,7 @@ func DecodeTOON(toonStr string) (any, error) {
 		return nil, err
 	}
 
-	// Call tru binary to decode
+	// Call the toon_rust CLI to decode
 	cmd := exec.Command(binPath, "-d")
 	cmd.Stdin = bytes.NewReader([]byte(toonStr))
 
@@ -100,7 +113,7 @@ func DecodeTOON(toonStr string) (any, error) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("tru decode failed: %s: %w", stderr.String(), err)
+		return nil, fmt.Errorf("toon_rust decode failed: %s: %w", stderr.String(), err)
 	}
 
 	// Parse the resulting JSON
@@ -116,7 +129,7 @@ func toonBinaryFromEnv() (string, error) {
 	for _, env := range []string{"TOON_TRU_BIN", "TOON_BIN", "TRU_PATH"} {
 		if val := strings.TrimSpace(os.Getenv(env)); val != "" {
 			if !isToonRustBinary(val) {
-				return "", fmt.Errorf("%s=%q does not appear to be toon_rust (expected tru binary)", env, val)
+				return "", fmt.Errorf("%s=%q does not appear to be the toon_rust CLI (tru or toon); %s", env, val, toonInstallHint)
 			}
 			return val, nil
 		}
@@ -124,19 +137,23 @@ func toonBinaryFromEnv() (string, error) {
 	return "", nil
 }
 
+// isToonRustBinary reports whether path is the toon_rust CLI. Identity comes
+// from the binary's own output, never from its name alone, because the name
+// "toon" is shared by toon_rust (since v0.2.0) and the Node.js toon-format CLI,
+// which is not allowed as the TOON backend. toon_rust's --help says
+// "reference implementation in Rust"; the Node.js CLI never does, and neither
+// does coreutils `tr`.
 func isToonRustBinary(path string) bool {
-	// Distinguish toon_rust from:
-	// - system `tr` (coreutils)
-	// - the Node.js `toon` CLI (toon-format), which is not allowed here
-	base := strings.ToLower(filepathBase(path))
-	if base == "toon" || base == "toon.exe" {
-		// Never accept (or invoke) the Node.js encoder as the TOON backend.
-		return false
-	}
 	helpOut, _ := exec.Command(path, "--help").CombinedOutput()
 	helpLower := strings.ToLower(string(helpOut))
 	if strings.Contains(helpLower, "reference implementation in rust") {
 		return true
+	}
+
+	// A binary named "toon" is accepted only through the help text above, so
+	// the Node.js CLI stays refused whatever its --version prints.
+	if base := strings.ToLower(filepathBase(path)); base == "toon" || base == "toon.exe" {
+		return false
 	}
 
 	verOut, _ := exec.Command(path, "--version").CombinedOutput()
