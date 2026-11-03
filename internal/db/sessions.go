@@ -386,7 +386,7 @@ func (db *DB) FindStaleSessions(threshold time.Duration) ([]*Session, error) {
 }
 
 // FindStaleProjectSessions uses the same fixed cutoff as conditional cleanup.
-func (db *DB) FindStaleProjectSessions(project string, cutoff time.Time) ([]*Session, error) {
+func (db *DB) FindStaleProjectSessions(project string, cutoff time.Time) (_ []*Session, err error) {
 	if project == "" || cutoff.IsZero() {
 		return nil, fmt.Errorf("project and stale cutoff are required")
 	}
@@ -399,7 +399,11 @@ func (db *DB) FindStaleProjectSessions(project string, cutoff time.Time) ([]*Ses
 	if err != nil {
 		return nil, fmt.Errorf("finding stale project sessions: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
 	return scanSessions(rows)
 }
 

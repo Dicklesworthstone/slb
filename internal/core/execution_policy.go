@@ -57,12 +57,16 @@ func loadCommandPolicy(reader PolicyReader, opts config.LoadOptions) (*PatternEn
 
 // ReadCustomPatterns returns the persisted custom rules in stored order,
 // uncompiled. Only Tier, Pattern, Description and Source are set.
-func ReadCustomPatterns(reader PolicyReader) ([]Pattern, error) {
+func ReadCustomPatterns(reader PolicyReader) (_ []Pattern, err error) {
 	rows, err := reader.Query(`SELECT tier, pattern, COALESCE(description, ''), COALESCE(source, '') FROM custom_patterns ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("reading custom command policy: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
 	var patterns []Pattern
 	for rows.Next() {
 		var p Pattern

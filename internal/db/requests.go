@@ -166,7 +166,7 @@ func (db *DB) ListPendingRequests(projectPath string) ([]*Request, error) {
 // accept review. An empty projectPath explicitly selects all projects. Keep
 // this separate from pending-only timer and quota queries: escalation reopens
 // peer/operator review, not automatic approval or a pending capacity slot.
-func (db *DB) ListReviewableRequests(projectPath string) ([]*Request, error) {
+func (db *DB) ListReviewableRequests(projectPath string) (_ []*Request, err error) {
 	rows, err := db.Query(`
 		SELECT id, project_path,
 			command_raw, command_argv_json, command_cwd, command_shell, command_hash,
@@ -187,7 +187,11 @@ func (db *DB) ListReviewableRequests(projectPath string) ([]*Request, error) {
 	if err != nil {
 		return nil, fmt.Errorf("querying reviewable requests: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
 	return scanRequests(rows)
 }
 

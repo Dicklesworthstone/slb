@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -117,8 +118,10 @@ Examples:
 			if err != nil {
 				return fmt.Errorf("opening emergency ledger: %w", err)
 			}
-			defer database.Close()
 			records, err := database.ListEmergencyExecutions(selected)
+			if closeErr := database.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
 			if err != nil {
 				return err
 			}

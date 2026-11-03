@@ -281,7 +281,7 @@ func (db *DB) GetEmergencyExecution(id string) (*EmergencyExecution, error) {
 	return scanEmergencyExecution(db.QueryRow(selectEmergencyExecution+` WHERE id = ?`, id))
 }
 
-func (db *DB) ListEmergencyExecutions(filter EmergencyExecutionFilter) ([]*EmergencyExecution, error) {
+func (db *DB) ListEmergencyExecutions(filter EmergencyExecutionFilter) (_ []*EmergencyExecution, err error) {
 	if !filepath.IsAbs(filter.ProjectPath) {
 		return nil, errors.New("emergency history requires an absolute project path")
 	}
@@ -329,7 +329,11 @@ func (db *DB) ListEmergencyExecutions(filter EmergencyExecutionFilter) ([]*Emerg
 	if err != nil {
 		return nil, fmt.Errorf("listing emergency executions: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
 	records := make([]*EmergencyExecution, 0)
 	for rows.Next() {
 		record, err := scanEmergencyExecution(rows)

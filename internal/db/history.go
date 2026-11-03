@@ -22,7 +22,7 @@ type RequestHistoryFilter struct {
 // ListRequestHistory includes completed requests and never falls back to a
 // pending-only result when a search fails. All filters and the limit belong to
 // one query, so another project's traffic cannot hide matching history.
-func (db *DB) ListRequestHistory(filter RequestHistoryFilter) ([]*Request, error) {
+func (db *DB) ListRequestHistory(filter RequestHistoryFilter) (_ []*Request, err error) {
 	if strings.TrimSpace(filter.ProjectPath) == "" {
 		return nil, errors.New("history project is required")
 	}
@@ -83,6 +83,10 @@ func (db *DB) ListRequestHistory(filter RequestHistoryFilter) ([]*Request, error
 	if err != nil {
 		return nil, fmt.Errorf("querying request history: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
 	return scanRequests(rows)
 }

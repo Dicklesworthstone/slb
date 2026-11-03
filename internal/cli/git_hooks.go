@@ -150,7 +150,9 @@ func newNativeGitHookCmd(operation string) *cobra.Command {
 			return fmt.Errorf("SLB: %s (request %s). Review policy: %s. Review with 'slb review %s'; complete review under that policy, then retry Git. Do not use slb execute on this token", decision.Message, decision.RequestID, decision.ApprovalPolicyLabel, decision.RequestID)
 		}
 		if decision.RequestID != "" {
-			fmt.Fprintf(cmd.ErrOrStderr(), "SLB: consumed Git hook review %s (%s); Git's eventual outcome is not recorded by this hook.\n", decision.RequestID, decision.ApprovalPolicyLabel)
+			// The review is already consumed. Failing the hook over this notice
+			// would abort the approved Git operation and lose its approval.
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "SLB: consumed Git hook review %s (%s); Git's eventual outcome is not recorded by this hook.\n", decision.RequestID, decision.ApprovalPolicyLabel)
 		}
 		return nil // Native hooks never emit machine protocol on Git's stdout.
 	}

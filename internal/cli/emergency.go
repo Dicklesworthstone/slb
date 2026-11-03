@@ -67,7 +67,7 @@ Examples:
 To get the command hash for --ack, run:
   echo -n "your command" | sha256sum | cut -d' ' -f1`,
 	Args: cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
+	RunE: func(cmd *cobra.Command, args []string) (err error) {
 		command := args[0]
 
 		if strings.TrimSpace(command) == "" {
@@ -141,7 +141,11 @@ To get the command hash for --ack, run:
 		if err != nil {
 			return fmt.Errorf("opening database: %w", err)
 		}
-		defer dbConn.Close()
+		defer func() {
+			if closeErr := dbConn.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
+		}()
 
 		cfg, err := config.Load(config.LoadOptions{
 			ProjectDir: project,
@@ -171,7 +175,9 @@ To get the command hash for --ack, run:
 			if err != nil {
 				return fmt.Errorf("capturing emergency rollback state: %w", err)
 			} else if data == nil {
-				fmt.Fprintln(cmd.ErrOrStderr(), "warning: rollback capture unsupported for this command type")
+				if _, err := fmt.Fprintln(cmd.ErrOrStderr(), "warning: rollback capture unsupported for this command type"); err != nil {
+					return err
+				}
 			} else {
 				rollbackPath = data.RollbackPath
 			}

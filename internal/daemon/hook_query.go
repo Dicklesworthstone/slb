@@ -230,12 +230,16 @@ func customPatternsEqual(a, b []core.Pattern) bool {
 	return true
 }
 
-func readHookCustomPatterns(path string) ([]core.Pattern, error) {
+func readHookCustomPatterns(path string) (_ []core.Pattern, err error) {
 	conn, err := db.OpenWithOptions(path, db.OpenOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	defer func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
 	return core.ReadCustomPatterns(conn)
 }
 
@@ -430,7 +434,13 @@ func (s *IPCServer) classifyCommand(params HookQueryParams) *HookQueryResult {
 	if err != nil {
 		return result
 	}
-	defer conn.Close()
+	defer func() {
+		// classifyCommand has no error result: the decision stands, and the
+		// close failure is reported in the daemon log.
+		if closeErr := conn.Close(); closeErr != nil && s.logger != nil {
+			s.logger.Warn("closing hook approval lookup database", "error", closeErr)
+		}
+	}()
 	approved := findHookApproval(conn, engine, params, policy.projectRoot)
 	if approved == nil {
 		return result

@@ -105,12 +105,16 @@ func authenticateSessionRow(row *sql.Row, supplied string) (*Session, error) {
 // ActiveSessionKeyMatches reports whether supplied is the key of any active
 // session whose recorded project path inProject accepts. Every candidate
 // digest is compared in constant time.
-func (db *DB) ActiveSessionKeyMatches(inProject func(projectPath string) bool, supplied string) (bool, error) {
+func (db *DB) ActiveSessionKeyMatches(inProject func(projectPath string) bool, supplied string) (_ bool, err error) {
 	rows, err := db.Query(`SELECT project_path, session_key_digest FROM sessions WHERE ended_at IS NULL`)
 	if err != nil {
 		return false, sessionDigestReadError(err)
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
 	matched := false
 	for rows.Next() {
 		var projectPath string
