@@ -177,7 +177,7 @@ install() {
         if ! cp "${SLB_WORK_DIR}/${EXECUTABLE}" "${INSTALL_DIR}/${EXECUTABLE}"; then
             error "Could not copy release executable to destination"
         fi
-        if ! chmod +x "${INSTALL_DIR}/${EXECUTABLE}"; then
+        if ! chmod 0755 "${INSTALL_DIR}/${EXECUTABLE}"; then
             error "Could not make installed executable runnable"
         fi
     else
@@ -185,7 +185,7 @@ install() {
         if ! sudo cp "${SLB_WORK_DIR}/${EXECUTABLE}" "${INSTALL_DIR}/${EXECUTABLE}"; then
             error "Could not copy release executable to destination"
         fi
-        if ! sudo chmod +x "${INSTALL_DIR}/${EXECUTABLE}"; then
+        if ! sudo chmod 0755 "${INSTALL_DIR}/${EXECUTABLE}"; then
             error "Could not make installed executable runnable"
         fi
     fi
@@ -198,7 +198,12 @@ verify() {
     local installed="${INSTALL_DIR}/${EXECUTABLE}"
     [ -f "$installed" ] || error "Installed executable is missing: $installed"
     info "Verifying installation..."
-    if ! "$installed" version; then
+    # Run it from / so that a .slb directory above the caller's cwd is not taken as its project.
+    case "$installed" in
+        /* | [A-Za-z]:[/\\]*) ;;
+        *) installed="$(pwd -P)/${installed}" ;;
+    esac
+    if ! (cd / && "$installed" version); then
         error "Installed executable could not report its version"
     fi
     success "SLB installed successfully!"
