@@ -242,7 +242,7 @@ func (g *historyGit) validateRoot(ctx context.Context) error {
 	case "false":
 		root, err = g.run(ctx, nil, "rev-parse", "--show-toplevel")
 	default:
-		return errors.New("Git returned an invalid history repository type")
+		return errors.New("git returned an invalid history repository type")
 	}
 	if err != nil {
 		return fmt.Errorf("resolving history repository root: %w", err)
@@ -271,7 +271,7 @@ func (g *historyGit) readRef(ctx context.Context, ref string) (string, error) {
 	}
 	value = strings.TrimSpace(value)
 	if !historyObjectID(value) {
-		return "", errors.New("Git returned an invalid history object ID")
+		return "", errors.New("git returned an invalid history object ID")
 	}
 	kind, err := g.run(ctx, nil, "cat-file", "-t", value)
 	if err != nil {
@@ -361,7 +361,7 @@ func (g *historyGit) buildCommit(ctx context.Context, parent string, checkpoint 
 	}
 	tree = strings.TrimSpace(tree)
 	if !historyObjectID(tree) {
-		return "", errors.New("Git returned an invalid history tree ID")
+		return "", errors.New("git returned an invalid history tree ID")
 	}
 	args := []string{"commit-tree", "--no-gpg-sign", tree}
 	if parent != "" {
@@ -374,7 +374,7 @@ func (g *historyGit) buildCommit(ctx context.Context, parent string, checkpoint 
 	}
 	commit = strings.TrimSpace(commit)
 	if !historyObjectID(commit) {
-		return "", errors.New("Git returned an invalid history commit ID")
+		return "", errors.New("git returned an invalid history commit ID")
 	}
 	return commit, nil
 }
@@ -391,7 +391,7 @@ func (g *historyGit) addJSON(ctx context.Context, indexInfo *strings.Builder, pa
 	}
 	object = strings.TrimSpace(object)
 	if !historyObjectID(object) {
-		return errors.New("Git returned an invalid history blob ID")
+		return errors.New("git returned an invalid history blob ID")
 	}
 	_, _ = fmt.Fprintf(indexInfo, "100644 %s\t%s%c", object, path, byte(0))
 	return nil

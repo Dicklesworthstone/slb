@@ -443,10 +443,10 @@ func runGitResetPreview(ctx context.Context, plan gitResetPreviewPlan, cwd strin
 		}
 		oid := strings.TrimSpace(out)
 		if len(oid) != 40 && len(oid) != 64 {
-			return "", errors.New("Git reset preview did not resolve one commit")
+			return "", errors.New("git reset preview did not resolve one commit")
 		}
 		if _, err := hex.DecodeString(oid); err != nil {
-			return "", errors.New("Git reset preview returned an invalid commit ID")
+			return "", errors.New("git reset preview returned an invalid commit ID")
 		}
 		return oid, nil
 	}
@@ -470,7 +470,7 @@ func runGitResetPreview(ctx context.Context, plan gitResetPreviewPlan, cwd strin
 		}
 		root = strings.TrimSuffix(rootOutput, "\n")
 		if !filepath.IsAbs(root) || strings.IndexByte(root, 0) >= 0 {
-			return result, errors.New("Git reset preview did not resolve an absolute repository root")
+			return result, errors.New("git reset preview did not resolve an absolute repository root")
 		}
 		// Comparing working files can run clean/process filters even with
 		// --no-textconv. Decline that environment instead of executing a
@@ -480,12 +480,12 @@ func runGitResetPreview(ctx context.Context, plan gitResetPreviewPlan, cwd strin
 			return result, err
 		}
 		if strings.Contains(keys, "[SLB: output truncated;") {
-			return result, errors.New("Git configuration is too large to inspect safely")
+			return result, errors.New("git configuration is too large to inspect safely")
 		}
 		for _, key := range strings.Split(keys, "\n") {
 			key = strings.ToLower(strings.TrimSpace(key))
 			if strings.HasPrefix(key, "filter.") && (strings.HasSuffix(key, ".clean") || strings.HasSuffix(key, ".process")) {
-				return result, errors.New("Git reset preview declines configured clean/process filters; working-tree inspection could execute them")
+				return result, errors.New("git reset preview declines configured clean/process filters; working-tree inspection could execute them")
 			}
 		}
 		if !plan.noRecurse {
@@ -494,7 +494,7 @@ func runGitResetPreview(ctx context.Context, plan gitResetPreviewPlan, cwd strin
 				return result, err
 			}
 			if strings.TrimSpace(recurse) != "false" {
-				return result, errors.New("Git reset preview does not inspect recursive submodule changes; use an explicit nonrecursive command")
+				return result, errors.New("git reset preview does not inspect recursive submodule changes; use an explicit nonrecursive command")
 			}
 		}
 	}

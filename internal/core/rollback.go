@@ -1348,7 +1348,7 @@ func captureKubernetesRollback(ctx context.Context, rollbackDir string, req *db.
 			return nil, err
 		}
 		if int64(len(manifest)) > remaining || len(manifest) > maxKubernetesObjectBytes {
-			return nil, errors.New("Kubernetes rollback capture exceeds max size")
+			return nil, errors.New("kubernetes rollback capture exceeds max size")
 		}
 		remaining -= int64(len(manifest))
 		// Indexes avoid collisions between aliases, API groups or names that
@@ -1395,7 +1395,7 @@ func kubernetesConfigFiles(cwd, explicit string) ([]KubernetesConfigFile, error)
 		if homeDir, err := os.UserHomeDir(); err != nil {
 			return nil, err
 		} else if _, err := os.Stat(filepath.Join(homeDir, ".kube", "kuberc")); err == nil || !os.IsNotExist(err) {
-			return nil, errors.New("Kubernetes rollback requires kuberc preferences to be disabled")
+			return nil, errors.New("kubernetes rollback requires kuberc preferences to be disabled")
 		}
 	}
 	seen := map[string]bool{}
@@ -1425,14 +1425,14 @@ func kubernetesConfigFiles(cwd, explicit string) ([]KubernetesConfigFile, error)
 		}
 	}
 	if len(files) == 0 {
-		return nil, errors.New("Kubernetes rollback requires an explicit file-backed configuration")
+		return nil, errors.New("kubernetes rollback requires an explicit file-backed configuration")
 	}
 	return files, nil
 }
 
 func verifyKubernetesConfigFiles(files []KubernetesConfigFile) error {
 	if len(files) == 0 || len(files) > 32 {
-		return errors.New("Kubernetes rollback has no bound kubeconfig; recapture before execution")
+		return errors.New("kubernetes rollback has no bound kubeconfig; recapture before execution")
 	}
 	for _, file := range files {
 		if !filepath.IsAbs(file.Path) || len(file.SHA256) != sha256.Size*2 {
@@ -1505,7 +1505,7 @@ func runKubernetesCommand(ctx context.Context, cwd string, files []KubernetesCon
 		return nil, err
 	}
 	if limit <= 0 || limit > maxKubernetesObjectBytes {
-		return nil, errors.New("Kubernetes rollback capture exceeds max size")
+		return nil, errors.New("kubernetes rollback capture exceeds max size")
 	}
 	var paths []string
 	for _, file := range files {
@@ -1541,7 +1541,7 @@ func runKubernetesCommand(ctx context.Context, cwd string, files []KubernetesCon
 		return nil, fmt.Errorf("kubectl process failed: %w", errors.Join(ctx.Err(), err))
 	}
 	if stdout.omitted > 0 {
-		return nil, errors.New("Kubernetes rollback output exceeds max size")
+		return nil, errors.New("kubernetes rollback output exceeds max size")
 	}
 	return []byte(stdout.String()), nil
 }
@@ -1552,7 +1552,7 @@ func readKubernetesFile(name string, limit int64) ([]byte, error) {
 		return nil, err
 	}
 	if !info.Mode().IsRegular() || info.Size() > limit {
-		return nil, errors.New("Kubernetes recovery requires a bounded regular file")
+		return nil, errors.New("kubernetes recovery requires a bounded regular file")
 	}
 	file, err := os.Open(name)
 	if err != nil {
@@ -1560,14 +1560,14 @@ func readKubernetesFile(name string, limit int64) ([]byte, error) {
 	}
 	opened, statErr := file.Stat()
 	if statErr != nil || !opened.Mode().IsRegular() || opened.Size() > limit || !os.SameFile(info, opened) {
-		return nil, errors.Join(errors.New("Kubernetes recovery requires a bounded regular file"), statErr, file.Close())
+		return nil, errors.Join(errors.New("kubernetes recovery requires a bounded regular file"), statErr, file.Close())
 	}
 	contents, readErr := io.ReadAll(io.LimitReader(file, limit+1))
 	if err := errors.Join(readErr, file.Close()); err != nil {
 		return nil, err
 	}
 	if int64(len(contents)) > limit {
-		return nil, errors.New("Kubernetes recovery file exceeds max size")
+		return nil, errors.New("kubernetes recovery file exceeds max size")
 	}
 	return contents, nil
 }
@@ -1577,11 +1577,11 @@ func normalizeKubernetesManifest(contents []byte, namespace, expectedName string
 	decoder := json.NewDecoder(bytes.NewReader(contents))
 	decoder.UseNumber() // CRDs can contain int64 values beyond float64 precision.
 	if decoder.Decode(&resource) != nil {
-		return nil, errors.New("Kubernetes recovery requires one complete JSON object")
+		return nil, errors.New("kubernetes recovery requires one complete JSON object")
 	}
 	var trailing any
 	if decoder.Decode(&trailing) != io.EOF {
-		return nil, errors.New("Kubernetes recovery requires one complete JSON object")
+		return nil, errors.New("kubernetes recovery requires one complete JSON object")
 	}
 	apiVersion, _ := resource["apiVersion"].(string)
 	kind, _ := resource["kind"].(string)
@@ -1590,7 +1590,7 @@ func normalizeKubernetesManifest(contents []byte, namespace, expectedName string
 	objectNamespace, _ := metadata["namespace"].(string)
 	if apiVersion == "" || !kubernetesIdentifier(kind) || strings.HasSuffix(kind, "List") || !kubernetesIdentifier(name) ||
 		(expectedName != "" && name != expectedName) || (objectNamespace != "" && objectNamespace != namespace) {
-		return nil, errors.New("Kubernetes object identity differs from the captured target")
+		return nil, errors.New("kubernetes object identity differs from the captured target")
 	}
 	delete(resource, "status")
 	for _, key := range []string{"uid", "resourceVersion", "generation", "creationTimestamp", "deletionTimestamp", "deletionGracePeriodSeconds", "managedFields", "selfLink", "generateName"} {
@@ -1608,7 +1608,7 @@ func restoreKubernetesRollback(ctx context.Context, data *RollbackData, opts Rol
 	target := data.Kubernetes
 	if target == nil || target.Context == "" || target.Server == "" || target.Namespace == "" ||
 		len(target.Manifests) == 0 || len(target.Manifests) > maxKubernetesObjects {
-		return errors.New("Kubernetes snapshot lacks a bound target; recapture before execution")
+		return errors.New("kubernetes snapshot lacks a bound target; recapture before execution")
 	}
 	ctx, cancel := context.WithTimeout(ctx, 2*DefaultExecutionTimeout)
 	defer cancel()
@@ -1621,7 +1621,7 @@ func restoreKubernetesRollback(ctx context.Context, data *RollbackData, opts Rol
 		return err
 	}
 	if current.Server != target.Server || current.Context != target.Context || current.Namespace != target.Namespace {
-		return errors.New("Kubernetes target changed since capture")
+		return errors.New("kubernetes target changed since capture")
 	}
 	// Read and validate the ENTIRE snapshot before the first remote write.
 	// Passing these verified bytes on stdin also avoids a later path reread.
@@ -1651,7 +1651,7 @@ func restoreKubernetesRollback(ctx context.Context, data *RollbackData, opts Rol
 		}
 		digest := sha256.Sum256(contents)
 		if hex.EncodeToString(digest[:]) != target.ManifestSHA256[rel] {
-			return errors.New("Kubernetes manifest integrity check failed")
+			return errors.New("kubernetes manifest integrity check failed")
 		}
 		manifest, err := normalizeKubernetesManifest(contents, target.Namespace, "")
 		if err != nil {
@@ -1659,7 +1659,7 @@ func restoreKubernetesRollback(ctx context.Context, data *RollbackData, opts Rol
 		}
 		remaining -= int64(len(manifest))
 		if remaining < 0 {
-			return errors.New("Kubernetes recovery snapshot exceeds max size")
+			return errors.New("kubernetes recovery snapshot exceeds max size")
 		}
 		manifests = append(manifests, manifest)
 	}
