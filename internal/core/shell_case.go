@@ -184,7 +184,7 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 				if target != "-" && (fd == "" || strings.Trim(fd, "0123456789") != "") {
 					result.ParseError = true
 				}
-			case syntax.RdrOut, syntax.AppOut, syntax.RdrAll, syntax.AppAll, syntax.ClbOut, syntax.RdrInOut:
+			case syntax.RdrOut, syntax.AppOut, syntax.RdrAll, syntax.AppAll, syntax.RdrClob, syntax.RdrInOut:
 				target := raw[node.Word.Pos().Offset():node.Word.End().Offset()]
 				if target != "/dev/null" && target != "'/dev/null'" && target != `"/dev/null"` {
 					result.ParseError = true
