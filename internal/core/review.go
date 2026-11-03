@@ -425,7 +425,7 @@ func (rs *ReviewService) CanReview(sessionID, requestID string, decision db.Deci
 	if err != nil {
 		return false, fmt.Sprintf("request not found: %v", err)
 	}
-	if !CanApprove(request.Status) && !(request.Status == db.StatusApproved && decision == db.DecisionReject) {
+	if !CanApprove(request.Status) && (request.Status != db.StatusApproved || decision != db.DecisionReject) {
 		return false, fmt.Sprintf("request cannot be reviewed (status: %s)", request.Status)
 	}
 	if request.Status == db.StatusPending && request.ExpiresAt != nil && !time.Now().Before(*request.ExpiresAt) {

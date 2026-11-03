@@ -824,7 +824,7 @@ func stripRedirectedSubshell(seg string) (inner string, ok, discardOnly bool) {
 	}
 	rest := seg[end+1:]
 	if rest[0] != ' ' && rest[0] != '\t' && rest[0] != '<' && rest[0] != '>' &&
-		!(rest[0] == '&' && len(rest) > 1 && rest[1] == '>') {
+		(rest[0] != '&' || len(rest) <= 1 || rest[1] != '>') {
 		return "", false, false // `(a)b` is not a subshell followed by redirections
 	}
 	if strings.Contains(rest, "<<<") || strings.TrimSpace(stripRedirections(rest)) != "" {

@@ -935,9 +935,10 @@ func TestSameHostReviewIntegrationSignedSubmission(t *testing.T) {
 			database, request, sessions := reviewDecisionFixture(t, 1, ApprovalPolicySameHost)
 			reviewer := sessions[1]
 			at := time.Now().UTC().Truncate(time.Second)
-			if mode == "stale" {
+			switch mode {
+			case "stale":
 				at = at.Add(-6 * time.Minute)
-			} else if mode == "future" {
+			case "future":
 				at = at.Add(2 * time.Minute)
 			}
 			vote := &Review{RequestID: request.ID, ReviewerSessionID: reviewer.ID,

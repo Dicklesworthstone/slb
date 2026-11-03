@@ -125,7 +125,7 @@ func (a *feedAnalysis) addPayload(payload string) {
 // output exceptions. Input-only redirections do not create a write effect.
 func redirectionWritesFiles(redirect *syntax.Redirect) bool {
 	switch redirect.Op {
-	case syntax.RdrOut, syntax.AppOut, syntax.RdrAll, syntax.AppAll, syntax.ClbOut, syntax.RdrInOut:
+	case syntax.RdrOut, syntax.AppOut, syntax.RdrAll, syntax.AppAll, syntax.RdrClob, syntax.RdrInOut:
 		target, literal := staticWordValue(redirect.Word)
 		return !literal || target != "/dev/null"
 	case syntax.DplOut:

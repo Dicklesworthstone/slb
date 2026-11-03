@@ -1913,11 +1913,12 @@ func TestHookUnavailableSelectedPolicyPreservesInstallation(t *testing.T) {
 				t.Fatal(err)
 			}
 			selected := filepath.Join(h.ProjectDir, "unavailable.toml")
-			if kind == "directory" {
+			switch kind {
+			case "directory":
 				if err := os.Mkdir(selected, 0700); err != nil {
 					t.Fatal(err)
 				}
-			} else if kind == "malformed" {
+			case "malformed":
 				h.WriteFile("unavailable.toml", []byte("[general\n"), 0600)
 			}
 			for _, operation := range [][]string{{"install"}, {"generate", "--output-dir", filepath.Dir(scriptPath)}} {

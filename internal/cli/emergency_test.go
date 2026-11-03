@@ -564,11 +564,12 @@ func TestEmergencyExecutionPersistenceFailuresAreConservative(t *testing.T) {
 			trigger := `CREATE TRIGGER injected_emergency_failure BEFORE INSERT ON emergency_executions
 BEGIN SELECT RAISE(ABORT, 'injected emergency persistence failure'); END`
 			command := "printf child-ran > child-marker; printf observed-output"
-			if stage == "startup" {
+			switch stage {
+			case "startup":
 				trigger = `CREATE TRIGGER injected_emergency_failure BEFORE UPDATE OF started_at ON emergency_executions
 BEGIN SELECT RAISE(ABORT, 'injected emergency persistence failure'); END`
 				command = "sleep 30"
-			} else if stage == "completion" {
+			case "completion":
 				trigger = `CREATE TRIGGER injected_emergency_failure BEFORE UPDATE OF completed_at ON emergency_executions
 BEGIN SELECT RAISE(ABORT, 'injected emergency persistence failure'); END`
 			}

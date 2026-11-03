@@ -213,7 +213,7 @@ func (db *DB) ApplyReview(review *Review, sessionKey string, policy ReviewPolicy
 		// after every current-identity and policy observation has completed.
 		now := time.Now().UTC()
 		if request.Status != StatusPending && request.Status != StatusEscalated &&
-			!(request.Status == StatusApproved && accepted.Decision == DecisionReject) {
+			(request.Status != StatusApproved || accepted.Decision != DecisionReject) {
 			return fmt.Errorf("%w: status is %s", ErrReviewNotPending, request.Status)
 		}
 		// Escalation explicitly reopens human review after a pending timeout.
