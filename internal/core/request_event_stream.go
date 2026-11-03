@@ -72,6 +72,9 @@ func StreamRequestEvents(ctx context.Context, database *db.DB, project string, o
 		var err error
 		cursor, err = database.RequestEventHead(ctx, project)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			return err
 		}
 	}
@@ -82,6 +85,12 @@ func StreamRequestEvents(ctx context.Context, database *db.DB, project string, o
 		}
 		page, err := database.ReadRequestEvents(ctx, project, cursor, opts.Limit)
 		if err != nil {
+			// A deadline or cancel that lands inside the read's transaction makes
+			// database/sql roll it back, and the read then fails with
+			// sql.ErrTxDone. Report the context's error, which callers act on.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			return fmt.Errorf("reading durable request events: %w", err)
 		}
 		for _, event := range page.Events {

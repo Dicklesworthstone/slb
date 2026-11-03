@@ -101,6 +101,11 @@ func reconcileRequestState(ctx context.Context, database *db.DB, project string,
 		for _, server := range servers {
 			server.invalidateRequestState(err)
 		}
+		// A shutdown that lands inside the read can surface as sql.ErrTxDone.
+		// Report the context's error so startup treats it as a clean stop.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return err
 	}
 	for _, server := range servers {
