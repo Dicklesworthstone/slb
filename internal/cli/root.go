@@ -75,6 +75,9 @@ Commands are classified by risk level:
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print version information",
+	// Handle -C below so an unavailable project is diagnostic information,
+	// not a pre-run failure. State-dependent commands keep the root hook.
+	PersistentPreRunE: func(*cobra.Command, []string) error { return nil },
 	RunE: func(cmd *cobra.Command, args []string) error {
 		goVersion := runtime.Version()
 		configPath := flagConfig
@@ -82,13 +85,16 @@ var versionCmd = &cobra.Command{
 			home, _ := os.UserHomeDir()
 			configPath = filepath.Join(home, ".slb", "config.toml")
 		}
-		dbPath, err := GetDB()
-		if err != nil {
-			return err
+		// Version reporting never needs project state. Keep the strict discovery
+		// helpers unchanged, retaining any paths resolved before an error. An
+		// explicit database selection is useful even if the project is unavailable.
+		dbPath, resolvedProject := flagDB, ""
+		projectErr := enterProjectDir()
+		if projectErr == nil {
+			resolvedProject, projectErr = projectPath()
 		}
-		projectPath, err := projectPath()
-		if err != nil {
-			return err
+		if projectErr == nil {
+			dbPath, projectErr = GetDB()
 		}
 
 		payload := map[string]any{
@@ -98,7 +104,10 @@ var versionCmd = &cobra.Command{
 			"go_version":   goVersion,
 			"config_path":  configPath,
 			"db_path":      dbPath,
-			"project_path": projectPath,
+			"project_path": resolvedProject,
+		}
+		if projectErr != nil {
+			payload["project_error"] = projectErr.Error()
 		}
 
 		switch GetOutput() {
@@ -106,13 +115,22 @@ var versionCmd = &cobra.Command{
 			out := output.New(output.Format(GetOutput()), output.WithStats(GetStats()))
 			return out.Write(payload)
 		case "text":
+			if projectErr != nil {
+				unavailable := fmt.Sprintf("unavailable (%v)", projectErr)
+				if dbPath == "" {
+					dbPath = unavailable
+				}
+				if resolvedProject == "" {
+					resolvedProject = unavailable
+				}
+			}
 			fmt.Printf("slb %s\n", version)
 			fmt.Printf("  commit:  %s\n", commit)
 			fmt.Printf("  built:   %s\n", date)
 			fmt.Printf("  go:      %s\n", goVersion)
 			fmt.Printf("  config:  %s\n", configPath)
 			fmt.Printf("  db:      %s\n", dbPath)
-			fmt.Printf("  project: %s\n", projectPath)
+			fmt.Printf("  project: %s\n", resolvedProject)
 			return nil
 		default:
 			return fmt.Errorf("unsupported format: %s", GetOutput())

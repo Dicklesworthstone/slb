@@ -17,7 +17,9 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
+	"github.com/Dicklesworthstone/slb/internal/output"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
+	"go.yaml.in/yaml/v3"
 )
 
 // TestBuiltCLIRefusesLocalApprovals checks issue #30's fail-closed boundary
@@ -92,7 +94,7 @@ func TestBuiltCLIRefusesLocalApprovals(t *testing.T) {
 
 // Build a production binary: none of these subprocesses can invoke the test
 // identity simulation used by older peer-review tests.
-func buildIdentityBoundaryCLI(t *testing.T) string {
+func buildIdentityBoundaryCLI(t *testing.T, buildFlags ...string) string {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("builds the CLI")
@@ -107,7 +109,9 @@ func buildIdentityBoundaryCLI(t *testing.T) string {
 	binary := filepath.Join(t.TempDir(), "slb")
 	buildCtx, cancelBuild := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancelBuild()
-	build := exec.CommandContext(buildCtx, "go", "build", "-o", binary, "./cmd/slb")
+	args := append([]string{"build"}, buildFlags...)
+	args = append(args, "-o", binary, "./cmd/slb")
+	build := exec.CommandContext(buildCtx, "go", args...)
 	build.Dir = moduleRoot
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("building CLI: %v\n%s", err, output)
@@ -2040,5 +2044,250 @@ func (f *sameHostCLI) assertExecuted(id string) {
 	if err := json.NewDecoder(bytes.NewReader(data)).Decode(&evidence); err != nil || evidence["event"] != "execution_claim" ||
 		evidence["request_id"] != id || evidence["approval_policy"] != "same_host" || evidence["assurance"] != "same_host" {
 		f.T.Fatalf("execution log lost its policy/evidence header: %v\n%s", err, data)
+	}
+}
+
+// TestBuiltCLIVersionOptionalProjectState exercises issue #32 through the real
+// executable, including Cobra's inherited pre-run hook and process exit status.
+// The incomplete project is inside an initialized parent to catch fallback to
+// a different store as well as accidental initialization of the missing store.
+func TestBuiltCLIVersionOptionalProjectState(t *testing.T) {
+	binary := buildIdentityBoundaryCLI(t, "-ldflags",
+		"-X github.com/Dicklesworthstone/slb/internal/cli.version=issue32-test "+
+			"-X github.com/Dicklesworthstone/slb/internal/cli.commit=abc1234 "+
+			"-X github.com/Dicklesworthstone/slb/internal/cli.date=2026-11-04T00:00:00Z")
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(base, "home")
+	parent := filepath.Join(base, "initialized")
+	broken := filepath.Join(parent, "hooks-only")
+	child := filepath.Join(broken, "src", "deep")
+	empty := filepath.Join(base, "uninitialized")
+	nonregular := filepath.Join(base, "nonregular")
+	badMarker := filepath.Join(base, "bad-marker")
+	missing := filepath.Join(base, "missing-project")
+	for _, dir := range []string{home, parent, child, filepath.Join(broken, ".slb", "hooks"), empty,
+		filepath.Join(nonregular, ".slb", "state.db"), badMarker, filepath.Join(parent, "healthy-child")} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(badMarker, ".slb"), []byte("preserve this marker"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	run := func(t *testing.T, cwd string, extraEnv, args []string) (string, string, error) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, binary, args...)
+		cmd.Dir, cmd.Env = cwd, append(identityCLIEnvironment(home), extraEnv...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		return stdout.String(), stderr.String(), err
+	}
+	if stdout, stderr, err := run(t, parent, nil, []string{"init", "--json"}); err != nil {
+		t.Fatalf("initialize parent: %v\n%s\n%s", err, stdout, stderr)
+	}
+	parentDB := filepath.Join(parent, ".slb", "state.db")
+	before, err := os.ReadFile(parentDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultConfig := filepath.Join(home, ".slb", "config.toml")
+	checkMetadata := func(t *testing.T, payload map[string]string, config string) {
+		t.Helper()
+		for key, want := range map[string]string{
+			"version": "issue32-test", "commit": "abc1234", "build_date": "2026-11-04T00:00:00Z",
+			"go_version": runtime.Version(), "config_path": config,
+		} {
+			if payload[key] != want {
+				t.Errorf("%s = %q, want %q; payload=%+v", key, payload[key], want, payload)
+			}
+		}
+		for _, key := range []string{"db_path", "project_path"} {
+			if _, exists := payload[key]; !exists {
+				t.Errorf("version omitted %s; payload=%+v", key, payload)
+			}
+		}
+	}
+	selectedDB := filepath.Join(base, "selected", "missing.db")
+	cases := []struct {
+		name, cwd, project, database, diagnostic string
+		env, flags                               []string
+	}{
+		{name: "hooks only root", cwd: broken, project: broken, diagnostic: "is unavailable"},
+		{name: "hooks only descendant", cwd: child, project: broken, diagnostic: "is unavailable"},
+		{name: "SLB_PROJECT absolute", cwd: empty, project: broken, diagnostic: "is unavailable", env: []string{"SLB_PROJECT=" + child}},
+		{name: "SLB_PROJECT relative", cwd: parent, project: broken, diagnostic: "is unavailable", env: []string{"SLB_PROJECT=hooks-only/src/deep"}},
+		{name: "project flag relative", cwd: parent, project: broken, diagnostic: "is unavailable", flags: []string{"-C", "hooks-only/src/deep"}},
+		{name: "project flag beats environment", cwd: empty, project: broken, diagnostic: "is unavailable", flags: []string{"-C", broken}, env: []string{"SLB_PROJECT=" + parent}},
+		{name: "initialized root", cwd: parent, project: parent, database: parentDB},
+		{name: "initialized descendant", cwd: filepath.Join(parent, "healthy-child"), project: parent, database: parentDB},
+		{name: "uninitialized directory", cwd: empty, project: empty, database: filepath.Join(empty, ".slb", "state.db")},
+		{name: "explicit existing database", cwd: child, project: broken, database: parentDB, flags: []string{"--db", parentDB}},
+		{name: "explicit missing database", cwd: child, project: broken, database: selectedDB, flags: []string{"--db", selectedDB}},
+		{name: "explicit relative database", cwd: parent, project: broken, database: "relative.db", flags: []string{"-C", "hooks-only", "--db", "relative.db"}},
+		{name: "missing SLB_PROJECT", cwd: parent, diagnostic: "resolving project working directory", env: []string{"SLB_PROJECT=" + missing}},
+		{name: "missing project flag", cwd: parent, diagnostic: "changing directory", flags: []string{"-C", missing}},
+		{name: "explicit database with missing project", cwd: parent, database: selectedDB, diagnostic: "changing directory", flags: []string{"-C", missing, "--db", selectedDB}},
+		{name: "explicit database with bad environment", cwd: parent, database: parentDB, diagnostic: "resolving project working directory", flags: []string{"--db", parentDB}, env: []string{"SLB_PROJECT=" + missing}},
+		{name: "nonregular database", cwd: nonregular, project: nonregular, diagnostic: "not a regular file"},
+		{name: "invalid project marker", cwd: badMarker, diagnostic: "not a directory"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append(append([]string{}, tc.flags...), "--json", "version")
+			stdout, stderr, err := run(t, tc.cwd, tc.env, args)
+			if err != nil || stderr != "" {
+				t.Fatalf("version must succeed: %v\nstdout=%s\nstderr=%s", err, stdout, stderr)
+			}
+			var payload map[string]string
+			if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+				t.Fatalf("invalid version JSON: %v\n%s", err, stdout)
+			}
+			checkMetadata(t, payload, defaultConfig)
+			if payload["project_path"] != tc.project || payload["db_path"] != tc.database {
+				t.Fatalf("wrong diagnostic paths: %+v; want project=%q db=%q", payload, tc.project, tc.database)
+			}
+			if tc.diagnostic == "" {
+				if value, exists := payload["project_error"]; exists {
+					t.Fatalf("healthy discovery reported project_error=%q", value)
+				}
+			} else if !strings.Contains(payload["project_error"], tc.diagnostic) {
+				t.Fatalf("missing %q diagnostic: %+v", tc.diagnostic, payload)
+			}
+
+			// Explicit --db intentionally permits a caller-selected store. The
+			// refusal requirement applies to failed implicit state discovery.
+			if tc.diagnostic != "" && tc.database == "" {
+				for _, command := range [][]string{
+					{"pending", "--json"},
+					{"session", "start", "--agent", "Unexpected", "--program", "e2e", "--json"},
+					{"patterns", "version", "--json"},
+				} {
+					args := append(append([]string{}, tc.flags...), command...)
+					stdout, stderr, err := run(t, tc.cwd, tc.env, args)
+					var exit *exec.ExitError
+					if !errors.As(err, &exit) || exit.ExitCode() != 1 || !strings.Contains(stdout+stderr, tc.diagnostic) {
+						t.Fatalf("state command %v must refuse %q: %v\nstdout=%s\nstderr=%s", args, tc.diagnostic, err, stdout, stderr)
+					}
+				}
+			}
+		})
+	}
+
+	// Exercise format selection on the failing discovery path, including the
+	// existing JSON fallback when the external TOON encoder is unavailable.
+	for _, format := range []struct {
+		name, decode string
+		flags, env   []string
+	}{
+		{name: "text", decode: "text"},
+		{name: "explicit text", decode: "text", flags: []string{"-o", "text"}},
+		{name: "json shorthand", decode: "json", flags: []string{"--json"}},
+		{name: "json", decode: "json", flags: []string{"-o", "json"}},
+		{name: "yaml", decode: "yaml", flags: []string{"-o", "yaml"}},
+		{name: "environment yaml", decode: "yaml", env: []string{"SLB_OUTPUT_FORMAT=yaml"}},
+		{name: "toon fallback", decode: "json", flags: []string{"-o", "toon"}, env: []string{"TOON_TRU_BIN=" + filepath.Join(base, "missing-encoder")}},
+		{name: "toon shorthand fallback", decode: "json", flags: []string{"--toon"}, env: []string{"TOON_TRU_BIN=" + filepath.Join(base, "missing-encoder")}},
+	} {
+		t.Run("formats/"+format.name, func(t *testing.T) {
+			const config = "custom-config.toml"
+			args := append([]string{"--config", config}, format.flags...)
+			args = append(args, "version")
+			stdout, stderr, err := run(t, child, format.env, args)
+			if err != nil {
+				t.Fatalf("version format failed: %v\n%s\n%s", err, stdout, stderr)
+			}
+			if strings.Contains(format.name, "fallback") {
+				if !strings.Contains(stderr, "falling back to JSON") {
+					t.Fatalf("missing existing TOON fallback warning: %s", stderr)
+				}
+			} else if stderr != "" {
+				t.Fatalf("unexpected stderr: %s", stderr)
+			}
+			if format.decode == "text" {
+				for _, line := range []string{"slb issue32-test\n", "  commit:  abc1234\n", "  built:   2026-11-04T00:00:00Z\n",
+					"  go:      " + runtime.Version() + "\n", "  config:  " + config + "\n", "  project: " + broken + "\n",
+					"  db:      unavailable (", filepath.Join(broken, ".slb", "state.db"), "explicitly with slb init"} {
+					if !strings.Contains(stdout, line) {
+						t.Errorf("text version missing %q: %s", line, stdout)
+					}
+				}
+				return
+			}
+			var payload map[string]string
+			if format.decode == "yaml" {
+				err = yaml.Unmarshal([]byte(stdout), &payload)
+			} else {
+				err = json.Unmarshal([]byte(stdout), &payload)
+			}
+			if err != nil {
+				t.Fatalf("invalid %s version: %v\n%s", format.decode, err, stdout)
+			}
+			checkMetadata(t, payload, config)
+			if payload["project_path"] != broken || payload["db_path"] != "" || !strings.Contains(payload["project_error"], "explicitly with slb init") {
+				t.Fatalf("format lost project diagnostic: %+v", payload)
+			}
+		})
+	}
+	t.Run("formats/native toon", func(t *testing.T) {
+		t.Setenv("HOME", home)
+		t.Setenv("USERPROFILE", home)
+		if !output.TOONAvailable() {
+			t.Skip("toon_rust CLI unavailable; JSON fallback is covered separately")
+		}
+		// Preserve an explicitly selected encoder for the child, while keeping
+		// project/output environment variables isolated by identityCLIEnvironment.
+		var encoderEnv []string
+		for _, key := range []string{"TOON_TRU_BIN", "TOON_BIN", "TRU_PATH"} {
+			if value := os.Getenv(key); value != "" {
+				encoderEnv = append(encoderEnv, key+"="+value)
+			}
+		}
+		stdout, stderr, err := run(t, child, encoderEnv, []string{"--toon", "version"})
+		if err != nil || stderr != "" {
+			t.Fatalf("native TOON version failed: %v\n%s\n%s", err, stdout, stderr)
+		}
+		decoded, err := output.DecodeTOON(stdout)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(decoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var payload map[string]string
+		if err := json.Unmarshal(data, &payload); err != nil {
+			t.Fatal(err)
+		}
+		checkMetadata(t, payload, defaultConfig)
+		if payload["project_path"] != broken || payload["db_path"] != "" || !strings.Contains(payload["project_error"], "explicitly with slb init") {
+			t.Fatalf("TOON lost project diagnostic: %+v", payload)
+		}
+	})
+	t.Run("unsupported format remains an error", func(t *testing.T) {
+		stdout, stderr, err := run(t, child, nil, []string{"-o", "unsupported", "version"})
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || exit.ExitCode() != 1 || !strings.Contains(stderr, "unsupported format: unsupported") || stdout != "" {
+			t.Fatalf("unsupported output must still fail: %v\nstdout=%s\nstderr=%s", err, stdout, stderr)
+		}
+	})
+
+	for _, path := range []string{filepath.Join(broken, ".slb", "state.db"), filepath.Join(child, ".slb"),
+		filepath.Join(empty, ".slb"), filepath.Join(home, ".slb"), filepath.Join(broken, "relative.db"), filepath.Dir(selectedDB), missing} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Errorf("diagnostics or refused state commands created %s: %v", path, err)
+		}
+	}
+	after, err := os.ReadFile(parentDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Error("version or refused state commands modified the initialized parent database")
 	}
 }

@@ -1,6 +1,7 @@
 # SLB Commands — Complete Reference
 
 ## Table of Contents
+- [Version Information](#version-information)
 - [Session Management](#session-management)
 - [Request & Run](#request--run)
 - [Review & Approve](#review--approve)
@@ -10,6 +11,32 @@
 - [Claude Code Hook](#claude-code-hook)
 - [History & Audit](#history--audit)
 - [Exit Codes](#exit-codes)
+
+---
+
+## Version Information
+
+```bash
+slb version
+slb --json version
+slb version --output yaml
+slb version --toon
+```
+
+`version` reports the binary version, commit, build date, Go version and config
+path without requiring an initialized or accessible project database. Project
+and database paths are optional diagnostics: text output shows an error in place
+of an unavailable path, while JSON, YAML and TOON include a `project_error` string
+and leave unresolved `project_path` or `db_path` values empty. Successfully
+resolved paths are retained; `project_error` is omitted when discovery succeeds.
+TOON retains the normal JSON fallback with a warning if its encoder is unavailable.
+
+Project selection follows `-C` / `--project`, `SLB_PROJECT`, then the current
+directory. A failed `-C` directory change is also reported as a diagnostic. An
+explicit `--db` is reported as selected, even if that file does not exist; version
+reporting does not open, create or initialize a database. Commands that read or
+modify project state still refuse unavailable discovered state without selecting
+another database.
 
 ---
 
