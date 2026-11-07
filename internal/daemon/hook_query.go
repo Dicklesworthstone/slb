@@ -2,6 +2,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -445,7 +446,7 @@ func (s *IPCServer) classifyCommand(params HookQueryParams) *HookQueryResult {
 			s.logger.Warn("closing hook approval lookup database", "error", closeErr)
 		}
 	}()
-	approved := findHookApproval(conn, engine, params, policy.projectRoot)
+	approved := findHookApproval(s.ctx, conn, engine, params, policy.projectRoot)
 	if approved == nil {
 		return result
 	}
@@ -481,38 +482,93 @@ func sameHookConfigFile(expected, actual string) bool {
 	return err == nil && right.Mode().IsRegular() && os.SameFile(left, right)
 }
 
-func findHookApproval(conn *db.DB, engine *core.PatternEngine, params HookQueryParams, projectRoot string) *db.Request {
-	var id string
-	err := conn.QueryRow(`
-		SELECT r.id FROM requests r JOIN sessions s ON s.id = r.requestor_session_id
+const hookApprovalPageSize = 32
+
+type hookApprovalCandidate struct {
+	id, createdAt string
+}
+
+// Read a bounded page and release its rows before any nested request/evidence
+// reads. Keep the stored timestamp text: parsing and reformatting it can change
+// its position in SQLite's existing created_at, id ordering.
+func readHookApprovalCandidates(conn *db.DB, params HookQueryParams, after *hookApprovalCandidate) (candidates []hookApprovalCandidate, err error) {
+	query := `
+		SELECT r.id, r.created_at FROM requests r JOIN sessions s ON s.id = r.requestor_session_id
 		WHERE r.command_raw = ? AND r.command_cwd = ?
 			AND r.requestor_session_id = ? AND r.status = 'approved'
 			AND s.ended_at IS NULL AND s.project_path = r.project_path
-			AND (r.approval_expires_at IS NULL OR julianday(r.approval_expires_at) > julianday('now'))
-		ORDER BY r.created_at DESC, r.id DESC LIMIT 1
-	`, params.Command, params.CWD, params.SessionID).Scan(&id)
+			AND (r.approval_expires_at IS NULL OR julianday(r.approval_expires_at) > julianday('now'))`
+	args := []any{params.Command, params.CWD, params.SessionID}
+	if after != nil {
+		query += ` AND (r.created_at < ? OR (r.created_at = ? AND r.id < ?))`
+		args = append(args, after.createdAt, after.createdAt, after.id)
+	}
+	query += ` ORDER BY r.created_at DESC, r.id DESC LIMIT ?`
+	args = append(args, hookApprovalPageSize)
+	rows, err := conn.Query(query, args...)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	req, err := conn.GetRequest(id)
-	if err != nil || req.Status != db.StatusApproved || req.Command.Raw != params.Command ||
-		req.Command.Cwd != params.CWD || req.RequestorSessionID != params.SessionID {
-		return nil
+	defer func() { err = errors.Join(err, rows.Close()) }()
+	candidates = make([]hookApprovalCandidate, 0, hookApprovalPageSize)
+	for rows.Next() {
+		var candidate hookApprovalCandidate
+		if err := rows.Scan(&candidate.id, &candidate.createdAt); err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, candidate)
 	}
-	// Keep the stored requester/project identity and exact command cwd. Its
-	// spelling may predate discovery or use a root alias, so do not infer it
-	// from the query cwd. It must still belong to the physical project whose
-	// policy and database we selected; CanExecute re-verifies the signed hash.
-	approvedRoot, err := PhysicalProjectRootForCWD(req.ProjectPath)
-	if err != nil || approvedRoot != projectRoot {
-		return nil
+	return candidates, rows.Err()
+}
+
+func findHookApproval(ctx context.Context, conn *db.DB, engine *core.PatternEngine, params HookQueryParams, projectRoot string) *db.Request {
+	if ctx == nil {
+		ctx = context.Background() // Zero-value servers are used for local policy checks.
 	}
-	// CanExecute checks the current project-local dynamic quorum; comparing
-	// against the classifier's advisory full quorum would reject valid claims.
-	if ok, _ := core.NewExecutor(conn, engine).CanExecute(id); !ok {
-		return nil
+	executor := core.NewExecutor(conn, engine)
+	var after *hookApprovalCandidate
+	for ctx.Err() == nil {
+		candidates, err := readHookApprovalCandidates(conn, params, after)
+		if err != nil || len(candidates) == 0 {
+			return nil
+		}
+		for _, candidate := range candidates {
+			if ctx.Err() != nil {
+				return nil
+			}
+			req, err := conn.GetRequest(candidate.id)
+			if err != nil {
+				return nil // A failed read cannot establish an eligible approval.
+			}
+			if req.Status != db.StatusApproved || req.Command.Raw != params.Command ||
+				req.Command.Cwd != params.CWD || req.RequestorSessionID != params.SessionID {
+				continue
+			}
+			// Keep the stored requester/project identity and exact command cwd.
+			// Physical discovery must not transfer another project's approval.
+			approvedRoot, err := PhysicalProjectRootForCWD(req.ProjectPath)
+			if err != nil || approvedRoot != projectRoot {
+				continue
+			}
+			if ctx.Err() != nil {
+				return nil
+			}
+			// Recheck signed evidence, the command hash and current policy for
+			// EVERY candidate. An unusable newer grant cannot hide a valid older
+			// one; lookup still never consumes it or permits raw-shell execution.
+			if ok, _ := executor.CanExecute(candidate.id); ok && ctx.Err() == nil {
+				return req
+			}
+		}
+		if len(candidates) < hookApprovalPageSize {
+			return nil
+		}
+		// Keyset pagination retains older candidates when another executor
+		// claims/removes previously scanned approvals between page reads.
+		last := candidates[len(candidates)-1]
+		after = &last
 	}
-	return req
+	return nil
 }
 
 // HookHealthParams scopes diagnostics to the same project policy as hook_query.
