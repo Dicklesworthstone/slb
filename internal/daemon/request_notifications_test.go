@@ -289,6 +289,9 @@ func TestRunDaemonInvalidExplicitConfigDoesNotOpenDatabase(t *testing.T) {
 			if _, err := os.Stat(filepath.Join(project, ".slb", "state.db")); !os.IsNotExist(err) {
 				t.Fatalf("daemon opened database despite invalid selected config: %v", err)
 			}
+			if _, err := os.Lstat(filepath.Join(project, ".slb")); !os.IsNotExist(err) {
+				t.Fatalf("daemon created project runtime state despite invalid selected config: %v", err)
+			}
 		})
 	}
 }

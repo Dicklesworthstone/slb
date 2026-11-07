@@ -33,6 +33,18 @@ func openPIDFile(string, int) (*os.File, os.FileInfo, error) {
 	return nil, nil, errors.New("safe daemon PID files are unsupported on this platform")
 }
 
+func openDiscoveryFile(string, int) (*os.File, os.FileInfo, error) {
+	return nil, nil, errors.New("safe daemon discovery is unsupported on this platform")
+}
+
+func validateRuntimePermissions(string, os.FileInfo, bool) error {
+	return errors.New("safe daemon discovery is unsupported on this platform")
+}
+
+func validateRuntimeParents(string) error {
+	return errors.New("safe daemon discovery is unsupported on this platform")
+}
+
 func acquireFileLease(string) (*fileLease, error) {
 	return nil, errors.New("exclusive daemon ownership is unsupported on this platform")
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"github.com/Dicklesworthstone/slb/internal/daemon"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
+	"github.com/charmbracelet/log"
 	"github.com/spf13/cobra"
 )
 
@@ -283,13 +285,22 @@ func TestWatchDiscoveryKeepsAncestorDatabaseAfterDaemonLoss(t *testing.T) {
 	t.Setenv("SLB_HOST", "")
 	requester := testutil.MakeSession(t, h.DB, testutil.WithProject(project))
 	request := testutil.MakeRequest(t, h.DB, requester)
-	server, err := daemon.NewIPCServer(daemon.SocketPathForCWD(project), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	serverCtx, stopServer := context.WithCancel(context.Background())
 	serverDone := make(chan error, 1)
-	go func() { serverDone <- server.Start(context.Background()) }()
-	defer func() { _ = server.Stop(); <-serverDone }()
+	go func() {
+		serverDone <- daemon.RunDaemon(serverCtx, daemon.ServerOptions{ProjectDir: project, Logger: log.New(io.Discard)})
+	}()
+	defer func() {
+		stopServer()
+		if err := <-serverDone; err != nil {
+			t.Error(err)
+		}
+	}()
+	if !testutil.WaitForCondition(func() bool {
+		return daemon.NewProjectClient(project, daemon.WithLocalOnly()).IsDaemonRunning()
+	}, time.Millisecond, 2*time.Second) {
+		t.Fatal("project daemon did not become ready")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	var buf syncBuffer
@@ -299,9 +310,7 @@ func TestWatchDiscoveryKeepsAncestorDatabaseAfterDaemonLoss(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runWatch(cmd, nil) }()
 	defer func() { cancel(); <-done }()
-	snapshot := watchRequestSnapshot(t, h.DB, request)
 	if !testutil.WaitForCondition(func() bool {
-		server.BroadcastEvent("request_pending", daemon.RequestStreamEventFromState(snapshot))
 		return strings.Contains(buf.String(), request.ID)
 	}, time.Millisecond, 2*time.Second) {
 		t.Fatalf("watch did not discover ancestor daemon: %s", buf.String())
@@ -309,9 +318,7 @@ func TestWatchDiscoveryKeepsAncestorDatabaseAfterDaemonLoss(t *testing.T) {
 	if err := h.DB.UpdateRequestStatus(request.ID, db.StatusApproved); err != nil {
 		t.Fatal(err)
 	}
-	if err := server.Stop(); err != nil {
-		t.Fatal(err)
-	}
+	stopServer()
 	if !testutil.WaitForCondition(func() bool {
 		return strings.Contains(buf.String(), `"event":"watch_degraded"`) && strings.Contains(buf.String(), `"event":"request_approved"`)
 	}, time.Millisecond, 2*time.Second) {

@@ -70,6 +70,74 @@ func openPIDFile(path string, flags int) (*os.File, os.FileInfo, error) {
 	return file, info, nil
 }
 
+func openDiscoveryFile(path string, flags int) (*os.File, os.FileInfo, error) {
+	file, info, err := openPIDFile(path, flags)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := validateRuntimePermissions(path, info, true); err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	return file, info, nil
+}
+
+func validateRuntimePermissions(_ string, info os.FileInfo, private bool) error {
+	mask := os.FileMode(0022)
+	if private {
+		mask = 0077
+	}
+	if info.Mode().Perm()&mask != 0 {
+		return errors.New("unsafe daemon runtime permissions")
+	}
+	return nil
+}
+
+// Ancestors may be owned by this user or root. A shared writable directory
+// is safe only with the sticky bit (e.g. /tmp), which prevents another user
+// from replacing the owned socket. Resolve platform aliases such as /var
+// before inspecting them; the socket itself is never followed as a symlink.
+func validateRuntimeParents(directory string) error {
+	remaining := 512
+	return validateRuntimeAncestors(directory, &remaining)
+}
+
+func validateRuntimeAncestors(directory string, remaining *int) error {
+	for dir := filepath.Clean(directory); ; dir = filepath.Dir(dir) {
+		*remaining--
+		if *remaining < 0 {
+			return errors.New("daemon runtime directory has too many links or ancestors")
+		}
+		info, err := os.Lstat(dir)
+		if err != nil {
+			return err
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || (stat.Uid != 0 && stat.Uid != uint32(os.Geteuid())) {
+			return errors.New("unsafe daemon runtime directory")
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(dir)
+			if err != nil {
+				return err
+			}
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(filepath.Dir(dir), target)
+			}
+			// Check both the target chain and the lexical containing directory.
+			// Resolving first alone could hide a writable alias directory.
+			if err := validateRuntimeAncestors(target, remaining); err != nil {
+				return err
+			}
+		} else if !info.IsDir() || (info.Mode().Perm()&0022 != 0 && info.Mode()&os.ModeSticky == 0) {
+			return errors.New("unsafe daemon runtime directory")
+		}
+		if filepath.Dir(dir) == dir {
+			return nil
+		}
+	}
+}
+
 func acquireFileLease(path string) (*fileLease, error) {
 	if !filepath.IsAbs(path) {
 		return nil, errors.New("daemon lease path must be absolute")

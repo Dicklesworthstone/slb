@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -102,6 +103,7 @@ func TestWindowsDaemonSecurity(t *testing.T) {
 		{"readable legacy PID", owner + "D:P" + allowUser + "(A;;GR;;;WD)", false, false},
 		{"public lease", owner + "D:P" + allowUser + "(A;;GR;;;WD)", true, true},
 		{"public data write", owner + "D:P" + allowUser + "(A;;0x2;;;WD)", false, true},
+		{"public child deletion", owner + "D:P" + allowUser + "(A;;0x40;;;WD)", false, true},
 		{"public ACL write", owner + "D:P" + allowUser + "(A;;0x40000;;;WD)", false, true},
 		{"null DACL", owner + "D:NO_ACCESS_CONTROL", false, true},
 		{"foreign owner", "O:WDD:P" + allowUser, false, true},
@@ -116,6 +118,148 @@ func TestWindowsDaemonSecurity(t *testing.T) {
 				t.Fatalf("security check: %v, want error=%v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestWindowsRuntimeAncestorSecurity(t *testing.T) {
+	// Keep the expected owner distinct from SYSTEM and Administrators even
+	// when the test itself runs under an elevated or service account.
+	user, err := windows.StringToSid("S-1-5-21-1-2-3-1001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := "O:" + user.String()
+	allowUser := "(A;;FA;;;" + user.String() + ")"
+	for _, tc := range []struct {
+		name    string
+		sddl    string
+		kind    windowsRuntimeObject
+		wantErr bool
+	}{
+		{"user ancestor", owner + "D:P" + allowUser + "(A;;GR;;;WD)", windowsRuntimeAncestor, false},
+		{"system ancestor", "O:SYD:P(A;;FA;;;SY)" + allowUser, windowsRuntimeAncestor, false},
+		{"administrator ancestor", "O:BAD:P(A;;FA;;;BA)" + allowUser, windowsRuntimeAncestor, false},
+		{"TrustedInstaller ancestor", "O:" + windowsTrustedInstallerSID + "D:P(A;;FA;;;" + windowsTrustedInstallerSID + ")" + allowUser, windowsRuntimeAncestor, false},
+		{"TrustedInstaller reparse ancestor", "O:" + windowsTrustedInstallerSID + "D:P(A;;FA;;;" + windowsTrustedInstallerSID + ")" + allowUser, windowsRuntimeReparseAncestor, false},
+		{"foreign ancestor", "O:WDD:P" + allowUser, windowsRuntimeAncestor, true},
+		{"foreign service ancestor", "O:S-1-5-80-1-2-3-4-5D:P" + allowUser, windowsRuntimeAncestor, true},
+		{"system final file", "O:SYD:P" + allowUser, windowsRuntimeFile, true},
+		{"administrator final file", "O:BAD:P" + allowUser, windowsRuntimeFile, true},
+		{"TrustedInstaller final file", "O:" + windowsTrustedInstallerSID + "D:P" + allowUser, windowsRuntimeFile, true},
+		{"TrustedInstaller access to final file", owner + "D:P" + allowUser + "(A;;FA;;;" + windowsTrustedInstallerSID + ")", windowsRuntimeFile, true},
+		{"foreign service access to ancestor", owner + "D:P" + allowUser + "(A;;FA;;;S-1-5-80-1-2-3-4-5)", windowsRuntimeAncestor, true},
+		{"creation only ancestor", owner + "D:P" + allowUser + "(A;;0x6;;;AU)", windowsRuntimeAncestor, false},
+		{"creation rights on final file", owner + "D:P" + allowUser + "(A;;0x6;;;AU)", windowsRuntimeFile, true},
+		{"creation rights on reparse point", owner + "D:P" + allowUser + "(A;;0x6;;;AU)", windowsRuntimeReparseAncestor, true},
+		{"child deletion", owner + "D:P" + allowUser + "(A;;0x40;;;WD)", windowsRuntimeAncestor, true},
+		{"object deletion", owner + "D:P" + allowUser + "(A;;0x10000;;;WD)", windowsRuntimeAncestor, true},
+		{"attribute write", owner + "D:P" + allowUser + "(A;;0x100;;;WD)", windowsRuntimeAncestor, true},
+		{"extended attribute write", owner + "D:P" + allowUser + "(A;;0x10;;;WD)", windowsRuntimeAncestor, true},
+		{"ACL write", owner + "D:P" + allowUser + "(A;;0x40000;;;WD)", windowsRuntimeAncestor, true},
+		{"ownership write", owner + "D:P" + allowUser + "(A;;0x80000;;;WD)", windowsRuntimeAncestor, true},
+		{"generic write", owner + "D:P" + allowUser + "(A;;GW;;;WD)", windowsRuntimeAncestor, true},
+		{"inherit only rights", owner + "D:P" + allowUser + "(A;OIIO;FA;;;WD)", windowsRuntimeAncestor, false},
+		{"null DACL", owner + "D:NO_ACCESS_CONTROL", windowsRuntimeAncestor, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sd, err := windows.SecurityDescriptorFromString(tc.sddl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = validateWindowsRuntimeSecurity(sd, user, user, false, tc.kind)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("security check: %v, want error=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestWindowsRuntimeParentsChecksLinkAncestors(t *testing.T) {
+	for _, unsafeParent := range []string{"lexical", "target"} {
+		t.Run(unsafeParent, func(t *testing.T) {
+			dir := t.TempDir()
+			aliasParent := filepath.Join(dir, "aliases")
+			targetParent := filepath.Join(dir, "targets")
+			target := filepath.Join(targetParent, "runtime")
+			for _, path := range []string{aliasParent, target} {
+				if err := os.MkdirAll(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			alias := filepath.Join(aliasParent, "runtime")
+			if err := os.Symlink(filepath.Join("..", "targets", "runtime"), alias); err != nil {
+				t.Skipf("symlink creation requires Windows developer mode or privilege: %v", err)
+			}
+			if err := validateRuntimeParents(alias); err != nil {
+				t.Fatalf("safe link ancestors: %v", err)
+			}
+			user, _, err := windowsDaemonIdentity()
+			if err != nil {
+				t.Fatal(err)
+			}
+			sd, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;" + user.String() + ")(A;;0x40;;;WD)")
+			if err != nil {
+				t.Fatal(err)
+			}
+			acl, _, err := sd.DACL()
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := aliasParent
+			if unsafeParent == "target" {
+				path = targetParent
+			}
+			if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
+				windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateRuntimeParents(alias); err == nil {
+				t.Fatal("accepted a link with an ancestor granting child deletion to another user")
+			}
+		})
+	}
+}
+
+func TestWindowsDiscoveryReaderAllowsAtomicReplacement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.json")
+	for _, record := range []struct {
+		path string
+		data string
+	}{
+		{path, "original"},
+		{path + ".pending", "replacement"},
+	} {
+		file, _, err := openDiscoveryFile(record.path, os.O_CREATE|os.O_EXCL|os.O_WRONLY)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := file.WriteString(record.data); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reader, original, err := openDiscoveryFile(path, os.O_RDONLY)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Close() }()
+	if err := os.Rename(path+".pending", path); err != nil {
+		t.Fatalf("reader blocked atomic discovery publication: %v", err)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil || string(data) != "original" {
+		t.Fatalf("reader lost its original snapshot: %q, %v", data, err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil || string(data) != "replacement" {
+		t.Fatalf("new discovery generation: %q, %v", data, err)
+	}
+	current, err := lstatOwnedPath(path)
+	if err != nil || os.SameFile(original, current) {
+		t.Fatalf("discovery publication did not replace the old file: %v", err)
 	}
 }
 

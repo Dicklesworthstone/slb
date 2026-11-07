@@ -29,16 +29,19 @@ var ErrIPCSubscribed = errors.New("IPC client is subscribed; use a separate clie
 // I/O; Close must be able to interrupt a blocked reader or writer immediately.
 // gate serializes connection setup and RPCs and is itself context-cancellable.
 type IPCClient struct {
-	socketPath string
-	conn       net.Conn
-	scanner    *bufio.Scanner
-	mu         sync.Mutex
-	nextID     atomic.Int64
-	gateOnce   sync.Once
-	gate       chan struct{}
-	generation uint64
-	connDone   chan struct{}
-	subscribed bool
+	socketPath   string
+	runtime      *RuntimePaths
+	discoveryErr error
+	localOnly    bool
+	conn         net.Conn
+	scanner      *bufio.Scanner
+	mu           sync.Mutex
+	nextID       atomic.Int64
+	gateOnce     sync.Once
+	gate         chan struct{}
+	generation   uint64
+	connDone     chan struct{}
+	subscribed   bool
 }
 
 type ipcClientConnection struct {
@@ -49,6 +52,18 @@ type ipcClientConnection struct {
 }
 
 func NewIPCClient(socketPath string) *IPCClient { return &IPCClient{socketPath: socketPath} }
+
+// NewProjectIPCClient discovers and verifies exactly one project's listener.
+// Discovery errors are retained until Connect so callers use their existing
+// fail-closed handling. An explicitly configured TCP transport remains separate.
+func NewProjectIPCClient(cwd string) *IPCClient {
+	paths, err := DiscoverRuntime(cwd)
+	return &IPCClient{socketPath: paths.SocketPath, runtime: &paths, discoveryErr: err}
+}
+
+// SocketPath is the selected local endpoint (or expected default on an invalid
+// record). It never exposes an unvalidated path read from a discovery record.
+func (c *IPCClient) SocketPath() string { return c.socketPath }
 
 func (c *IPCClient) acquire(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
@@ -93,14 +108,26 @@ func (c *IPCClient) connect(ctx context.Context) error {
 	c.mu.Unlock()
 
 	network, address := "unix", c.socketPath
-	if host := strings.TrimSpace(os.Getenv("SLB_HOST")); host != "" {
+	if host := strings.TrimSpace(os.Getenv("SLB_HOST")); host != "" && !c.localOnly {
 		network, address = "tcp", host
+	}
+	var socketInfo os.FileInfo
+	if network == "unix" && c.runtime != nil {
+		if c.discoveryErr != nil {
+			return c.discoveryErr
+		}
+		var err error
+		socketInfo, err = validateRuntimeSocket(address)
+		if err != nil {
+			return fmt.Errorf("validating daemon socket: %w", err)
+		}
 	}
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
 		return fmt.Errorf("connecting to daemon: %w", err)
 	}
+	reader := bufio.NewReaderSize(conn, 4096)
 	// DialContext does not cancel subsequent I/O. Bound the TCP hello too.
 	stop := closeIPCOnCancel(ctx, func() { _ = conn.Close() })
 	if deadline, ok := ctx.Deadline(); ok {
@@ -111,6 +138,15 @@ func (c *IPCClient) connect(ctx context.Context) error {
 		hello, err = json.Marshal(map[string]string{"auth": strings.TrimSpace(os.Getenv("SLB_SESSION_KEY"))})
 		if err == nil {
 			err = writeIPCFrame(conn, append(hello, '\n'))
+		}
+	}
+	if err == nil && network == "unix" && c.runtime != nil {
+		err = verifyRuntimeIdentity(conn, reader, *c.runtime)
+		if err == nil {
+			current, statErr := validateRuntimeSocket(address)
+			if statErr != nil || !os.SameFile(socketInfo, current) {
+				err = fmt.Errorf("%w: socket changed during connection", ErrDiscoveryInvalid)
+			}
 		}
 	}
 	stop()
@@ -132,10 +168,43 @@ func (c *IPCClient) connect(ctx context.Context) error {
 		return net.ErrClosed // Close won while the dial/handshake was in flight.
 	}
 	c.conn = conn
-	c.scanner = bufio.NewScanner(conn)
+	c.scanner = bufio.NewScanner(reader)
 	c.scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	c.connDone = make(chan struct{})
 	c.subscribed = false
+	return nil
+}
+
+// Verify on the connection that will carry the command. A separate status
+// probe followed by a new dial would leave a daemon replacement race.
+func verifyRuntimeIdentity(conn net.Conn, reader *bufio.Reader, expected RuntimePaths) error {
+	if err := json.NewEncoder(conn).Encode(RPCRequest{Method: "status", ID: 0}); err != nil {
+		return err
+	}
+	var response struct {
+		Result struct {
+			PID         int    `json:"pid"`
+			ProjectPath string `json:"project_path"`
+			StateReady  bool   `json:"state_ready"`
+		} `json:"result"`
+		Error *Error `json:"error"`
+		ID    *int64 `json:"id"`
+	}
+	// Consume the newline too: JSON Decode may otherwise return before a
+	// fragmented newline arrives, leaving an empty frame for the next RPC.
+	// Keeping reader for subsequent calls also preserves any buffered bytes.
+	frame, err := reader.ReadSlice('\n')
+	if err != nil || len(frame) > 4096 {
+		return fmt.Errorf("reading daemon identity frame: %w", errors.Join(err, ErrDiscoveryInvalid))
+	}
+	if err := json.Unmarshal(frame, &response); err != nil {
+		return fmt.Errorf("reading daemon identity: %w", err)
+	}
+	if response.ID == nil || *response.ID != 0 || response.Error != nil || !response.Result.StateReady ||
+		response.Result.ProjectPath != expected.ProjectPath || response.Result.PID <= 0 ||
+		(expected.PID != 0 && response.Result.PID != expected.PID) {
+		return fmt.Errorf("%w: listener identity does not match the selected project and process", ErrDiscoveryInvalid)
+	}
 	return nil
 }
 
@@ -331,10 +400,13 @@ func (c *IPCClient) Ping(ctx context.Context) error {
 }
 
 type DaemonStatusInfo struct {
-	UptimeSeconds  int64 `json:"uptime_seconds"`
-	PendingCount   int32 `json:"pending_count"`
-	ActiveSessions int32 `json:"active_sessions"`
-	Subscribers    int   `json:"subscribers"`
+	PID            int    `json:"pid"`
+	ProjectPath    string `json:"project_path"`
+	StateReady     bool   `json:"state_ready"`
+	UptimeSeconds  int64  `json:"uptime_seconds"`
+	PendingCount   int32  `json:"pending_count"`
+	ActiveSessions int32  `json:"active_sessions"`
+	Subscribers    int    `json:"subscribers"`
 }
 
 func (c *IPCClient) Status(ctx context.Context) (*DaemonStatusInfo, error) {

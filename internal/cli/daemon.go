@@ -94,11 +94,7 @@ var daemonStartCmd = &cobra.Command{
 			return err
 		}
 
-		info := daemon.NewClient(
-			daemon.WithSocketPath(socketPath),
-			daemon.WithPIDFile(daemon.PIDFileForCWD(project)),
-			daemon.WithLocalOnly(),
-		).GetStatusInfo()
+		info := daemon.NewProjectClient(project, daemon.WithLocalOnly()).GetStatusInfo()
 		out := output.New(output.Format(GetOutput()))
 		return out.Write(map[string]any{
 			"pid":         info.PID,
@@ -141,11 +137,7 @@ var daemonStatusCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		client := daemon.NewClient(
-			daemon.WithSocketPath(daemon.SocketPathForCWD(project)),
-			daemon.WithPIDFile(daemon.PIDFileForCWD(project)),
-			daemon.WithLocalOnly(),
-		)
+		client := daemon.NewProjectClient(project, daemon.WithLocalOnly())
 		info := client.GetStatusInfo()
 
 		// Best-effort uptime based on pid file mtime.

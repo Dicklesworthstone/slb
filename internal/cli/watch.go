@@ -100,8 +100,7 @@ func runWatch(cmd *cobra.Command, args []string) error {
 	}
 
 	// Try daemon IPC first
-	client := daemon.NewClient(daemon.WithSocketPath(state.socket),
-		daemon.WithPIDFile(daemon.PIDFileForCWD(state.project)), daemon.WithLocalOnly())
+	client := daemon.NewProjectClient(state.project, daemon.WithLocalOnly())
 	if state.useDaemon && client.IsDaemonRunning() {
 		err := runWatchDaemon(ctx, cmd.OutOrStdout(), state)
 		if ctx.Err() != nil {
@@ -124,7 +123,7 @@ func runWatch(cmd *cobra.Command, args []string) error {
 
 // runWatchDaemon streams events via daemon IPC subscription.
 func runWatchDaemon(ctx context.Context, out io.Writer, state *watchState) error {
-	ipcClient := daemon.NewIPCClient(state.socket)
+	ipcClient := daemon.NewProjectIPCClient(state.project)
 	defer ipcClient.Close()
 
 	events, err := ipcClient.Subscribe(ctx)
@@ -215,15 +214,15 @@ const watchRecentCompletionWindow = 15 * time.Minute
 // detect submitted votes even when status stays pending. Only active IDs extend
 // the bounded completion snapshot; no stream event grants execution authority.
 type watchState struct {
-	project, database, socket string
-	remote, useDaemon         bool
-	requests                  map[string]daemon.RequestStreamEvent
+	project, database string
+	remote, useDaemon bool
+	requests          map[string]daemon.RequestStreamEvent
 }
 
 func newWatchState(project string) *watchState {
 	return &watchState{project: project, database: filepath.Join(project, ".slb", "state.db"),
-		socket: daemon.SocketPathForCWD(project), useDaemon: true,
-		requests: make(map[string]daemon.RequestStreamEvent)}
+		useDaemon: true,
+		requests:  make(map[string]daemon.RequestStreamEvent)}
 }
 
 // Select one source before connecting. Discovery chooses the same database as

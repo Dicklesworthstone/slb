@@ -5,6 +5,7 @@
 package daemon
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -42,7 +43,8 @@ type ServerOptions struct {
 	Logger     *log.Logger
 }
 
-// DefaultServerOptions returns defaults aligned with the daemon client.
+// DefaultServerOptions returns placement defaults for a new daemon. Clients
+// discover the running daemon's published paths through DiscoverRuntime.
 func DefaultServerOptions() ServerOptions {
 	return normalizeServerOptions(ServerOptions{})
 }
@@ -73,6 +75,13 @@ func StartDaemonWithOptions(ctx context.Context, opts ServerOptions) error {
 	}
 	if _, err := db.ProjectDatabasePath(opts.ProjectDir); err != nil {
 		return fmt.Errorf("resolving daemon database: %w", err)
+	}
+	if record, _, err := readRuntimeRecord(opts.ProjectDir); err == nil {
+		if processAlive(record.PID) {
+			return fmt.Errorf("%w: recorded daemon process is still alive", ErrDaemonOwned)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("%w: %w", ErrDiscoveryInvalid, err)
 	}
 	if running, pid := daemonRunning(opts); running {
 		return fmt.Errorf("daemon already running (pid=%d)", pid)
@@ -144,6 +153,10 @@ func waitDaemonReady(ctx context.Context, opts ServerOptions, pid int) error {
 }
 
 func daemonReady(ctx context.Context, opts ServerOptions, pid int) bool {
+	record, _, err := readRuntimeRecord(opts.ProjectDir)
+	if err != nil || record.PID != pid || record.SocketPath != opts.SocketPath || record.PIDFile != opts.PIDFile {
+		return false
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
 	defer cancel()
 	conn, err := (&net.Dialer{}).DialContext(probeCtx, "unix", opts.SocketPath)
@@ -177,9 +190,18 @@ func StopDaemon(timeout time.Duration) error {
 }
 
 func StopDaemonWithOptions(opts ServerOptions, timeout time.Duration) error {
+	discover := strings.TrimSpace(opts.SocketPath) == "" && strings.TrimSpace(opts.PIDFile) == ""
 	opts, err := resolveServerOptions(opts)
 	if err != nil {
 		return err
+	}
+	var discovered RuntimePaths
+	if discover {
+		discovered, err = DiscoverRuntime(opts.ProjectDir)
+		if err != nil {
+			return err
+		}
+		opts.SocketPath, opts.PIDFile = discovered.SocketPath, discovered.PIDFile
 	}
 	pid, original, err := readPIDFileInfo(opts.PIDFile)
 	if err != nil && !os.IsNotExist(err) {
@@ -190,8 +212,23 @@ func StopDaemonWithOptions(opts ServerOptions, timeout time.Duration) error {
 	}
 	deadline := time.Now().Add(timeout)
 	socketOriginal, _ := lstatOwnedPath(opts.SocketPath)
+	runtimeOriginal, _ := lstatOwnedPath(filepath.Join(opts.ProjectDir, ".slb", runtimeRecordName))
+	projectLeasePath := filepath.Join(opts.ProjectDir, ".slb", "daemon.lock")
+	if _, err := os.Lstat(projectLeasePath); os.IsNotExist(err) {
+		projectLeasePath = "" // A legacy daemon has only path-scoped leases.
+	}
+	if discover {
+		if _, err := validateRuntimeSocket(opts.SocketPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("validating selected daemon socket: %w", err)
+		}
+	}
 	conn, dialErr := net.DialTimeout("unix", opts.SocketPath, min(timeout, time.Second))
 	if dialErr != nil {
+		if discover && discovered.Version != 0 {
+			// A record is a locator, not authority to remove a file when its
+			// listener cannot confirm the recorded project/process identity.
+			return fmt.Errorf("cannot verify the recorded project daemon: %w", dialErr)
+		}
 		if original == nil || processAlive(pid) {
 			return fmt.Errorf("cannot verify the selected project's daemon: %w", dialErr)
 		}
@@ -207,6 +244,16 @@ func StopDaemonWithOptions(opts ServerOptions, timeout time.Duration) error {
 	if err := conn.SetDeadline(deadline); err != nil {
 		return err
 	}
+	reader := bufio.NewReaderSize(conn, 4096)
+	if discover {
+		if err := verifyRuntimeIdentity(conn, reader, discovered); err != nil {
+			return err
+		}
+		current, err := validateRuntimeSocket(opts.SocketPath)
+		if err != nil || socketOriginal == nil || !os.SameFile(socketOriginal, current) {
+			return errors.New("daemon socket changed during shutdown verification")
+		}
+	}
 	params, err := json.Marshal(map[string]any{"pid": pid, "project_path": opts.ProjectDir})
 	if err != nil {
 		return err
@@ -221,7 +268,7 @@ func StopDaemonWithOptions(opts ServerOptions, timeout time.Duration) error {
 		Error *Error `json:"error"`
 		ID    int64  `json:"id"`
 	}
-	if err := json.NewDecoder(io.LimitReader(conn, 4096)).Decode(&response); err != nil {
+	if err := json.NewDecoder(io.LimitReader(reader, 4096)).Decode(&response); err != nil {
 		return fmt.Errorf("reading daemon shutdown response: %w", err)
 	}
 	if response.Error != nil {
@@ -237,10 +284,27 @@ func StopDaemonWithOptions(opts ServerOptions, timeout time.Duration) error {
 		lease, err := acquireFileLease(opts.PIDFile + ".lock")
 		if err == nil {
 			_ = lease.Close()
-			return nil
+			if projectLeasePath == "" {
+				return nil
+			}
+			// RunDaemon releases the project lease last. Wait for it too so
+			// an immediate restart after stop cannot race final cleanup.
+			projectLease, projectErr := acquireFileLease(projectLeasePath)
+			if projectErr == nil {
+				_ = projectLease.Close()
+				return nil
+			}
+			err = projectErr
 		}
 		if !errors.Is(err, ErrDaemonOwned) {
 			return err
+		}
+		if current, info, err := readRuntimeRecord(opts.ProjectDir); err == nil &&
+			(current.PID != response.Result.PID || current.SocketPath != opts.SocketPath ||
+				current.PIDFile != opts.PIDFile || (runtimeOriginal != nil && !os.SameFile(runtimeOriginal, info))) {
+			// A new generation may have chosen a different TMPDIR entirely.
+			// It owns the project lease; do not wait for or stop that daemon.
+			return nil
 		}
 		if currentPID, current, err := readPIDFileInfo(opts.PIDFile); err == nil && (currentPID != response.Result.PID || (original != nil && !os.SameFile(original, current))) {
 			// A new generation is already running. Its PID file and process
@@ -287,6 +351,17 @@ func RunDaemon(ctx context.Context, opts ServerOptions) error {
 			return errors.New("explicit daemon config is not a regular file")
 		}
 	}
+	cfg, err := config.Load(config.LoadOptions{ProjectDir: projectPath, ConfigPath: opts.ConfigPath})
+	if err != nil {
+		// Validate policy before creating a project marker or runtime lease.
+		// A daemon running a weaker default policy is not graceful degradation.
+		return fmt.Errorf("loading daemon config: %w", err)
+	}
+	projectLease, err := claimProjectRuntime(opts)
+	if err != nil {
+		return fmt.Errorf("claiming project daemon: %w", err)
+	}
+	defer func() { _ = projectLease.Close() }()
 	owner, err := claimPIDFile(opts.PIDFile, os.Getpid())
 	if err != nil {
 		return fmt.Errorf("claiming daemon pid file: %w", err)
@@ -296,11 +371,6 @@ func RunDaemon(ctx context.Context, opts ServerOptions) error {
 			logger.Warn("daemon pid cleanup", "error", err)
 		}
 	}()
-	cfg, err := config.Load(config.LoadOptions{ProjectDir: projectPath, ConfigPath: opts.ConfigPath})
-	if err != nil {
-		// A daemon running a weaker default policy is not graceful degradation.
-		return fmt.Errorf("loading daemon config: %w", err)
-	}
 	database, err := db.OpenAndMigrate(dbPath)
 	if err != nil {
 		return fmt.Errorf("opening daemon database: %w", err)
@@ -360,6 +430,15 @@ func RunDaemon(ctx context.Context, opts ServerOptions) error {
 	for _, server := range servers {
 		go func(server *IPCServer) { errCh <- server.Start(signalCtx) }(server)
 	}
+	cleanupRuntime, err := publishRuntime(opts)
+	if err != nil {
+		return fmt.Errorf("publishing daemon discovery: %w", err)
+	}
+	defer func() {
+		if err := cleanupRuntime(); err != nil {
+			logger.Warn("daemon discovery cleanup", "error", err)
+		}
+	}()
 	logger.Info("daemon started", "pid", os.Getpid(), "project", projectPath,
 		"pid_file", opts.PIDFile, "socket", opts.SocketPath)
 	select {

@@ -48,10 +48,12 @@ func (s DaemonStatus) String() string {
 
 // Client provides methods to interact with the daemon.
 type Client struct {
-	socketPath string
-	pidFile    string
-	logger     *log.Logger
-	localOnly  bool
+	socketPath   string
+	pidFile      string
+	runtime      *RuntimePaths
+	discoveryErr error
+	logger       *log.Logger
+	localOnly    bool
 }
 
 // ClientOption configures a Client.
@@ -61,6 +63,9 @@ type ClientOption func(*Client)
 func WithSocketPath(path string) ClientOption {
 	return func(c *Client) {
 		c.socketPath = path
+		// An explicit path is a deliberate transport selection, not project
+		// discovery. Project callers use NewProjectClient instead.
+		c.runtime, c.discoveryErr = nil, nil
 	}
 }
 
@@ -90,10 +95,19 @@ func WithLogger(l *log.Logger) ClientOption {
 // NewClient creates a new daemon client with optional configuration.
 func NewClient(opts ...ClientOption) *Client {
 	defaults := DefaultServerOptions()
+	return NewProjectClient(defaults.ProjectDir, opts...)
+}
+
+// NewProjectClient shares discovery with hooks and lifecycle commands, so a
+// changed caller environment cannot select a different socket or PID file.
+func NewProjectClient(cwd string, opts ...ClientOption) *Client {
+	paths, err := DiscoverRuntime(cwd)
 	c := &Client{
-		socketPath: defaults.SocketPath,
-		pidFile:    defaults.PIDFile,
-		logger:     log.Default(),
+		socketPath:   paths.SocketPath,
+		pidFile:      paths.PIDFile,
+		runtime:      &paths,
+		discoveryErr: err,
+		logger:       log.Default(),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -101,25 +115,18 @@ func NewClient(opts ...ClientOption) *Client {
 	return c
 }
 
-// DefaultSocketPath returns the default Unix socket path for the current project.
-// Format: /tmp/slb-{project-hash}.sock
-//
-// The project hash is derived from the path of the nearest ancestor
-// directory containing a .slb/ directory (walked up from CWD), not
-// from CWD itself. This ensures the daemon and any hook invoked from
-// a sub-directory of the same project converge on the same socket
-// (issue #3) — without it, a daemon started in /path/A and a hook
-// fired from /path/A/sub silently miss each other.
-//
-// Falls back to the raw CWD if no .slb/ ancestor exists, which
-// preserves the v0.3.x behavior for setups that don't use `slb init`.
+// DefaultSocketPath returns the current project's recorded socket, or its
+// expected default when discovery is unavailable. Communication must use a
+// project client, which retains discovery errors and verifies the listener.
 func DefaultSocketPath() string {
-	return DefaultServerOptions().SocketPath
+	return NewClient().socketPath
 }
 
-// SocketPathForCWD returns the project-scoped Unix socket path that a hook
-// running from cwd will use. This is the explicit-CWD counterpart to
-// DefaultSocketPath and must stay in lockstep with generated hook discovery.
+// SocketPathForCWD computes a new daemon's default socket placement, using a
+// hash of its physical project root and the daemon's temporary directory.
+// Clients use DiscoverRuntime/NewProjectIPCClient to find the published path
+// instead of recomputing placement from their own environment (issue #33).
+// The generated hook mirrors this default only when no record exists.
 func SocketPathForCWD(cwd string) string {
 	return projectRuntimePath(cwd, ".sock")
 }
@@ -223,10 +230,10 @@ func PhysicalProjectRootForCWD(cwd string) (string, error) {
 	}
 }
 
-// DefaultPIDFile returns the PID file for the current project.
-// Format: /tmp/slb-{project-hash}.pid, using the same identity as the socket.
+// DefaultPIDFile returns the recorded PID file for the current project, or its
+// expected default when discovery is unavailable.
 func DefaultPIDFile() string {
-	return DefaultServerOptions().PIDFile
+	return NewClient().pidFile
 }
 
 // IsDaemonRunning checks if the daemon is running and responsive.
@@ -240,6 +247,9 @@ func (c *Client) GetStatus() DaemonStatus {
 	// Prefer real connectivity checks (supports TCP when SLB_HOST is set).
 	if c.canConnectSocket() {
 		return DaemonRunning
+	}
+	if c.discoveryErr != nil {
+		return DaemonNotRunning
 	}
 
 	// Fall back to PID checks to distinguish "not running" vs "unresponsive".
@@ -282,10 +292,19 @@ func (c *Client) GetStatusInfo() StatusInfo {
 		info.Message = fmt.Sprintf("Daemon reachable at %s", socketCheck.host)
 		return info
 	}
+	if c.discoveryErr != nil {
+		info.Status = DaemonNotRunning
+		info.Message = "Project daemon discovery is invalid; refusing fallback socket lookup"
+		return info
+	}
 
 	pid, err := c.readPID()
 	if socketCheck.transport == "unix" {
-		if daemonPID, ok := socketDaemonPID(ctx, c.socketPath); ok {
+		daemonPID, ok := socketCheck.pid, socketCheck.pid > 0
+		if c.runtime == nil {
+			daemonPID, ok = socketDaemonPID(ctx, c.socketPath)
+		}
+		if ok {
 			// The selected listener identifies its own process. A stale file
 			// may name another live daemon, so existence alone cannot bind
 			// that PID to this project's socket.
@@ -418,6 +437,7 @@ type socketConnectivityResult struct {
 	transport string // "", "tcp", "unix"
 	tcpErr    error
 	unixErr   error
+	pid       int
 }
 
 func (c *Client) checkSocketConnectivity(ctx context.Context) socketConnectivityResult {
@@ -434,7 +454,17 @@ func (c *Client) checkSocketConnectivity(ctx context.Context) socketConnectivity
 		}
 	}
 
-	result.unixErr = pingDaemonUnix(ctx, c.socketPath)
+	if c.runtime != nil {
+		client := &IPCClient{socketPath: c.socketPath, runtime: c.runtime, discoveryErr: c.discoveryErr, localOnly: true}
+		defer func() { _ = client.Close() }()
+		var status *DaemonStatusInfo
+		status, result.unixErr = client.Status(ctx)
+		if result.unixErr == nil {
+			result.pid = status.PID
+		}
+	} else {
+		result.unixErr = pingDaemonUnix(ctx, c.socketPath)
+	}
 	if result.unixErr == nil {
 		result.transport = "unix"
 	}

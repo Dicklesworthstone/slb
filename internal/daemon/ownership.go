@@ -35,6 +35,9 @@ func claimPIDFile(path string, pid int) (*pidFileOwner, error) {
 			_ = lease.Close()
 		}
 	}()
+	if err := validateRuntimeParents(filepath.Dir(path)); err != nil {
+		return nil, err
+	}
 	file, info, err := openPIDFile(path, os.O_CREATE|os.O_RDWR)
 	if err != nil {
 		return nil, err
@@ -126,8 +129,8 @@ func removeOwnedPath(path string, original os.FileInfo) error {
 // A cooperating owner is fenced by the persistent lock; an older/foreign
 // listener is preserved even if it does not implement SLB's lock protocol.
 func listenOwnedUnix(path string) (net.Listener, func() error, error) {
-	if path == "" || !filepath.IsAbs(path) {
-		return nil, nil, errors.New("Unix socket path must be absolute")
+	if !validRuntimePath(path) || len(path) > maxUnixSocketPathBytes {
+		return nil, nil, errors.New("Unix socket path must be absolute and at most 103 bytes")
 	}
 	lease, err := acquireFileLease(path + ".lock")
 	if err != nil {
@@ -139,6 +142,9 @@ func listenOwnedUnix(path string) (net.Listener, func() error, error) {
 			_ = lease.Close()
 		}
 	}()
+	if err := validateRuntimeParents(filepath.Dir(path)); err != nil {
+		return nil, nil, err
+	}
 	if original, err := lstatOwnedPath(path); err == nil {
 		if original.Mode()&os.ModeSocket == 0 {
 			return nil, nil, errors.New("preserving existing path: not a socket")

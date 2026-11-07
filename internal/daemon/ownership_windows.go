@@ -115,7 +115,107 @@ func processAlive(pid int) bool {
 }
 
 func openPIDFile(path string, flags int) (*os.File, os.FileInfo, error) {
-	return openWindowsDaemonFile(path, flags, false)
+	return openWindowsDaemonFile(path, flags, false, false)
+}
+
+func openDiscoveryFile(path string, flags int) (*os.File, os.FileInfo, error) {
+	return openWindowsDaemonFile(path, flags, true, false)
+}
+
+func validateRuntimePermissions(path string, original os.FileInfo, private bool) error {
+	sd, err := windowsRuntimeSecurity(path, original)
+	if err != nil {
+		return err
+	}
+	user, owner, err := windowsDaemonIdentity()
+	if err != nil {
+		return err
+	}
+	return validateWindowsDaemonSecurity(sd, user, owner, private)
+}
+
+func windowsRuntimeSecurity(path string, original os.FileInfo) (*windows.SECURITY_DESCRIPTOR, error) {
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+	handle, err := windows.CreateFile(name, windows.READ_CONTROL|windows.FILE_READ_ATTRIBUTES,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(handle), path)
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
+	if err != nil || !os.SameFile(info, original) {
+		return nil, errors.New("daemon runtime path changed during validation")
+	}
+	return windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+}
+
+func validateRuntimeParents(directory string) error {
+	if !filepath.IsAbs(directory) {
+		return errors.New("daemon runtime directory must be absolute")
+	}
+	user, owner, err := windowsDaemonIdentity()
+	if err != nil {
+		return err
+	}
+	remaining := 512
+	return validateWindowsRuntimeAncestors(directory, &remaining, user, owner)
+}
+
+func validateWindowsRuntimeAncestors(directory string, remaining *int, user, owner *windows.SID) error {
+	for dir := filepath.Clean(directory); ; dir = filepath.Dir(dir) {
+		*remaining--
+		if *remaining < 0 {
+			return errors.New("daemon runtime directory has too many links or ancestors")
+		}
+		info, err := lstatOwnedPath(dir)
+		if err != nil {
+			return err
+		}
+		kind := windowsRuntimeAncestor
+		reparse := info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0
+		if reparse {
+			kind = windowsRuntimeReparseAncestor
+		} else if !info.IsDir() {
+			return errors.New("daemon runtime parent is not a directory")
+		}
+		sd, err := windowsRuntimeSecurity(dir, info)
+		if err != nil {
+			return err
+		}
+		if err := validateWindowsRuntimeSecurity(sd, user, owner, false, kind); err != nil {
+			return err
+		}
+		if reparse {
+			// Go reports junctions as ModeIrregular. Readlink supports both
+			// symlinks and junctions and rejects other reparse-point kinds.
+			target, err := os.Readlink(dir)
+			if err != nil {
+				return err
+			}
+			if !filepath.IsAbs(target) {
+				// Drive-relative and rooted-without-volume paths depend on
+				// process state rather than the link's containing directory.
+				if target == "" || filepath.VolumeName(target) != "" || os.IsPathSeparator(target[0]) {
+					return errors.New("daemon runtime link target must have an unambiguous path")
+				}
+				target = filepath.Join(filepath.Dir(dir), target)
+			}
+			// Check the target and the lexical containing directories. A
+			// safe target alone does not protect a replaceable link.
+			if err := validateWindowsRuntimeAncestors(target, remaining, user, owner); err != nil {
+				return err
+			}
+		}
+		if filepath.Dir(dir) == dir {
+			return nil
+		}
+	}
 }
 
 // os.Lstat on Windows can defer fetching a regular file's identity until
@@ -144,7 +244,7 @@ func acquireFileLease(path string) (*fileLease, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
 	}
-	file, info, err := openWindowsDaemonFile(path, os.O_CREATE|os.O_RDWR, true)
+	file, info, err := openWindowsDaemonFile(path, os.O_CREATE|os.O_RDWR, true, true)
 	if err != nil {
 		return nil, err
 	}
@@ -174,7 +274,7 @@ func acquireFileLease(path string) (*fileLease, error) {
 // openWindowsDaemonFile never truncates or follows the final path component.
 // Lease handles deny delete sharing, keeping one stable lock file for all
 // contenders; PID handles allow ownership-checked publication and cleanup.
-func openWindowsDaemonFile(path string, flags int, private bool) (*os.File, os.FileInfo, error) {
+func openWindowsDaemonFile(path string, flags int, private, lease bool) (*os.File, os.FileInfo, error) {
 	if flags & ^(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_EXCL) != 0 {
 		return nil, nil, errors.New("unsupported daemon file open flags")
 	}
@@ -215,7 +315,7 @@ func openWindowsDaemonFile(path string, flags int, private bool) (*os.File, os.F
 		}
 	}
 	sharing := uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE)
-	if !private {
+	if !lease {
 		sharing |= windows.FILE_SHARE_DELETE
 	}
 	handle, err := windows.CreateFile(name, access, sharing, &security, creation,
@@ -267,18 +367,49 @@ func openWindowsDaemonFile(path string, flags int, private bool) (*os.File, os.F
 	return file, info, nil
 }
 
+type windowsRuntimeObject uint8
+
+// Windows Resource Protection owns system directories through this specific
+// privileged service. Do not extend this exception to arbitrary service SIDs.
+// https://learn.microsoft.com/en-us/archive/msdn-magazine/2008/november/access-control-understanding-windows-file-and-registry-permissions
+const windowsTrustedInstallerSID = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+
+const (
+	windowsRuntimeFile windowsRuntimeObject = iota
+	windowsRuntimeAncestor
+	windowsRuntimeReparseAncestor
+)
+
 func validateWindowsDaemonSecurity(sd *windows.SECURITY_DESCRIPTOR, user, defaultOwner *windows.SID, private bool) error {
+	return validateWindowsRuntimeSecurity(sd, user, defaultOwner, private, windowsRuntimeFile)
+}
+
+func validateWindowsRuntimeSecurity(sd *windows.SECURITY_DESCRIPTOR, user, defaultOwner *windows.SID, private bool, kind windowsRuntimeObject) error {
 	owner, _, err := sd.Owner()
-	if err != nil || owner == nil || (!owner.Equals(user) && !owner.Equals(defaultOwner)) {
+	owned := owner != nil && (owner.Equals(user) || owner.Equals(defaultOwner))
+	if owner != nil && kind != windowsRuntimeFile {
+		// System directories may have privileged owners. Final runtime
+		// objects still require the user's exact owner or token default.
+		owned = owned || owner.IsWellKnown(windows.WinLocalSystemSid) || owner.IsWellKnown(windows.WinBuiltinAdministratorsSid) || owner.String() == windowsTrustedInstallerSID
+	}
+	if err != nil || !owned {
 		return errors.New("daemon file must be owned by the current user")
 	}
 	acl, _, err := sd.DACL()
 	if err != nil || acl == nil {
 		return errors.New("daemon file must have a restrictive access control list")
 	}
-	const unsafeAccess = windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA | windows.FILE_WRITE_EA |
-		windows.FILE_WRITE_ATTRIBUTES | windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER |
-		windows.GENERIC_WRITE | windows.GENERIC_ALL | windows.MAXIMUM_ALLOWED
+	// FILE_DELETE_CHILD in WinNT.h; not exported by x/sys/windows.
+	const fileDeleteChild = 0x0040
+	unsafeAccess := uint32(windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA | windows.FILE_WRITE_EA |
+		windows.FILE_WRITE_ATTRIBUTES | fileDeleteChild | windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER |
+		windows.GENERIC_WRITE | windows.GENERIC_ALL | windows.MAXIMUM_ALLOWED)
+	if kind == windowsRuntimeAncestor {
+		// On ordinary directories these bits only create new entries; they
+		// cannot replace the protected existing components checked above.
+		// Keep the stricter mask for reparse points and final runtime files.
+		unsafeAccess &^= windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA
+	}
 	for i := uint32(0); i < uint32(acl.AceCount); i++ {
 		var ace *windows.ACCESS_ALLOWED_ACE
 		if err := windows.GetAce(acl, i, &ace); err != nil {
@@ -307,6 +438,9 @@ func validateWindowsDaemonSecurity(sd *windows.SECURITY_DESCRIPTOR, user, defaul
 		// SYSTEM and administrators already have privileged filesystem access,
 		// like root on Unix. Ordinary users may only read a compatible PID file.
 		if sid.Equals(user) || sid.Equals(defaultOwner) || sid.IsWellKnown(windows.WinLocalSystemSid) || sid.IsWellKnown(windows.WinBuiltinAdministratorsSid) {
+			continue
+		}
+		if kind != windowsRuntimeFile && sid.String() == windowsTrustedInstallerSID {
 			continue
 		}
 		if (private && ace.Mask != 0) || uint32(ace.Mask)&unsafeAccess != 0 {
