@@ -1011,7 +1011,7 @@ func TestHookGenerateCommand_SymlinkSocketParity(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	paths := []string{physical, subdir, rootAlias, subdirAlias, nestedAlias, filepath.Join(rootAlias, "missing"), outside}
+	paths := []string{physical, subdir, rootAlias, subdirAlias, nestedAlias, outside}
 	stdout := runGeneratedHookPython(t, filepath.Join(scriptDir, "slb_guard.py"),
 		"import json\nprint(json.dumps([g['get_socket_path'](path) for path in sys.argv[2:]]))", paths...)
 	var sockets []string
@@ -1030,6 +1030,17 @@ func TestHookGenerateCommand_SymlinkSocketParity(t *testing.T) {
 	}
 	if sockets[4] == sockets[0] {
 		t.Fatal("nested project incorrectly shares its parent socket")
+	}
+	// Discovery, unlike the diagnostic-only Go path calculator, must refuse a
+	// nonexistent command directory rather than select its lexical ancestor.
+	missing := filepath.Join(rootAlias, "missing")
+	if _, err := daemon.DiscoverRuntime(missing); err == nil {
+		t.Fatal("native discovery accepted a missing working directory")
+	}
+	stdout = runGeneratedHookPython(t, filepath.Join(scriptDir, "slb_guard.py"),
+		"try:\n    g['get_socket_path'](sys.argv[2])\nexcept g['_DaemonDiscoveryError']:\n    print('refused')\nelse:\n    raise AssertionError('missing working directory accepted')", missing)
+	if stdout != "refused" {
+		t.Fatalf("Python discovery did not refuse a missing working directory: %q", stdout)
 	}
 }
 

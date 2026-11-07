@@ -155,6 +155,9 @@ func TestOwnedSocketPreservesLiveListener(t *testing.T) {
 				ln, cleanup, err = listenOwnedUnix(path)
 			} else {
 				ln, err = net.Listen("unix", path)
+				if err != nil {
+					t.Fatal(err)
+				}
 				cleanup = ln.Close
 			}
 			if err != nil {

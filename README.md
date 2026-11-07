@@ -869,7 +869,18 @@ The socket and PID file (`/tmp/slb-<hash>.pid`) use the same hash of the physica
 
 Use `-C /path/to/project` with `slb daemon start`, `stop`, or `status` to select a project. Selection falls back to `SLB_PROJECT`, then the working directory; all three resolve symlink aliases and discover the nearest ancestor containing `.slb`, so commands also work from nested directories. If no ancestor contains `.slb`, the selected directory is the project root. A separately initialized nested project keeps its own discovery record.
 
-Discovery accepts only an owned, private regular record with the expected project identity and valid paths. Clients check socket ownership and permissions, then verify the listener's project, process ID, and readiness on the same connection before sending a command. A malformed or unsafe record stops discovery; it never causes a scan of other temporary directories or another project's sockets. When no record exists, only the exact historical project default is tried, with the same listener identity check. Hook fallback policy is unchanged: dangerous commands remain blocked and uncovered commands require confirmation. Offline and timeout diagnostics identify the selected socket; the corresponding audit records include `socket_path` and a short `daemon_error` category, without raw connection errors or environment contents.
+Discovery accepts only an owned, private regular record with the expected project identity and valid paths. Local clients check socket ownership and permissions, authenticate the connected OS user using kernel peer credentials, then verify the listener's project, process ID, and readiness on the same connection before sending a command. Where the kernel supplies a peer PID, it must match the discovery record and listener status. A malformed or unsafe record stops discovery; it never causes a scan of other temporary directories or another project's sockets. When no record exists, only the exact historical project default is tried, with the same listener identity check. Hook fallback policy is unchanged: dangerous commands remain blocked and uncovered commands require confirmation. Offline and timeout diagnostics identify the selected socket; the corresponding audit records include `socket_path` and a short `daemon_error` category, without raw connection errors or environment contents.
+
+The generated Python hook uses the same strict physical project boundary as the
+native client: an invalid or unreadable nearest `.slb` marker cannot redirect it
+to an ancestor daemon. Local peer authentication is implemented natively on
+Linux, macOS, FreeBSD, and Windows; the standalone Python transport supports
+Linux, macOS, and FreeBSD. An unavailable peer-credential API leaves local hooks
+on their existing fail-closed classification. Windows installations use the
+native guard for online transport. Explicit `SLB_HOST` transport remains
+authoritative and does not fall back to local discovery. These checks protect
+local routing; they do not isolate malicious processes sharing an OS user.
+See [the discovery trust boundary](references/SECURITY.md#local-daemon-discovery-issue-33).
 
 Lifecycle commands manage the local project daemon regardless of `SLB_HOST`. A persistent `.slb/daemon.lock` prevents simultaneous daemons for one project even when their temporary directories differ. It and the companion `.pid.lock` and `.sock.lock` files remain after shutdown by design; leave them in place so ownership remains coordinated across starts and stops. The discovery record is removed only by the daemon generation that published it.
 

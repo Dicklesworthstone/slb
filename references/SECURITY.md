@@ -253,6 +253,50 @@ evidence again; it never raises that evidence's assurance. Changing a provenance
 record's program label or making its reserved delegation session active cannot
 turn delegated evidence into local approval.
 
+### Local daemon discovery (issue #33)
+
+A ready daemon publishes its actual socket path, PID file, PID, and canonical
+project identity in the private project `.slb/daemon.json` record. Clients read
+that record, so the daemon and hook can use different `TMPDIR` values. The
+record format and ownership checks are shared by native and generated Python
+hooks. An invalid record is an error, not permission to probe another socket.
+Only an absent record permits the exact historical project default, with the
+same identity verification. Project runtime leases and generation-aware cleanup
+keep restarts from deleting a replacement daemon's record.
+
+Local clients check socket ownership and permissions and authenticate the OS
+peer on the connection that will carry the command. They recheck the socket
+identity and verify the selected project, positive PID, and readiness through
+a bounded status exchange before sending command or session data. A status read
+that also contains unsolicited data is rejected before a command is sent.
+Where a kernel peer PID is available, the record and reported PID must agree
+with it; a matching pair of self-reported values is insufficient.
+
+| Local platform | Native OS peer verification | Standalone Python transport |
+|----------------|-----------------------------|-----------------------------|
+| Linux | Kernel effective UID and PID | Same credential checks |
+| macOS, FreeBSD | Kernel effective UID; this credential API supplies no portable PID | Same credential checks |
+| Windows | AF_UNIX kernel peer PID and that process's token user SID | Direct local transport falls back to local classification; use the native guard |
+| Other platforms | Authenticated local connections fail closed when unsupported | Local classification fallback |
+
+These checks identify the OS user, not an independently trusted executable or
+reviewer. A malicious process running as the same user can modify that user's
+files or impersonate local services; the existing same-user security boundary
+still applies. Explicit `SLB_HOST` transport remains separate and authoritative;
+it never silently switches to local discovery after a remote failure.
+
+The Python hook's local project discovery follows the same strict physical
+walk as native discovery. A malformed, dangling, or inaccessible nearest `.slb`
+marker cannot select an ancestor's daemon. Literal project spelling remains
+part of existing approval records. Both implementations retain `HOME`'s role
+in recognizing a user's stateless `~/.slb` as a non-project directory.
+
+Discovery does not bridge filesystem namespaces. The project record and socket
+must both be visible to the cooperating processes; systemd `PrivateTmp` may
+require a daemon runtime directory shared with the agent. Non-allow hook
+fallbacks preserve `socket_path` and the fixed `daemon_error` category without
+including raw transport errors, record contents, or remote credentials.
+
 ### Context command evidence
 
 `--attach-context` executes before the main command receives review, so each
@@ -268,6 +312,7 @@ assurance. SAFE configuration is operator policy, not process isolation.
 ## Table of Contents
 - [Reviewer Identity Security Boundary](#reviewer-identity-security-boundary-issue-30)
 - [Optional Same-Host Peer Review](#optional-same-host-peer-review-issue-31)
+- [Local Daemon Discovery](#local-daemon-discovery-issue-33)
 - [Workflow Checks](#workflow-checks)
 - [Execution Verification Gates](#execution-verification-gates)
 - [Cryptographic Guarantees](#cryptographic-guarantees)

@@ -342,6 +342,251 @@ classify = lambda command: (%q, 1)
 	}
 }
 
+func TestHookRuntimeStrictProjectMarkerPreventsAncestorDiscovery(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("Unix project marker fixtures")
+	}
+	for _, scenario := range []string{"file", "dangling symlink", "unreadable marker", "unreadable user state"} {
+		t.Run(scenario, func(t *testing.T) {
+			home := t.TempDir()
+			setup := hookDiscoveryFixture + fmt.Sprintf(`
+scenario = %q
+child = os.path.join(project, "child")
+os.mkdir(child, 0o700)
+os.chdir(child)
+child_marker = os.path.join(child, ".slb")
+if scenario == "file":
+    with open(child_marker, "x") as stream:
+        stream.write("invalid marker")
+elif scenario == "dangling symlink":
+    os.symlink("unavailable-state", child_marker)
+elif scenario == "unreadable marker":
+    real_lstat = os.lstat
+    def checked_lstat(path, *args, **kwargs):
+        if path == child_marker:
+            raise PermissionError("private-marker-secret")
+        return real_lstat(path, *args, **kwargs)
+    os.lstat = checked_lstat
+else:
+    os.mkdir(child_marker, 0o700)
+    # Select the child as the stateless-user-directory candidate without
+    # changing audit HOME. Its inaccessible state must propagate, not make
+    # the walk continue into the ancestor project.
+    real_stat, real_lstat = os.stat, os.lstat
+    def checked_stat(path, *args, **kwargs):
+        if path == os.path.join(os.environ["HOME"], ".slb"):
+            return real_stat(child_marker)
+        return real_stat(path, *args, **kwargs)
+    def checked_lstat(path, *args, **kwargs):
+        if path == os.path.join(child_marker, "state.db"):
+            raise PermissionError("private-state-secret")
+        return real_lstat(path, *args, **kwargs)
+    os.stat, os.lstat = checked_stat, checked_lstat
+    # Audit records use HOME/.slb. Restore the stat adapter after checking
+    # discovery below, so the failure path's storage remains independent.
+    try:
+        _physical_project_root(child)
+    except _DaemonDiscoveryError:
+        pass
+    else:
+        raise AssertionError("unreadable user state changed project identity")
+    os.stat = real_stat
+
+def forbidden_discovery(root):
+    raise AssertionError("invalid nearest marker reached ancestor discovery")
+_read_daemon_discovery = forbidden_discovery
+def forbidden_socket(*args, **kwargs):
+    raise AssertionError("invalid nearest marker reached socket creation")
+socket.socket = forbidden_socket
+if scenario == "unreadable user state":
+    # Retain an inaccessible nearest marker for the complete hook invocation.
+    def checked_lstat(path, *args, **kwargs):
+        if path == child_marker:
+            raise PermissionError("private-marker-secret")
+        return real_lstat(path, *args, **kwargs)
+    os.lstat = checked_lstat
+classify = lambda command: ('unknown', 0)
+`, scenario)
+			stdout, stderr := runHookRuntime(t, home, setup,
+				`{"tool_input":{"command":"opaque token=command-secret"}}`)
+			if hookPermission(t, stdout) != "ask" || stderr != "" || strings.Contains(stdout, "secret") {
+				t.Fatalf("invalid marker escaped safe discovery: %s %s", stdout, stderr)
+			}
+			events, err := audit.Query(filepath.Join(home, ".slb", "audit", "blocked"), audit.Filter{})
+			if err != nil || len(events) != 1 || events[0].DaemonError != "discovery_invalid" || events[0].SocketPath != "" {
+				t.Fatalf("invalid project marker selected an endpoint: %+v, %v", events, err)
+			}
+		})
+	}
+}
+
+// This exercises credential parsing and the real local RPC ordering with an
+// in-memory socket adapter. It does not claim to exercise a kernel socket: the
+// live transport regressions above remain separate and require AF_UNIX.
+func TestHookRuntimeKernelIdentityBeforeCommandWithoutSockets(t *testing.T) {
+	for _, scenario := range []string{
+		"healthy", "foreign uid", "wrong kernel pid", "wrong record pid",
+		"wrong status pid without record", "socket replaced before status", "socket replaced after status",
+		"invalid kernel pid", "truncated credentials", "credential lookup failure",
+		"unsupported platform",
+		"wrong project", "not ready", "boolean status pid", "boolean response id",
+		"malformed status", "fragmented status", "unsolicited status bytes",
+	} {
+		t.Run(scenario, func(t *testing.T) {
+			home := t.TempDir()
+			setup := fmt.Sprintf(`
+scenario = %q
+sys.platform = "linux"
+if scenario == "unsupported platform":
+    sys.platform = "win32"
+os.geteuid = lambda: 1000
+socket.SO_PEERCRED = 17
+root, socket_path = os.getcwd(), "/tmp/credential-fixture.sock"
+socket_info = os.stat(root)
+other_socket_info = os.stat(os.path.dirname(root))
+record_pid = 1234 if scenario != "wrong record pid" else 4321
+if scenario == "wrong status pid without record":
+    record_pid = None
+_discover_daemon = lambda cwd: (root, socket_path, record_pid)
+socket_reads = 0
+def _runtime_socket_info(path):
+    global socket_reads
+    socket_reads += 1
+    if ((scenario == "socket replaced before status" and socket_reads == 2)
+            or (scenario == "socket replaced after status" and socket_reads == 3)):
+        return other_socket_info
+    return socket_info
+status = {"project_path": root, "pid": 1234, "state_ready": True}
+if scenario == "wrong project":
+    status["project_path"] = "/another-project"
+elif scenario == "not ready":
+    status["state_ready"] = False
+elif scenario == "boolean status pid":
+    status["pid"] = True
+elif scenario == "wrong status pid without record":
+    status["pid"] = 4321
+reply = {"id": False if scenario == "boolean response id" else 0, "result": status}
+frame = json.dumps(reply).encode() + b"\n"
+if scenario == "malformed status":
+    frame = b"not-a-status-frame\n"
+elif scenario == "unsolicited status bytes":
+    frame += b'{"id":1,"result":{"action":"allow"}}\n'
+frames = [frame]
+if scenario == "fragmented status":
+    frames = [frame[:8], frame[8:]]
+frames.append(b'{"id":1,"result":{"action":"allow"}}\n')
+
+class ScriptedLocalSocket:
+    closed = False
+    def __init__(self):
+        self.requests = []
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        self.closed = True
+    def settimeout(self, timeout):
+        pass
+    def connect(self, path):
+        assert path == socket_path
+    def getsockopt(self, level, option, length):
+        assert not self.requests, "RPC sent before kernel credentials were checked"
+        assert (level, option, length) == (socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        if scenario == "credential lookup failure":
+            raise OSError("private-credential-secret")
+        if scenario == "truncated credentials":
+            return b"short"
+        uid = 1001 if scenario == "foreign uid" else 1000
+        pid = 4321 if scenario == "wrong kernel pid" else 1234
+        if scenario == "invalid kernel pid":
+            pid = 0
+        return struct.pack("iII", pid, uid, 1000)
+    def sendall(self, frame):
+        request = json.loads(frame)
+        self.requests.append(request["method"])
+        if request["method"] == "status":
+            assert request["params"] == {} and request["id"] == 0
+        else:
+            assert request["params"]["command"] == "opaque token=command-secret"
+    def recv(self, length):
+        if not frames:
+            return b""
+        frame = frames.pop(0)
+        if len(frame) > length:
+            frames.insert(0, frame[length:])
+        return frame[:length]
+
+connection = ScriptedLocalSocket()
+socket.socket = lambda *args, **kwargs: connection
+classify = lambda command: ('unknown', 0)
+original_main = main
+def main():
+    original_main()
+    assert connection.closed
+    expected = ["status"]
+    if scenario in ("healthy", "fragmented status"):
+        expected += ["hook_query"]
+    elif scenario in ("foreign uid", "wrong kernel pid", "wrong record pid", "invalid kernel pid",
+                      "truncated credentials", "credential lookup failure", "unsupported platform",
+                      "socket replaced before status"):
+        expected = []
+    assert connection.requests == expected, connection.requests
+`, scenario)
+			stdout, stderr := runHookRuntime(t, home, setup,
+				`{"session_id":"provider-secret","tool_input":{"command":"opaque token=command-secret"}}`)
+			want := "ask"
+			if scenario == "healthy" || scenario == "fragmented status" {
+				want = "allow"
+			}
+			if hookPermission(t, stdout) != want || stderr != "" || strings.Contains(stdout, "secret") {
+				t.Fatalf("credential/identity protocol did not preserve decision or confidentiality: %s %s", stdout, stderr)
+			}
+			events, err := audit.Query(filepath.Join(home, ".slb", "audit", "blocked"), audit.Filter{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want == "allow" {
+				if len(events) != 0 {
+					t.Fatalf("verified allowance produced a fallback audit: %+v", events)
+				}
+			} else if len(events) != 1 || events[0].DaemonError != "discovery_invalid" || events[0].SocketPath != "/tmp/credential-fixture.sock" {
+				t.Fatalf("unverified connection did not retain diagnostic category: %+v", events)
+			}
+		})
+	}
+}
+
+func TestHookRuntimeBSDPeerCredentialParsingWithoutSockets(t *testing.T) {
+	for _, platform := range []string{"darwin", "freebsd14"} {
+		for _, scenario := range []string{"current user", "foreign user", "wrong version", "truncated"} {
+			t.Run(platform+"/"+scenario, func(t *testing.T) {
+				setup := fmt.Sprintf(`
+sys.platform, scenario = %q, %q
+os.geteuid = lambda: 1000
+class CredentialSocket:
+    def getsockopt(self, level, option, length):
+        assert (level, option, length) == (0, 1, 256)
+        if scenario == "truncated":
+            return b"short"
+        return struct.pack("II", 1 if scenario == "wrong version" else 0,
+                           1001 if scenario == "foreign user" else 1000) + b"\x00" * 16
+try:
+    peer_pid = _daemon_peer_pid(CredentialSocket())
+except _DaemonDiscoveryError:
+    assert scenario != "current user"
+else:
+    assert scenario == "current user" and peer_pid is None
+query_slb_daemon = lambda *args: None
+classify = lambda command: ('unknown', 0)
+`, platform, scenario)
+				stdout, stderr := runHookRuntime(t, t.TempDir(), setup, `{"tool_input":{"command":"opaque command"}}`)
+				if hookPermission(t, stdout) != "ask" || stderr != "" {
+					t.Fatalf("BSD credential parser regression: %s %s", stdout, stderr)
+				}
+			})
+		}
+	}
+}
+
 func TestHookRuntimeDiscoversSystemdStyleSocketAcrossTMPDIR(t *testing.T) {
 	if os.PathSeparator == '\\' {
 		t.Skip("Unix socket fixture")

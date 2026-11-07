@@ -590,7 +590,7 @@ func TestBuiltCLIHookDiscoveryAcrossTMPDIRs(t *testing.T) {
 				var result []string
 				for _, entry := range identityCLIEnvironment(home) {
 					key, _, _ := strings.Cut(entry, "=")
-					if key != "TMPDIR" && key != "TMP" && key != "TEMP" && key != "PWD" {
+					if key != "TMPDIR" && key != "TMP" && key != "TEMP" && key != "PWD" && key != "XDG_RUNTIME_DIR" {
 						result = append(result, entry)
 					}
 				}
@@ -607,6 +607,8 @@ func TestBuiltCLIHookDiscoveryAcrossTMPDIRs(t *testing.T) {
 			if setup.agentTemp {
 				agentEnv = environment(agentTemp)
 			}
+			serviceEnv = append(serviceEnv, "XDG_RUNTIME_DIR="+serviceTemp)
+			agentEnv = append(agentEnv, "XDG_RUNTIME_DIR="+agentTemp)
 
 			run := func(t *testing.T, cwd string, env []string, executable string, input []byte, args ...string) ([]byte, []byte, error) {
 				t.Helper()
@@ -897,6 +899,30 @@ desktop_enabled = false
 			}
 			assertStatus(t, otherNested, agentEnv, other)
 			assertGuards(t, "other_project_survives_stop", otherNested, scripts[otherProject], agentEnv, "allow", "")
+
+			// Restart the actual daemon under a third environment while its
+			// preceding generation's stale record remains. Both guards must
+			// discover the newly published endpoint, not cache the old path.
+			restartedRuntime := filepath.Join(base, "restarted-service")
+			if err := os.Mkdir(restartedRuntime, 0700); err != nil {
+				t.Fatal(err)
+			}
+			serviceRuntime = restartedRuntime
+			serviceEnv = append(environment(restartedRuntime), "XDG_RUNTIME_DIR="+restartedRuntime)
+			restarted, _, _ := start(t, project, false)
+			if restarted.PID == selected.PID || restarted.SocketPath == selected.SocketPath || restarted.PIDFile == selected.PIDFile {
+				t.Fatalf("restart did not publish its new process and runtime paths: old=%+v new=%+v", selected, restarted)
+			}
+			assertStatus(t, nested, agentEnv, restarted)
+			assertGuards(t, "restarted_with_different_environment", nested, scripts[project], agentEnv, "allow", "")
+			assertStatus(t, otherNested, agentEnv, other)
+			jsonCLI(t, nested, agentEnv, "daemon", "stop", "--timeout", "3")
+			for _, path := range []string{recordPath, restarted.SocketPath, restarted.PIDFile} {
+				if _, err := os.Lstat(path); !os.IsNotExist(err) {
+					t.Fatalf("restarted service left a runtime resource after stop: %s (%v)", path, err)
+				}
+			}
+			assertGuards(t, "stopped_after_restart", nested, scripts[project], agentEnv, "ask", "")
 			jsonCLI(t, otherNested, agentEnv, "daemon", "stop", "--timeout", "3")
 		})
 	}

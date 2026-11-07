@@ -29,19 +29,20 @@ var ErrIPCSubscribed = errors.New("IPC client is subscribed; use a separate clie
 // I/O; Close must be able to interrupt a blocked reader or writer immediately.
 // gate serializes connection setup and RPCs and is itself context-cancellable.
 type IPCClient struct {
-	socketPath   string
-	runtime      *RuntimePaths
-	discoveryErr error
-	localOnly    bool
-	conn         net.Conn
-	scanner      *bufio.Scanner
-	mu           sync.Mutex
-	nextID       atomic.Int64
-	gateOnce     sync.Once
-	gate         chan struct{}
-	generation   uint64
-	connDone     chan struct{}
-	subscribed   bool
+	socketPath    string
+	runtime       *RuntimePaths
+	discoveryErr  error
+	localOnly     bool
+	conn          net.Conn
+	scanner       *bufio.Scanner
+	mu            sync.Mutex
+	nextID        atomic.Int64
+	gateOnce      sync.Once
+	gate          chan struct{}
+	generation    uint64
+	connDone      chan struct{}
+	subscribed    bool
+	connectCancel context.CancelFunc
 }
 
 type ipcClientConnection struct {
@@ -105,7 +106,17 @@ func (c *IPCClient) connect(ctx context.Context) error {
 		return nil
 	}
 	generation := c.generation
+	ctx, cancel := context.WithCancel(ctx)
+	c.connectCancel = cancel
 	c.mu.Unlock()
+	defer func() {
+		cancel()
+		c.mu.Lock()
+		if c.generation == generation {
+			c.connectCancel = nil
+		}
+		c.mu.Unlock()
+	}()
 
 	network, address := "unix", c.socketPath
 	if host := strings.TrimSpace(os.Getenv("SLB_HOST")); host != "" && !c.localOnly {
@@ -128,7 +139,8 @@ func (c *IPCClient) connect(ctx context.Context) error {
 		return fmt.Errorf("connecting to daemon: %w", err)
 	}
 	reader := bufio.NewReaderSize(conn, 4096)
-	// DialContext does not cancel subsequent I/O. Bound the TCP hello too.
+	// DialContext does not cancel subsequent I/O. Bound both the TCP hello
+	// and project identity exchange, including an explicit Close during setup.
 	stop := closeIPCOnCancel(ctx, func() { _ = conn.Close() })
 	if deadline, ok := ctx.Deadline(); ok {
 		err = conn.SetDeadline(deadline)
@@ -141,13 +153,7 @@ func (c *IPCClient) connect(ctx context.Context) error {
 		}
 	}
 	if err == nil && network == "unix" && c.runtime != nil {
-		err = verifyRuntimeIdentity(conn, reader, *c.runtime)
-		if err == nil {
-			current, statErr := validateRuntimeSocket(address)
-			if statErr != nil || !os.SameFile(socketInfo, current) {
-				err = fmt.Errorf("%w: socket changed during connection", ErrDiscoveryInvalid)
-			}
-		}
+		err = verifyRuntimeConnection(conn, reader, *c.runtime, socketInfo, true)
 	}
 	stop()
 	if err == nil {
@@ -175,9 +181,37 @@ func (c *IPCClient) connect(ctx context.Context) error {
 	return nil
 }
 
-// Verify on the connection that will carry the command. A separate status
-// probe followed by a new dial would leave a daemon replacement race.
-func verifyRuntimeIdentity(conn net.Conn, reader *bufio.Reader, expected RuntimePaths) error {
+// Verify the kernel peer and the selected socket on the connection that will
+// carry the command. A status reply alone cannot authenticate an OS identity.
+func verifyRuntimeConnection(conn net.Conn, reader *bufio.Reader, expected RuntimePaths, original os.FileInfo, requireReady bool) error {
+	peerPID, err := authenticatedPeerPID(conn)
+	if err != nil {
+		return fmt.Errorf("%w: authenticating daemon peer: %w", ErrDiscoveryInvalid, err)
+	}
+	if peerPID > 0 {
+		if expected.PID != 0 && peerPID != expected.PID {
+			return fmt.Errorf("%w: kernel peer does not match the recorded daemon process", ErrDiscoveryInvalid)
+		}
+		// Even the no-record compatibility path must report the kernel PID.
+		expected.PID = peerPID
+	}
+	current, err := validateRuntimeSocket(expected.SocketPath)
+	if err != nil || original == nil || !os.SameFile(original, current) {
+		return fmt.Errorf("%w: socket changed during connection", ErrDiscoveryInvalid)
+	}
+	if err := verifyRuntimeIdentity(conn, reader, expected, requireReady); err != nil {
+		return err
+	}
+	current, err = validateRuntimeSocket(expected.SocketPath)
+	if err != nil || !os.SameFile(original, current) {
+		return fmt.Errorf("%w: socket changed during identity verification", ErrDiscoveryInvalid)
+	}
+	return nil
+}
+
+// A separate status probe followed by a new dial would leave a daemon
+// replacement race. Shutdown still verifies identity when services are unready.
+func verifyRuntimeIdentity(conn net.Conn, reader *bufio.Reader, expected RuntimePaths, requireReady bool) error {
 	if err := json.NewEncoder(conn).Encode(RPCRequest{Method: "status", ID: 0}); err != nil {
 		return err
 	}
@@ -192,15 +226,18 @@ func verifyRuntimeIdentity(conn net.Conn, reader *bufio.Reader, expected Runtime
 	}
 	// Consume the newline too: JSON Decode may otherwise return before a
 	// fragmented newline arrives, leaving an empty frame for the next RPC.
-	// Keeping reader for subsequent calls also preserves any buffered bytes.
+	// No later response is legitimate until this connection sends another RPC.
 	frame, err := reader.ReadSlice('\n')
 	if err != nil || len(frame) > 4096 {
 		return fmt.Errorf("reading daemon identity frame: %w", errors.Join(err, ErrDiscoveryInvalid))
 	}
 	if err := json.Unmarshal(frame, &response); err != nil {
-		return fmt.Errorf("reading daemon identity: %w", err)
+		return fmt.Errorf("%w: reading daemon identity: %w", ErrDiscoveryInvalid, err)
 	}
-	if response.ID == nil || *response.ID != 0 || response.Error != nil || !response.Result.StateReady ||
+	if reader.Buffered() != 0 {
+		return fmt.Errorf("%w: unsolicited data after daemon identity", ErrDiscoveryInvalid)
+	}
+	if response.ID == nil || *response.ID != 0 || response.Error != nil || (requireReady && !response.Result.StateReady) ||
 		response.Result.ProjectPath != expected.ProjectPath || response.Result.PID <= 0 ||
 		(expected.PID != 0 && response.Result.PID != expected.PID) {
 		return fmt.Errorf("%w: listener identity does not match the selected project and process", ErrDiscoveryInvalid)
@@ -213,8 +250,12 @@ func verifyRuntimeIdentity(conn net.Conn, reader *bufio.Reader, expected Runtime
 func (c *IPCClient) Close() error {
 	c.mu.Lock()
 	conn := c.conn
+	cancel := c.connectCancel
 	c.clearConnectionLocked()
 	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	if conn != nil {
 		return conn.Close()
 	}
@@ -224,6 +265,7 @@ func (c *IPCClient) Close() error {
 func (c *IPCClient) clearConnectionLocked() {
 	c.generation++
 	c.conn, c.scanner, c.subscribed = nil, nil, false
+	c.connectCancel = nil
 	if c.connDone != nil {
 		close(c.connDone)
 		c.connDone = nil

@@ -157,6 +157,10 @@ func daemonReady(ctx context.Context, opts ServerOptions, pid int) bool {
 	if err != nil || record.PID != pid || record.SocketPath != opts.SocketPath || record.PIDFile != opts.PIDFile {
 		return false
 	}
+	original, err := validateRuntimeSocket(opts.SocketPath)
+	if err != nil {
+		return false
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
 	defer cancel()
 	conn, err := (&net.Dialer{}).DialContext(probeCtx, "unix", opts.SocketPath)
@@ -168,21 +172,7 @@ func daemonReady(ctx context.Context, opts ServerOptions, pid int) bool {
 	if err := conn.SetDeadline(deadline); err != nil {
 		return false
 	}
-	if err := json.NewEncoder(conn).Encode(RPCRequest{Method: "status", ID: 1}); err != nil {
-		return false
-	}
-	var response struct {
-		Result struct {
-			PID         int    `json:"pid"`
-			ProjectPath string `json:"project_path"`
-			StateReady  bool   `json:"state_ready"`
-		} `json:"result"`
-		Error *Error `json:"error"`
-		ID    int64  `json:"id"`
-	}
-	return json.NewDecoder(io.LimitReader(conn, 4096)).Decode(&response) == nil &&
-		response.ID == 1 && response.Error == nil && response.Result.StateReady &&
-		response.Result.PID == pid && response.Result.ProjectPath == opts.ProjectDir
+	return verifyRuntimeConnection(conn, bufio.NewReaderSize(conn, 4096), record, original, true) == nil
 }
 
 func StopDaemon(timeout time.Duration) error {
@@ -246,12 +236,8 @@ func StopDaemonWithOptions(opts ServerOptions, timeout time.Duration) error {
 	}
 	reader := bufio.NewReaderSize(conn, 4096)
 	if discover {
-		if err := verifyRuntimeIdentity(conn, reader, discovered); err != nil {
+		if err := verifyRuntimeConnection(conn, reader, discovered, socketOriginal, false); err != nil {
 			return err
-		}
-		current, err := validateRuntimeSocket(opts.SocketPath)
-		if err != nil || socketOriginal == nil || !os.SameFile(socketOriginal, current) {
-			return errors.New("daemon socket changed during shutdown verification")
 		}
 	}
 	params, err := json.Marshal(map[string]any{"pid": pid, "project_path": opts.ProjectDir})

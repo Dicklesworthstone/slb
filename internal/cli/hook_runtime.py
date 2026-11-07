@@ -10,6 +10,7 @@ import shlex
 import shutil
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -23,22 +24,27 @@ MAX_DISCOVERY_BYTES = 8192
 MAX_UNIX_SOCKET_BYTES = 103
 
 
-# Both project walks here, _project_root_for_approval and _execution_paths,
-# mirror the rule of Go's daemon.ProjectRootForCWD (PhysicalProjectRootForCWD
-# for physical paths): the nearest .slb marks the project, except slb's own
-# ~/.slb while it holds no state.db.
-def _is_user_dir_without_state(marker: str) -> bool:
+# Project discovery and execution use the nearest .slb marker, except slb's
+# own ~/.slb while it holds no state.db. Approval records preserve literal
+# paths; authenticated local discovery uses strict physical project identity.
+def _is_user_dir_without_state(marker: str, strict=False) -> bool:
     """Mirror config.IsUserDirWithoutState: slb's own ~/.slb marks no project until it holds state.db.
 
     The home comes from the variable Go's os.UserHomeDir reads; directories are
-    compared physically, so an aliased home matches. Any error keeps the marker."""
+    compared physically, so an aliased home matches. Strict callers must refuse
+    an unreadable marker or state path rather than change project boundaries."""
     home = os.environ.get("USERPROFILE" if os.name == "nt" else "HOME", "")
     if not home:
         return False
     try:
         user_info = os.stat(os.path.join(home, ".slb"))
+    except (OSError, ValueError):
+        return False
+    try:
         marker_info = os.stat(marker)
     except (OSError, ValueError):
+        if strict:
+            raise
         return False
     if not os.path.samestat(marker_info, user_info):
         return False
@@ -47,6 +53,8 @@ def _is_user_dir_without_state(marker: str) -> bool:
     except FileNotFoundError:
         return True
     except (OSError, ValueError):
+        if strict:
+            raise
         return False
     return False
 
@@ -82,6 +90,36 @@ def _project_root_for_socket(start: str) -> str:
 
 class _DaemonDiscoveryError(ValueError):
     pass
+
+
+def _physical_project_root(cwd):
+    """Mirror native physical discovery without skipping malformed markers.
+
+    Approval records retain their literal paths through the separate approval
+    helper. Local socket discovery must stop at an invalid nearest boundary.
+    """
+    try:
+        if (not isinstance(cwd, str) or not os.path.isabs(cwd)
+                or "\x00" in cwd or not os.path.isdir(cwd)):
+            raise _DaemonDiscoveryError("invalid project working directory")
+        root = physical_cwd = os.path.realpath(cwd)
+        while True:
+            marker = os.path.join(root, ".slb")
+            try:
+                os.lstat(marker)
+            except FileNotFoundError:
+                pass
+            else:
+                if not stat.S_ISDIR(os.stat(marker).st_mode):
+                    raise _DaemonDiscoveryError("invalid project state directory")
+                if not _is_user_dir_without_state(marker, strict=True):
+                    return root
+            parent = os.path.dirname(root)
+            if parent == root:
+                return physical_cwd
+            root = parent
+    except (OSError, ValueError, RecursionError) as error:
+        raise _DaemonDiscoveryError("project identity is unavailable") from error
 
 
 def _require_unix_discovery_capabilities():
@@ -208,7 +246,7 @@ def _read_daemon_discovery(root):
 
 
 def _discover_daemon(cwd):
-    root = _project_root_for_socket(cwd)
+    root = _physical_project_root(cwd)
     record = _read_daemon_discovery(root)
     if record is not None:
         return root, record["socket_path"], record["pid"]
@@ -230,6 +268,35 @@ def _runtime_socket_info(socket_path):
         raise _DaemonDiscoveryError("unsafe daemon socket")
     _validate_runtime_parents(os.path.dirname(socket_path))
     return info
+
+
+def _daemon_peer_pid(sock):
+    """Authenticate the connected OS user, with a kernel PID where available.
+
+    Filesystem ownership and daemon-reported identity do not replace kernel
+    credentials for the actual connection. This remains a same-user boundary.
+    """
+    try:
+        uid = os.geteuid()
+        if sys.platform.startswith("linux"):
+            credentials = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+            pid, peer_uid, _ = struct.unpack("iII", credentials)
+            if peer_uid != uid or pid <= 0:
+                raise _DaemonDiscoveryError("daemon peer identity mismatch")
+            return pid
+        if sys.platform == "darwin" or sys.platform.startswith("freebsd"):
+            # SOL_LOCAL / LOCAL_PEERCRED on Darwin and FreeBSD. xucred begins
+            # with uint32 version and UID; trailing fields are platform-specific.
+            credentials = sock.getsockopt(0, 1, 256)
+            if len(credentials) < 8:
+                raise _DaemonDiscoveryError("incomplete daemon credentials")
+            version, peer_uid = struct.unpack("II", credentials[:8])
+            if version != 0 or peer_uid != uid:
+                raise _DaemonDiscoveryError("daemon peer identity mismatch")
+            return None  # These credentials do not supply a portable peer PID.
+        raise _DaemonDiscoveryError("native socket authentication required")
+    except (OSError, ValueError, AttributeError, NotImplementedError, struct.error) as error:
+        raise _DaemonDiscoveryError("daemon peer credentials are unavailable or invalid") from error
 
 
 def _daemon_rpc(sock, deadline, method, params, request_id, limit=65536):
@@ -294,9 +361,20 @@ def query_slb_daemon(command: str, session_id: str, cwd: str, diagnostics=None) 
                 sock.sendall(json.dumps({"auth": os.environ.get("SLB_SESSION_KEY", "").strip()}).encode() + b"\n")
             else:
                 sock.connect(socket_path)
-                status = _daemon_rpc(sock, deadline, "status", {}, 0, 4096)
+                peer_pid = _daemon_peer_pid(sock)
+                if peer_pid is not None and expected_pid is not None and peer_pid != expected_pid:
+                    raise _DaemonDiscoveryError("daemon peer does not match the discovery record")
+                if not os.path.samestat(info, _runtime_socket_info(socket_path)):
+                    raise _DaemonDiscoveryError("socket changed during connection")
+                try:
+                    # The framed reader refuses unsolicited bytes after status;
+                    # they cannot become authority for a command sent later.
+                    status = _daemon_rpc(sock, deadline, "status", {}, 0, 4096)
+                except (ValueError, UnicodeError, RecursionError) as error:
+                    raise _DaemonDiscoveryError("invalid daemon identity frame") from error
                 if (status.get("project_path") != root or status.get("state_ready") is not True
                         or type(status.get("pid")) is not int or status["pid"] <= 0
+                        or (peer_pid is not None and status["pid"] != peer_pid)
                         or (expected_pid is not None and status["pid"] != expected_pid)):
                     raise _DaemonDiscoveryError("daemon identity mismatch")
                 if not os.path.samestat(info, _runtime_socket_info(socket_path)):

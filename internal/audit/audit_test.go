@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +10,51 @@ import (
 	"testing"
 	"time"
 )
+
+func TestDaemonDiagnosticsPersistWithoutChangingOlderAuditEvents(t *testing.T) {
+	for _, tc := range []struct {
+		name, socketPath, daemonError string
+	}{
+		{"both fields", "/tmp/custom-daemon.sock", "identity_mismatch"},
+		{"socket only", "/tmp/custom-daemon.sock", ""},
+		{"category only", "", "discovery_invalid"},
+		{"older event", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			directory := t.TempDir()
+			event := sampleEvent(time.Now())
+			event.Source = "hook_native_offline"
+			event.SocketPath, event.DaemonError = tc.socketPath, tc.daemonError
+			if err := Record(directory, event); err != nil {
+				t.Fatal(err)
+			}
+			events, err := Query(directory, Filter{})
+			if err != nil || len(events) != 1 || events[0].SocketPath != tc.socketPath ||
+				events[0].DaemonError != tc.daemonError || events[0].Source != event.Source {
+				t.Fatalf("persisted daemon diagnostics changed: %+v, %v", events, err)
+			}
+
+			entries, err := os.ReadDir(directory)
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("expected one persisted event: %+v, %v", entries, err)
+			}
+			data, err := os.ReadFile(filepath.Join(directory, entries[0].Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]any
+			if err := json.Unmarshal(data, &fields); err != nil {
+				t.Fatal(err)
+			}
+			for field, want := range map[string]string{"socket_path": tc.socketPath, "daemon_error": tc.daemonError} {
+				value, present := fields[field]
+				if present != (want != "") || (present && value != want) {
+					t.Fatalf("optional %s field changed the stored schema: %s", field, data)
+				}
+			}
+		})
+	}
+}
 
 func sampleEvent(at time.Time) Event {
 	return Event{

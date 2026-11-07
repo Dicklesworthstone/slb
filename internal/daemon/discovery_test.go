@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -444,15 +445,16 @@ func TestPublishRuntimeFailurePreservesExistingRecord(t *testing.T) {
 // discoveryProbe records every connection and RPC so tests can distinguish
 // rejecting an endpoint from contacting it and rejecting a later response.
 type discoveryProbe struct {
-	listener net.Listener
-	status   map[string]any
-	mu       sync.Mutex
-	conns    map[net.Conn]struct{}
-	accepted int
-	methods  []string
-	stopped  bool
-	wg       sync.WaitGroup
-	once     sync.Once
+	listener      net.Listener
+	status        map[string]any
+	mu            sync.Mutex
+	conns         map[net.Conn]struct{}
+	accepted      int
+	firstAccepted chan struct{}
+	methods       []string
+	stopped       bool
+	wg            sync.WaitGroup
+	once          sync.Once
 }
 
 func startDiscoveryProbe(t *testing.T, socket string, status map[string]any) *discoveryProbe {
@@ -465,7 +467,7 @@ func startDiscoveryProbe(t *testing.T, socket string, status map[string]any) *di
 		_ = listener.Close()
 		t.Fatal(err)
 	}
-	probe := &discoveryProbe{listener: listener, status: status, conns: make(map[net.Conn]struct{})}
+	probe := &discoveryProbe{listener: listener, status: status, conns: make(map[net.Conn]struct{}), firstAccepted: make(chan struct{})}
 	probe.wg.Add(1)
 	go func() {
 		defer probe.wg.Done()
@@ -482,6 +484,9 @@ func startDiscoveryProbe(t *testing.T, socket string, status map[string]any) *di
 			}
 			probe.conns[conn] = struct{}{}
 			probe.accepted++
+			if probe.accepted == 1 {
+				close(probe.firstAccepted)
+			}
 			probe.wg.Add(1)
 			probe.mu.Unlock()
 			go probe.serve(conn)
@@ -561,8 +566,8 @@ func TestProjectIPCClientRejectsWrongDaemonBeforeCommand(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			for _, kind := range []string{"wrong_project", "zero_pid", "not_ready", "wrong_pid"} {
-				if !withRecord && kind == "wrong_pid" {
-					continue // A missing record has no expected generation PID.
+				if !withRecord && kind == "wrong_pid" && runtime.GOOS != "linux" {
+					continue // Linux authenticates PID even without a published generation.
 				}
 				t.Run(kind, func(t *testing.T) {
 					project := discoveryProject(t)
@@ -782,15 +787,166 @@ func TestProjectRuntimeLeaseFencesDifferentTMPDIRs(t *testing.T) {
 	}
 }
 
+func TestProjectIPCClientRejectsForgedRecordPIDAgainstKernelPeer(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux SO_PEERCRED exposes the peer PID; BSD credentials authenticate UID only")
+	}
+	t.Setenv("SLB_HOST", "")
+	project := discoveryProject(t)
+	socket := filepath.Join(shortSocketDir(t), "daemon.sock")
+	forgedPID := os.Getpid() + 100000
+	probe := startDiscoveryProbe(t, socket, map[string]any{
+		"pid": forgedPID, "project_path": project, "state_ready": true,
+	})
+	record := discoveryFixture(project, socket)
+	record.PID = forgedPID
+	writeDiscoveryFixture(t, project, record)
+	client := NewProjectIPCClient(project)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := client.HookQuery(ctx, HookQueryParams{CWD: project, Command: "private-command-must-not-be-sent"}); err == nil {
+		t.Fatal("a self-consistent forged record and status bypassed kernel peer identity")
+	}
+	select {
+	case <-probe.firstAccepted:
+	case <-time.After(time.Second):
+		t.Fatal("forged-generation test did not reach a kernel peer")
+	}
+	probe.stop()
+	if probe.accepted != 1 || len(probe.methods) != 0 {
+		t.Fatalf("forged generation received traffic before peer authentication: connections=%d methods=%v", probe.accepted, probe.methods)
+	}
+}
+
+func TestProjectIPCClientCloseInterruptsIdentityAndAllowsReconnect(t *testing.T) {
+	t.Setenv("SLB_HOST", "")
+	project := discoveryProject(t)
+	socket := filepath.Join(shortSocketDir(t), "daemon.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := os.Chmod(socket, 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeDiscoveryFixture(t, project, discoveryFixture(project, socket))
+	client := NewProjectIPCClient(project)
+	t.Cleanup(func() { _ = client.Close() })
+	type callResult struct {
+		response *HookQueryResult
+		err      error
+	}
+	query := func(ctx context.Context, command string) <-chan callResult {
+		finished := make(chan callResult, 1)
+		go func() {
+			response, err := client.HookQuery(ctx, HookQueryParams{Command: command, SessionID: "private-session", CWD: project})
+			finished <- callResult{response, err}
+		}()
+		return finished
+	}
+	readProbe := func(conn *net.UnixConn) *bufio.Reader {
+		t.Helper()
+		if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		reader := bufio.NewReader(conn)
+		frame, err := reader.ReadString('\n')
+		var probe map[string]any
+		if err != nil || json.Unmarshal([]byte(frame), &probe) != nil || len(probe) != 2 || probe["method"] != "status" || probe["id"] != float64(0) {
+			t.Fatalf("expected a bare identity probe before protected traffic: %q (%v)", frame, err)
+		}
+		return reader
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	firstResult := query(ctx, "first-secret-must-not-be-sent")
+	_ = listener.SetDeadline(time.Now().Add(2 * time.Second))
+	first, err := listener.AcceptUnix()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	firstReader := readProbe(first)
+	// The bare status probe synchronizes with the unpublished connection's
+	// authentication phase. Deliberately withhold the identity response.
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-firstResult:
+		if result.err == nil || result.response != nil {
+			t.Fatalf("closed authentication returned a usable response: %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close waited for the operation deadline instead of interrupting identity setup")
+	}
+	if _, err := client.connection(); err == nil {
+		t.Fatal("Close published an unauthenticated connection")
+	}
+	if err := first.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := io.ReadAll(firstReader)
+	if len(remaining) != 0 || (err != nil && !errors.Is(err, syscall.ECONNRESET)) {
+		t.Fatalf("cancelled authentication leaked protected data or retained its socket: data=%q err=%v", remaining, err)
+	}
+
+	// A fresh generation must authenticate normally; the retired setup's
+	// cancellation must not poison another connection on the same client.
+	reconnectCtx, reconnectCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer reconnectCancel()
+	secondResult := query(reconnectCtx, "second-authenticated-command")
+	_ = listener.SetDeadline(time.Now().Add(2 * time.Second))
+	second, err := listener.AcceptUnix()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	secondReader := readProbe(second)
+	if err := json.NewEncoder(second).Encode(map[string]any{"id": 0, "result": map[string]any{
+		"project_path": project, "pid": os.Getpid(), "state_ready": true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	var request RPCRequest
+	if err := json.NewDecoder(secondReader).Decode(&request); err != nil || request.Method != "hook_query" || request.ID != 1 || !strings.Contains(string(request.Params), "second-authenticated-command") {
+		t.Fatalf("reconnected client did not send its authenticated query: %+v (%v)", request, err)
+	}
+	if err := json.NewEncoder(second).Encode(map[string]any{"id": request.ID, "result": map[string]string{"action": "allow"}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-secondResult:
+		if result.err != nil || result.response == nil || result.response.Action != "allow" {
+			t.Fatalf("new authenticated generation was poisoned by Close: %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("new authenticated generation did not finish")
+	}
+}
+
+func TestAuthenticatedProjectPeerRejectsNonUnixTransport(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	if _, err := authenticatedPeerPID(left); err == nil {
+		t.Fatal("non-Unix transport accepted as an authenticated local peer")
+	}
+}
+
 func TestVerifyRuntimeIdentityProtocol(t *testing.T) {
 	for _, kind := range []string{
 		"valid", "no_record_pid", "wrong_project", "wrong_pid", "zero_pid", "not_ready",
 		"wrong_response_id", "missing_response_id", "daemon_error", "malformed", "missing_identity", "oversized",
+		"unready_shutdown", "unready_shutdown_wrong_project", "unready_shutdown_wrong_pid",
 	} {
 		t.Run(kind, func(t *testing.T) {
 			expected := RuntimePaths{ProjectPath: "/example/project", PID: os.Getpid()}
 			status := map[string]any{"pid": os.Getpid(), "project_path": expected.ProjectPath, "state_ready": true}
 			response := RPCResponse{ID: 0, Result: status}
+			requireReady := true
 			switch kind {
 			case "no_record_pid":
 				expected.PID = 0
@@ -806,6 +962,17 @@ func TestVerifyRuntimeIdentityProtocol(t *testing.T) {
 				response.ID = 1
 			case "daemon_error":
 				response.Error = &Error{Code: ErrCodeInternal, Message: "unavailable"}
+			case "unready_shutdown", "unready_shutdown_wrong_project", "unready_shutdown_wrong_pid":
+				// A broken policy/database must not strand the operator's own
+				// daemon, but shutdown still requires the exact identity.
+				requireReady = false
+				status["state_ready"] = false
+				if kind == "unready_shutdown_wrong_project" {
+					status["project_path"] = "/other/project"
+				}
+				if kind == "unready_shutdown_wrong_pid" {
+					status["pid"] = os.Getpid() + 1
+				}
 			}
 			data, err := json.Marshal(response)
 			if err != nil {
@@ -830,7 +997,7 @@ func TestVerifyRuntimeIdentityProtocol(t *testing.T) {
 				t.Fatal(err)
 			}
 			done := make(chan error, 1)
-			go func() { done <- verifyRuntimeIdentity(local, bufio.NewReader(local), expected) }()
+			go func() { done <- verifyRuntimeIdentity(local, bufio.NewReader(local), expected, requireReady) }()
 			request := receiveIPCRequest(t, peer)
 			if request.Method != "status" || request.ID != 0 || len(request.Params) != 0 {
 				t.Fatalf("identity probe sent command data: %+v", request)
@@ -843,7 +1010,7 @@ func TestVerifyRuntimeIdentityProtocol(t *testing.T) {
 			}()
 			select {
 			case err := <-done:
-				valid := kind == "valid" || kind == "no_record_pid"
+				valid := kind == "valid" || kind == "no_record_pid" || kind == "unready_shutdown"
 				if (err == nil) != valid {
 					t.Errorf("identity %s: got %v, want valid=%v", kind, err, valid)
 				}
@@ -856,53 +1023,56 @@ func TestVerifyRuntimeIdentityProtocol(t *testing.T) {
 	}
 }
 
-func TestVerifyRuntimeIdentityConsumesSplitNewlineAndRetainsBufferedFrame(t *testing.T) {
-	local, peer := net.Pipe()
-	defer func() { _ = local.Close(); _ = peer.Close() }()
-	if err := local.SetDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	expected := RuntimePaths{ProjectPath: "/example/project", PID: os.Getpid()}
-	reader := bufio.NewReader(local)
-	done := make(chan error, 1)
-	go func() { done <- verifyRuntimeIdentity(local, reader, expected) }()
-	request := receiveIPCRequest(t, peer)
-	if request.Method != "status" {
-		t.Fatalf("identity request = %q, want status", request.Method)
-	}
-	frame, err := json.Marshal(RPCResponse{ID: 0, Result: map[string]any{
-		"pid": os.Getpid(), "project_path": expected.ProjectPath, "state_ready": true,
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	written := make(chan error, 1)
-	go func() { _, err := peer.Write(frame); written <- err }()
-	if err := <-written; err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-done:
-		t.Fatalf("accepted an unterminated identity frame: %v", err)
-	case <-time.After(20 * time.Millisecond):
-	}
-	// A transport read may contain the end of this frame and bytes from the
-	// following frame. The caller must retain the reader for later RPCs.
-	next := "{\"id\":1,\"result\":{\"pong\":true}}\n"
-	go func() { _, err := peer.Write([]byte("\n" + next)); written <- err }()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("complete identity frame was not accepted")
-	}
-	if err := <-written; err != nil {
-		t.Fatal(err)
-	}
-	remaining, err := reader.ReadString('\n')
-	if err != nil || remaining != next {
-		t.Fatalf("identity probe lost later frame bytes: %q, %v", remaining, err)
+func TestVerifyRuntimeIdentityConsumesSplitNewlineAndRejectsUnsolicitedFrame(t *testing.T) {
+	for _, unsolicited := range []bool{false, true} {
+		t.Run(strconv.FormatBool(unsolicited), func(t *testing.T) {
+			local, peer := net.Pipe()
+			defer func() { _ = local.Close(); _ = peer.Close() }()
+			if err := local.SetDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			expected := RuntimePaths{ProjectPath: "/example/project", PID: os.Getpid()}
+			reader := bufio.NewReader(local)
+			done := make(chan error, 1)
+			go func() { done <- verifyRuntimeIdentity(local, reader, expected, true) }()
+			request := receiveIPCRequest(t, peer)
+			if request.Method != "status" {
+				t.Fatalf("identity request = %q, want status", request.Method)
+			}
+			frame, err := json.Marshal(RPCResponse{ID: 0, Result: map[string]any{
+				"pid": os.Getpid(), "project_path": expected.ProjectPath, "state_ready": true,
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			written := make(chan error, 1)
+			go func() { _, err := peer.Write(frame); written <- err }()
+			if err := <-written; err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("accepted an unterminated identity frame: %v", err)
+			case <-time.After(20 * time.Millisecond):
+			}
+			ending := "\n"
+			if unsolicited {
+				// No command has been sent. A prefetched allow response must
+				// never become authority for the next protected RPC.
+				ending += "{\"id\":1,\"result\":{\"action\":\"allow\"}}\n"
+			}
+			go func() { _, err := peer.Write([]byte(ending)); written <- err }()
+			select {
+			case err := <-done:
+				if (err != nil) != unsolicited {
+					t.Fatalf("split identity frame with unsolicited=%t: %v", unsolicited, err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("complete identity exchange did not finish")
+			}
+			if err := <-written; err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
