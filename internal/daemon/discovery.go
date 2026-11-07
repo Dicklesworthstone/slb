@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 )
@@ -187,9 +188,50 @@ func validateRuntimeSocket(path string) (os.FileInfo, error) {
 	return info, nil
 }
 
+// projectRuntimeOwner binds recovery authority to the held project lease and
+// the exact discovery record observed under it. A numeric PID may be reused;
+// it cannot establish ownership of a preceding daemon generation by itself.
+type projectRuntimeOwner struct {
+	mu         sync.Mutex
+	lease      *fileLease
+	project    string
+	record     RuntimePaths
+	recordInfo os.FileInfo
+	retired    *retiredRuntimeSnapshot
+}
+
+func (owner *projectRuntimeOwner) Close() error {
+	if owner == nil {
+		return nil
+	}
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	lease := owner.lease
+	owner.lease = nil
+	return lease.Close()
+}
+
+// Callers hold owner.mu, or have not yet published the newly created owner.
+func (owner *projectRuntimeOwner) verifyRecord() error {
+	if owner.lease == nil {
+		return errors.New("project runtime ownership has been released")
+	}
+	if err := verifyFileLease(owner.lease); err != nil {
+		return err
+	}
+	current, info, err := readRuntimeRecord(owner.project)
+	if owner.recordInfo == nil && os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil || owner.recordInfo == nil || current != owner.record || !os.SameFile(owner.recordInfo, info) {
+		return fmt.Errorf("%w: discovery record changed during ownership recovery", ErrDiscoveryInvalid)
+	}
+	return nil
+}
+
 // claimProjectRuntime prevents daemons with different socket/PID environments
 // from owning the same project. Like other leases, daemon.lock is never removed.
-func claimProjectRuntime(opts ServerOptions) (*fileLease, error) {
+func claimProjectRuntime(opts ServerOptions) (*projectRuntimeOwner, error) {
 	directory := filepath.Join(opts.ProjectDir, ".slb")
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		return nil, err
@@ -201,16 +243,25 @@ func claimProjectRuntime(opts ServerOptions) (*fileLease, error) {
 	if err != nil {
 		return nil, err
 	}
-	record, _, err := readRuntimeRecord(opts.ProjectDir)
+	owner := &projectRuntimeOwner{lease: lease, project: opts.ProjectDir}
+	record, info, err := readRuntimeRecord(opts.ProjectDir)
 	if err != nil && !os.IsNotExist(err) {
-		_ = lease.Close()
+		_ = owner.Close()
 		return nil, fmt.Errorf("%w: %w", ErrDiscoveryInvalid, err)
 	}
-	if err == nil && processAlive(record.PID) {
-		_ = lease.Close()
-		return nil, fmt.Errorf("%w: recorded daemon process is still alive", ErrDaemonOwned)
+	if err == nil {
+		owner.record, owner.recordInfo = record, info
+		release, err := owner.lockRetiredRuntime(nil)
+		if err != nil {
+			_ = owner.Close()
+			return nil, fmt.Errorf("checking preceding daemon ownership: %w", err)
+		}
+		if err := release(); err != nil {
+			_ = owner.Close()
+			return nil, err
+		}
 	}
-	return lease, nil
+	return owner, nil
 }
 
 // publishRuntime runs while the project lease is held, after service startup.

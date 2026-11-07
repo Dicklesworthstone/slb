@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -1078,6 +1079,772 @@ func TestProjectRuntimeLeaseFencesDifferentTMPDIRs(t *testing.T) {
 	current, err := os.Lstat(lock)
 	if err != nil || !os.SameFile(original, current) {
 		t.Fatalf("project lease inode was removed or replaced: %v", err)
+	}
+}
+
+func startDiscoveryRecoverySentinel(t *testing.T) int {
+	t.Helper()
+	// A separate process models a reused PID without risking the test runner.
+	// Its unrelated lease must survive every attempted recovery.
+	path := filepath.Join(t.TempDir(), "unrelated.lock")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestFileLeaseProcessHelper$")
+	cmd.Env = append(os.Environ(), "SLB_TEST_OWNER_PATH="+path)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		_ = stdin.Close()
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		cancel()
+		_ = stdin.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		cancel()
+		_ = cmd.Wait()
+	})
+	if ready, err := bufio.NewReader(stdout).ReadString('\n'); err != nil || ready != "owned\n" {
+		t.Fatalf("unrelated process did not acquire its lease: %q, %v", ready, err)
+	}
+	original, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if !processAlive(cmd.Process.Pid) {
+			t.Error("recovery terminated the unrelated process")
+		}
+		current, err := os.Lstat(path)
+		if err != nil || !os.SameFile(original, current) {
+			t.Errorf("recovery replaced the unrelated process's lease: %v", err)
+		}
+		if lease, err := acquireFileLease(path); !errors.Is(err, ErrDaemonOwned) {
+			if lease != nil {
+				_ = lease.Close()
+			}
+			t.Errorf("unrelated process lost its lease: %v", err)
+		}
+	})
+	return cmd.Process.Pid
+}
+
+func preserveDiscoveryPath(t *testing.T, path string) {
+	t.Helper()
+	original, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contents []byte
+	if original.Mode().IsRegular() {
+		contents, err = os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		current, err := os.Lstat(path)
+		if err != nil || !os.SameFile(original, current) || original.Mode() != current.Mode() {
+			t.Errorf("recovery changed existing path %s: %v", path, err)
+			return
+		}
+		if original.Mode().IsRegular() {
+			data, err := os.ReadFile(path)
+			if err != nil || string(data) != string(contents) {
+				t.Errorf("recovery changed existing contents at %s: %v", path, err)
+			}
+		}
+	})
+}
+
+func TestProjectRuntimeLeaseRecoversStaleRecordWithReusedPID(t *testing.T) {
+	for _, layout := range []string{"same_runtime", "changed_runtime", "runtime_alias"} {
+		t.Run(layout, func(t *testing.T) {
+			project := discoveryProject(t)
+			previous := shortSocketDir(t)
+			record := discoveryFixture(project, filepath.Join(previous, "daemon.sock"))
+			record.PID = startDiscoveryRecoverySentinel(t)
+			writeDiscoveryFixture(t, project, record)
+			if err := os.WriteFile(record.PIDFile, []byte(strconv.Itoa(record.PID)+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			opts := ServerOptions{ProjectDir: project, SocketPath: record.SocketPath, PIDFile: record.PIDFile}
+			switch layout {
+			case "changed_runtime":
+				next := shortSocketDir(t)
+				opts.SocketPath, opts.PIDFile = filepath.Join(next, "daemon.sock"), filepath.Join(next, "daemon.pid")
+			case "runtime_alias":
+				alias := filepath.Join(shortSocketDir(t), "alias")
+				if err := os.Symlink(previous, alias); err != nil {
+					t.Fatal(err)
+				}
+				opts.SocketPath, opts.PIDFile = filepath.Join(alias, "daemon.sock"), filepath.Join(alias, "daemon.pid")
+			}
+			preserveDiscoveryPath(t, filepath.Join(project, ".slb", runtimeRecordName))
+			preserveDiscoveryPath(t, record.PIDFile)
+			if _, err := os.Lstat(record.SocketPath); !os.IsNotExist(err) {
+				t.Fatalf("fixture socket must be absent: %v", err)
+			}
+			owner, err := claimProjectRuntime(opts)
+			if err != nil {
+				t.Fatalf("free project lease and absent socket did not permit reused-PID recovery: %v", err)
+			}
+			defer func() { _ = owner.Close() }()
+			if contender, err := claimProjectRuntime(opts); !errors.Is(err, ErrDaemonOwned) {
+				if contender != nil {
+					_ = contender.Close()
+				}
+				t.Fatalf("recovery failed to fence another starter: %v", err)
+			}
+		})
+	}
+}
+
+func discoveryRecoveryFixture(t *testing.T, layout string) (RuntimePaths, ServerOptions) {
+	t.Helper()
+	project := discoveryProject(t)
+	previous := shortSocketDir(t)
+	record := discoveryFixture(project, filepath.Join(previous, "daemon.sock"))
+	record.PID = startDiscoveryRecoverySentinel(t)
+	opts := ServerOptions{ProjectDir: project, SocketPath: record.SocketPath, PIDFile: record.PIDFile}
+	switch layout {
+	case "changed_runtime":
+		next := shortSocketDir(t)
+		opts.SocketPath, opts.PIDFile = filepath.Join(next, "daemon.sock"), filepath.Join(next, "daemon.pid")
+	case "runtime_alias", "recorded_alias":
+		alias := filepath.Join(shortSocketDir(t), "alias")
+		if err := os.Symlink(previous, alias); err != nil {
+			t.Fatal(err)
+		}
+		if layout == "runtime_alias" {
+			opts.SocketPath, opts.PIDFile = filepath.Join(alias, "daemon.sock"), filepath.Join(alias, "daemon.pid")
+		} else {
+			record.SocketPath, record.PIDFile = filepath.Join(alias, "daemon.sock"), filepath.Join(alias, "daemon.pid")
+		}
+	}
+	writeDiscoveryFixture(t, project, record)
+	if err := os.WriteFile(record.PIDFile, []byte(strconv.Itoa(record.PID)+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return record, opts
+}
+
+func TestProjectRuntimeRecoveryClaimsMatchingPID(t *testing.T) {
+	for _, layout := range []string{"same_runtime", "changed_runtime", "runtime_alias", "recorded_alias"} {
+		t.Run(layout, func(t *testing.T) {
+			record, opts := discoveryRecoveryFixture(t, layout)
+			preserveDiscoveryPath(t, filepath.Join(record.ProjectPath, ".slb", runtimeRecordName))
+			if layout == "changed_runtime" {
+				preserveDiscoveryPath(t, record.PIDFile)
+			}
+			if legacy, err := claimPIDFile(record.PIDFile, os.Getpid()); !errors.Is(err, ErrDaemonOwned) {
+				if legacy != nil {
+					_ = legacy.Close()
+				}
+				t.Fatalf("a PID claim without project authority accepted a live PID: %v", err)
+			}
+			owner, err := claimProjectRuntime(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = owner.Close() }()
+			pidOwner, err := owner.claimPIDFile(opts.PIDFile, os.Getpid())
+			if err != nil {
+				t.Fatalf("record-bound recovery could not claim the selected PID file: %v", err)
+			}
+			defer func() { _ = pidOwner.Close() }()
+			if pid, err := readPIDFile(opts.PIDFile); err != nil || pid != os.Getpid() {
+				t.Fatalf("replacement PID not published: %d, %v", pid, err)
+			}
+			if layout != "changed_runtime" {
+				// Directory aliases identify the same PID and persistent lock;
+				// acquiring that lock twice would incorrectly refuse this claim.
+				if pid, err := readPIDFile(record.PIDFile); err != nil || pid != os.Getpid() {
+					t.Fatalf("recorded runtime alias did not identify the claimed PID: %d, %v", pid, err)
+				}
+			}
+			if contender, err := acquireFileLease(opts.PIDFile + ".lock"); !errors.Is(err, ErrDaemonOwned) {
+				if contender != nil {
+					_ = contender.Close()
+				}
+				t.Fatalf("replacement did not retain PID ownership: %v", err)
+			}
+			if err := pidOwner.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Lstat(opts.PIDFile); !os.IsNotExist(err) {
+				t.Fatalf("replacement did not clean up its own PID: %v", err)
+			}
+		})
+	}
+}
+
+func TestProjectRuntimeRecoveryPreservesRemovedRuntimeDirectory(t *testing.T) {
+	for _, layout := range []string{"same_runtime", "changed_runtime"} {
+		t.Run(layout, func(t *testing.T) {
+			project := discoveryProject(t)
+			old := filepath.Join(shortSocketDir(t), "removed-at-reboot")
+			record := discoveryFixture(project, filepath.Join(old, "daemon.sock"))
+			record.PID = startDiscoveryRecoverySentinel(t)
+			writeDiscoveryFixture(t, project, record)
+			preserveDiscoveryPath(t, filepath.Join(project, ".slb", runtimeRecordName))
+			next := old
+			if layout == "changed_runtime" {
+				next = shortSocketDir(t)
+			}
+			opts := ServerOptions{ProjectDir: project, SocketPath: filepath.Join(next, "daemon.sock"), PIDFile: filepath.Join(next, "daemon.pid")}
+			owner, err := claimProjectRuntime(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = owner.Close() }()
+			if _, err := os.Lstat(old); !os.IsNotExist(err) {
+				t.Fatalf("ownership proof recreated an obsolete runtime directory: %v", err)
+			}
+			pidOwner, err := owner.claimPIDFile(opts.PIDFile, os.Getpid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = pidOwner.Close() }()
+			if pid, err := readPIDFile(opts.PIDFile); err != nil || pid != os.Getpid() {
+				t.Fatalf("selected runtime did not publish the replacement PID: %d, %v", pid, err)
+			}
+			if layout == "changed_runtime" {
+				if _, err := os.Lstat(old); !os.IsNotExist(err) {
+					t.Fatalf("recovery recreated an obsolete runtime directory: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestProjectRuntimeRecoveryPreservesCrashBeforePublication(t *testing.T) {
+	const deadPID = 2147483647
+	if processAlive(deadPID) {
+		t.Fatal("dead-PID fixture unexpectedly identifies a live process")
+	}
+	for _, layout := range []string{"same_runtime", "changed_runtime"} {
+		for _, contents := range []string{strconv.Itoa(deadPID) + "\n", "interrupted pid write\n", ""} {
+			t.Run(layout+"/"+strconv.Quote(contents), func(t *testing.T) {
+				record, opts := discoveryRecoveryFixture(t, layout)
+				// A new PID can reach disk before its discovery record does. A
+				// crash there must not turn harmless dead metadata into a lockout.
+				if err := os.WriteFile(record.PIDFile, []byte(contents), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if layout == "changed_runtime" {
+					preserveDiscoveryPath(t, record.PIDFile)
+				}
+				owner, err := claimProjectRuntime(opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = owner.Close() }()
+				pidOwner, err := owner.claimPIDFile(opts.PIDFile, os.Getpid())
+				if err != nil {
+					t.Fatalf("crash before discovery publication prevented recovery: %v", err)
+				}
+				defer func() { _ = pidOwner.Close() }()
+				if pid, err := readPIDFile(opts.PIDFile); err != nil || pid != os.Getpid() {
+					t.Fatalf("replacement PID = %d, %v", pid, err)
+				}
+			})
+		}
+	}
+}
+
+func TestProjectRuntimeRecoveryPreservesUnmatchedLivePID(t *testing.T) {
+	for _, kind := range []string{"recorded_same_runtime", "recorded_changed_runtime", "selected_other_path", "copied_recorded_pid"} {
+		t.Run(kind, func(t *testing.T) {
+			layout := "same_runtime"
+			if kind != "recorded_same_runtime" {
+				layout = "changed_runtime"
+			}
+			record, opts := discoveryRecoveryFixture(t, layout)
+			conflict := record.PIDFile
+			if kind == "selected_other_path" || kind == "copied_recorded_pid" {
+				conflict = opts.PIDFile
+			}
+			pid := os.Getpid()
+			if kind == "copied_recorded_pid" {
+				pid = record.PID
+			}
+			if err := os.WriteFile(conflict, []byte(strconv.Itoa(pid)+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			preserveDiscoveryPath(t, conflict)
+			preserveDiscoveryPath(t, filepath.Join(record.ProjectPath, ".slb", runtimeRecordName))
+			owner, err := claimProjectRuntime(opts)
+			if kind != "selected_other_path" && kind != "copied_recorded_pid" {
+				if owner != nil {
+					_ = owner.Close()
+				}
+				if !errors.Is(err, ErrDaemonOwned) {
+					t.Fatalf("conflicting live recorded PID was not protected: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = owner.Close() }()
+			if claimed, err := owner.claimPIDFile(opts.PIDFile, os.Getpid()); !errors.Is(err, ErrDaemonOwned) {
+				if claimed != nil {
+					_ = claimed.Close()
+				}
+				t.Fatalf("project record authorized an unrelated live PID file: %v", err)
+			}
+		})
+	}
+}
+
+func TestProjectRuntimeRecoveryRejectsChangedAuthority(t *testing.T) {
+	for _, layout := range []string{"same_runtime", "changed_runtime"} {
+		for _, change := range []string{"released_owner", "record_contents", "record_inode", "project_lock_inode",
+			"pid_contents", "pid_inode", "pid_lock_inode", "socket_lock_inode", "held_pid_lock", "held_socket_lock", "endpoint_appeared"} {
+			t.Run(layout+"/"+change, func(t *testing.T) {
+				record, opts := discoveryRecoveryFixture(t, layout)
+				owner, err := claimProjectRuntime(opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = owner.Close() }()
+				recordPath := filepath.Join(record.ProjectPath, ".slb", runtimeRecordName)
+				replace := func(path string) {
+					t.Helper()
+					data, err := os.ReadFile(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Rename(path, path+".previous"); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(path, data, 0600); err != nil {
+						t.Fatal(err)
+					}
+					preserveDiscoveryPath(t, path+".previous")
+					preserveDiscoveryPath(t, path)
+				}
+				switch change {
+				case "released_owner":
+					if err := owner.Close(); err != nil {
+						t.Fatal(err)
+					}
+				case "record_contents":
+					changed := record
+					changed.PID = os.Getpid()
+					writeDiscoveryFixture(t, record.ProjectPath, changed)
+				case "record_inode":
+					replace(recordPath)
+				case "project_lock_inode":
+					replace(filepath.Join(record.ProjectPath, ".slb", "daemon.lock"))
+				case "pid_contents":
+					if err := os.WriteFile(record.PIDFile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				case "pid_inode":
+					replace(record.PIDFile)
+				case "pid_lock_inode":
+					replace(record.PIDFile + ".lock")
+				case "socket_lock_inode":
+					replace(record.SocketPath + ".lock")
+				case "held_pid_lock", "held_socket_lock":
+					path := record.PIDFile + ".lock"
+					if change == "held_socket_lock" {
+						path = record.SocketPath + ".lock"
+					}
+					lease, err := acquireFileLease(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = lease.Close() }()
+				case "endpoint_appeared":
+					if err := os.WriteFile(record.SocketPath, []byte("new endpoint owner"), 0600); err != nil {
+						t.Fatal(err)
+					}
+					preserveDiscoveryPath(t, record.SocketPath)
+				}
+				preserveDiscoveryPath(t, recordPath)
+				preserveDiscoveryPath(t, record.PIDFile)
+				if claimed, err := owner.claimPIDFile(opts.PIDFile, os.Getpid()); err == nil {
+					_ = claimed.Close()
+					t.Fatal("changed runtime authority permitted PID mutation")
+				}
+				if layout == "changed_runtime" {
+					if _, err := os.Lstat(opts.PIDFile); !os.IsNotExist(err) {
+						t.Fatalf("refused recovery created a new PID file: %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestProjectRuntimeRecoveryPreservesHeldLeases(t *testing.T) {
+	for _, resource := range []string{"project", "pid", "socket"} {
+		t.Run(resource, func(t *testing.T) {
+			record, opts := discoveryRecoveryFixture(t, "changed_runtime")
+			path := filepath.Join(record.ProjectPath, ".slb", "daemon.lock")
+			switch resource {
+			case "pid":
+				path = record.PIDFile + ".lock"
+			case "socket":
+				path = record.SocketPath + ".lock"
+			}
+			lease, err := acquireFileLease(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = lease.Close() }()
+			preserveDiscoveryPath(t, path)
+			preserveDiscoveryPath(t, record.PIDFile)
+			preserveDiscoveryPath(t, filepath.Join(record.ProjectPath, ".slb", runtimeRecordName))
+			owner, err := claimProjectRuntime(opts)
+			if owner != nil {
+				_ = owner.Close()
+			}
+			if !errors.Is(err, ErrDaemonOwned) {
+				t.Fatalf("different runtime bypassed the held %s lease: %v", resource, err)
+			}
+		})
+	}
+}
+
+func TestProjectRuntimeRecoveryRejectsRetargetedRuntimeAlias(t *testing.T) {
+	for _, layout := range []string{"runtime_alias", "recorded_alias"} {
+		t.Run(layout, func(t *testing.T) {
+			record, opts := discoveryRecoveryFixture(t, layout)
+			owner, err := claimProjectRuntime(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = owner.Close() }()
+			alias := filepath.Dir(opts.PIDFile)
+			if layout == "recorded_alias" {
+				alias = filepath.Dir(record.PIDFile)
+			}
+			next := shortSocketDir(t)
+			unrelatedPID := filepath.Join(next, "daemon.pid")
+			if err := os.WriteFile(unrelatedPID, []byte(strconv.Itoa(record.PID)+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(alias, alias+".previous"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(next, alias); err != nil {
+				t.Fatal(err)
+			}
+			preserveDiscoveryPath(t, alias)
+			preserveDiscoveryPath(t, unrelatedPID)
+			preserveDiscoveryPath(t, filepath.Join(record.ProjectPath, ".slb", runtimeRecordName))
+			if claimed, err := owner.claimPIDFile(opts.PIDFile, os.Getpid()); err == nil {
+				_ = claimed.Close()
+				t.Fatal("retargeted runtime alias authorized a different physical PID file")
+			}
+		})
+	}
+}
+
+func TestProjectRuntimeRecoveryRejectsUnsafeEvidence(t *testing.T) {
+	for _, kind := range []string{"wrong_project", "record_symlink", "public_record", "pid_symlink", "pid_hardlink",
+		"pid_fifo", "public_pid", "socket_file", "socket_symlink", "socket_fifo", "socket_directory",
+		"unsafe_missing_ancestor", "regular_ancestor", "looping_ancestor", "pid_lock_symlink", "socket_lock_symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			record, opts := discoveryRecoveryFixture(t, "changed_runtime")
+			recordPath := filepath.Join(record.ProjectPath, ".slb", runtimeRecordName)
+			var protected []string
+			var err error
+			switch kind {
+			case "wrong_project":
+				invalid := record
+				invalid.ProjectPath = filepath.Dir(record.ProjectPath)
+				writeDiscoveryFixture(t, record.ProjectPath, invalid)
+			case "record_symlink", "pid_symlink", "pid_fifo":
+				path := record.PIDFile
+				if kind == "record_symlink" {
+					path = recordPath
+				}
+				if err := os.Rename(path, path+".target"); err != nil {
+					t.Fatal(err)
+				}
+				protected = append(protected, path+".target")
+				if kind == "pid_fifo" {
+					err = syscall.Mkfifo(path, 0600)
+				} else {
+					err = os.Symlink(path+".target", path)
+				}
+			case "public_record":
+				err = os.Chmod(recordPath, 0644)
+			case "pid_hardlink":
+				err = os.Link(record.PIDFile, record.PIDFile+".linked")
+				protected = append(protected, record.PIDFile+".linked")
+			case "public_pid":
+				err = os.Chmod(record.PIDFile, 0666)
+			case "socket_file":
+				err = os.WriteFile(record.SocketPath, []byte("owned non-socket"), 0600)
+				protected = append(protected, record.SocketPath)
+			case "socket_symlink":
+				err = os.Symlink(record.PIDFile, record.SocketPath)
+				protected = append(protected, record.SocketPath)
+			case "socket_fifo":
+				err = syscall.Mkfifo(record.SocketPath, 0600)
+				protected = append(protected, record.SocketPath)
+			case "socket_directory":
+				err = os.Mkdir(record.SocketPath, 0700)
+				protected = append(protected, record.SocketPath)
+			case "unsafe_missing_ancestor", "regular_ancestor", "looping_ancestor":
+				ancestor := filepath.Join(filepath.Dir(record.SocketPath), "ancestor")
+				switch kind {
+				case "unsafe_missing_ancestor":
+					if err := os.Mkdir(ancestor, 0700); err != nil {
+						t.Fatal(err)
+					}
+					err = os.Chmod(ancestor, 0777)
+				case "regular_ancestor":
+					err = os.WriteFile(ancestor, []byte("preserve ancestor"), 0600)
+				case "looping_ancestor":
+					err = os.Symlink(ancestor, ancestor)
+				}
+				record.SocketPath = filepath.Join(ancestor, "missing", "daemon.sock")
+				writeDiscoveryFixture(t, record.ProjectPath, record)
+				protected = append(protected, ancestor)
+			case "pid_lock_symlink", "socket_lock_symlink":
+				path := record.PIDFile + ".lock"
+				if kind == "socket_lock_symlink" {
+					path = record.SocketPath + ".lock"
+				}
+				err = os.Symlink(record.PIDFile, path)
+				protected = append(protected, path)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, path := range append(protected, recordPath, record.PIDFile) {
+				preserveDiscoveryPath(t, path)
+			}
+			owner, err := claimProjectRuntime(opts)
+			if owner != nil {
+				_ = owner.Close()
+			}
+			if err == nil {
+				t.Fatal("unsafe stale discovery evidence permitted takeover")
+			}
+		})
+	}
+}
+
+func TestProjectRuntimeRecoveryInvalidConfigPreservesEvidence(t *testing.T) {
+	lifecycleEnvironment(t)
+	for _, invalid := range []string{"missing", "malformed"} {
+		t.Run(invalid, func(t *testing.T) {
+			project := lifecycleProject(t)
+			record := discoveryFixture(project, filepath.Join(shortSocketDir(t), "daemon.sock"))
+			record.PID = startDiscoveryRecoverySentinel(t)
+			writeDiscoveryFixture(t, project, record)
+			if err := os.WriteFile(record.PIDFile, []byte(strconv.Itoa(record.PID)+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			for _, path := range []string{filepath.Join(project, ".slb", runtimeRecordName), record.PIDFile, filepath.Join(project, ".slb", "state.db")} {
+				preserveDiscoveryPath(t, path)
+			}
+			configPath := filepath.Join(t.TempDir(), "selected.toml")
+			want := "reading explicit daemon config"
+			if invalid == "malformed" {
+				if err := os.WriteFile(configPath, []byte("[not valid TOML"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				want = "loading daemon config"
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			err := RunDaemon(ctx, ServerOptions{ProjectDir: project, SocketPath: record.SocketPath, PIDFile: record.PIDFile,
+				ConfigPath: configPath, Logger: log.New(io.Discard)})
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("invalid selected policy did not stop startup first: %v", err)
+			}
+			for _, path := range []string{filepath.Join(project, ".slb", "daemon.lock"), record.PIDFile + ".lock", record.SocketPath + ".lock", record.SocketPath} {
+				if _, err := os.Lstat(path); !os.IsNotExist(err) {
+					t.Fatalf("invalid policy created a runtime resource %s: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestProjectRuntimeLiveSocketOwnership(t *testing.T) {
+	for _, state := range []string{"live", "refused", "public", "replaced_after_claim"} {
+		t.Run(state, func(t *testing.T) {
+			record, opts := discoveryRecoveryFixture(t, "changed_runtime")
+			listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: record.SocketPath, Net: "unix"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			listener.SetUnlinkOnClose(false)
+			t.Cleanup(func() { _ = listener.Close() })
+			if err := os.Chmod(record.SocketPath, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if state == "public" {
+				if err := os.Chmod(record.SocketPath, 0666); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if state == "refused" || state == "replaced_after_claim" {
+				if err := listener.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			owner, err := claimProjectRuntime(opts)
+			if state == "live" || state == "public" {
+				if owner != nil {
+					_ = owner.Close()
+				}
+				if err == nil {
+					t.Fatal("live or unsafe listener was treated as retired")
+				}
+				if state == "live" {
+					if !errors.Is(err, ErrDaemonOwned) {
+						t.Fatalf("live listener produced the wrong refusal: %v", err)
+					}
+					if err := listener.SetDeadline(time.Now().Add(time.Second)); err != nil {
+						t.Fatal(err)
+					}
+					conn, err := listener.AcceptUnix()
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer conn.Close()
+					if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+						t.Fatal(err)
+					}
+					if n, err := conn.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+						t.Fatalf("retirement probe sent protocol data to an unrelated listener: %d, %v", n, err)
+					}
+				}
+				preserveDiscoveryPath(t, record.SocketPath)
+				return
+			}
+			if err != nil {
+				t.Fatalf("owned refused socket prevented recovery: %v", err)
+			}
+			defer func() { _ = owner.Close() }()
+			if state == "replaced_after_claim" {
+				if err := os.Rename(record.SocketPath, record.SocketPath+".previous"); err != nil {
+					t.Fatal(err)
+				}
+				replacement, err := net.ListenUnix("unix", &net.UnixAddr{Name: record.SocketPath, Net: "unix"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				replacement.SetUnlinkOnClose(false)
+				if err := replacement.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(record.SocketPath, 0600); err != nil {
+					t.Fatal(err)
+				}
+				preserveDiscoveryPath(t, record.SocketPath+".previous")
+			}
+			preserveDiscoveryPath(t, record.SocketPath)
+			preserveDiscoveryPath(t, record.PIDFile)
+			pidOwner, err := owner.claimPIDFile(opts.PIDFile, os.Getpid())
+			if state == "replaced_after_claim" {
+				if pidOwner != nil {
+					_ = pidOwner.Close()
+				}
+				if err == nil {
+					t.Fatal("replacement socket inode authorized recovery")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := pidOwner.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestDaemonLifecycle_ReusedPIDRecovery(t *testing.T) {
+	lifecycleEnvironment(t)
+	for _, layout := range []string{"same_runtime", "changed_runtime", "runtime_alias"} {
+		t.Run(layout, func(t *testing.T) {
+			project := lifecycleProject(t)
+			previous := shortSocketDir(t)
+			opts := ServerOptions{ProjectDir: project, SocketPath: filepath.Join(previous, "daemon.sock"), PIDFile: filepath.Join(previous, "daemon.pid")}
+			crashed := startLifecycleChild(t, opts, false)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			err := waitDaemonReady(ctx, crashed.opts, crashed.cmd.Process.Pid)
+			cancel()
+			if err != nil {
+				t.Fatalf("daemon was not ready before crash: %v\n%s", err, crashed.logs())
+			}
+			if err := crashed.cmd.Process.Kill(); err != nil {
+				t.Fatal(err)
+			}
+			crashed.wait(t, false)
+			record, _, err := readRuntimeRecord(project)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Model PID reuse deterministically after an actual daemon crash.
+			// The unrelated process owns only its private sentinel lease.
+			record.PID = startDiscoveryRecoverySentinel(t)
+			writeDiscoveryFixture(t, project, record)
+			if err := os.WriteFile(record.PIDFile, []byte(strconv.Itoa(record.PID)+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			switch layout {
+			case "changed_runtime":
+				next := shortSocketDir(t)
+				opts.SocketPath, opts.PIDFile = filepath.Join(next, "daemon.sock"), filepath.Join(next, "daemon.pid")
+				preserveDiscoveryPath(t, record.SocketPath)
+				preserveDiscoveryPath(t, record.PIDFile)
+			case "runtime_alias":
+				alias := filepath.Join(shortSocketDir(t), "alias")
+				if err := os.Symlink(previous, alias); err != nil {
+					t.Fatal(err)
+				}
+				opts.SocketPath, opts.PIDFile = filepath.Join(alias, "daemon.sock"), filepath.Join(alias, "daemon.pid")
+			}
+			restarted := startLifecycleChild(t, opts, false)
+			ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+			err = waitDaemonReady(ctx, restarted.opts, restarted.cmd.Process.Pid)
+			cancel()
+			if err != nil {
+				t.Fatalf("daemon could not recover stale reused-PID state: %v\n%s", err, restarted.logs())
+			}
+			current, _, err := readRuntimeRecord(project)
+			if err != nil || current.PID != restarted.cmd.Process.Pid || current.SocketPath != opts.SocketPath || current.PIDFile != opts.PIDFile {
+				t.Fatalf("replacement did not publish its actual runtime: %+v, %v", current, err)
+			}
+			client := NewProjectIPCClient(project)
+			ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+			err = client.Ping(ctx)
+			cancel()
+			_ = client.Close()
+			if err != nil {
+				t.Fatalf("authenticated project client did not reconnect after recovery: %v", err)
+			}
+			if err := StopDaemonWithOptions(ServerOptions{ProjectDir: project}, 3*time.Second); err != nil {
+				t.Fatal(err)
+			}
+			restarted.wait(t, true)
+			for _, path := range []string{filepath.Join(project, ".slb", runtimeRecordName), opts.SocketPath, opts.PIDFile} {
+				if _, err := os.Lstat(path); !os.IsNotExist(err) {
+					t.Fatalf("replacement failed to clean its owned runtime %s: %v", path, err)
+				}
+			}
+		})
 	}
 }
 

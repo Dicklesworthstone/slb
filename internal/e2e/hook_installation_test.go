@@ -900,9 +900,26 @@ desktop_enabled = false
 			assertStatus(t, otherNested, agentEnv, other)
 			assertGuards(t, "other_project_survives_stop", otherNested, scripts[otherProject], agentEnv, "allow", "")
 
+			// Model reuse of the old PID by the still-healthy other project.
+			// Both stale references agree on that live number, but its process
+			// has never owned this project's now-absent socket or free lease.
+			reused := selected
+			reused.PID = other.PID
+			reusedJSON, err := json.Marshal(reused)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeRecord(reusedJSON)
+			stalePID := []byte(fmt.Sprintf("%d\n", other.PID))
+			if err := os.WriteFile(selected.PIDFile, stalePID, 0600); err != nil {
+				t.Fatal(err)
+			}
+			oldPIDInfo, err := os.Lstat(selected.PIDFile)
+			if err != nil {
+				t.Fatal(err)
+			}
 			// Restart the actual daemon under a third environment while its
-			// preceding generation's stale record remains. Both guards must
-			// discover the newly published endpoint, not cache the old path.
+			// stale record remains. Both guards must discover the new endpoint.
 			restartedRuntime := filepath.Join(base, "restarted-service")
 			if err := os.Mkdir(restartedRuntime, 0700); err != nil {
 				t.Fatal(err)
@@ -916,6 +933,11 @@ desktop_enabled = false
 			assertStatus(t, nested, agentEnv, restarted)
 			assertGuards(t, "restarted_with_different_environment", nested, scripts[project], agentEnv, "allow", "")
 			assertStatus(t, otherNested, agentEnv, other)
+			currentPIDInfo, err := os.Lstat(selected.PIDFile)
+			currentPID, readErr := os.ReadFile(selected.PIDFile)
+			if err != nil || readErr != nil || !os.SameFile(oldPIDInfo, currentPIDInfo) || !bytes.Equal(stalePID, currentPID) {
+				t.Fatalf("changed-runtime recovery modified old PID evidence: %v, %v", err, readErr)
+			}
 			jsonCLI(t, nested, agentEnv, "daemon", "stop", "--timeout", "3")
 			for _, path := range []string{recordPath, restarted.SocketPath, restarted.PIDFile} {
 				if _, err := os.Lstat(path); !os.IsNotExist(err) {
@@ -925,5 +947,126 @@ desktop_enabled = false
 			assertGuards(t, "stopped_after_restart", nested, scripts[project], agentEnv, "ask", "")
 			jsonCLI(t, otherNested, agentEnv, "daemon", "stop", "--timeout", "3")
 		})
+	}
+}
+
+func TestBuiltCLIDaemonStaleRecordInvalidConfigPreservesRuntime(t *testing.T) {
+	binary := buildIdentityBoundaryCLI(t)
+	for _, foreground := range []bool{false, true} {
+		for _, invalid := range []string{"missing", "malformed"} {
+			t.Run(fmt.Sprintf("foreground_%t/%s", foreground, invalid), func(t *testing.T) {
+				base, err := os.MkdirTemp("/tmp", "slb-config-")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.RemoveAll(base) })
+				base, err = filepath.EvalSymlinks(base)
+				if err != nil {
+					t.Fatal(err)
+				}
+				project, home := filepath.Join(base, "project"), filepath.Join(base, "home")
+				for _, path := range []string{project, home} {
+					if err := os.Mkdir(path, 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				env := identityCLIEnvironment(home)
+				run := func(args ...string) ([]byte, error) {
+					t.Helper()
+					ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+					defer cancel()
+					cmd := exec.CommandContext(ctx, binary, args...)
+					cmd.Dir, cmd.Env = project, env
+					output, err := cmd.CombinedOutput()
+					if ctx.Err() != nil {
+						t.Fatalf("CLI did not finish: %v\n%s", ctx.Err(), output)
+					}
+					return output, err
+				}
+				if output, err := run("init", "--json"); err != nil {
+					t.Fatalf("init: %v\n%s", err, output)
+				}
+				// This controlled unrelated process remains blocked on its own
+				// input pipe; neither failed startup may signal it or claim its PID.
+				sentinelCtx, cancelSentinel := context.WithTimeout(context.Background(), 30*time.Second)
+				sentinel := exec.CommandContext(sentinelCtx, "/bin/sh", "-c", "read value")
+				stdin, err := sentinel.StdinPipe()
+				if err != nil {
+					cancelSentinel()
+					t.Fatal(err)
+				}
+				if err := sentinel.Start(); err != nil {
+					_ = stdin.Close()
+					cancelSentinel()
+					t.Fatal(err)
+				}
+				exited := make(chan error, 1)
+				go func() { exited <- sentinel.Wait(); close(exited) }()
+				t.Cleanup(func() {
+					_ = stdin.Close()
+					cancelSentinel()
+					select {
+					case <-exited:
+					case <-time.After(3 * time.Second):
+						t.Error("sentinel did not exit after cleanup")
+					}
+				})
+				record := daemon.RuntimePaths{Version: 1, ProjectPath: project, SocketPath: filepath.Join(base, "old.sock"),
+					PIDFile: filepath.Join(base, "old.pid"), PID: sentinel.Process.Pid}
+				recordJSON, err := json.Marshal(record)
+				if err != nil {
+					t.Fatal(err)
+				}
+				recordPath := filepath.Join(project, ".slb", "daemon.json")
+				pidJSON := []byte(fmt.Sprintf("%d\n", record.PID))
+				for path, data := range map[string][]byte{recordPath: recordJSON, record.PIDFile: pidJSON} {
+					if err := os.WriteFile(path, data, 0600); err != nil {
+						t.Fatal(err)
+					}
+					original, err := os.Lstat(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() {
+						current, statErr := os.Lstat(path)
+						contents, readErr := os.ReadFile(path)
+						if statErr != nil || readErr != nil || !os.SameFile(original, current) || !bytes.Equal(contents, data) {
+							t.Errorf("failed startup modified stale evidence %s: %v, %v", path, statErr, readErr)
+						}
+					})
+				}
+				configPath := filepath.Join(project, "selected.toml")
+				policyError := "reading explicit daemon config"
+				if invalid == "malformed" {
+					if err := os.WriteFile(configPath, []byte("[not valid TOML"), 0600); err != nil {
+						t.Fatal(err)
+					}
+					policyError = "loading daemon config"
+				}
+				args := []string{"--config", configPath, "daemon", "start", "--json"}
+				if foreground {
+					args = append(args, "--foreground")
+				}
+				output, err := run(args...)
+				policyRefused := bytes.Contains(output, []byte(policyError)) || (!foreground && bytes.Contains(output, []byte("daemon exited before readiness")))
+				if err == nil || !policyRefused ||
+					bytes.Contains(output, []byte("already running")) || bytes.Contains(output, []byte("recorded daemon process")) {
+					t.Fatalf("stale live PID prevented policy validation or invalid policy was accepted: %v\n%s", err, output)
+				}
+				select {
+				case err := <-exited:
+					t.Fatalf("failed startup terminated the unrelated process: %v", err)
+				default:
+				}
+				selectedPID := filepath.Join(home, filepath.Base(daemon.PIDFileForCWD(project)))
+				selectedSocket := filepath.Join(home, filepath.Base(daemon.SocketPathForCWD(project)))
+				for _, path := range []string{filepath.Join(project, ".slb", "daemon.lock"), record.PIDFile + ".lock", record.SocketPath + ".lock",
+					selectedPID, selectedPID + ".lock", selectedSocket, selectedSocket + ".lock"} {
+					if _, err := os.Lstat(path); !os.IsNotExist(err) {
+						t.Fatalf("invalid policy created runtime state at %s: %v", path, err)
+					}
+				}
+			})
+		}
 	}
 }

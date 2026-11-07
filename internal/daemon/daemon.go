@@ -76,16 +76,18 @@ func StartDaemonWithOptions(ctx context.Context, opts ServerOptions) error {
 	if _, err := db.ProjectDatabasePath(opts.ProjectDir); err != nil {
 		return fmt.Errorf("resolving daemon database: %w", err)
 	}
-	if record, _, err := readRuntimeRecord(opts.ProjectDir); err == nil {
-		if processAlive(record.PID) {
-			return fmt.Errorf("%w: recorded daemon process is still alive", ErrDaemonOwned)
+	if _, _, err := readRuntimeRecord(opts.ProjectDir); os.IsNotExist(err) {
+		// Legacy PID files have no recorded generation against which a
+		// reused PID can be recovered safely. Keep their live-PID guard.
+		if running, pid := daemonRunning(opts); running {
+			return fmt.Errorf("daemon already running (pid=%d)", pid)
 		}
-	} else if !os.IsNotExist(err) {
+	} else if err != nil {
 		return fmt.Errorf("%w: %w", ErrDiscoveryInvalid, err)
 	}
-	if running, pid := daemonRunning(opts); running {
-		return fmt.Errorf("daemon already running (pid=%d)", pid)
-	}
+	// A valid record is a locator, not proof that its PID still owns the
+	// project. The child validates policy before claiming runtime resources;
+	// this parent preflight must not create project markers or leases.
 	childOpts := opts
 	childOpts.Logger = nil
 	encoded, err := json.Marshal(childOpts)
@@ -348,7 +350,7 @@ func RunDaemon(ctx context.Context, opts ServerOptions) error {
 		return fmt.Errorf("claiming project daemon: %w", err)
 	}
 	defer func() { _ = projectLease.Close() }()
-	owner, err := claimPIDFile(opts.PIDFile, os.Getpid())
+	owner, err := projectLease.claimPIDFile(opts.PIDFile, os.Getpid())
 	if err != nil {
 		return fmt.Errorf("claiming daemon pid file: %w", err)
 	}

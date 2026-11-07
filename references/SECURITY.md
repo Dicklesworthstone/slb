@@ -264,6 +264,19 @@ Only an absent record permits the exact historical project default, with the
 same identity verification. Project runtime leases and generation-aware cleanup
 keep restarts from deleting a replacement daemon's record.
 
+Startup can recover a valid stale record after acquiring its project lease and
+locking the recorded resources that still exist. The recorded socket must be
+absent or an owned private socket that refuses connections; live listeners and
+ambiguous failures stop recovery. A live PID file value can be reclaimed only
+when it matches the recorded PID and physical PID file. Dead or incomplete PID
+contents may remain after a crash before discovery publication and can recover
+under the same ownership checks. The record, PID metadata, socket state, and
+persistent lock identities are rechecked before changing the PID file. Trusted
+ancestor directory aliases share ownership without following leaf symlinks.
+Missing old runtime directories are not recreated merely to obtain
+obsolete locks. Legacy live-PID files without a valid project record keep their
+conservative checks, and recovery never terminates a process from stale metadata.
+
 Local clients check socket ownership and permissions and authenticate the OS
 peer on the connection that will carry the command. They recheck the socket
 identity and verify the selected project, positive PID, and readiness through
