@@ -145,6 +145,155 @@ func TestHookRuntimeDaemonAcknowledgementAvoidsDuplicateAudit(t *testing.T) {
 	}
 }
 
+func TestHookRuntimeObservationCorrelationAfterLostAcknowledgement(t *testing.T) {
+	const command = "git reset --hard HEAD token=command-secret"
+	untrustedID := strings.Repeat("a", 32)
+	for _, failure := range []string{"closed", "timeout"} {
+		t.Run(failure, func(t *testing.T) {
+			home, project := t.TempDir(), t.TempDir()
+			input, err := json.Marshal(map[string]any{
+				"session_id": "agent-session", "cwd": project,
+				"observation_id": "external-observation-secret", "_slb_observation_id": untrustedID,
+				"tool_input": map[string]any{"command": command},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			setup := fmt.Sprintf(`
+os.environ["SLB_HOST"] = "fixture.invalid:1"
+os.environ["SLB_SESSION_KEY"] = "authentication-secret"
+failure = %q
+connections = []
+class LostAcknowledgementSocket:
+    def __init__(self):
+        self.closed = False
+        self.requests = []
+        connections.append(self)
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        self.closed = True
+    def settimeout(self, timeout):
+        pass
+    def sendall(self, frame):
+        request = json.loads(frame)
+        self.requests.append(request.get("method", "auth"))
+        if "auth" in request:
+            assert request["auth"] == "authentication-secret"
+            return
+        assert request["method"] == "hook_query"
+        params = request["params"]
+        assert params["execution_handoff"] is True
+        observation = params["observation_id"]
+        assert _valid_observation_id(observation) and observation != "a" * 32
+        # Persist the daemon's observation, then lose its reply. The fallback
+        # must retain the sent identifier without replacing the original row.
+        assert _record_audit(params["command"], params["session_id"], params["cwd"],
+                             "block", "dangerous", 1, "daemon", observation_id=observation)
+    def recv(self, limit):
+        if failure == "timeout":
+            raise TimeoutError("lost acknowledgement secret")
+        return b""
+_connect_remote_daemon = lambda *args: LostAcknowledgementSocket()
+def classify(command):
+    assert len(connections) == 1
+    assert connections[0].closed and connections[0].requests == ["auth", "hook_query"]
+    return "dangerous", 1
+`, failure)
+			var outputs strings.Builder
+			for range 2 {
+				stdout, stderr := runHookRuntime(t, home, setup, string(input))
+				if hookPermission(t, stdout) != "deny" || stderr != "" || strings.Contains(stdout, "command-secret") ||
+					strings.Contains(stdout, "authentication-secret") || strings.Contains(stdout, "lost acknowledgement secret") ||
+					strings.Contains(stdout, "external-observation-secret") {
+					t.Fatalf("lost acknowledgement changed denial or exposed a secret: %s %s", stdout, stderr)
+				}
+				outputs.WriteString(stdout)
+			}
+			events, err := audit.Query(filepath.Join(home, ".slb", "audit", "blocked"), audit.Filter{})
+			if err != nil || len(events) != 4 {
+				t.Fatalf("lost-ack audit records were omitted or overwritten: %+v, %v", events, err)
+			}
+			observations := make(map[string]map[string]string)
+			for _, event := range events {
+				encoded, err := json.Marshal(event)
+				if err != nil || !audit.ValidObservationID(event.ObservationID) || event.ObservationID == untrustedID ||
+					strings.Contains(outputs.String(), event.ObservationID) || strings.Contains(string(encoded), "command-secret") ||
+					strings.Contains(string(encoded), "external-observation-secret") || strings.Contains(string(encoded), "authentication-secret") ||
+					event.Action != "block" || event.Tier != "dangerous" || event.CWD != project || event.SessionID != "agent-session" ||
+					event.CommandHash != audit.CommandHash(command, project) {
+					t.Fatalf("correlated Python audit lost identity, scope, classification, or redaction: %+v, %v", event, err)
+				}
+				if observations[event.ObservationID] == nil {
+					observations[event.ObservationID] = make(map[string]string)
+				}
+				if observations[event.ObservationID][event.Source] != "" {
+					t.Fatalf("repeated a source within one observation: %+v", events)
+				}
+				observations[event.ObservationID][event.Source] = event.ID
+			}
+			if len(observations) != 2 {
+				t.Fatalf("independent identical invocations reused an ID: %+v", events)
+			}
+			for _, sources := range observations {
+				if len(sources) != 2 || sources["daemon"] == "" || sources["hook_offline"] == "" || sources["daemon"] == sources["hook_offline"] {
+					t.Fatalf("one invocation did not retain independent correlated records: %v", sources)
+				}
+			}
+		})
+	}
+}
+
+func TestHookRuntimeObservationGenerationFailurePreservesDecision(t *testing.T) {
+	for _, failure := range []string{"entropy", "invalid value"} {
+		for _, tc := range []struct{ tier, permission, action string }{
+			{"safe", "allow", ""}, {"unknown", "ask", "ask"}, {"dangerous", "deny", "block"},
+		} {
+			t.Run(failure+"/"+tc.tier, func(t *testing.T) {
+				home := t.TempDir()
+				setup := fmt.Sprintf(`
+failure = %q
+original_uuid4 = uuid.uuid4
+attempted = False
+def fail_once():
+    global attempted
+    if not attempted:
+        attempted = True
+        if failure == "entropy":
+            raise OSError("entropy-secret")
+        return type("InvalidUUID", (), {"hex": "invalid-observation-secret"})()
+    return original_uuid4()
+uuid.uuid4 = fail_once
+def query_slb_daemon(command, session_id, cwd, diagnostics=None, observation_id=""):
+    assert attempted and observation_id == ""
+    return None
+classify = lambda command: (%q, 1)
+`, failure, tc.tier)
+				stdout, stderr := runHookRuntime(t, home, setup,
+					`{"observation_id":"external-observation-secret","tool_input":{"command":"opaque token=command-secret"}}`)
+				if hookPermission(t, stdout) != tc.permission || stderr != "" || strings.Contains(stdout, "entropy-secret") ||
+					strings.Contains(stdout, "invalid-observation-secret") || strings.Contains(stdout, "command-secret") {
+					t.Fatalf("optional metadata changed authorization or exposed a secret: %s %s", stdout, stderr)
+				}
+				events, err := audit.Query(filepath.Join(home, ".slb", "audit", "blocked"), audit.Filter{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tc.permission == "allow" {
+					if len(events) != 0 {
+						t.Fatalf("observation generation failure created safe-command audit: %+v", events)
+					}
+					return
+				}
+				if len(events) != 1 || events[0].ObservationID != "" || events[0].Action != tc.action || events[0].Tier != tc.tier ||
+					strings.Contains(events[0].CommandRedacted, "command-secret") {
+					t.Fatalf("metadata failure lost the original decision audit: %+v", events)
+				}
+			})
+		}
+	}
+}
+
 func TestHookRuntimeMalformedInputsAskInsteadOfAllowing(t *testing.T) {
 	for _, input := range []string{"not-json", "[]", "null", `{"tool_input":[]}`, `{"tool_input":{}}`, `{"tool_input":{"command":42}}`} {
 		stdout, _ := runHookRuntime(t, t.TempDir(), "", input)

@@ -58,6 +58,65 @@ func TestHookAuditRedactsBeforePersistence(t *testing.T) {
 	}
 }
 
+func TestHookQueryObservationMetadataIsAdvisory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	cwd := t.TempDir()
+	server := &IPCServer{}
+	observation := audit.NewObservationID()
+	for _, id := range []string{observation, observation, "", "untrusted-secret-metadata"} {
+		params, err := json.Marshal(HookQueryParams{
+			Command: "git push --force", CWD: cwd, SessionID: "test-session", ObservationID: id,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := server.handleHookQuery(RPCRequest{Params: params, ID: 1})
+		if response.Error != nil {
+			t.Fatalf("advisory metadata rejected a hook query: %+v", response.Error)
+		}
+		result := response.Result.(*HookQueryResult)
+		if result.Action != "block" || result.Tier != "critical" || !result.AuditRecorded || result.AuditError != "" || result.ExecutionHandoff != nil {
+			t.Fatalf("observation metadata changed authorization: %+v", result)
+		}
+	}
+	directory, err := audit.DefaultDirectory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := audit.Query(directory, audit.Filter{})
+	if err != nil || len(events) != 4 {
+		t.Fatalf("reused correlation IDs lost distinct daemon observations: %+v, %v", events, err)
+	}
+	seen, correlated := make(map[string]bool), 0
+	for _, event := range events {
+		if seen[event.ID] || event.Source != "daemon" || event.CommandHash != audit.CommandHash("git push --force", cwd) {
+			t.Fatalf("daemon audit identity or context changed: %+v", event)
+		}
+		seen[event.ID] = true
+		if event.ObservationID == observation {
+			correlated++
+		} else if event.ObservationID != "" {
+			t.Fatalf("invalid correlation persisted: %q", event.ObservationID)
+		}
+	}
+	if correlated != 2 {
+		t.Fatalf("wire correlation metadata was not preserved: got %d records", correlated)
+	}
+	params, err := json.Marshal(HookQueryParams{Command: "git status", CWD: cwd, ObservationID: observation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := server.handleHookQuery(RPCRequest{Params: params, ID: 2}).Result.(*HookQueryResult)
+	if result.Action != "allow" || result.AuditRecorded {
+		t.Fatalf("correlation caused a safe command to be audited or refused: %+v", result)
+	}
+	if events, err := audit.Query(directory, audit.Filter{}); err != nil || len(events) != 4 {
+		t.Fatalf("safe query added audit evidence: %d, %v", len(events), err)
+	}
+}
+
 func TestHookAuditFailureDoesNotAllowBlockedCommand(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

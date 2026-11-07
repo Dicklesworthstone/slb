@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -1418,6 +1419,13 @@ func TestHookStatusCommand_DetectsChangedApprovalPolicy(t *testing.T) {
 
 func nativeHookOutput(t *testing.T, payload map[string]any, home string) map[string]any {
 	t.Helper()
+	return nativeHookOutputWithRunner(t, payload, home, func(cmd *cobra.Command) error {
+		return runHookGuard(cmd, nil)
+	})
+}
+
+func nativeHookOutputWithRunner(t *testing.T, payload map[string]any, home string, run func(*cobra.Command) error) map[string]any {
+	t.Helper()
 	t.Setenv("HOME", home)
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -1427,7 +1435,7 @@ func nativeHookOutput(t *testing.T, payload map[string]any, home string) map[str
 	cmd.SetIn(strings.NewReader(string(data)))
 	var stdout strings.Builder
 	cmd.SetOut(&stdout)
-	if err := runHookGuard(cmd, nil); err != nil {
+	if err := run(cmd); err != nil {
 		t.Fatalf("native hook guard: %v", err)
 	}
 	var output map[string]any
@@ -1539,6 +1547,128 @@ func TestNativeHookGuardOfflineCompoundCoverage(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestNativeHookGuardObservationCorrelationAfterLostAcknowledgement(t *testing.T) {
+	resetHookFlags()
+	t.Cleanup(resetHookFlags)
+	t.Setenv("SLB_HOST", "")
+	t.Setenv("SLB_SESSION_ID", "")
+	const command = "git reset --hard HEAD token=command-secret"
+	untrustedID := strings.Repeat("a", 32)
+	for _, tc := range []struct {
+		name, category, source string
+		err                    error
+	}{
+		{"closed connection", "unavailable", "hook_native_offline", io.EOF},
+		{"deadline", "timeout", "hook_native_timeout", context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home, project := t.TempDir(), t.TempDir()
+			t.Setenv("USERPROFILE", home)
+			directory := filepath.Join(home, ".slb", "audit", "blocked")
+			var observations []string
+			query := func(_ context.Context, cwd string, params daemon.HookQueryParams) (*daemon.HookQueryResult, hookDaemonDiagnostic, error) {
+				if cwd != project || params.CWD != project || params.Command != command || params.SessionID != "provider-session" || !params.ExecutionHandoff {
+					t.Fatalf("hook query changed command or authorization inputs: %+v", params)
+				}
+				if !audit.ValidObservationID(params.ObservationID) || params.ObservationID == untrustedID {
+					t.Fatalf("query did not receive a fresh observation ID: %q", params.ObservationID)
+				}
+				observations = append(observations, params.ObservationID)
+				// Model a durable daemon decision followed by a lost reply. The
+				// real hook must retain this identifier when local policy takes over.
+				if err := audit.Record(directory, audit.Event{
+					ObservationID: params.ObservationID, CommandRedacted: core.ApplyRedaction(params.Command, nil),
+					CommandHash: audit.CommandHash(params.Command, params.CWD), CWD: params.CWD, SessionID: params.SessionID,
+					Action: "block", Tier: "dangerous", MinApprovals: 1, Source: "daemon",
+				}); err != nil {
+					t.Fatal(err)
+				}
+				return nil, hookDaemonDiagnostic{socketPath: filepath.Join(project, "fixture.sock"), category: tc.category}, tc.err
+			}
+			for range 2 {
+				output := nativeHookOutputWithRunner(t, map[string]any{
+					"session_id": "provider-session", "cwd": project,
+					"observation_id": "external-observation-secret", "_slb_observation_id": untrustedID,
+					"tool_input": map[string]any{"command": command},
+				}, home, func(cmd *cobra.Command) error { return runHookGuardWithQuery(cmd, query) })
+				if permission, _ := nativeHookPermission(t, output); permission != "deny" {
+					t.Fatalf("lost acknowledgement changed denial: %+v", output)
+				}
+				encoded, err := json.Marshal(output)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if strings.Contains(string(encoded), "command-secret") || strings.Contains(string(encoded), "external-observation-secret") ||
+					strings.Contains(string(encoded), observations[len(observations)-1]) {
+					t.Fatalf("hook output exposed audit metadata or secrets: %s", encoded)
+				}
+			}
+			if len(observations) != 2 || observations[0] == observations[1] {
+				t.Fatalf("independent invocations reused an ID or retried the query: %v", observations)
+			}
+			events, err := audit.Query(directory, audit.Filter{})
+			if err != nil || len(events) != 4 {
+				t.Fatalf("lost-ack audit records were omitted or overwritten: %+v, %v", events, err)
+			}
+			for _, observation := range observations {
+				sources := make(map[string]int)
+				recordIDs := make(map[string]bool)
+				for _, event := range events {
+					if event.ObservationID != observation {
+						continue
+					}
+					sources[event.Source]++
+					recordIDs[event.ID] = true
+					encoded, err := json.Marshal(event)
+					if err != nil || strings.Contains(string(encoded), "command-secret") || strings.Contains(string(encoded), "external-observation-secret") ||
+						event.Action != "block" || event.Tier != "dangerous" || event.CWD != project ||
+						event.CommandHash != audit.CommandHash(command, project) || event.SessionID != "provider-session" {
+						t.Fatalf("correlated audit lost classification, scope, or redaction: %+v, %v", event, err)
+					}
+				}
+				if len(sources) != 2 || sources["daemon"] != 1 || sources[tc.source] != 1 || len(recordIDs) != 2 {
+					t.Fatalf("one invocation did not retain two independent correlated records: sources=%v IDs=%v", sources, recordIDs)
+				}
+			}
+		})
+	}
+}
+
+func TestNativeHookGuardObservationKeepsSafeCommandsUnaudited(t *testing.T) {
+	resetHookFlags()
+	t.Cleanup(resetHookFlags)
+	t.Setenv("SLB_HOST", "")
+	t.Setenv("SLB_SESSION_ID", "")
+	for _, offline := range []bool{false, true} {
+		t.Run(fmt.Sprintf("offline=%t", offline), func(t *testing.T) {
+			home, project := t.TempDir(), t.TempDir()
+			t.Setenv("USERPROFILE", home)
+			calls := 0
+			output := nativeHookOutputWithRunner(t, map[string]any{
+				"cwd": project, "tool_input": map[string]any{"command": "git stash"},
+			}, home, func(cmd *cobra.Command) error {
+				return runHookGuardWithQuery(cmd, func(_ context.Context, _ string, params daemon.HookQueryParams) (*daemon.HookQueryResult, hookDaemonDiagnostic, error) {
+					calls++
+					if !audit.ValidObservationID(params.ObservationID) {
+						t.Fatalf("safe hook query did not receive an observation ID: %q", params.ObservationID)
+					}
+					if offline {
+						return nil, hookDaemonDiagnostic{category: "unavailable"}, io.EOF
+					}
+					return &daemon.HookQueryResult{Action: "allow", Tier: "safe"}, hookDaemonDiagnostic{}, nil
+				})
+			})
+			if permission, specific := nativeHookPermission(t, output); permission != "allow" || specific["permissionDecisionReason"] != nil || calls != 1 {
+				t.Fatalf("correlation changed safe-command behavior: %+v, queries=%d", output, calls)
+			}
+			events, err := audit.Query(filepath.Join(home, ".slb", "audit", "blocked"), audit.Filter{})
+			if err != nil || len(events) != 0 {
+				t.Fatalf("correlation created a blocked audit for a safe command: %+v, %v", events, err)
+			}
+		})
 	}
 }
 

@@ -45,6 +45,19 @@ var hookGuardCmd = &cobra.Command{
 }
 
 func runHookGuard(cmd *cobra.Command, _ []string) error {
+	return runHookGuardWithQuery(cmd, queryNativeHookDaemon)
+}
+
+func queryNativeHookDaemon(ctx context.Context, cwd string, params daemon.HookQueryParams) (*daemon.HookQueryResult, hookDaemonDiagnostic, error) {
+	client := daemon.NewProjectIPCClient(cwd)
+	defer func() { _ = client.Close() }()
+	result, err := client.HookQuery(ctx, params)
+	return result, hookDaemonDiagnosticFor(client, err), err
+}
+
+func runHookGuardWithQuery(cmd *cobra.Command,
+	query func(context.Context, string, daemon.HookQueryParams) (*daemon.HookQueryResult, hookDaemonDiagnostic, error),
+) error {
 	input, err := readHookGuardInput(cmd.InOrStdin())
 	if err != nil {
 		return emitHookDecision(cmd, "ask", "SLB: invalid hook input; unable to inspect the command.")
@@ -65,6 +78,9 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return emitHookDecision(cmd, "ask", "SLB: invalid working directory; unable to inspect the command.")
 	}
+	// Correlate daemon and fallback observations of this invocation only. This
+	// value is never accepted from hook input or used as authorization.
+	observationID := audit.NewObservationID()
 	sessionID := strings.TrimSpace(os.Getenv("SLB_SESSION_ID"))
 	if sessionID == "" {
 		if providerSession, ok := input["session_id"].(string); ok {
@@ -80,7 +96,7 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return decideAndAuditNativeHook(cmd, command, sessionID, cwd, "block",
 			"SLB: selected hook policy could not be loaded; command blocked until policy is repaired.",
-			"unknown", 0, "policy_load_error", "hook_native_policy", false, "")
+			"unknown", 0, "policy_load_error", "hook_native_policy", observationID, false, "")
 	}
 
 	parent := cmd.Context()
@@ -89,19 +105,17 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 	}
 	queryTimeout := hookQueryTimeout(cwd)
 	queryCtx, cancel := context.WithTimeout(parent, queryTimeout)
-	client := daemon.NewProjectIPCClient(cwd)
-	live, liveErr := client.HookQuery(queryCtx, daemon.HookQueryParams{
+	live, diagnostic, liveErr := query(queryCtx, cwd, daemon.HookQueryParams{
 		Command: command, SessionID: sessionID, CWD: cwd, ExecutionHandoff: true,
-		ConfigPath: policyOptions.ConfigPath,
+		ConfigPath: policyOptions.ConfigPath, ObservationID: observationID,
 	})
 	cancel()
-	_ = client.Close()
 	if liveErr == nil {
 		if live == nil || (policyOptions.ConfigPath != "" && !nativeHookPolicyAcknowledged(live, cwd, policyOptions.ConfigPath)) {
 			recorded := live != nil && live.AuditRecorded && live.Action == "block" && live.MatchedPattern == "policy_config_mismatch"
 			return decideAndAuditNativeHook(cmd, command, sessionID, cwd, "block",
 				"SLB: daemon did not acknowledge the hook's selected policy; restart it with the same --config before retrying.",
-				"unknown", 0, "policy_config_mismatch", "hook_native_daemon", recorded, "")
+				"unknown", 0, "policy_config_mismatch", "hook_native_daemon", observationID, recorded, "")
 		}
 		if live.Action == "execute" {
 			if err := emitNativeExecutionHandoff(cmd, live, toolInput, sessionID, cwd, policyOptions.ConfigPath); err == nil {
@@ -109,10 +123,10 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 			}
 			return decideAndAuditNativeHook(cmd, command, sessionID, cwd, "block",
 				"SLB: execution handoff unavailable or invalid; use slb execute explicitly.",
-				live.Tier, live.MinApprovals, live.MatchedPattern, "hook_native_daemon", live.AuditRecorded, live.ApprovalPolicy)
+				live.Tier, live.MinApprovals, live.MatchedPattern, "hook_native_daemon", observationID, live.AuditRecorded, live.ApprovalPolicy)
 		}
 		return decideAndAuditNativeHook(cmd, command, sessionID, cwd, live.Action, live.Message,
-			live.Tier, live.MinApprovals, live.MatchedPattern, "hook_native_daemon", live.AuditRecorded, live.ApprovalPolicy)
+			live.Tier, live.MinApprovals, live.MatchedPattern, "hook_native_daemon", observationID, live.AuditRecorded, live.ApprovalPolicy)
 	}
 
 	// The local fallback stays fail-closed whatever the cause. A deadline on a
@@ -123,19 +137,18 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 	if timedOut {
 		source = "hook_native_timeout"
 	}
-	diagnostic := hookDaemonDiagnosticFor(client, liveErr)
 	fallback, err := classifyNativeHookFallback(command, cwd)
 	if err != nil {
 		return decideAndAuditNativeHook(cmd, command, sessionID, cwd, "block",
 			diagnostic.message(queryTimeout)+" SLB: classification failed; command blocked until policy is available.",
-			"unknown", 0, "policy_load_error", source, false, "", diagnostic)
+			"unknown", 0, "policy_load_error", source, observationID, false, "", diagnostic)
 	}
 	message := fallback.Message
 	if fallback.Action != "allow" {
 		message = diagnostic.message(queryTimeout) + " " + message
 	}
 	return decideAndAuditNativeHook(cmd, command, sessionID, cwd, fallback.Action, message,
-		fallback.Tier, fallback.MinApprovals, fallback.MatchedPattern, source, false, fallback.ApprovalPolicy, diagnostic)
+		fallback.Tier, fallback.MinApprovals, fallback.MatchedPattern, source, observationID, false, fallback.ApprovalPolicy, diagnostic)
 }
 
 // Only the selected socket and a fixed failure category belong in offline
@@ -387,7 +400,7 @@ func classifyNativeHookFallback(command, cwd string) (*daemon.HookQueryResult, e
 }
 
 func decideAndAuditNativeHook(cmd *cobra.Command, command, sessionID, cwd, action, message, tier string,
-	minApprovals int, matchedPattern, source string, alreadyRecorded bool, policy db.ApprovalPolicy,
+	minApprovals int, matchedPattern, source, observationID string, alreadyRecorded bool, policy db.ApprovalPolicy,
 	diagnostics ...hookDaemonDiagnostic,
 ) error {
 	action = normalizedNativeHookAction(action)
@@ -399,6 +412,7 @@ func decideAndAuditNativeHook(cmd *cobra.Command, command, sessionID, cwd, actio
 				notice = policy.Label()
 			}
 			event := audit.Event{
+				ObservationID:   observationID,
 				CommandRedacted: core.ApplyRedaction(command, nil),
 				CommandHash:     audit.CommandHash(command, cwd), CWD: cwd, SessionID: sessionID,
 				Action: action, Tier: tier, MatchedPattern: matchedPattern,

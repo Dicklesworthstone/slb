@@ -112,6 +112,22 @@ counts. Nested initialized projects are excluded from their parent's scan;
 traffic in unrelated projects cannot displace relevant records through a
 shared newest-N cutoff. Repeated event IDs are counted once.
 
+Updated native and standalone Python hooks assign a fresh `observation_id` to
+each invocation and carry it through the daemon query and local fallback audit.
+If a daemon records a block but its reply is lost, that record and one matching
+hook record count as one attempt. Both immutable audit records remain available
+to `slb audit`, with their own event IDs. Correlation applies only within the
+same project, exact working directory, session label, and command fingerprint.
+It never grants approval or changes a hook decision.
+
+At most one daemon/hook pair is combined for each valid observation ID. Extra
+records, repeated records from the same source, and missing or invalid IDs
+continue to count independently. A pair retains its earliest observation time
+and its highest risk tier, so a late counterpart alone does not manufacture a
+new reminder. A higher observed risk can still trigger an escalation. Upgrade
+the daemon and native hook binary, and regenerate standalone Python hooks, to
+carry this optional metadata through both paths; older records remain readable.
+
 With default settings, three attempts within ten minutes make an alert
 repeated. A first dangerous block has normal Agent Mail importance; critical
 or repeated blocks are urgent. Repeated alerts also request acknowledgment and
@@ -183,8 +199,16 @@ remote response, can cause a retry duplicate. Destination-side deduplication
 can help for webhooks. Delivery also is not guaranteed after the event ages out
 of the window. Alert failure never grants execution permission.
 
-Aggregation supports up to 10,000 relevant events per window and delivery state
-up to 4 MiB. Overflow or corrupt published audit records is reported instead of
+Correlation considers counterpart timestamps up to one configured window apart.
+The scan retains one additional window of correlation metadata so a counterpart
+cannot revive an attempt whose first observation just aged out. That older
+observation can explain a pair but cannot itself produce an alert. Beyond this
+bound, ambiguous observations count independently.
+
+Aggregation supports up to 10,000 relevant events, including the bounded
+correlation lookback, and up to 8 MiB of retained event text. Unused audit fields
+are not retained for aggregation. Delivery state supports up to 4 MiB.
+Overflow or corrupt published audit records is reported instead of
 presenting incomplete counts as complete. Shorten the window or inspect/retain
 the audit explicitly when these limits are reached; the worker never prunes
 source audit records. Redaction quality depends on the hook that recorded the

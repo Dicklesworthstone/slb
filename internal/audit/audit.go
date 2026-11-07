@@ -24,8 +24,11 @@ const maxRecordBytes = 64 * 1024
 // Event describes a denied or confirmation-required command, not its execution.
 // CommandRedacted must be redacted by the caller before it reaches this store.
 type Event struct {
-	Version         int       `json:"version"`
-	ID              string    `json:"id"`
+	Version int    `json:"version"`
+	ID      string `json:"id"`
+	// ObservationID correlates daemon and fallback observations of one hook
+	// invocation. It is advisory metadata, never an approval or event identity.
+	ObservationID   string    `json:"observation_id,omitempty"`
 	Timestamp       time.Time `json:"timestamp"`
 	CommandRedacted string    `json:"command_redacted"`
 	CommandHash     string    `json:"command_hash"`
@@ -70,6 +73,31 @@ func CommandHash(command, cwd string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// NewObservationID creates an identifier for one hook invocation. Losing this
+// optional correlation must not change the hook's authorization decision.
+func NewObservationID() string {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(id[:])
+}
+
+// ValidObservationID bounds untrusted correlation metadata and agrees with the
+// standalone Python hook's UUID hex representation. Missing or invalid values
+// retain conservative, independent attempt counting.
+func ValidObservationID(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	for _, c := range id {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // Record syncs and atomically publishes an event before returning success. It does not change
 // the hook decision when storage fails; callers must expose that failure.
 func Record(directory string, event Event) error {
@@ -84,6 +112,9 @@ func Record(directory string, event Event) error {
 		event.Timestamp = time.Now()
 	}
 	event.Timestamp = event.Timestamp.UTC()
+	if !ValidObservationID(event.ObservationID) {
+		event.ObservationID = ""
+	}
 	var id [16]byte
 	if _, err := rand.Read(id[:]); err != nil {
 		return fmt.Errorf("generating audit ID: %w", err)

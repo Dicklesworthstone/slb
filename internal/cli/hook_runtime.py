@@ -337,7 +337,7 @@ def _connect_remote_daemon(endpoint, timeout):
     return socket.create_connection((host, int(port)), timeout=timeout)
 
 
-def query_slb_daemon(command: str, session_id: str, cwd: str, diagnostics=None) -> Optional[dict]:
+def query_slb_daemon(command: str, session_id: str, cwd: str, diagnostics=None, observation_id="") -> Optional[dict]:
     """Verify project identity before sending a command on the same connection."""
     if diagnostics is None:
         diagnostics = {}
@@ -379,10 +379,13 @@ def query_slb_daemon(command: str, session_id: str, cwd: str, diagnostics=None) 
                     raise _DaemonDiscoveryError("daemon identity mismatch")
                 if not os.path.samestat(info, _runtime_socket_info(socket_path)):
                     raise _DaemonDiscoveryError("socket changed during connection")
-            result = _daemon_rpc(sock, deadline, "hook_query", {
+            params = {
                 "command": command, "session_id": session_id, "cwd": cwd,
                 "execution_handoff": True,
-            }, 1)
+            }
+            if _valid_observation_id(observation_id):
+                params["observation_id"] = observation_id
+            result = _daemon_rpc(sock, deadline, "hook_query", params, 1)
             diagnostics.clear()
             return result
     except (_DaemonDiscoveryError, NotImplementedError):
@@ -568,7 +571,20 @@ def _execution_paths(cwd, database_path):
     return expected_db, os.path.join(state_directory, "logs")
 
 
-def _record_audit(command, session_id, cwd, action, tier, min_approvals, source, matched_pattern="", approval_policy="", diagnostics=None) -> bool:
+def _valid_observation_id(value):
+    return isinstance(value, str) and re.fullmatch(r"[a-f0-9]{32}", value) is not None
+
+
+def _new_observation_id():
+    """Optional correlation metadata must never change the safety decision."""
+    try:
+        value = uuid.uuid4().hex
+        return value if _valid_observation_id(value) else ""
+    except (OSError, ValueError, TypeError, AttributeError, NotImplementedError):
+        return ""
+
+
+def _record_audit(command, session_id, cwd, action, tier, min_approvals, source, matched_pattern="", approval_policy="", diagnostics=None, observation_id="") -> bool:
     """Publish the same private JSONL schema as internal/audit, without slb or a daemon."""
     action = _normalized_action(action)
     if action == "allow":
@@ -594,6 +610,8 @@ def _record_audit(command, session_id, cwd, action, tier, min_approvals, source,
             "matched_pattern": matched_pattern if isinstance(matched_pattern, str) else "",
             "source": source,
         }
+        if _valid_observation_id(observation_id):
+            event["observation_id"] = observation_id
         notice = _approval_policy_notice(approval_policy)
         if notice:
             event["approval_policy"] = approval_policy
@@ -632,7 +650,7 @@ def _record_audit(command, session_id, cwd, action, tier, min_approvals, source,
 
 
 def _decide_and_audit(command, session_id, cwd, action, message, tier, min_approvals, source,
-                      matched_pattern="", audit_recorded=False, approval_policy="", diagnostics=None):
+                      matched_pattern="", audit_recorded=False, approval_policy="", diagnostics=None, observation_id=""):
     action = _normalized_action(action)
     if not isinstance(message, str):
         message = "SLB: invalid response reason; asking for confirmation."
@@ -642,7 +660,7 @@ def _decide_and_audit(command, session_id, cwd, action, message, tier, min_appro
     if action != "allow" and notice and notice not in message:
         message += " Review policy: " + notice + "."
     if action != "allow" and audit_recorded is not True:
-        if not _record_audit(command, session_id, cwd, action, tier, min_approvals, source, matched_pattern, approval_policy, diagnostics):
+        if not _record_audit(command, session_id, cwd, action, tier, min_approvals, source, matched_pattern, approval_policy, diagnostics, observation_id):
             message += " Audit recording failed; safety decision unchanged."
     _emit_decision(action, message)
 
@@ -681,8 +699,13 @@ def main():
                               "SLB: selected hook policy unavailable; restore its file and native slb guard before retrying.",
                               "unknown", 0, "hook_offline", "policy_load_error")
         return
+    # One fresh identifier belongs to this execution of the standalone hook,
+    # even when its daemon acknowledgement is lost and local policy takes over.
+    # Provider input cannot choose it. Selected-policy forwarding above lets
+    # the executing native hook create its own identifier.
+    observation_id = _new_observation_id()
     diagnostics = {}
-    response = query_slb_daemon(command, session_id, cwd, diagnostics)
+    response = query_slb_daemon(command, session_id, cwd, diagnostics, observation_id)
     if response is not None:
         if response.get("action") == "execute":
             try:
@@ -691,19 +714,20 @@ def main():
                 _decide_and_audit(command, session_id, cwd, "block",
                                   "SLB: execution handoff unavailable or invalid; use slb execute explicitly.",
                                   response.get("tier", "unknown"), response.get("min_approvals", 0), "hook_daemon",
-                                  approval_policy=response.get("approval_policy", ""))
+                                  approval_policy=response.get("approval_policy", ""), observation_id=observation_id)
             return
         _decide_and_audit(command, session_id, cwd, response.get("action"), response.get("message", ""),
                           response.get("tier", "unknown"), response.get("min_approvals", 0), "hook_daemon",
                           response.get("matched_pattern", ""), response.get("audit_recorded", False),
-                          response.get("approval_policy", ""))
+                          response.get("approval_policy", ""), observation_id=observation_id)
         return
     try:
         tier, min_approvals = classify(command)
     except Exception:
         _decide_and_audit(command, session_id, cwd, "block",
                           "SLB: classification failed; command blocked until policy is available.",
-                          "unknown", 0, "hook_offline", approval_policy=HOOK_APPROVAL_POLICY, diagnostics=diagnostics)
+                          "unknown", 0, "hook_offline", approval_policy=HOOK_APPROVAL_POLICY, diagnostics=diagnostics,
+                          observation_id=observation_id)
         return
     if tier == "critical":
         action = "block"
@@ -728,7 +752,7 @@ def main():
     else:
         action, message = "block", "SLB: invalid local classification; command blocked."
     _decide_and_audit(command, session_id, cwd, action, message, tier, min_approvals, "hook_offline",
-                      approval_policy=HOOK_APPROVAL_POLICY, diagnostics=diagnostics)
+                      approval_policy=HOOK_APPROVAL_POLICY, diagnostics=diagnostics, observation_id=observation_id)
 
 
 if __name__ == "__main__":

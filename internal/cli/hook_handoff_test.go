@@ -39,7 +39,7 @@ func TestHookRuntimeExecutionHandoff(t *testing.T) {
 	setup := fmt.Sprintf(`
 shutil.which = lambda name: '/opt/slb bin/slb'
 os.environ['SLB_SESSION_ID'] = 'slb-session'
-def query_slb_daemon(command, session_id, cwd, diagnostics=None):
+def query_slb_daemon(command, session_id, cwd, diagnostics=None, observation_id=""):
     assert session_id == 'slb-session'
     assert cwd == %q
     return {'action': 'execute', 'approval_policy': 'same_host', 'execution_handoff': {
@@ -414,7 +414,7 @@ func TestHookRuntimeSymlinkHandoffPreservesApprovalIdentity(t *testing.T) {
 			setup := fmt.Sprintf(`
 shutil.which = lambda name: '/usr/local/bin/slb'
 os.environ['SLB_SESSION_ID'] = 'slb-session'
-def query_slb_daemon(command, session_id, cwd, diagnostics=None):
+def query_slb_daemon(command, session_id, cwd, diagnostics=None, observation_id=""):
     assert cwd == %q
     assert command == 'git reset --hard'
     assert session_id == 'slb-session'

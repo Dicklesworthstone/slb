@@ -22,6 +22,9 @@ type HookQueryParams struct {
 	SessionID        string `json:"session_id"`
 	CWD              string `json:"cwd"`
 	ExecutionHandoff bool   `json:"execution_handoff,omitempty"`
+	// ObservationID is only for correlating duplicate audit observations;
+	// it never selects, authenticates, or consumes an approval.
+	ObservationID string `json:"observation_id,omitempty"`
 	// ConfigPath asserts the caller's selected policy; it never overrides
 	// the daemon's configuration or chooses another file for the daemon.
 	ConfigPath string `json:"config_path,omitempty"`
@@ -93,6 +96,7 @@ func (s *IPCServer) handleHookQuery(req RPCRequest) *RPCResponse {
 
 func recordHookAudit(directory string, params HookQueryParams, result *HookQueryResult) error {
 	return audit.Record(directory, audit.Event{
+		ObservationID:   params.ObservationID,
 		CommandRedacted: core.ApplyRedaction(params.Command, nil),
 		CommandHash:     audit.CommandHash(params.Command, params.CWD),
 		CWD:             params.CWD,

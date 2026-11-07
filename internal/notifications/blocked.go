@@ -22,6 +22,7 @@ import (
 )
 
 const maxEvents = 10000
+const maxAggregationTextBytes = 8 * 1024 * 1024
 const maxStateBytes = 4 * 1024 * 1024
 
 // Policy bounds repeat detection, reminders and ALL transport attempts,
@@ -79,7 +80,11 @@ func (a Alert) Importance() string {
 }
 
 // ReadBlocked scopes BEFORE aggregation and before applying capacity bounds.
-// Offline Python and native/daemon audit records use the same Event schema.
+// A valid observation ID can pair one daemon and one hook record. One extra
+// window of eligible records prevents a late counterpart from reviving an
+// expired attempt. The bounds of 10000 physical events and 8 MiB of retained
+// event text include this correlation lookback. Unused audit fields are dropped
+// from aggregation memory; the original records remain unchanged.
 // Missing logs are empty; corruption/overflow is reported, not a partial count.
 func ReadBlocked(ctx context.Context, directory, project string, now time.Time, policy Policy) ([]Alert, error) {
 	p, err := policy.normalized()
@@ -93,12 +98,17 @@ func ReadBlocked(ctx context.Context, directory, project string, now time.Time, 
 	if resolved, err := filepath.EvalSymlinks(project); err == nil {
 		project = resolved
 	}
-	groups := make(map[string]*Alert)
+	groups := make(map[string][]audit.Event)
 	seen := make(map[string]bool)
+	retainedTextBytes := 0
 	cutoff := now.Add(-p.Window)
+	lookback := cutoff.Add(-p.Window)
 	err = audit.Visit(ctx, directory, func(event audit.Event) error {
 		if event.Action != "block" || (event.Tier != "critical" && event.Tier != "dangerous") ||
-			event.Timestamp.Before(cutoff) || event.Timestamp.After(now) {
+			event.Timestamp.After(now) {
+			return nil
+		}
+		if event.Timestamp.Before(cutoff) && (event.Timestamp.Before(lookback) || !correlatableBlock(event)) {
 			return nil
 		}
 		belongs, err := belongsToProject(event.CWD, project)
@@ -109,7 +119,7 @@ func ReadBlocked(ctx context.Context, directory, project string, now time.Time, 
 			return nil
 		}
 		if len(seen) >= maxEvents {
-			return errors.New("blocked alert window exceeds 10000 events; shorten the window or inspect slb audit")
+			return errors.New("blocked alert window and correlation lookback exceed 10000 events; shorten the window or inspect slb audit")
 		}
 		seen[event.ID] = true
 		if event.CommandHash == "" {
@@ -118,31 +128,49 @@ func ReadBlocked(ctx context.Context, directory, project string, now time.Time, 
 		identity, _ := json.Marshal([]string{project, event.CWD, event.SessionID, event.CommandHash})
 		digest := sha256.Sum256(identity)
 		key := hex.EncodeToString(digest[:])
-		a := groups[key]
-		if a == nil {
-			a = &Alert{Key: key, Project: project, CWD: event.CWD, SessionID: event.SessionID,
-				CommandHash: event.CommandHash, Tier: event.Tier, FirstAt: event.Timestamp, WindowSeconds: int64(p.Window / time.Second)}
-			groups[key] = a
+		textBytes := len(key) + len(event.ID) + len(event.ObservationID) + len(event.CommandRedacted) +
+			len(event.CommandHash) + len(event.CWD) + len(event.SessionID) + len(event.Source) + len(event.Tier)
+		if textBytes > maxAggregationTextBytes-retainedTextBytes {
+			return errors.New("blocked alert window and correlation lookback exceed 8 MiB of retained event text; shorten the window or inspect slb audit")
 		}
-		a.Attempts++
-		a.Repeated = a.Attempts >= p.RepeatThreshold
-		if event.Tier == "critical" {
-			a.Tier = "critical"
-		}
-		if event.Timestamp.Before(a.FirstAt) {
-			a.FirstAt = event.Timestamp
-		}
-		if event.Timestamp.After(a.LastAt) || (event.Timestamp.Equal(a.LastAt) && event.ID > a.EventID) {
-			a.LastAt, a.EventID, a.CommandRedacted = event.Timestamp, event.ID, event.CommandRedacted
-		}
+		retainedTextBytes += textBytes
+		groups[key] = append(groups[key], audit.Event{ID: event.ID, ObservationID: event.ObservationID,
+			Timestamp: event.Timestamp, CommandRedacted: event.CommandRedacted, CommandHash: event.CommandHash,
+			CWD: event.CWD, SessionID: event.SessionID, Source: event.Source, Tier: event.Tier})
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	alerts := make([]Alert, 0, len(groups))
-	for _, a := range groups {
-		alerts = append(alerts, *a)
+	for key, events := range groups {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var a *Alert
+		for _, event := range correlateBlocks(events, p.Window) {
+			if event.Timestamp.Before(cutoff) {
+				continue
+			}
+			if a == nil {
+				a = &Alert{Key: key, Project: project, CWD: event.CWD, SessionID: event.SessionID,
+					CommandHash: event.CommandHash, Tier: event.Tier, FirstAt: event.Timestamp, WindowSeconds: int64(p.Window / time.Second)}
+			}
+			a.Attempts++
+			a.Repeated = a.Attempts >= p.RepeatThreshold
+			if event.Tier == "critical" {
+				a.Tier = "critical"
+			}
+			if event.Timestamp.Before(a.FirstAt) {
+				a.FirstAt = event.Timestamp
+			}
+			if event.Timestamp.After(a.LastAt) || (event.Timestamp.Equal(a.LastAt) && event.ID > a.EventID) {
+				a.LastAt, a.EventID, a.CommandRedacted = event.Timestamp, event.ID, event.CommandRedacted
+			}
+		}
+		if a != nil {
+			alerts = append(alerts, *a)
+		}
 	}
 	// Urgent groups go first, with oldest first to avoid starvation on floods.
 	sort.Slice(alerts, func(i, j int) bool {
@@ -155,6 +183,59 @@ func ReadBlocked(ctx context.Context, directory, project string, now time.Time, 
 		return alerts[i].Key < alerts[j].Key
 	})
 	return alerts, nil
+}
+
+func correlatableBlock(event audit.Event) bool {
+	if !audit.ValidObservationID(event.ObservationID) {
+		return false
+	}
+	switch event.Source {
+	case "daemon", "hook_native_offline", "hook_native_timeout", "hook_native_daemon", "hook_offline", "hook_daemon":
+		return true
+	default:
+		return false
+	}
+}
+
+// correlateBlocks operates only inside one project/CWD/session/command group.
+// At most one pair per observation ID is collapsed; further uses of either
+// source remain independent attempts. An ambiguous reused ID can overcount,
+// but cannot turn an arbitrary number of blocked records into one attempt.
+func correlateBlocks(events []audit.Event, window time.Duration) []audit.Event {
+	sort.Slice(events, func(i, j int) bool {
+		if !events[i].Timestamp.Equal(events[j].Timestamp) {
+			return events[i].Timestamp.Before(events[j].Timestamp)
+		}
+		return events[i].ID < events[j].ID
+	})
+	type observation struct {
+		index  int
+		paired bool
+	}
+	observations := make(map[string]observation)
+	attempts := make([]audit.Event, 0, len(events))
+	for _, event := range events {
+		if correlatableBlock(event) {
+			first, exists := observations[event.ObservationID]
+			if !exists {
+				observations[event.ObservationID] = observation{index: len(attempts)}
+			} else if !first.paired {
+				earlier := &attempts[first.index]
+				if (earlier.Source == "daemon") != (event.Source == "daemon") && event.Timestamp.Sub(earlier.Timestamp) <= window {
+					// Keep the earliest ID/time stable for delivery suppression,
+					// including when a counterpart arrives after the cooldown.
+					if event.Tier == "critical" {
+						earlier.Tier = "critical"
+					}
+					first.paired = true
+					observations[event.ObservationID] = first
+					continue
+				}
+			}
+		}
+		attempts = append(attempts, event)
+	}
+	return attempts
 }
 
 func belongsToProject(cwd, project string) (bool, error) {
@@ -276,7 +357,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, now time.Time, alerts []Alert
 			entry := state.Entries[key]
 			entry.SeenAt = alert.LastAt
 			escalation := (alert.Repeated && !entry.Repeated) || (alert.Tier == "critical" && !entry.Critical)
-			newEvent := alert.LastAt.After(entry.EventAt) || (alert.LastAt.Equal(entry.EventAt) && alert.EventID != entry.EventID)
+			newEvent := alert.LastAt.After(entry.EventAt) || (alert.LastAt.Equal(entry.EventAt) && alert.EventID > entry.EventID)
 			if !entry.SentAt.IsZero() && ((!newEvent && !escalation) || (!escalation && now.Sub(entry.SentAt) < p.Cooldown)) {
 				report.Suppressed++
 				continue

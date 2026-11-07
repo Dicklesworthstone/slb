@@ -64,6 +64,70 @@ func sampleEvent(at time.Time) Event {
 	}
 }
 
+func TestObservationMetadataPreservesIndependentAuditRecords(t *testing.T) {
+	directory := t.TempDir()
+	observation := NewObservationID()
+	if !ValidObservationID(observation) {
+		t.Fatalf("generated observation ID has invalid format: %q", observation)
+	}
+	if next := NewObservationID(); !ValidObservationID(next) || next == observation {
+		t.Fatal("independent hook invocations did not receive distinct valid IDs")
+	}
+	for _, source := range []string{"daemon", "hook_native_timeout"} {
+		event := sampleEvent(time.Now())
+		event.ID, event.ObservationID, event.Source = "caller-selected-record", observation, source
+		if err := Record(directory, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events, err := Query(directory, Filter{})
+	if err != nil || len(events) != 2 {
+		t.Fatalf("correlated observations lost immutable evidence: %+v, %v", events, err)
+	}
+	if events[0].ID == events[1].ID {
+		t.Fatal("correlation replaced independent event identities")
+	}
+	for _, event := range events {
+		if event.ObservationID != observation || !ValidObservationID(event.ID) || event.ID == observation ||
+			event.Version != 1 || event.Action != "block" || event.Tier != "dangerous" {
+			t.Fatalf("correlation changed the audit record's identity or decision: %+v", event)
+		}
+	}
+}
+
+func TestInvalidObservationMetadataDoesNotLoseAudit(t *testing.T) {
+	for _, tc := range []struct{ name, id string }{
+		{"legacy", ""}, {"short", strings.Repeat("a", 31)},
+		{"long", strings.Repeat("a", 33)}, {"uppercase", strings.Repeat("A", 32)},
+		{"nonhex", strings.Repeat("g", 32)}, {"unicode", strings.Repeat("é", 16)},
+		{"control", strings.Repeat("a", 31) + "\n"}, {"oversized", strings.Repeat("a", maxRecordBytes+1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if ValidObservationID(tc.id) {
+				t.Fatal("invalid or absent correlation metadata accepted")
+			}
+			directory := t.TempDir()
+			event := sampleEvent(time.Now())
+			event.ObservationID = tc.id
+			if err := Record(directory, event); err != nil {
+				t.Fatalf("optional metadata prevented recording the decision: %v", err)
+			}
+			events, err := Query(directory, Filter{})
+			if err != nil || len(events) != 1 || events[0].ObservationID != "" || events[0].CommandHash != event.CommandHash {
+				t.Fatalf("invalid metadata damaged audit evidence: %+v, %v", events, err)
+			}
+			entries, err := os.ReadDir(directory)
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("audit publication: %v, %v", entries, err)
+			}
+			data, err := os.ReadFile(filepath.Join(directory, entries[0].Name()))
+			if err != nil || strings.Contains(string(data), "observation_id") {
+				t.Fatalf("invalid optional metadata was persisted: %v", err)
+			}
+		})
+	}
+}
+
 func TestRecordQueryAndRetention(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "audit")
 	now := time.Now().UTC()
