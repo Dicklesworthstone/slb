@@ -9,14 +9,18 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 from typing import Optional
 
 SLB_TIMEOUT = 0.05
+MAX_DISCOVERY_BYTES = 8192
+MAX_UNIX_SOCKET_BYTES = 103
 
 
 # Both project walks here, _project_root_for_approval and _execution_paths,
@@ -76,45 +80,256 @@ def _project_root_for_socket(start: str) -> str:
     return _project_root_for_approval(path)
 
 
-def get_socket_path(cwd=None) -> str:
-    root = _project_root_for_socket(cwd if cwd is not None else os.getcwd())
+class _DaemonDiscoveryError(ValueError):
+    pass
+
+
+def _require_unix_discovery_capabilities():
+    """Keep ownership and no-follow checks mandatory on every local path."""
+    required_flags = ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK", "O_CLOEXEC")
+    if (os.name != "posix" or not callable(getattr(os, "geteuid", None))
+            or not hasattr(socket, "AF_UNIX")
+            or any(not isinstance(getattr(os, flag, None), int) or getattr(os, flag, 0) == 0
+                   for flag in required_flags)
+            or os.open not in getattr(os, "supports_dir_fd", ())
+            or os.stat not in getattr(os, "supports_dir_fd", ())
+            or os.stat not in getattr(os, "supports_follow_symlinks", ())):
+        raise _DaemonDiscoveryError("secure Unix daemon discovery is unavailable")
+
+
+def _unique_discovery_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DaemonDiscoveryError("duplicate discovery field")
+        result[key] = value
+    return result
+
+
+def _valid_runtime_path(value):
+    if (not isinstance(value, str) or not os.path.isabs(value)
+            or value != os.path.normpath(value) or (os.name != "nt" and value.startswith("//"))):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        return False
+    return not any(unicodedata.category(character) == "Cc" for character in value)
+
+
+def _validate_runtime_parents(directory):
+    remaining = [512]
+    def ancestors(path):
+        path = os.path.normpath(path)
+        while True:
+            remaining[0] -= 1
+            if remaining[0] < 0:
+                raise _DaemonDiscoveryError("too many runtime ancestors")
+            info = os.lstat(path)
+            if info.st_uid not in (0, os.geteuid()):
+                raise _DaemonDiscoveryError("unsafe daemon runtime directory")
+            if stat.S_ISLNK(info.st_mode):
+                target = os.readlink(path)
+                if not os.path.isabs(target):
+                    target = os.path.join(os.path.dirname(path), target)
+                ancestors(target)
+            elif (not stat.S_ISDIR(info.st_mode)
+                    or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+                raise _DaemonDiscoveryError("unsafe daemon runtime directory")
+            parent = os.path.dirname(path)
+            if parent == path:
+                return
+            path = parent
+    ancestors(directory)
+
+
+def _read_daemon_discovery(root):
+    """Read only this physical project's private, bounded discovery record.
+
+    A missing record permits the deterministic legacy address. Any malformed
+    or unsafe record fails closed; it must never select another daemon.
+    """
+    _require_unix_discovery_capabilities()
+    marker = os.path.join(root, ".slb")
+    directory_fd = None
+    record_fd = None
+    try:
+        try:
+            directory = os.lstat(marker)
+        except FileNotFoundError:
+            return None
+        if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.geteuid()
+                or directory.st_mode & 0o022):
+            raise _DaemonDiscoveryError("unsafe project state directory")
+        _validate_runtime_parents(root)
+        directory_fd = os.open(marker, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        if not os.path.samestat(directory, os.fstat(directory_fd)):
+            raise _DaemonDiscoveryError("project state directory changed")
+        try:
+            record_info = os.stat("daemon.json", dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if (not stat.S_ISREG(record_info.st_mode) or record_info.st_uid != os.geteuid()
+                or record_info.st_mode & 0o077 or record_info.st_nlink != 1
+                or record_info.st_size > MAX_DISCOVERY_BYTES):
+            raise _DaemonDiscoveryError("unsafe discovery file")
+        record_fd = os.open("daemon.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                            dir_fd=directory_fd)
+        if not os.path.samestat(record_info, os.fstat(record_fd)):
+            raise _DaemonDiscoveryError("discovery file changed")
+        with os.fdopen(record_fd, "rb") as stream:
+            record_fd = None
+            encoded = stream.read(MAX_DISCOVERY_BYTES + 1)
+        if len(encoded) > MAX_DISCOVERY_BYTES:
+            raise _DaemonDiscoveryError("discovery file too large")
+        record = json.loads(encoded.decode("utf-8"), object_pairs_hook=_unique_discovery_object)
+        if (not isinstance(record, dict)
+                or set(record) != {"version", "project_path", "socket_path", "pid_file", "pid"}
+                or type(record["version"]) is not int or record["version"] != 1
+                or record["project_path"] != root
+                or not _valid_runtime_path(record["socket_path"])
+                or not _valid_runtime_path(record["pid_file"])
+                or record["pid_file"] == record["socket_path"]
+                or len(os.fsencode(record["socket_path"])) > MAX_UNIX_SOCKET_BYTES
+                or type(record["pid"]) is not int or not 0 < record["pid"] <= sys.maxsize):
+            raise _DaemonDiscoveryError("invalid discovery record")
+        current = os.stat("daemon.json", dir_fd=directory_fd, follow_symlinks=False)
+        if (not os.path.samestat(record_info, current)
+                or not os.path.samestat(directory, os.lstat(marker))):
+            raise _DaemonDiscoveryError("discovery file changed while reading")
+        return record
+    except (OSError, ValueError, UnicodeError, NotImplementedError, RecursionError) as error:
+        raise _DaemonDiscoveryError("daemon discovery is invalid") from error
+    finally:
+        if record_fd is not None:
+            os.close(record_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _discover_daemon(cwd):
+    root = _project_root_for_socket(cwd)
+    record = _read_daemon_discovery(root)
+    if record is not None:
+        return root, record["socket_path"], record["pid"]
     digest = hashlib.sha256(root.encode()).hexdigest()[:12]
-    return os.path.join(tempfile.gettempdir(), f"slb-{digest}.sock")
+    return root, os.path.join(tempfile.gettempdir(), f"slb-{digest}.sock"), None
 
 
-def query_slb_daemon(command: str, session_id: str, cwd: str) -> Optional[dict]:
-    """Read one bounded JSON-RPC frame within a single total time budget."""
-    socket_path = get_socket_path(cwd)
-    if not os.path.exists(socket_path):
-        return None
+def get_socket_path(cwd=None) -> str:
+    return _discover_daemon(cwd if cwd is not None else os.getcwd())[1]
+
+
+def _runtime_socket_info(socket_path):
+    _require_unix_discovery_capabilities()
+    if not _valid_runtime_path(socket_path) or len(os.fsencode(socket_path)) > MAX_UNIX_SOCKET_BYTES:
+        raise _DaemonDiscoveryError("invalid socket path")
+    info = os.lstat(socket_path)
+    if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid()
+            or info.st_mode & 0o077):
+        raise _DaemonDiscoveryError("unsafe daemon socket")
+    _validate_runtime_parents(os.path.dirname(socket_path))
+    return info
+
+
+def _daemon_rpc(sock, deadline, method, params, request_id, limit=65536):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("daemon deadline expired")
+    sock.settimeout(remaining)
+    sock.sendall(json.dumps({"method": method, "params": params, "id": request_id}).encode() + b"\n")
+    response = bytearray()
+    while b"\n" not in response:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("daemon deadline expired")
+        sock.settimeout(remaining)
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise OSError("daemon closed connection")
+        response.extend(chunk)
+        if len(response) > limit:
+            raise ValueError("daemon response too large")
+    frame, remainder = response.split(b"\n", 1)
+    data = json.loads(frame.decode())
+    if (remainder or not isinstance(data, dict) or type(data.get("id")) is not int
+            or data["id"] != request_id or data.get("error") is not None
+            or not isinstance(data.get("result"), dict)):
+        raise ValueError("invalid daemon response")
+    return data["result"]
+
+
+def _connect_remote_daemon(endpoint, timeout):
+    host, separator, port = endpoint.rpartition(":")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    elif ":" in host:
+        raise ValueError("invalid remote daemon endpoint")
+    if not separator or not host or not port.isascii() or not port.isdigit() or not 0 < int(port) < 65536:
+        raise ValueError("invalid remote daemon endpoint")
+    return socket.create_connection((host, int(port)), timeout=timeout)
+
+
+def query_slb_daemon(command: str, session_id: str, cwd: str, diagnostics=None) -> Optional[dict]:
+    """Verify project identity before sending a command on the same connection."""
+    if diagnostics is None:
+        diagnostics = {}
+    diagnostics.clear()
+    diagnostics["daemon_error"] = "unavailable"
     try:
         deadline = time.monotonic() + SLB_TIMEOUT
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(SLB_TIMEOUT)
-            sock.connect(socket_path)
-            request = {"method": "hook_query", "params": {
+        remote = os.environ.get("SLB_HOST", "").strip()
+        if remote:
+            diagnostics["remote"] = True
+            root, expected_pid = _project_root_for_socket(cwd), None
+            connection = _connect_remote_daemon(remote, SLB_TIMEOUT)
+        else:
+            root, socket_path, expected_pid = _discover_daemon(cwd)
+            diagnostics["socket_path"] = socket_path
+            info = _runtime_socket_info(socket_path)
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with connection as sock:
+            sock.settimeout(max(0.001, deadline - time.monotonic()))
+            if remote:
+                sock.sendall(json.dumps({"auth": os.environ.get("SLB_SESSION_KEY", "").strip()}).encode() + b"\n")
+            else:
+                sock.connect(socket_path)
+                status = _daemon_rpc(sock, deadline, "status", {}, 0, 4096)
+                if (status.get("project_path") != root or status.get("state_ready") is not True
+                        or type(status.get("pid")) is not int or status["pid"] <= 0
+                        or (expected_pid is not None and status["pid"] != expected_pid)):
+                    raise _DaemonDiscoveryError("daemon identity mismatch")
+                if not os.path.samestat(info, _runtime_socket_info(socket_path)):
+                    raise _DaemonDiscoveryError("socket changed during connection")
+            result = _daemon_rpc(sock, deadline, "hook_query", {
                 "command": command, "session_id": session_id, "cwd": cwd,
                 "execution_handoff": True,
-            }, "id": 1}
-            sock.sendall(json.dumps(request).encode() + b"\n")
-            response = bytearray()
-            while b"\n" not in response:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return None
-                sock.settimeout(remaining)
-                chunk = sock.recv(4096)
-                if not chunk:
-                    return None
-                response.extend(chunk)
-                if len(response) > 65536:
-                    return None
-            data = json.loads(response.split(b"\n", 1)[0].decode())
-            if isinstance(data, dict) and data.get("id") == 1 and isinstance(data.get("result"), dict):
-                return data["result"]
-    except (OSError, ValueError, UnicodeError):
+            }, 1)
+            diagnostics.clear()
+            return result
+    except (_DaemonDiscoveryError, NotImplementedError):
+        diagnostics["daemon_error"] = "discovery_invalid"
+    except (TimeoutError, socket.timeout):
+        diagnostics["daemon_error"] = "timeout"
+    except (OSError, ValueError, UnicodeError, RecursionError):
         pass
     return None
+
+
+def _daemon_diagnostic_message(diagnostics):
+    category = diagnostics.get("daemon_error")
+    if category == "discovery_invalid":
+        message = "SLB OFFLINE: daemon discovery or identity validation failed; used local policy."
+    elif category == "timeout":
+        message = "SLB OFFLINE: daemon did not answer within the hook deadline; used local policy."
+    else:
+        message = "SLB OFFLINE: daemon unavailable; used local policy."
+    if diagnostics.get("remote"):
+        return message + " Transport: explicitly configured remote daemon."
+    socket_path = diagnostics.get("socket_path")
+    if isinstance(socket_path, str) and socket_path:
+        return message + " Socket: " + json.dumps(socket_path, ensure_ascii=True) + "."
+    return message + " No socket was selected."
 
 
 def _normalized_action(action) -> str:
@@ -275,7 +490,7 @@ def _execution_paths(cwd, database_path):
     return expected_db, os.path.join(state_directory, "logs")
 
 
-def _record_audit(command, session_id, cwd, action, tier, min_approvals, source, matched_pattern="", approval_policy="") -> bool:
+def _record_audit(command, session_id, cwd, action, tier, min_approvals, source, matched_pattern="", approval_policy="", diagnostics=None) -> bool:
     """Publish the same private JSONL schema as internal/audit, without slb or a daemon."""
     action = _normalized_action(action)
     if action == "allow":
@@ -305,6 +520,11 @@ def _record_audit(command, session_id, cwd, action, tier, min_approvals, source,
         if notice:
             event["approval_policy"] = approval_policy
             event["review_notice"] = notice
+        if diagnostics:
+            if isinstance(diagnostics.get("socket_path"), str) and not diagnostics.get("remote"):
+                event["socket_path"] = diagnostics["socket_path"]
+            if diagnostics.get("daemon_error") in ("unavailable", "timeout", "discovery_invalid"):
+                event["daemon_error"] = diagnostics["daemon_error"]
         data = (json.dumps(event, ensure_ascii=False) + "\n").encode()
         if len(data) > 65536:
             raise ValueError("audit record exceeds 64 KiB")
@@ -334,15 +554,17 @@ def _record_audit(command, session_id, cwd, action, tier, min_approvals, source,
 
 
 def _decide_and_audit(command, session_id, cwd, action, message, tier, min_approvals, source,
-                      matched_pattern="", audit_recorded=False, approval_policy=""):
+                      matched_pattern="", audit_recorded=False, approval_policy="", diagnostics=None):
     action = _normalized_action(action)
     if not isinstance(message, str):
         message = "SLB: invalid response reason; asking for confirmation."
+    if action != "allow" and diagnostics:
+        message = _daemon_diagnostic_message(diagnostics) + " " + message
     notice = _approval_policy_notice(approval_policy)
     if action != "allow" and notice and notice not in message:
         message += " Review policy: " + notice + "."
     if action != "allow" and audit_recorded is not True:
-        if not _record_audit(command, session_id, cwd, action, tier, min_approvals, source, matched_pattern, approval_policy):
+        if not _record_audit(command, session_id, cwd, action, tier, min_approvals, source, matched_pattern, approval_policy, diagnostics):
             message += " Audit recording failed; safety decision unchanged."
     _emit_decision(action, message)
 
@@ -381,7 +603,8 @@ def main():
                               "SLB: selected hook policy unavailable; restore its file and native slb guard before retrying.",
                               "unknown", 0, "hook_offline", "policy_load_error")
         return
-    response = query_slb_daemon(command, session_id, cwd)
+    diagnostics = {}
+    response = query_slb_daemon(command, session_id, cwd, diagnostics)
     if response is not None:
         if response.get("action") == "execute":
             try:
@@ -402,7 +625,7 @@ def main():
     except Exception:
         _decide_and_audit(command, session_id, cwd, "block",
                           "SLB: classification failed; command blocked until policy is available.",
-                          "unknown", 0, "hook_offline", approval_policy=HOOK_APPROVAL_POLICY)
+                          "unknown", 0, "hook_offline", approval_policy=HOOK_APPROVAL_POLICY, diagnostics=diagnostics)
         return
     if tier == "critical":
         action = "block"
@@ -427,7 +650,7 @@ def main():
     else:
         action, message = "block", "SLB: invalid local classification; command blocked."
     _decide_and_audit(command, session_id, cwd, action, message, tier, min_approvals, "hook_offline",
-                      approval_policy=HOOK_APPROVAL_POLICY)
+                      approval_policy=HOOK_APPROVAL_POLICY, diagnostics=diagnostics)
 
 
 if __name__ == "__main__":

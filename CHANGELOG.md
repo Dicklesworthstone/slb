@@ -8,6 +8,15 @@ SLB is a cross-platform CLI that implements a **two-person rule** for running po
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- Project daemon discovery now uses a private `.slb/daemon.json` record, so native and generated hooks, daemon status/stop, and watch clients find a healthy daemon even when their `TMPDIR` differs from the daemon's ([#33](https://github.com/Dicklesworthstone/slb/issues/33)). Records and socket ownership are validated, and the listener must identify the selected project and process on the same connection before receiving a command. A project lease prevents duplicate daemons across temporary directories; invalid records never trigger fallback to another daemon.
+- Offline hook messages and audit entries identify the selected socket and distinguish unavailable, timed-out, and invalid-discovery cases while preserving existing fail-closed policy. Restart daemons and regenerate standalone Python hooks after upgrading. Separate filesystem namespaces still require a socket directory visible to both processes.
+
+---
+
 ## [v0.6.0] -- 2026-11-03
 
 Compare: [`v0.5.2...v0.6.0`](https://github.com/Dicklesworthstone/slb/compare/v0.5.2...v0.6.0)

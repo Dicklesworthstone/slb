@@ -89,7 +89,7 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 	}
 	queryTimeout := hookQueryTimeout(cwd)
 	queryCtx, cancel := context.WithTimeout(parent, queryTimeout)
-	client := daemon.NewIPCClient(daemon.SocketPathForCWD(cwd))
+	client := daemon.NewProjectIPCClient(cwd)
 	live, liveErr := client.HookQuery(queryCtx, daemon.HookQueryParams{
 		Command: command, SessionID: sessionID, CWD: cwd, ExecutionHandoff: true,
 		ConfigPath: policyOptions.ConfigPath,
@@ -123,19 +123,72 @@ func runHookGuard(cmd *cobra.Command, _ []string) error {
 	if timedOut {
 		source = "hook_native_timeout"
 	}
+	diagnostic := hookDaemonDiagnosticFor(client, liveErr)
 	fallback, err := classifyNativeHookFallback(command, cwd)
 	if err != nil {
 		return decideAndAuditNativeHook(cmd, command, sessionID, cwd, "block",
-			"SLB: classification failed; command blocked until policy is available.",
-			"unknown", 0, "policy_load_error", source, false, "")
+			diagnostic.message(queryTimeout)+" SLB: classification failed; command blocked until policy is available.",
+			"unknown", 0, "policy_load_error", source, false, "", diagnostic)
 	}
 	message := fallback.Message
-	if timedOut && fallback.Action != "allow" {
-		message = fmt.Sprintf("SLB: daemon did not answer within %s (integrations.hook_query_timeout_ms); used local policy. %s",
-			queryTimeout, message)
+	if fallback.Action != "allow" {
+		message = diagnostic.message(queryTimeout) + " " + message
 	}
 	return decideAndAuditNativeHook(cmd, command, sessionID, cwd, fallback.Action, message,
-		fallback.Tier, fallback.MinApprovals, fallback.MatchedPattern, source, false, fallback.ApprovalPolicy)
+		fallback.Tier, fallback.MinApprovals, fallback.MatchedPattern, source, false, fallback.ApprovalPolicy, diagnostic)
+}
+
+// Only the selected socket and a fixed failure category belong in offline
+// diagnostics. Transport errors may contain untrusted record contents or
+// credentials; the command and session already have separate audit fields.
+type hookDaemonDiagnostic struct {
+	socketPath string
+	category   string
+	remote     bool
+}
+
+func hookDaemonDiagnosticFor(client *daemon.IPCClient, err error) hookDaemonDiagnostic {
+	diagnostic := hookDaemonDiagnostic{socketPath: client.SocketPath(), remote: strings.TrimSpace(os.Getenv("SLB_HOST")) != ""}
+	if diagnostic.remote {
+		diagnostic.socketPath = ""
+	}
+	if err != nil {
+		diagnostic.category = "unavailable"
+		if errors.Is(err, context.DeadlineExceeded) {
+			diagnostic.category = "timeout"
+		} else if errors.Is(err, daemon.ErrDiscoveryInvalid) {
+			diagnostic.category = "discovery_invalid"
+		}
+	}
+	return diagnostic
+}
+
+func (d hookDaemonDiagnostic) message(timeout time.Duration) string {
+	message := "SLB OFFLINE: daemon unavailable; used local policy."
+	switch d.category {
+	case "timeout":
+		message = fmt.Sprintf("SLB: daemon did not answer within %s (integrations.hook_query_timeout_ms); used local policy.", timeout)
+	case "discovery_invalid":
+		message = "SLB OFFLINE: daemon discovery or identity validation failed; used local policy."
+	}
+	if d.remote {
+		return message + " Transport: explicitly configured remote daemon."
+	}
+	if d.socketPath == "" {
+		return message + " No socket was selected."
+	}
+	return message + fmt.Sprintf(" Socket: %q.", d.socketPath)
+}
+
+func (d hookDaemonDiagnostic) addTo(result map[string]any) {
+	if d.remote {
+		result["daemon_transport"] = "remote"
+	} else if d.socketPath != "" {
+		result["socket_path"] = d.socketPath
+	}
+	if d.category != "" {
+		result["daemon_error"] = d.category
+	}
 }
 
 // hookQueryTimeout is the configured daemon-query deadline for cwd's physical project.
@@ -334,6 +387,7 @@ func classifyNativeHookFallback(command, cwd string) (*daemon.HookQueryResult, e
 
 func decideAndAuditNativeHook(cmd *cobra.Command, command, sessionID, cwd, action, message, tier string,
 	minApprovals int, matchedPattern, source string, alreadyRecorded bool, policy db.ApprovalPolicy,
+	diagnostics ...hookDaemonDiagnostic,
 ) error {
 	action = normalizedNativeHookAction(action)
 	if action != "allow" && !alreadyRecorded {
@@ -343,13 +397,18 @@ func decideAndAuditNativeHook(cmd *cobra.Command, command, sessionID, cwd, actio
 			if policy != "" {
 				notice = policy.Label()
 			}
-			err = audit.Record(directory, audit.Event{
+			event := audit.Event{
 				CommandRedacted: core.ApplyRedaction(command, nil),
 				CommandHash:     audit.CommandHash(command, cwd), CWD: cwd, SessionID: sessionID,
 				Action: action, Tier: tier, MatchedPattern: matchedPattern,
 				MinApprovals: minApprovals, Source: source,
 				ApprovalPolicy: string(policy), ReviewNotice: notice,
-			})
+			}
+			if len(diagnostics) != 0 {
+				event.SocketPath = diagnostics[0].socketPath
+				event.DaemonError = diagnostics[0].category
+			}
+			err = audit.Record(directory, event)
 		}
 		if err != nil {
 			message += " Audit recording failed; safety decision unchanged."

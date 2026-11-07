@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/daemon"
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
 
@@ -535,5 +536,368 @@ func TestBuiltCLIHookInstallationIntegration(t *testing.T) {
 	unchanged(otherSettings, []byte(unrelated))
 	if _, err := os.Stat(filepath.Join(project, ".claude", "hooks.json")); !os.IsNotExist(err) {
 		t.Fatalf("unified installer created obsolete hook configuration: %v", err)
+	}
+}
+
+// GH #33 / bd-pz16: launch the real service and hooks with independent process
+// environments. The systemd-style case models an unset service TMPDIR, not a
+// separate PrivateTmp mount namespace; every process shares these fixture paths.
+func TestBuiltCLIHookDiscoveryAcrossTMPDIRs(t *testing.T) {
+	binary := buildIdentityBoundaryCLI(t)
+	python, _ := exec.LookPath("python3")
+	for _, setup := range []struct {
+		name        string
+		serviceTemp bool
+		agentTemp   bool
+		foreground  bool
+	}{
+		{"systemd_foreground_unset_service_tmpdir", false, true, true},
+		{"detached_service_tmpdir_agent_unset", true, false, false},
+		{"detached_different_service_and_agent_tmpdirs", true, true, false},
+	} {
+		t.Run(setup.name, func(t *testing.T) {
+			// A long project and agent TMPDIR must not lengthen the service's
+			// socket. Use /tmp explicitly so macOS's inherited TMPDIR cannot
+			// exhaust its 103-byte Unix socket path limit before the test starts.
+			base, err := os.MkdirTemp("/tmp", "slb-discovery-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(base) })
+			base, err = filepath.EvalSymlinks(base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			home := filepath.Join(base, "home")
+			serviceTemp := filepath.Join(base, "service")
+			agentTemp := filepath.Join(base, strings.Repeat("agent-temporary-", 8))
+			project := filepath.Join(base, strings.Repeat("long-project-", 9), "selected")
+			nested := filepath.Join(project, "src", "deep")
+			// The nearest initialized project must win even inside the first
+			// project's directory tree, while both daemons remain healthy.
+			otherProject := filepath.Join(project, "independent-project")
+			otherNested := filepath.Join(otherProject, "src")
+			for _, directory := range []string{home, serviceTemp, agentTemp, nested, otherNested} {
+				if err := os.MkdirAll(directory, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(project) <= 103 || len(agentTemp) <= 103 {
+				t.Fatal("fixture does not exercise paths longer than a Unix socket address")
+			}
+
+			environment := func(tempDir string) []string {
+				var result []string
+				for _, entry := range identityCLIEnvironment(home) {
+					key, _, _ := strings.Cut(entry, "=")
+					if key != "TMPDIR" && key != "TMP" && key != "TEMP" && key != "PWD" {
+						result = append(result, entry)
+					}
+				}
+				if tempDir != "" {
+					result = append(result, "TMPDIR="+tempDir, "TMP="+tempDir, "TEMP="+tempDir)
+				}
+				return append(result, "SLB_SESSION_KEY=discovery-diagnostic-secret")
+			}
+			serviceRuntime := "/tmp"
+			serviceEnv, agentEnv := environment(""), environment("")
+			if setup.serviceTemp {
+				serviceRuntime, serviceEnv = serviceTemp, environment(serviceTemp)
+			}
+			if setup.agentTemp {
+				agentEnv = environment(agentTemp)
+			}
+
+			run := func(t *testing.T, cwd string, env []string, executable string, input []byte, args ...string) ([]byte, []byte, error) {
+				t.Helper()
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				command := exec.CommandContext(ctx, executable, args...)
+				command.Dir, command.Env, command.Stdin = cwd, env, bytes.NewReader(input)
+				var stdout, stderr bytes.Buffer
+				command.Stdout, command.Stderr = &stdout, &stderr
+				err := command.Run()
+				if ctx.Err() != nil {
+					err = fmt.Errorf("subprocess deadline exceeded: %w", ctx.Err())
+				}
+				return stdout.Bytes(), stderr.Bytes(), err
+			}
+			jsonCLI := func(t *testing.T, cwd string, env []string, args ...string) map[string]any {
+				t.Helper()
+				stdout, stderr, err := run(t, cwd, env, binary, nil, append(args, "--json")...)
+				var result map[string]any
+				if err != nil || json.Unmarshal(stdout, &result) != nil {
+					t.Fatalf("CLI %v failed: %v\nstdout=%s\nstderr=%s", args, err, stdout, stderr)
+				}
+				return result
+			}
+			const configuration = `[general]
+enable_dry_run = false
+enable_rollback_capture = false
+[daemon]
+use_file_watcher = false
+[integrations]
+agent_mail_enabled = false
+hook_query_timeout_ms = 1000
+[notifications]
+desktop_enabled = false
+`
+			scripts := make(map[string]string)
+			for _, selected := range []string{project, otherProject} {
+				jsonCLI(t, base, agentEnv, "init", "--project", selected)
+				if err := os.WriteFile(filepath.Join(selected, ".slb", "config.toml"), []byte(configuration), 0600); err != nil {
+					t.Fatal(err)
+				}
+				generated := jsonCLI(t, selected, agentEnv, "hook", "generate", "--output-dir", filepath.Join(selected, ".slb", "hooks"))
+				script, ok := generated["script_path"].(string)
+				if !ok || script == "" || generated["policy_config"] != "" {
+					t.Fatalf("expected an independent generated Python runtime: %+v", generated)
+				}
+				scripts[selected] = script
+			}
+
+			type runtimeRecord struct {
+				Version     int    `json:"version"`
+				ProjectPath string `json:"project_path"`
+				SocketPath  string `json:"socket_path"`
+				PIDFile     string `json:"pid_file"`
+				PID         int    `json:"pid"`
+			}
+			assertStatus := func(t *testing.T, cwd string, env []string, expected runtimeRecord) {
+				t.Helper()
+				view := jsonCLI(t, cwd, env, "daemon", "status")
+				if view["running"] != true || view["socket_alive"] != true || view["pid"] != float64(expected.PID) ||
+					view["socket_path"] != expected.SocketPath || view["pid_file"] != expected.PIDFile {
+					t.Fatalf("caller environment selected a different daemon: %+v, want %+v", view, expected)
+				}
+			}
+			start := func(t *testing.T, selected string, foreground bool) (runtimeRecord, []byte, <-chan error) {
+				t.Helper()
+				// Explicit cleanup paths remain usable even if a deliberately
+				// invalid record or the cross-environment CLI stop check fails.
+				cleanupOptions := daemon.ServerOptions{
+					ProjectDir: selected,
+					SocketPath: filepath.Join(serviceRuntime, filepath.Base(daemon.SocketPathForCWD(selected))),
+					PIDFile:    filepath.Join(serviceRuntime, filepath.Base(daemon.PIDFileForCWD(selected))),
+				}
+				var process *exec.Cmd
+				var exited chan error
+				var processLog *os.File
+				t.Cleanup(func() {
+					_ = daemon.StopDaemonWithOptions(cleanupOptions, 3*time.Second)
+					if process != nil {
+						select {
+						case <-exited:
+						case <-time.After(3 * time.Second):
+							_ = process.Process.Kill() // Only this test's foreground child.
+							<-exited
+						}
+					}
+					if processLog != nil {
+						_ = processLog.Close()
+					}
+				})
+				var expectedPID int
+				if foreground {
+					var err error
+					processLog, err = os.CreateTemp(base, "foreground-daemon-*.log")
+					if err != nil {
+						t.Fatal(err)
+					}
+					process = exec.Command(binary, "daemon", "start", "--foreground", "--json")
+					process.Dir, process.Env = selected, serviceEnv
+					process.Stdout, process.Stderr = processLog, processLog
+					if err := process.Start(); err != nil {
+						process = nil
+						t.Fatal(err)
+					}
+					expectedPID = process.Process.Pid
+					exited = make(chan error, 1)
+					go func() { exited <- process.Wait(); close(exited) }()
+				} else {
+					started := jsonCLI(t, selected, serviceEnv, "daemon", "start")
+					pid, ok := started["pid"].(float64)
+					if !ok || pid <= 0 || started["foreground"] != false {
+						t.Fatalf("invalid detached daemon start: %+v", started)
+					}
+					expectedPID = int(pid)
+				}
+				recordPath := filepath.Join(selected, ".slb", "daemon.json")
+				deadline := time.Now().Add(10 * time.Second)
+				for time.Now().Before(deadline) {
+					if exited != nil {
+						select {
+						case err := <-exited:
+							output, _ := os.ReadFile(processLog.Name())
+							t.Fatalf("foreground daemon exited before discovery: %v\n%s", err, output)
+						default:
+						}
+					}
+					data, err := os.ReadFile(recordPath)
+					if os.IsNotExist(err) {
+						time.Sleep(20 * time.Millisecond)
+						continue
+					}
+					var record runtimeRecord
+					if err != nil || json.Unmarshal(data, &record) != nil || record.Version != 1 ||
+						record.ProjectPath != selected || record.PID != expectedPID ||
+						len(record.SocketPath) > 103 || filepath.Dir(record.SocketPath) != serviceRuntime {
+						t.Fatalf("daemon did not publish its project-scoped short endpoint: %s (%v)", data, err)
+					}
+					if info, err := os.Stat(recordPath); err != nil || info.Mode().Perm() != 0600 {
+						t.Fatalf("discovery record is not private: %v, %v", info, err)
+					}
+					assertStatus(t, selected, agentEnv, record)
+					return record, data, exited
+				}
+				t.Fatal("daemon did not publish a discovery record before the startup deadline")
+				return runtimeRecord{}, nil, nil
+			}
+
+			selected, selectedJSON, foregroundExit := start(t, project, setup.foreground)
+			other, otherJSON, _ := start(t, otherProject, false)
+			if selected.PID == other.PID || selected.SocketPath == other.SocketPath || selected.PIDFile == other.PIDFile {
+				t.Fatalf("independent projects share a daemon: selected=%+v other=%+v", selected, other)
+			}
+			assertStatus(t, nested, agentEnv, selected)
+			assertStatus(t, otherNested, agentEnv, other)
+
+			const unknown = "slb-discovery-unclassified-probe"
+			assertGuards := func(t *testing.T, phase, cwd, script string, env []string, unknownDecision, attemptedSocket string) {
+				t.Helper()
+				for _, guard := range []string{"native", "python"} {
+					if !t.Run(phase+"/"+guard, func(t *testing.T) {
+						if guard == "python" && python == "" {
+							t.Skip("python3 unavailable; the native guard is tested separately")
+						}
+						for _, probe := range []struct{ command, decision string }{{unknown, unknownDecision}, {"rm -rf /", "deny"}} {
+							input, err := json.Marshal(map[string]any{
+								"tool_name": "Bash", "cwd": cwd, "session_id": "discovery-session-private",
+								"tool_input": map[string]any{"command": probe.command},
+							})
+							if err != nil {
+								t.Fatal(err)
+							}
+							executable, args := binary, []string{"hook", "guard"}
+							if guard == "python" {
+								executable, args = python, []string{script}
+							}
+							stdout, stderr, err := run(t, cwd, env, executable, input, args...)
+							var result struct {
+								Output struct {
+									Event    string `json:"hookEventName"`
+									Decision string `json:"permissionDecision"`
+									Reason   string `json:"permissionDecisionReason"`
+								} `json:"hookSpecificOutput"`
+							}
+							if err != nil || json.Unmarshal(stdout, &result) != nil || result.Output.Event != "PreToolUse" || result.Output.Decision != probe.decision {
+								t.Fatalf("%s guard wanted %s for %q: %v\nstdout=%s\nstderr=%s", guard, probe.decision, probe.command, err, stdout, stderr)
+							}
+							if unknownDecision == "ask" {
+								if !strings.Contains(result.Output.Reason, "SLB OFFLINE") ||
+									(attemptedSocket != "" && !strings.Contains(result.Output.Reason, attemptedSocket)) {
+									t.Fatalf("offline decision lost the attempted endpoint: %+v, want socket %q", result, attemptedSocket)
+								}
+								for _, secret := range []string{unknown, "discovery-diagnostic-secret", "discovery-session-private", "record-secret-must-not-leak"} {
+									if strings.Contains(result.Output.Reason+string(stderr), secret) {
+										t.Fatalf("offline diagnostic exposed unnecessary command/session/record data: %s\n%s", stdout, stderr)
+									}
+								}
+							}
+						}
+					}) {
+						t.FailNow()
+					}
+				}
+			}
+			assertGuards(t, "online_nested_project", nested, scripts[project], agentEnv, "allow", "")
+			assertGuards(t, "online_independent_project", otherNested, scripts[otherProject], agentEnv, "allow", "")
+
+			recordPath := filepath.Join(project, ".slb", "daemon.json")
+			restoreOnFailure := true
+			t.Cleanup(func() {
+				if restoreOnFailure {
+					_ = os.WriteFile(recordPath, selectedJSON, 0600)
+				}
+			})
+			writeRecord := func(data []byte) {
+				t.Helper()
+				// Preserve the publisher's inode so restoring the original bytes
+				// also restores its right to clean up its own record on shutdown.
+				if err := os.WriteFile(recordPath, data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, invalid := range []string{"malformed", "wrong_project", "wrong_daemon", "stale_pid", "missing_socket"} {
+				bad := selected
+				var data []byte
+				switch invalid {
+				case "malformed":
+					data = []byte(`{"socket_path":"record-secret-must-not-leak"`)
+				case "wrong_project":
+					data = otherJSON
+				case "wrong_daemon":
+					bad.SocketPath, bad.PIDFile, bad.PID = other.SocketPath, other.PIDFile, other.PID
+				case "stale_pid":
+					bad.PID = other.PID
+				case "missing_socket":
+					bad.SocketPath = filepath.Join(serviceTemp, "missing.sock")
+				}
+				if data == nil {
+					data, err = json.Marshal(bad)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				writeRecord(data)
+				attempted := ""
+				if invalid == "missing_socket" {
+					attempted = bad.SocketPath
+				}
+				assertGuards(t, invalid+"_agent", nested, scripts[project], agentEnv, "ask", attempted)
+				// Even when the caller's own deterministic address is a healthy
+				// listener, an invalid/stale record cannot authorize fallback.
+				assertGuards(t, invalid+"_service_environment", nested, scripts[project], serviceEnv, "ask", attempted)
+				if stdout, stderr, err := run(t, nested, agentEnv, binary, nil, "daemon", "stop", "--timeout", "1"); err == nil {
+					t.Fatalf("unsafe discovery stopped a daemon (%s): %s\n%s", invalid, stdout, stderr)
+				}
+				writeRecord(selectedJSON)
+				assertStatus(t, nested, agentEnv, selected)
+				assertStatus(t, otherNested, agentEnv, other)
+			}
+
+			jsonCLI(t, nested, agentEnv, "daemon", "stop", "--timeout", "3")
+			restoreOnFailure = false
+			if foregroundExit != nil {
+				select {
+				case err := <-foregroundExit:
+					if err != nil {
+						t.Fatalf("foreground service did not stop cleanly: %v", err)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("cross-environment stop did not end the foreground service")
+				}
+			}
+			for _, path := range []string{recordPath, selected.SocketPath, selected.PIDFile} {
+				if _, err := os.Lstat(path); !os.IsNotExist(err) {
+					t.Fatalf("stopped service left runtime resource %s: %v", path, err)
+				}
+			}
+			if view := jsonCLI(t, nested, agentEnv, "daemon", "status"); view["running"] != false || view["socket_alive"] != false {
+				t.Fatalf("stopped project discovered another project's healthy daemon: %+v", view)
+			}
+			assertGuards(t, "stopped_without_record", nested, scripts[project], agentEnv, "ask", "")
+			// A crash can leave a valid record with no listener. Keep the other
+			// project's daemon healthy to detect unsafe wildcard/global discovery.
+			writeRecord(selectedJSON)
+			assertGuards(t, "stale_record_missing_socket", nested, scripts[project], agentEnv, "ask", selected.SocketPath)
+			diagnostic := jsonCLI(t, nested, agentEnv, "hook", "test", unknown)
+			if diagnostic["fallback"] != true || diagnostic["action"] != "ask" || diagnostic["socket_path"] != selected.SocketPath {
+				t.Fatalf("CLI offline diagnostics lost the selected missing socket: %+v", diagnostic)
+			}
+			assertStatus(t, otherNested, agentEnv, other)
+			assertGuards(t, "other_project_survives_stop", otherNested, scripts[otherProject], agentEnv, "allow", "")
+			jsonCLI(t, otherNested, agentEnv, "daemon", "stop", "--timeout", "3")
+		})
 	}
 }

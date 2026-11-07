@@ -38,6 +38,8 @@ type Event struct {
 	Source          string    `json:"source"`
 	ApprovalPolicy  string    `json:"approval_policy,omitempty"`
 	ReviewNotice    string    `json:"review_notice,omitempty"`
+	SocketPath      string    `json:"socket_path,omitempty"`
+	DaemonError     string    `json:"daemon_error,omitempty"`
 }
 
 // Filter selects audit records. Limit defaults to 100 and cannot exceed 10000.

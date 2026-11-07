@@ -3,9 +3,11 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -16,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/audit"
 	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/daemon"
 	"github.com/Dicklesworthstone/slb/internal/db"
@@ -974,6 +977,9 @@ func TestHookGenerateCommand_SocketPathWalksUpToProjectRoot(t *testing.T) {
 }
 
 func TestHookGenerateCommand_SymlinkSocketParity(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("standalone Python discovery requires Unix ownership checks")
+	}
 	h := testutil.NewHarness(t)
 	resetHookFlags()
 	t.Cleanup(resetHookFlags)
@@ -1033,6 +1039,9 @@ func TestHookGenerateCommand_SymlinkSocketParity(t *testing.T) {
 // and any other .slb stays a marker. Each row also names its root, so both
 // sides missing the rule cannot pass.
 func TestHookGenerateCommand_UserDirSocketParity(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("standalone Python discovery requires Unix ownership checks")
+	}
 	h := testutil.NewHarness(t)
 	resetHookFlags()
 	t.Cleanup(resetHookFlags)
@@ -2097,6 +2106,13 @@ func fakeHookDaemon(t *testing.T, project string, delay time.Duration) {
 	if err != nil {
 		t.Fatalf("listen %s: %v", socketPath, err)
 	}
+	if err := os.Chmod(socketPath, 0600); err != nil {
+		t.Fatal(err)
+	}
+	projectRoot, err := daemon.PhysicalProjectRootForCWD(project)
+	if err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan struct{})
 	t.Cleanup(func() {
 		close(done)
@@ -2119,6 +2135,15 @@ func fakeHookDaemon(t *testing.T, project string, delay time.Duration) {
 					}
 					if json.Unmarshal(scanner.Bytes(), &req) != nil {
 						return
+					}
+					if req.Method == "status" {
+						reply, _ := json.Marshal(map[string]any{"id": req.ID, "result": map[string]any{
+							"project_path": projectRoot, "pid": os.Getpid(), "state_ready": true,
+						}})
+						if _, err := conn.Write(append(reply, '\n')); err != nil {
+							return
+						}
+						continue
 					}
 					if delay < 0 {
 						<-done
@@ -2213,22 +2238,108 @@ func TestNativeHookGuardDeadlineFallsBackFailClosedAndIsDiagnosable(t *testing.T
 }
 
 func TestNativeHookGuardUnreachableDaemonIsRecordedOffline(t *testing.T) {
+	t.Setenv("SLB_HOST", "")
 	home := t.TempDir()
 	project := shortProjectDir(t)
 	output := nativeHookOutput(t, map[string]any{
 		"session_id": "provider-session", "cwd": project,
 		"tool_input": map[string]any{"command": "frobnicate --report"},
 	}, home)
-	if permission, _ := nativeHookPermission(t, output); permission != "ask" {
+	permission, specific := nativeHookPermission(t, output)
+	if permission != "ask" {
 		t.Fatalf("unreachable daemon must fall back to confirmation, got %q", permission)
+	}
+	reason, _ := specific["permissionDecisionReason"].(string)
+	if !strings.Contains(reason, fmt.Sprintf("Socket: %q.", daemon.SocketPathForCWD(project))) || strings.Contains(reason, "provider-session") {
+		t.Fatalf("offline diagnostic does not safely identify the selected socket: %q", reason)
 	}
 	entries, err := os.ReadDir(filepath.Join(home, ".slb", "audit", "blocked"))
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("expected one audit record, entries=%d err=%v", len(entries), err)
 	}
 	record, _ := os.ReadFile(filepath.Join(home, ".slb", "audit", "blocked", entries[0].Name()))
-	if !strings.Contains(string(record), `"source":"hook_native_offline"`) {
+	if !strings.Contains(string(record), `"source":"hook_native_offline"`) || !strings.Contains(string(record), `"daemon_error":"unavailable"`) {
 		t.Fatalf("unreachable daemon not recorded as offline: %s", record)
+	}
+}
+
+func TestNativeHookGuardInvalidDiscoveryFailsClosedWithoutLeakingRecord(t *testing.T) {
+	resetHookFlags()
+	t.Cleanup(resetHookFlags)
+	t.Setenv("SLB_HOST", "")
+	h := testutil.NewHarness(t)
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(h.ProjectDir, ".slb", "daemon.json"),
+		[]byte(`{"socket_path":"untrusted-record-secret"`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	output := nativeHookOutput(t, map[string]any{
+		"session_id": "provider-secret", "cwd": h.ProjectDir,
+		"tool_input": map[string]any{"command": "frobnicate token=command-secret"},
+	}, home)
+	permission, specific := nativeHookPermission(t, output)
+	reason, _ := specific["permissionDecisionReason"].(string)
+	if permission != "ask" || !strings.Contains(reason, "discovery or identity validation failed") ||
+		strings.Contains(reason, "untrusted-record-secret") || strings.Contains(reason, "command-secret") || strings.Contains(reason, "provider-secret") {
+		t.Fatalf("invalid discovery did not retain a safe offline decision: %+v", output)
+	}
+	events, err := audit.Query(filepath.Join(home, ".slb", "audit", "blocked"), audit.Filter{})
+	if err != nil || len(events) != 1 || events[0].DaemonError != "discovery_invalid" ||
+		events[0].SocketPath != daemon.SocketPathForCWD(h.ProjectDir) {
+		t.Fatalf("invalid discovery audit does not identify the expected endpoint: %+v, %v", events, err)
+	}
+}
+
+func TestNativeHookGuardDiscoversDaemonAcrossTMPDIR(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix daemon transport")
+	}
+	resetHookFlags()
+	t.Cleanup(resetHookFlags)
+	t.Setenv("SLB_HOST", "")
+	project, daemonTmp, hookTmp := shortProjectDir(t), shortProjectDir(t), shortProjectDir(t)
+	if err := os.Mkdir(filepath.Join(project, ".slb"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", daemonTmp)
+	socketPath := daemon.SocketPathForCWD(project)
+	fakeHookDaemon(t, project, 0)
+	record, err := json.Marshal(daemon.RuntimePaths{
+		Version: 1, ProjectPath: project, SocketPath: socketPath,
+		PIDFile: daemon.PIDFileForCWD(project), PID: os.Getpid(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, ".slb", "daemon.json"), record, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", hookTmp)
+	if socketPath == daemon.SocketPathForCWD(project) {
+		t.Fatal("fixture does not distinguish caller and daemon temporary directories")
+	}
+	output := nativeHookOutput(t, map[string]any{
+		"cwd": project, "tool_input": map[string]any{"command": "frobnicate --report"},
+	}, t.TempDir())
+	if permission, _ := nativeHookPermission(t, output); permission != "allow" {
+		t.Fatalf("healthy daemon became an offline approval prompt across TMPDIR: %+v", output)
+	}
+}
+
+func TestHookDaemonDiagnosticUsesQuotedActualTransport(t *testing.T) {
+	t.Setenv("SLB_HOST", "")
+	path := "/tmp/quoted\"socket\n.sock"
+	diagnostic := hookDaemonDiagnosticFor(daemon.NewIPCClient(path), context.DeadlineExceeded)
+	message := diagnostic.message(40 * time.Millisecond)
+	if !strings.Contains(message, fmt.Sprintf("Socket: %q.", path)) || strings.Contains(message, "\n") {
+		t.Fatalf("socket was not safely quoted: %q", message)
+	}
+	t.Setenv("SLB_HOST", "remote-secret:invalid-port")
+	diagnostic = hookDaemonDiagnosticFor(daemon.NewIPCClient(path), context.DeadlineExceeded)
+	message = diagnostic.message(40 * time.Millisecond)
+	if !strings.Contains(message, "explicitly configured remote daemon") || diagnostic.socketPath != "" ||
+		strings.Contains(message, "Socket:") || strings.Contains(message, "remote-secret") {
+		t.Fatalf("remote transport leaked its endpoint or claimed a local socket: %q", message)
 	}
 }
 
