@@ -512,3 +512,72 @@ func TestProjectServicesInvalidAlertConfigDoesNotDisableNotary(t *testing.T) {
 		t.Fatalf("invalid alert config touched delivery state: %v", err)
 	}
 }
+
+func TestProjectServicesNotificationSettingsPreserveNotary(t *testing.T) {
+	for _, source := range []string{"TOML", "environment"} {
+		t.Run(source, func(t *testing.T) {
+			home, project := t.TempDir(), t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			for _, pair := range os.Environ() {
+				name, _, _ := strings.Cut(pair, "=")
+				if strings.HasPrefix(name, "SLB_NOTIFICATIONS_") {
+					t.Setenv(name, "")
+				}
+			}
+			t.Setenv("SLB_AGENT_MAIL_ENABLED", "true")
+			t.Setenv("SLB_DAEMON_USE_FILE_WATCHER", "false")
+			t.Setenv("SLB_DESKTOP_NOTIFICATIONS", "false")
+			t.Setenv("SLB_WEBHOOK_URL", "")
+			t.Setenv("SLB_HISTORY_AUTO_GIT_COMMIT", "false")
+			database, err := db.OpenAndMigrate(filepath.Join(project, ".slb", "state.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = database.Close() }()
+			text := "[daemon]\nuse_file_watcher = false\n"
+			if source == "TOML" {
+				text += `[notifications.blocked]
+enabled = true
+agent_mail_url = "file:///invalid-blocked-route"
+agent_mail_sender = "BlueLake"
+agent_mail_recipients = ["GreenCastle"]
+[notifications.requests]
+enabled = true
+webhook_url = "file:///invalid-request-route"
+`
+			} else {
+				t.Setenv("SLB_NOTIFICATIONS_BLOCKED_ENABLED", "true")
+				t.Setenv("SLB_NOTIFICATIONS_BLOCKED_AGENT_MAIL_URL", "file:///invalid-blocked-route")
+				t.Setenv("SLB_NOTIFICATIONS_BLOCKED_AGENT_MAIL_SENDER", "BlueLake")
+				t.Setenv("SLB_NOTIFICATIONS_BLOCKED_AGENT_MAIL_RECIPIENTS", "GreenCastle")
+				t.Setenv("SLB_NOTIFICATIONS_REQUESTS_ENABLED", "true")
+				t.Setenv("SLB_NOTIFICATIONS_REQUESTS_WEBHOOK_URL", "file:///invalid-request-route")
+			}
+			if err := os.WriteFile(filepath.Join(project, ".slb", "config.toml"), []byte(text), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(config.LoadOptions{ProjectDir: project})
+			if err != nil || !cfg.Notifications.Blocked.Enabled || !cfg.Notifications.Requests.Enabled ||
+				cfg.Notifications.Blocked.AgentMailURL != "file:///invalid-blocked-route" ||
+				cfg.Notifications.Requests.WebhookURL != "file:///invalid-request-route" {
+				t.Fatalf("optional route settings failed global configuration loading: %+v, %v", cfg.Notifications, err)
+			}
+			// Service wiring and verifier readiness do not require a listening
+			// socket. Both optional routes fail validation before transport I/O.
+			server := newIPCServer(nil, "", log.New(io.Discard), nil, nil)
+			defer server.cancel()
+			stop, err := startProjectServices(context.Background(), database, project, "", cfg, []*IPCServer{server}, log.New(io.Discard))
+			if err != nil {
+				t.Fatalf("invalid notification routes disabled project services: %v", err)
+			}
+			stop()
+			if server.verifier == nil || server.verifier.projectPath != project {
+				t.Fatal("invalid optional routes disabled or retargeted the verifier")
+			}
+			if _, err := os.Stat(filepath.Join(project, ".slb", "notifications")); !os.IsNotExist(err) {
+				t.Fatalf("invalid routes created notification delivery state: %v", err)
+			}
+		})
+	}
+}

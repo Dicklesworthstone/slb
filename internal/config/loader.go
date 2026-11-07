@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/Dicklesworthstone/slb/internal/notifications"
 	"github.com/spf13/viper"
 )
 
@@ -108,6 +109,25 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("notifications.desktop_delay_seconds", def.Notifications.DesktopDelaySecs)
 	v.SetDefault("notifications.webhook_url", def.Notifications.WebhookURL)
 	v.SetDefault("notifications.email_enabled", def.Notifications.EmailEnabled)
+	v.SetDefault("notifications.blocked.enabled", def.Notifications.Blocked.Enabled)
+	v.SetDefault("notifications.blocked.window_seconds", def.Notifications.Blocked.WindowSeconds)
+	v.SetDefault("notifications.blocked.repeat_threshold", def.Notifications.Blocked.RepeatThreshold)
+	v.SetDefault("notifications.blocked.cooldown_seconds", def.Notifications.Blocked.CooldownSeconds)
+	v.SetDefault("notifications.blocked.max_per_minute", def.Notifications.Blocked.MaxPerMinute)
+	v.SetDefault("notifications.blocked.agent_mail_url", def.Notifications.Blocked.AgentMailURL)
+	v.SetDefault("notifications.blocked.agent_mail_sender", def.Notifications.Blocked.AgentMailSender)
+	v.SetDefault("notifications.blocked.agent_mail_recipients", def.Notifications.Blocked.AgentMailRecipients)
+	v.SetDefault("notifications.blocked.human_recipient", def.Notifications.Blocked.HumanRecipient)
+	v.SetDefault("notifications.blocked.blocked_template", def.Notifications.Blocked.BlockedTemplate)
+	v.SetDefault("notifications.blocked.repeated_template", def.Notifications.Blocked.RepeatedTemplate)
+	v.SetDefault("notifications.requests.enabled", def.Notifications.Requests.Enabled)
+	v.SetDefault("notifications.requests.lookback_seconds", def.Notifications.Requests.LookbackSeconds)
+	v.SetDefault("notifications.requests.max_per_minute", def.Notifications.Requests.MaxPerMinute)
+	v.SetDefault("notifications.requests.agent_mail_url", def.Notifications.Requests.AgentMailURL)
+	v.SetDefault("notifications.requests.agent_mail_sender", def.Notifications.Requests.AgentMailSender)
+	v.SetDefault("notifications.requests.agent_mail_recipients", def.Notifications.Requests.AgentMailRecipients)
+	v.SetDefault("notifications.requests.webhook_url", def.Notifications.Requests.WebhookURL)
+	v.SetDefault("notifications.requests.template", def.Notifications.Requests.TemplatePath)
 
 	v.SetDefault("history.database_path", def.History.DatabasePath)
 	v.SetDefault("history.git_repo_path", def.History.GitRepoPath)
@@ -448,6 +468,10 @@ func GetValue(cfg Config, key string) (any, bool) {
 			}
 		case NotificationsConfig:
 			switch seg {
+			case "blocked":
+				current = c.Blocked
+			case "requests":
+				current = c.Requests
 			case "desktop_enabled":
 				return c.DesktopEnabled, true
 			case "desktop_delay_seconds":
@@ -456,6 +480,54 @@ func GetValue(cfg Config, key string) (any, bool) {
 				return c.WebhookURL, true
 			case "email_enabled":
 				return c.EmailEnabled, true
+			default:
+				return nil, false
+			}
+		case notifications.Config:
+			switch seg {
+			case "enabled":
+				current = c.Enabled
+			case "window_seconds":
+				current = c.WindowSeconds
+			case "repeat_threshold":
+				current = c.RepeatThreshold
+			case "cooldown_seconds":
+				current = c.CooldownSeconds
+			case "max_per_minute":
+				current = c.MaxPerMinute
+			case "agent_mail_url":
+				current = c.AgentMailURL
+			case "agent_mail_sender":
+				current = c.AgentMailSender
+			case "agent_mail_recipients":
+				current = c.AgentMailRecipients
+			case "human_recipient":
+				current = c.HumanRecipient
+			case "blocked_template":
+				current = c.BlockedTemplate
+			case "repeated_template":
+				current = c.RepeatedTemplate
+			default:
+				return nil, false
+			}
+		case notifications.RequestSettings:
+			switch seg {
+			case "enabled":
+				current = c.Enabled
+			case "lookback_seconds":
+				current = c.LookbackSeconds
+			case "max_per_minute":
+				current = c.MaxPerMinute
+			case "agent_mail_url":
+				current = c.AgentMailURL
+			case "agent_mail_sender":
+				current = c.AgentMailSender
+			case "agent_mail_recipients":
+				current = c.AgentMailRecipients
+			case "webhook_url":
+				current = c.WebhookURL
+			case "template":
+				current = c.TemplatePath
 			default:
 				return nil, false
 			}
@@ -642,6 +714,27 @@ var keyKinds = map[string]valueKind{
 	"notifications.webhook_url":           kindString,
 	"notifications.email_enabled":         kindBool,
 
+	"notifications.blocked.enabled":               kindBool,
+	"notifications.blocked.window_seconds":        kindInt,
+	"notifications.blocked.repeat_threshold":      kindInt,
+	"notifications.blocked.cooldown_seconds":      kindInt,
+	"notifications.blocked.max_per_minute":        kindInt,
+	"notifications.blocked.agent_mail_url":        kindString,
+	"notifications.blocked.agent_mail_sender":     kindString,
+	"notifications.blocked.agent_mail_recipients": kindStringSlice,
+	"notifications.blocked.human_recipient":       kindString,
+	"notifications.blocked.blocked_template":      kindString,
+	"notifications.blocked.repeated_template":     kindString,
+
+	"notifications.requests.enabled":               kindBool,
+	"notifications.requests.lookback_seconds":      kindInt,
+	"notifications.requests.max_per_minute":        kindInt,
+	"notifications.requests.agent_mail_url":        kindString,
+	"notifications.requests.agent_mail_sender":     kindString,
+	"notifications.requests.agent_mail_recipients": kindStringSlice,
+	"notifications.requests.webhook_url":           kindString,
+	"notifications.requests.template":              kindString,
+
 	"history.database_path":   kindString,
 	"history.git_repo_path":   kindString,
 	"history.retention_days":  kindInt,
@@ -718,6 +811,25 @@ var envBindings = []struct {
 	{"SLB_DESKTOP_DELAY_SECONDS", "notifications.desktop_delay_seconds", kindInt},
 	{"SLB_WEBHOOK_URL", "notifications.webhook_url", kindString},
 	{"SLB_EMAIL_ENABLED", "notifications.email_enabled", kindBool},
+	{"SLB_NOTIFICATIONS_BLOCKED_ENABLED", "notifications.blocked.enabled", kindBool},
+	{"SLB_NOTIFICATIONS_BLOCKED_WINDOW_SECONDS", "notifications.blocked.window_seconds", kindInt},
+	{"SLB_NOTIFICATIONS_BLOCKED_REPEAT_THRESHOLD", "notifications.blocked.repeat_threshold", kindInt},
+	{"SLB_NOTIFICATIONS_BLOCKED_COOLDOWN_SECONDS", "notifications.blocked.cooldown_seconds", kindInt},
+	{"SLB_NOTIFICATIONS_BLOCKED_MAX_PER_MINUTE", "notifications.blocked.max_per_minute", kindInt},
+	{"SLB_NOTIFICATIONS_BLOCKED_AGENT_MAIL_URL", "notifications.blocked.agent_mail_url", kindString},
+	{"SLB_NOTIFICATIONS_BLOCKED_AGENT_MAIL_SENDER", "notifications.blocked.agent_mail_sender", kindString},
+	{"SLB_NOTIFICATIONS_BLOCKED_AGENT_MAIL_RECIPIENTS", "notifications.blocked.agent_mail_recipients", kindStringSlice},
+	{"SLB_NOTIFICATIONS_BLOCKED_HUMAN_RECIPIENT", "notifications.blocked.human_recipient", kindString},
+	{"SLB_NOTIFICATIONS_BLOCKED_BLOCKED_TEMPLATE", "notifications.blocked.blocked_template", kindString},
+	{"SLB_NOTIFICATIONS_BLOCKED_REPEATED_TEMPLATE", "notifications.blocked.repeated_template", kindString},
+	{"SLB_NOTIFICATIONS_REQUESTS_ENABLED", "notifications.requests.enabled", kindBool},
+	{"SLB_NOTIFICATIONS_REQUESTS_LOOKBACK_SECONDS", "notifications.requests.lookback_seconds", kindInt},
+	{"SLB_NOTIFICATIONS_REQUESTS_MAX_PER_MINUTE", "notifications.requests.max_per_minute", kindInt},
+	{"SLB_NOTIFICATIONS_REQUESTS_AGENT_MAIL_URL", "notifications.requests.agent_mail_url", kindString},
+	{"SLB_NOTIFICATIONS_REQUESTS_AGENT_MAIL_SENDER", "notifications.requests.agent_mail_sender", kindString},
+	{"SLB_NOTIFICATIONS_REQUESTS_AGENT_MAIL_RECIPIENTS", "notifications.requests.agent_mail_recipients", kindStringSlice},
+	{"SLB_NOTIFICATIONS_REQUESTS_WEBHOOK_URL", "notifications.requests.webhook_url", kindString},
+	{"SLB_NOTIFICATIONS_REQUESTS_TEMPLATE", "notifications.requests.template", kindString},
 
 	{"SLB_HISTORY_DB_PATH", "history.database_path", kindString},
 	{"SLB_HISTORY_GIT_PATH", "history.git_repo_path", kindString},

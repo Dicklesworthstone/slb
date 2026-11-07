@@ -399,6 +399,187 @@ func TestParseValue(t *testing.T) {
 	}
 }
 
+type notificationSettingFixture struct {
+	key, env, raw string
+	want          any
+}
+
+func notificationSettingFixtures() []notificationSettingFixture {
+	return []notificationSettingFixture{
+		{"notifications.blocked.enabled", "SLB_NOTIFICATIONS_BLOCKED_ENABLED", "true", true},
+		{"notifications.blocked.window_seconds", "SLB_NOTIFICATIONS_BLOCKED_WINDOW_SECONDS", "180", 180},
+		{"notifications.blocked.repeat_threshold", "SLB_NOTIFICATIONS_BLOCKED_REPEAT_THRESHOLD", "4", 4},
+		{"notifications.blocked.cooldown_seconds", "SLB_NOTIFICATIONS_BLOCKED_COOLDOWN_SECONDS", "45", 45},
+		{"notifications.blocked.max_per_minute", "SLB_NOTIFICATIONS_BLOCKED_MAX_PER_MINUTE", "7", 7},
+		{"notifications.blocked.agent_mail_url", "SLB_NOTIFICATIONS_BLOCKED_AGENT_MAIL_URL", "https://blocked.example.invalid/mcp/", "https://blocked.example.invalid/mcp/"},
+		{"notifications.blocked.agent_mail_sender", "SLB_NOTIFICATIONS_BLOCKED_AGENT_MAIL_SENDER", "BlueLake", "BlueLake"},
+		{"notifications.blocked.agent_mail_recipients", "SLB_NOTIFICATIONS_BLOCKED_AGENT_MAIL_RECIPIENTS", " GreenCastle, , RedStone, ", []string{"GreenCastle", "RedStone"}},
+		{"notifications.blocked.human_recipient", "SLB_NOTIFICATIONS_BLOCKED_HUMAN_RECIPIENT", "GoldenOwl", "GoldenOwl"},
+		{"notifications.blocked.blocked_template", "SLB_NOTIFICATIONS_BLOCKED_BLOCKED_TEMPLATE", "~/templates/blocked.md", "~/templates/blocked.md"},
+		{"notifications.blocked.repeated_template", "SLB_NOTIFICATIONS_BLOCKED_REPEATED_TEMPLATE", "~/templates/repeated.md", "~/templates/repeated.md"},
+		{"notifications.requests.enabled", "SLB_NOTIFICATIONS_REQUESTS_ENABLED", "true", true},
+		{"notifications.requests.lookback_seconds", "SLB_NOTIFICATIONS_REQUESTS_LOOKBACK_SECONDS", "3600", 3600},
+		{"notifications.requests.max_per_minute", "SLB_NOTIFICATIONS_REQUESTS_MAX_PER_MINUTE", "31", 31},
+		{"notifications.requests.agent_mail_url", "SLB_NOTIFICATIONS_REQUESTS_AGENT_MAIL_URL", "https://requests.example.invalid/mcp/", "https://requests.example.invalid/mcp/"},
+		{"notifications.requests.agent_mail_sender", "SLB_NOTIFICATIONS_REQUESTS_AGENT_MAIL_SENDER", "SilverFox", "SilverFox"},
+		{"notifications.requests.agent_mail_recipients", "SLB_NOTIFICATIONS_REQUESTS_AGENT_MAIL_RECIPIENTS", " AmberWolf, , VioletHill, ", []string{"AmberWolf", "VioletHill"}},
+		{"notifications.requests.webhook_url", "SLB_NOTIFICATIONS_REQUESTS_WEBHOOK_URL", "https://webhook.example.invalid/slb", "https://webhook.example.invalid/slb"},
+		{"notifications.requests.template", "SLB_NOTIFICATIONS_REQUESTS_TEMPLATE", "~/templates/request.md", "~/templates/request.md"},
+	}
+}
+
+func notificationConfigEnvironment(t *testing.T) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	for _, binding := range envBindings {
+		t.Setenv(binding.Env, "")
+	}
+}
+
+func TestNotificationConfigKeyRoundTrip(t *testing.T) {
+	notificationConfigEnvironment(t)
+	for _, tc := range notificationSettingFixtures() {
+		t.Run(tc.key, func(t *testing.T) {
+			value, err := ParseValue(tc.key, tc.raw)
+			if err != nil || !reflect.DeepEqual(value, tc.want) {
+				t.Fatalf("ParseValue = %#v, %v; want %#v", value, err, tc.want)
+			}
+			project := t.TempDir()
+			if err := WriteValue(filepath.Join(project, ".slb", "config.toml"), tc.key, value); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(LoadOptions{ProjectDir: project})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, ok := GetValue(cfg, tc.key); !ok || !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("stored setting = %#v, found=%t; want %#v", got, ok, tc.want)
+			}
+		})
+	}
+}
+
+func TestNotificationConfigEnvironmentPrecedenceAndSnapshots(t *testing.T) {
+	notificationConfigEnvironment(t)
+	for _, tc := range notificationSettingFixtures() {
+		t.Run(tc.key, func(t *testing.T) {
+			// A distinct same-type value makes file/env/flag precedence visible.
+			var alternative any
+			switch value := tc.want.(type) {
+			case bool:
+				alternative = !value
+			case int:
+				alternative = value + 1
+			case string:
+				alternative = "file-value"
+			case []string:
+				alternative = []string{"FileRecipient"}
+			default:
+				t.Fatalf("unsupported fixture type %T", value)
+			}
+			project := t.TempDir()
+			if err := WriteValue(filepath.Join(project, ".slb", "config.toml"), tc.key, alternative); err != nil {
+				t.Fatal(err)
+			}
+			opts := LoadOptions{ProjectDir: project}
+			before, err := ReadSources(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(tc.env, tc.raw)
+			after, err := ReadSources(opts)
+			if err != nil || before.Equal(after) {
+				t.Fatalf("environment change was not captured: %v", err)
+			}
+			cfg, err := Load(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, ok := GetValue(cfg, tc.key); !ok || !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("environment did not override the file: %#v, found=%t", got, ok)
+			}
+			opts.FlagOverrides = map[string]any{tc.key: alternative}
+			cfg, err = Load(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, ok := GetValue(cfg, tc.key); !ok || !reflect.DeepEqual(got, alternative) {
+				t.Fatalf("flag did not override environment: %#v, found=%t", got, ok)
+			}
+			t.Setenv(tc.env, "")
+			for _, snapshot := range []struct {
+				sources Sources
+				want    any
+			}{{before, alternative}, {after, tc.want}} {
+				cfg, err := LoadSources(snapshot.sources)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, ok := GetValue(cfg, tc.key); !ok || !reflect.DeepEqual(got, snapshot.want) {
+					t.Fatalf("snapshot read live environment: %#v, found=%t; want %#v", got, ok, snapshot.want)
+				}
+			}
+		})
+	}
+}
+
+func TestNotificationConfigDefaultsAndTypedErrors(t *testing.T) {
+	notificationConfigEnvironment(t)
+	project := t.TempDir()
+	cfg, err := Load(LoadOptions{ProjectDir: project})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaults := DefaultConfig()
+	if cfg.Notifications.Blocked.Enabled || cfg.Notifications.Requests.Enabled ||
+		!reflect.DeepEqual(cfg.Notifications, defaults.Notifications) {
+		t.Fatalf("registering nested settings changed notification defaults: %+v", cfg.Notifications)
+	}
+	for _, tc := range notificationSettingFixtures() {
+		switch tc.want.(type) {
+		case bool, int:
+			t.Run(tc.key, func(t *testing.T) {
+				if _, err := ParseValue(tc.key, "invalid-typed-value"); err == nil {
+					t.Fatal("invalid CLI setting was accepted")
+				}
+				t.Setenv(tc.env, "invalid-typed-value")
+				if _, err := Load(LoadOptions{ProjectDir: project}); err == nil || !strings.Contains(err.Error(), tc.env) {
+					t.Fatalf("invalid environment setting lost its typed diagnostic: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestNotificationConfigRecipientsCanBeCleared(t *testing.T) {
+	notificationConfigEnvironment(t)
+	for _, key := range []string{"notifications.blocked.agent_mail_recipients", "notifications.requests.agent_mail_recipients"} {
+		t.Run(key, func(t *testing.T) {
+			project := t.TempDir()
+			userPath, projectPath := ConfigPaths(project, "")
+			if err := WriteValue(userPath, key, []string{"InheritedRecipient"}); err != nil {
+				t.Fatal(err)
+			}
+			value, err := ParseValue(key, " , , ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := WriteValue(projectPath, key, value); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(LoadOptions{ProjectDir: project})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, ok := GetValue(cfg, key); !ok || !reflect.DeepEqual(got, []string{}) {
+				t.Fatalf("empty project CSV inherited recipients: %#v, found=%t", got, ok)
+			}
+		})
+	}
+}
+
 func TestGetValue(t *testing.T) {
 	cfg := DefaultConfig()
 
@@ -437,6 +618,8 @@ func TestGetValue(t *testing.T) {
 		{"notifications.desktop_delay_seconds", cfg.Notifications.DesktopDelaySecs},
 		{"notifications.webhook_url", cfg.Notifications.WebhookURL},
 		{"notifications.email_enabled", cfg.Notifications.EmailEnabled},
+		{"notifications.blocked", cfg.Notifications.Blocked},
+		{"notifications.requests", cfg.Notifications.Requests},
 
 		{"history.database_path", cfg.History.DatabasePath},
 		{"history.git_repo_path", cfg.History.GitRepoPath},
@@ -511,6 +694,10 @@ func TestGetValue(t *testing.T) {
 		"daemon.nope",
 		"rate_limits.nope",
 		"notifications.nope",
+		"notifications.blocked.nope",
+		"notifications.requests.nope",
+		"notifications.blocked.enabled.extra",
+		"notifications.requests.agent_mail_recipients.extra",
 		"history.nope",
 		"patterns.nope",
 		"patterns.critical.nope",

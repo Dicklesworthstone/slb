@@ -76,6 +76,52 @@ separate. Their destinations can overlap, producing intentionally different
 notices. Disable an old route separately when its additional reminders are not
 wanted. A project with request notifications disabled retains legacy behavior.
 
+## Configuration access
+
+Every setting in `[notifications.requests]` supports `slb config get/set` and a
+dedicated environment override:
+
+```sh
+slb -C /path/to/project config set notifications.requests.agent_mail_recipients 'GreenCastle,RedStone'
+slb -C /path/to/project config set notifications.requests.lookback_seconds 3600
+slb -C /path/to/project config get notifications.requests.enabled
+slb config set --global notifications.requests.max_per_minute 30
+slb -C /path/to/project --config /path/to/review-policy.toml config set notifications.requests.enabled true
+```
+
+Writes target the selected project's `.slb/config.toml`, or the user file with
+`--global`, or a replacement project file with `--config FILE`. When both flags
+are supplied to `config set`, `--global` selects the user file. `config get`
+always reads effective configuration, even with `--global`: defaults are
+overridden by user settings, then project or explicit-file settings, then
+environment values. A saved user value can therefore be shadowed by a project
+or environment override in the getter's output.
+
+Each setting name below is prefixed with `notifications.requests.` for CLI use.
+
+| Setting | Type | Environment variable |
+|---|---|---|
+| `enabled` | Boolean | `SLB_NOTIFICATIONS_REQUESTS_ENABLED` |
+| `lookback_seconds` | Integer | `SLB_NOTIFICATIONS_REQUESTS_LOOKBACK_SECONDS` |
+| `max_per_minute` | Integer | `SLB_NOTIFICATIONS_REQUESTS_MAX_PER_MINUTE` |
+| `agent_mail_url` | String | `SLB_NOTIFICATIONS_REQUESTS_AGENT_MAIL_URL` |
+| `agent_mail_sender` | String | `SLB_NOTIFICATIONS_REQUESTS_AGENT_MAIL_SENDER` |
+| `agent_mail_recipients` | String array | `SLB_NOTIFICATIONS_REQUESTS_AGENT_MAIL_RECIPIENTS` |
+| `webhook_url` | String | `SLB_NOTIFICATIONS_REQUESTS_WEBHOOK_URL` |
+| `template` | String | `SLB_NOTIFICATIONS_REQUESTS_TEMPLATE` |
+
+CLI and environment recipient lists use comma-separated names; whitespace is
+trimmed and empty elements are discarded. TOML uses string arrays. Pass an empty
+CLI value to clear recipients, for example
+`slb config set notifications.requests.agent_mail_recipients ""`. Empty environment
+values are ignored, while `false` explicitly disables an enabled Boolean setting.
+Authentication tokens remain external in `SLB_AGENT_MAIL_TOKEN` and
+`SLB_AGENT_MAIL_SENDER_TOKEN`; they are not config keys.
+
+Request delivery remains disabled by default. Numeric zeros retain their existing
+meaning of selecting the worker defaults below; getters show the configured
+values. Restart the daemon after changing its configuration or environment.
+
 ## What reviewers receive
 
 Notices preserve the journal event's metadata at the time of the mutation:
@@ -156,8 +202,6 @@ an outage or database restore; it is the evidence of what was acknowledged.
 A backwards wall-clock jump pauses delivery until the persisted time is reached,
 so it cannot reset the rate budget.
 
-These nested settings are read through TOML and do not yet have individual
-`slb config get/set` key bindings or dedicated `SLB_*` environment overrides.
 No new notify CLI commands are introduced here. The Go integration tests cover
 the actual journal/daemon/TOML paths, explicit configuration overrides, detached
 CLI execution and daemon restart recovery; run the full repository tests with

@@ -63,9 +63,56 @@ not replace that separate integration.
 
 To disable blocked alerts, set `notifications.blocked.enabled = false` and
 restart the daemon. Disabled alerts do not read templates or audit records,
-create delivery files, or contact destinations. The nested blocked settings
-are read from TOML; they do not currently have `slb config set/get` key bindings
-or individual `SLB_*` environment overrides.
+create delivery files, or contact destinations.
+
+## Configuration access
+
+All settings in `[notifications.blocked]` support `slb config get/set` and the
+environment bindings below. For example:
+
+```sh
+slb -C /path/to/project config set notifications.blocked.agent_mail_recipients 'GreenCastle,RedStone'
+slb -C /path/to/project config set notifications.blocked.repeat_threshold 4
+slb -C /path/to/project config get notifications.blocked.enabled
+slb config set --global notifications.blocked.max_per_minute 10
+slb -C /path/to/project --config /path/to/review-policy.toml config set notifications.blocked.enabled true
+```
+
+The default write target is the selected project's `.slb/config.toml`.
+`--global` writes the user's `~/.slb/config.toml`; `--config FILE` selects a
+replacement project file. If both are supplied to `config set`, `--global`
+selects the write target. `config get` always reports the effective value,
+including when `--global` is present: defaults, then user settings, then project
+or explicit-file settings, then environment overrides. Reading a global default
+from a project that overrides it therefore shows the project's effective value.
+
+Each setting name below is prefixed with `notifications.blocked.` for CLI use.
+
+| Setting | Type | Environment variable |
+|---|---|---|
+| `enabled` | Boolean | `SLB_NOTIFICATIONS_BLOCKED_ENABLED` |
+| `window_seconds` | Integer | `SLB_NOTIFICATIONS_BLOCKED_WINDOW_SECONDS` |
+| `repeat_threshold` | Integer | `SLB_NOTIFICATIONS_BLOCKED_REPEAT_THRESHOLD` |
+| `cooldown_seconds` | Integer | `SLB_NOTIFICATIONS_BLOCKED_COOLDOWN_SECONDS` |
+| `max_per_minute` | Integer | `SLB_NOTIFICATIONS_BLOCKED_MAX_PER_MINUTE` |
+| `agent_mail_url` | String | `SLB_NOTIFICATIONS_BLOCKED_AGENT_MAIL_URL` |
+| `agent_mail_sender` | String | `SLB_NOTIFICATIONS_BLOCKED_AGENT_MAIL_SENDER` |
+| `agent_mail_recipients` | String array | `SLB_NOTIFICATIONS_BLOCKED_AGENT_MAIL_RECIPIENTS` |
+| `human_recipient` | String | `SLB_NOTIFICATIONS_BLOCKED_HUMAN_RECIPIENT` |
+| `blocked_template` | String | `SLB_NOTIFICATIONS_BLOCKED_BLOCKED_TEMPLATE` |
+| `repeated_template` | String | `SLB_NOTIFICATIONS_BLOCKED_REPEATED_TEMPLATE` |
+
+Recipient arrays use comma-separated names in CLI arguments and environment
+values, with surrounding whitespace and empty elements discarded. TOML continues
+to use arrays. An empty CLI argument clears a list, for example
+`slb config set notifications.blocked.agent_mail_recipients ""`. Empty environment
+values are ignored and do not clear a file setting. Boolean `false` is an explicit
+override. Transport credentials remain in `SLB_AGENT_MAIL_TOKEN` and
+`SLB_AGENT_MAIL_SENDER_TOKEN`, separate from these settings.
+
+Alerts remain disabled by default. Numeric zero values select the service
+defaults described below; `config get` reports the configured zero rather than
+expanding it. Restart the daemon after changing files or its environment.
 
 ## Other destinations
 
