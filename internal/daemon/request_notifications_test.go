@@ -69,6 +69,112 @@ func TestRequestNotificationJournalProjectionAndScope(t *testing.T) {
 	}
 }
 
+func TestRequestNotificationJournalCatchupAndRestart(t *testing.T) {
+	project := t.TempDir()
+	databasePath := filepath.Join(project, ".slb", "state.db")
+	database, err := db.OpenAndMigrate(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	request := serviceRequest(t, database, project)
+	if _, err := database.Exec(`UPDATE requests SET command_raw = ?, justification_reason = ?, command_display_redacted = ? WHERE id = ?`,
+		"SECRET-RAW", "SECRET-REASON", "SECRET-DISPLAY", request.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Append controlled timestamps using the real metadata projection. Existing
+	// journal rows remain immutable, including the two older writer events.
+	now := time.Now().UTC().Add(48 * time.Hour).Truncate(time.Millisecond)
+	oldAt := now.Add(-2 * time.Hour)
+	tx, err := database.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	appendEvent := func(at time.Time) int64 {
+		t.Helper()
+		result, err := tx.Exec(`INSERT INTO request_events(kind, project_path, request_id, occurred_at, payload)
+			SELECT 'request_updated', project_path, request_id, ?, payload
+			FROM request_event_projection WHERE request_id = ?`, at.Format(time.RFC3339Nano), request.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sequence, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sequence
+	}
+	const historicalPrefix = 130
+	for i := 2; i < historicalPrefix; i++ {
+		appendEvent(oldAt)
+	}
+	firstEligible := appendEvent(now.Add(-10 * time.Minute))
+	appendEvent(oldAt) // Journal order need not be timestamp order.
+	secondEligible := appendEvent(now.Add(-5 * time.Minute))
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	var delivered []notifications.RequestNotice
+	routes := []notifications.RequestRoute{{ID: "in-memory-reviewer", Send: func(_ context.Context, notice notifications.RequestNotice) error {
+		data, err := json.Marshal(notice)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if notice.Project != project || notice.RequestID != request.ID || notice.Status != "pending" ||
+			notice.CommandHash != request.Command.Hash || notice.ID == "" {
+			t.Fatalf("catch-up changed request metadata: %+v", notice)
+		}
+		for _, forbidden := range []string{"SECRET-", `"cursor"`, `"command_raw"`, `"justification"`, `"session_key"`} {
+			if strings.Contains(string(data), forbidden) {
+				t.Fatalf("catch-up notice leaked private fields: %s", data)
+			}
+		}
+		delivered = append(delivered, notice)
+		return nil
+	}}}
+	statePath := filepath.Join(project, ".slb", "notifications", "request-delivery.json")
+	newDispatcher := func() *notifications.RequestDispatcher {
+		return &notifications.RequestDispatcher{Project: project, StatePath: statePath,
+			Source: requestJournalSource{database: database},
+			Policy: notifications.RequestDeliveryPolicy{Lookback: time.Hour, MaxPerMinute: 1}}
+	}
+	report, err := newDispatcher().Dispatch(context.Background(), now, routes)
+	if err != nil || report.Sent != 1 || report.Skipped != historicalPrefix+1 ||
+		report.Failed != 0 || report.Deferred != 1 || report.HasMore {
+		t.Fatalf("historical catch-up failed to reach live work within one pass: %+v %v", report, err)
+	}
+	if len(delivered) != 1 || delivered[0].Sequence != firstEligible {
+		t.Fatalf("historical exclusions consumed the send budget or bypassed eligible work: %+v", delivered)
+	}
+
+	// Reopen the journal and reconstruct the dispatcher from durable state. The
+	// second event is now older than a fresh lookback, but remains queued under
+	// this destination's original cutoff. The first event must not repeat.
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := db.OpenAndMigrate(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database = reopened
+	restartedAt := now.Add(48 * time.Hour)
+	report, err = newDispatcher().Dispatch(context.Background(), restartedAt, routes)
+	if err != nil || report.Sent != 1 || report.Skipped != 0 || report.Failed != 0 || report.Deferred != 0 || report.HasMore {
+		t.Fatalf("restart lost the saved cutoff or acknowledged position: %+v %v", report, err)
+	}
+	if len(delivered) != 2 || delivered[1].Sequence != secondEligible || delivered[0].ID == delivered[1].ID {
+		t.Fatalf("restart lost, repeated or reordered a journal event: %+v", delivered)
+	}
+	report, err = newDispatcher().Dispatch(context.Background(), restartedAt, routes)
+	if err != nil || report.Sent != 0 || report.Skipped != 0 || report.Failed != 0 || report.Deferred != 0 || report.HasMore || len(delivered) != 2 {
+		t.Fatalf("acknowledged catch-up was replayed: %+v %v", report, err)
+	}
+}
+
 func TestProjectServicesDeliverRequestJournalAndResume(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	project := t.TempDir()

@@ -18,12 +18,14 @@ type noticeJournal struct {
 	project, generation string
 	events              []RequestNotice
 	calls               int
+	cursors             []string
 	err                 error
 	alter               func(*RequestNoticePage)
 }
 
 func (j *noticeJournal) ReadNotices(ctx context.Context, project, after string, limit int) (RequestNoticePage, error) {
 	j.calls++
+	j.cursors = append(j.cursors, after)
 	if j.err != nil {
 		return RequestNoticePage{}, j.err
 	}
@@ -85,12 +87,12 @@ func TestRequestDeliveryReplayAndPagination(t *testing.T) {
 		delivered = append(delivered, n.RequestID)
 		return nil
 	}}}
-	for i, expected := range []int{64, 64, 2, 0} {
+	for i, expected := range []int{130, 0} {
 		report, err := d.Dispatch(context.Background(), now, routes)
-		if err != nil || report.Sent != expected {
-			t.Fatalf("page %d: %+v %v", i, report, err)
+		if err != nil || report.Sent != expected || report.HasMore {
+			t.Fatalf("pass %d: %+v %v", i, report, err)
 		}
-		// Restart the dispatcher after every page, using ONLY persisted state.
+		// A pass drains all three pages. Restart using ONLY persisted state.
 		d = &RequestDispatcher{Project: d.Project, StatePath: d.StatePath, Source: journal, Policy: d.Policy}
 	}
 	if len(delivered) != 130 {
@@ -100,6 +102,206 @@ func TestRequestDeliveryReplayAndPagination(t *testing.T) {
 		if id != fmt.Sprintf("req-%d", i+1) {
 			t.Fatalf("missing or reordered event %d: %s", i, id)
 		}
+	}
+}
+
+func TestRequestDeliveryReachesLiveEventsAfterHistoricalPages(t *testing.T) {
+	d, journal, now := noticeFixture(t, 194)
+	d.Policy.MaxPerMinute = 2
+	for i := 0; i < 192; i++ {
+		journal.events[i].OccurredAt = now.Add(-48 * time.Hour)
+	}
+	var delivered []int64
+	routes := []RequestRoute{{ID: "peer", Send: func(_ context.Context, notice RequestNotice) error {
+		state, err := readRequestDeliveryState(d.StatePath, d.Project)
+		if err != nil || state.Destinations["peer"].Sequence != notice.Sequence-1 ||
+			state.Destinations["peer"].Failures != 1 || len(state.Attempts) != len(delivered)+1 {
+			t.Fatalf("historical checkpoint or send reservation missing: %+v %v", state, err)
+		}
+		delivered = append(delivered, notice.Sequence)
+		return nil
+	}}}
+	report, err := d.Dispatch(context.Background(), now, routes)
+	if err != nil || report.Skipped != 192 || report.Sent != 2 || report.Deferred != 0 || report.HasMore ||
+		journal.calls != 4 || fmt.Sprint(delivered) != "[193 194]" {
+		t.Fatalf("historical pages delayed live work: %+v calls=%d delivered=%v error=%v", report, journal.calls, delivered, err)
+	}
+	d = &RequestDispatcher{Project: d.Project, StatePath: d.StatePath, Source: journal, Policy: d.Policy}
+	if report, err = d.Dispatch(context.Background(), now.Add(time.Second), routes); err != nil || report != (RequestDeliveryReport{}) ||
+		journal.cursors[len(journal.cursors)-1] != "journal-one:194" || len(delivered) != 2 {
+		t.Fatalf("restart rescanned acknowledged history: %+v delivered=%v error=%v", report, delivered, err)
+	}
+}
+
+func TestRequestDeliveryHistoricalCatchupDoesNotStarveCurrentRoute(t *testing.T) {
+	d, journal, now := noticeFixture(t, 194)
+	for i := 0; i < 192; i++ {
+		journal.events[i].OccurredAt = now.Add(-48 * time.Hour)
+	}
+	allEvents := journal.events
+	journal.events = allEvents[:192]
+	var delivered []string
+	healthy := RequestRoute{ID: "healthy", Send: func(_ context.Context, n RequestNotice) error {
+		delivered = append(delivered, "healthy:"+n.RequestID)
+		return nil
+	}}
+	if report, err := d.Dispatch(context.Background(), now, []RequestRoute{healthy}); err != nil || report.Skipped != 192 || len(delivered) != 0 {
+		t.Fatalf("initial healthy route catch-up: %+v %v", report, err)
+	}
+	journal.events = allEvents
+	newRoute := RequestRoute{ID: "new-route", Send: func(_ context.Context, n RequestNotice) error {
+		delivered = append(delivered, "new:"+n.RequestID)
+		return nil
+	}}
+	// The new route is first in the persisted rotation, but the caught-up
+	// route must get a turn before the new route drains all its history.
+	report, err := d.Dispatch(context.Background(), now.Add(time.Second), []RequestRoute{newRoute, healthy})
+	if err != nil || report.Sent != 4 || report.Skipped != 192 || report.HasMore ||
+		strings.Join(delivered, ",") != "healthy:req-193,healthy:req-194,new:req-193,new:req-194" {
+		t.Fatalf("historical route monopolized the pass: %+v delivered=%v error=%v", report, delivered, err)
+	}
+}
+
+func TestRequestDeliveryBoundedCatchupResumesFromCheckpoint(t *testing.T) {
+	for _, budgetAtBound := range []bool{false, true} {
+		t.Run(fmt.Sprintf("budget_exhausted=%t", budgetAtBound), func(t *testing.T) {
+			d, journal, now := noticeFixture(t, 4097)
+			d.Policy.MaxPerMinute = 1
+			for i := 0; i < 4096; i++ {
+				journal.events[i].OccurredAt = now.Add(-48 * time.Hour)
+			}
+			wantSkipped, wantSent := 4096, 0
+			if budgetAtBound {
+				journal.events[4095].OccurredAt = now.Add(-time.Minute)
+				wantSkipped, wantSent = 4095, 1
+			}
+			var delivered []int64
+			routes := []RequestRoute{{ID: "peer", Send: func(_ context.Context, n RequestNotice) error {
+				delivered = append(delivered, n.Sequence)
+				return nil
+			}}}
+			report, err := d.Dispatch(context.Background(), now, routes)
+			if err != nil || journal.calls != 64 || report.Skipped != wantSkipped || report.Sent != wantSent ||
+				report.HasMore == budgetAtBound {
+				t.Fatalf("incorrect bounded continuation: %+v calls=%d error=%v", report, journal.calls, err)
+			}
+			d = &RequestDispatcher{Project: d.Project, StatePath: d.StatePath, Source: journal, Policy: d.Policy}
+			if budgetAtBound {
+				report, err = d.Dispatch(context.Background(), now, routes)
+				if err != nil || report.Deferred != 1 || report.Sent != 0 || report.HasMore || len(delivered) != 1 {
+					t.Fatalf("full budget requested immediate work: %+v delivered=%v error=%v", report, delivered, err)
+				}
+			}
+			// Even after a long outage, restart must use the original cutoff
+			// and the last batched cursor, not rescan or age out queued work.
+			report, err = d.Dispatch(context.Background(), now.Add(48*time.Hour), routes)
+			if err != nil || report.Sent != 1 || report.Skipped != 0 || report.HasMore ||
+				journal.cursors[len(journal.cursors)-1] != "journal-one:4096" || delivered[len(delivered)-1] != 4097 {
+				t.Fatalf("bounded catch-up lost durable progress: %+v delivered=%v error=%v", report, delivered, err)
+			}
+		})
+	}
+}
+
+func TestRequestDeliveryHealthyBacklogContinuesAfterAnotherRouteError(t *testing.T) {
+	d, journal, now := noticeFixture(t, 4097)
+	for i := 0; i < 4096; i++ {
+		journal.events[i].OccurredAt = now.Add(-48 * time.Hour)
+	}
+	journal.alter = func(page *RequestNoticePage) {
+		if journal.calls == 1 {
+			page.Cursor = "invalid-first-route-page"
+		}
+	}
+	sends := 0
+	send := func(context.Context, RequestNotice) error { sends++; return nil }
+	report, err := d.Dispatch(context.Background(), now, []RequestRoute{{ID: "broken", Send: send}, {ID: "healthy", Send: send}})
+	if err == nil || !report.HasMore || report.Skipped != 4032 || report.Sent != 0 || sends != 0 || journal.calls != 64 {
+		t.Fatalf("route error hid runnable healthy backlog: %+v calls=%d sends=%d error=%v", report, journal.calls, sends, err)
+	}
+}
+
+func TestRequestDeliveryHistoricalBatchStopsBeforeUnacknowledgedEvent(t *testing.T) {
+	d, journal, now := noticeFixture(t, 5)
+	for _, i := range []int{0, 1, 3} {
+		journal.events[i].OccurredAt = now.Add(-48 * time.Hour)
+	}
+	fail := true
+	var attempted []int64
+	routes := []RequestRoute{{ID: "peer", Send: func(_ context.Context, n RequestNotice) error {
+		attempted = append(attempted, n.Sequence)
+		if fail {
+			return errors.New("unavailable")
+		}
+		return nil
+	}}}
+	report, err := d.Dispatch(context.Background(), now, routes)
+	if err == nil || report.Skipped != 2 || report.Failed != 1 || report.Sent != 0 || report.HasMore {
+		t.Fatalf("historical batch passed a failed eligible event: %+v %v", report, err)
+	}
+	d = &RequestDispatcher{Project: d.Project, StatePath: d.StatePath, Source: journal}
+	fail = false
+	report, err = d.Dispatch(context.Background(), now.Add(48*time.Hour), routes)
+	if err != nil || report.Sent != 2 || report.Skipped != 1 || report.HasMore ||
+		journal.cursors[len(journal.cursors)-1] != "journal-one:2" || fmt.Sprint(attempted) != "[3 3 5]" {
+		t.Fatalf("restart lost eligible work or moved cutoff: %+v attempts=%v error=%v", report, attempted, err)
+	}
+}
+
+func TestRequestDeliveryHistoricalCheckpointFailurePreventsSend(t *testing.T) {
+	for _, historical := range []int{2, 64} {
+		t.Run(fmt.Sprintf("historical=%d", historical), func(t *testing.T) {
+			d, journal, now := noticeFixture(t, historical+1)
+			for i := 0; i < historical; i++ {
+				journal.events[i].OccurredAt = now.Add(-48 * time.Hour)
+			}
+			originalPath := d.StatePath
+			obstacle := filepath.Join(t.TempDir(), "not-a-directory")
+			if err := os.WriteFile(obstacle, []byte("checkpoint unavailable"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			// Initial ledger creation succeeds; fail the next checkpoint after
+			// the source has supplied the historical prefix or complete page.
+			journal.alter = func(*RequestNoticePage) { d.StatePath = filepath.Join(obstacle, "ledger.json") }
+			sends := 0
+			routes := []RequestRoute{{ID: "peer", Send: func(context.Context, RequestNotice) error { sends++; return nil }}}
+			report, err := d.Dispatch(context.Background(), now, routes)
+			if err == nil || report.HasMore || sends != 0 || journal.calls != 1 {
+				t.Fatalf("failed skip checkpoint reached delivery or another page: %+v calls=%d sends=%d error=%v", report, journal.calls, sends, err)
+			}
+			journal.alter = nil
+			d = &RequestDispatcher{Project: d.Project, StatePath: originalPath, Source: journal}
+			report, err = d.Dispatch(context.Background(), now, routes)
+			if err != nil || report.Skipped != historical || report.Sent != 1 || report.HasMore || sends != 1 || journal.cursors[1] != "" {
+				t.Fatalf("failed checkpoint was treated as durable progress: %+v cursors=%v error=%v", report, journal.cursors, err)
+			}
+		})
+	}
+}
+
+func TestRequestDeliveryCancellationBetweenHistoricalPages(t *testing.T) {
+	d, journal, now := noticeFixture(t, 129)
+	for i := 0; i < 128; i++ {
+		journal.events[i].OccurredAt = now.Add(-48 * time.Hour)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	journal.alter = func(*RequestNoticePage) {
+		if journal.calls == 2 {
+			cancel()
+		}
+	}
+	sends := 0
+	routes := []RequestRoute{{ID: "peer", Send: func(context.Context, RequestNotice) error { sends++; return nil }}}
+	report, err := d.Dispatch(ctx, now, routes)
+	if !errors.Is(err, context.Canceled) || report.Skipped != 64 || report.HasMore || sends != 0 || journal.calls != 2 {
+		t.Fatalf("historical catch-up ignored cancellation: %+v calls=%d sends=%d error=%v", report, journal.calls, sends, err)
+	}
+	journal.alter = nil
+	d = &RequestDispatcher{Project: d.Project, StatePath: d.StatePath, Source: journal}
+	report, err = d.Dispatch(context.Background(), now, routes)
+	if err != nil || report.Skipped != 64 || report.Sent != 1 || report.HasMore || sends != 1 || journal.cursors[2] != "journal-one:64" {
+		t.Fatalf("cancellation lost the prior completed page: %+v cursors=%v error=%v", report, journal.cursors, err)
 	}
 }
 
@@ -118,7 +320,7 @@ func TestRequestDeliveryIndependentDestinationsAndRetry(t *testing.T) {
 		{ID: "healthy", Send: func(context.Context, RequestNotice) error { second++; return nil }},
 	}
 	report, err := d.Dispatch(context.Background(), now, routes)
-	if err == nil || strings.Contains(err.Error(), "secret-bearing") || report.Failed != 1 || report.Sent != 2 {
+	if err == nil || strings.Contains(err.Error(), "secret-bearing") || report.Failed != 1 || report.Sent != 2 || report.HasMore {
 		t.Fatalf("first delivery: %+v %v", report, err)
 	}
 	state, err := readRequestDeliveryState(d.StatePath, d.Project)
@@ -127,8 +329,8 @@ func TestRequestDeliveryIndependentDestinationsAndRetry(t *testing.T) {
 	}
 	d = &RequestDispatcher{Project: d.Project, StatePath: d.StatePath, Source: journal}
 	fail = false
-	if _, err := d.Dispatch(context.Background(), now.Add(14*time.Second), routes); err != nil || first != 1 || second != 2 {
-		t.Fatalf("retry backoff or independent success lost: %d %d %v", first, second, err)
+	if report, err := d.Dispatch(context.Background(), now.Add(14*time.Second), routes); err != nil || report.HasMore || first != 1 || second != 2 {
+		t.Fatalf("retry backoff or independent success lost: %+v %d %d %v", report, first, second, err)
 	}
 	if report, err = d.Dispatch(context.Background(), now.Add(15*time.Second), routes); err != nil || report.Sent != 2 || first != 3 || second != 2 {
 		t.Fatalf("failed destination did not recover: %+v %d %d %v", report, first, second, err)
@@ -143,12 +345,12 @@ func TestRequestDeliveryBudgetSurvivesRestartAndRotates(t *testing.T) {
 		{ID: "first", Send: func(context.Context, RequestNotice) error { names = append(names, "first"); return nil }},
 		{ID: "second", Send: func(context.Context, RequestNotice) error { names = append(names, "second"); return nil }},
 	}
-	if _, err := d.Dispatch(context.Background(), now, routes); err != nil {
-		t.Fatal(err)
+	if report, err := d.Dispatch(context.Background(), now, routes); err != nil || report.HasMore {
+		t.Fatalf("full budget scheduled continuation: %+v %v", report, err)
 	}
 	d = &RequestDispatcher{Project: d.Project, StatePath: d.StatePath, Source: journal, Policy: d.Policy}
-	if _, err := d.Dispatch(context.Background(), now.Add(time.Minute), routes); err != nil {
-		t.Fatal(err)
+	if report, err := d.Dispatch(context.Background(), now.Add(time.Minute), routes); err != nil || report.HasMore {
+		t.Fatalf("full budget scheduled continuation after restart: %+v %v", report, err)
 	}
 	if strings.Join(names, ",") != "first,second" {
 		t.Fatalf("second destination starved: %v", names)

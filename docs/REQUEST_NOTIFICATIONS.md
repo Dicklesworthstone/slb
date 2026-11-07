@@ -170,11 +170,19 @@ attempts per minute, including failures (supported 1..1000; zero selects default
 Destination order rotates so the first configured route cannot monopolize every
 pass. The budget and cursors survive restarts.
 
-At most 64 journal events per destination are examined per pass; pagination
-continues on subsequent passes without skipping to a new head. Large historical
-journals can therefore take multiple passes to catch up. The worker checks on
-startup and every five seconds, with a 15-second pass budget and ten-second
-transport deadlines. Hook queries, request admission, reviews and execution do
+Each pass reads up to 64 pages of 64 events, for at most 4,096 examined events
+across destinations. Ready destinations take turns one page at a time. A run of
+excluded historical events is checkpointed together; an eligible event still
+requires successful delivery before its cursor advances. Timestamps are checked
+for each event, so an older timestamp later in the journal cannot cause an
+eligible event to be skipped.
+
+When the page limit leaves ready backlog, the worker promptly starts another
+bounded pass. A route waiting for retry backoff or the shared send budget does
+not trigger this immediate continuation. The worker checks on startup and
+revisits idle or deferred work every five seconds, with a 15-second pass budget
+and ten-second transport deadlines. It resumes from the saved cursor without
+jumping to a new head. Hook queries, request admission, reviews and execution do
 not wait for it. Shutdown cancels and joins the worker before closing its DB.
 
 Run one daemon per project ledger. Calls on one dispatcher are serialized, not

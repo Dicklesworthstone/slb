@@ -210,25 +210,45 @@ func (s *RequestService) Check(ctx context.Context) (RequestDeliveryReport, erro
 }
 
 func (s *RequestService) Run(ctx context.Context, onError func(error)) {
+	s.run(ctx, onError, waitRequestNotificationPass)
+}
+
+// A bounded pass yields briefly while validated pages remain ready. Backoff,
+// rate limits and idle sources retain normal polling rather than spinning.
+// Waiting is supplied per invocation so scheduling can be tested without
+// changing shared timers or relying on wall-clock races.
+func (s *RequestService) run(ctx context.Context, onError func(error), wait func(context.Context, time.Duration) bool) {
 	if s == nil {
 		return
 	}
-	check := func() {
+	for ctx.Err() == nil {
 		pass, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
-		if _, err := s.Check(pass); err != nil && ctx.Err() == nil && onError != nil {
+		report, err := s.Check(pass)
+		cancel()
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil && onError != nil {
 			onError(err)
 		}
-	}
-	check()
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			check()
+		delay := 5 * time.Second
+		if report.HasMore {
+			// An unrelated route error must not stall healthy catch-up work.
+			delay = 25 * time.Millisecond
 		}
+		if !wait(ctx, delay) {
+			return
+		}
+	}
+}
+
+func waitRequestNotificationPass(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }

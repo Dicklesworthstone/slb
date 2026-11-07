@@ -16,6 +16,7 @@ import (
 )
 
 const requestDeliveryPageSize = 64
+const maxRequestDeliveryPages = 64
 const maxRequestDeliveryState = 4 * 1024 * 1024
 
 // RequestNotice is metadata observed at a committed journal event, not current
@@ -112,6 +113,9 @@ type requestDeliveryState struct {
 
 type RequestDeliveryReport struct {
 	Sent, Failed, Skipped, Deferred int
+	// HasMore requests another bounded pass for runnable backlog. Retry and
+	// rate-budget deferrals do not request an immediate continuation.
+	HasMore bool
 }
 
 // RequestDispatcher delivers the durable journal independently to each route.
@@ -173,12 +177,21 @@ func (d *RequestDispatcher) Dispatch(ctx context.Context, now time.Time, routes 
 	if err := writeRequestDeliveryState(d.StatePath, state); err != nil {
 		return report, err
 	}
-	var failures []error
+	// One page per active destination per round lets a new route traverse old
+	// history without holding back a route that has already caught up. Bound
+	// every source call, including failures, and retain only one page at a time.
+	queue := make([]RequestRoute, 0, len(routes))
 	for offset := range routes {
+		queue = append(queue, routes[(start+offset)%len(routes)])
+	}
+	var failures []error
+	pages := 0
+	for len(queue) > 0 && pages < maxRequestDeliveryPages {
 		if err := ctx.Err(); err != nil {
 			return report, errors.Join(append(failures, err)...)
 		}
-		route := routes[(start+offset)%len(routes)]
+		route := queue[0]
+		queue = queue[1:]
 		entry, found := state.Destinations[route.ID]
 		if !found {
 			if len(state.Destinations) >= 100 {
@@ -194,6 +207,7 @@ func (d *RequestDispatcher) Dispatch(ctx context.Context, now time.Time, routes 
 			report.Deferred++
 			continue
 		}
+		pages++
 		page, err := d.Source.ReadNotices(ctx, d.Project, entry.Cursor, requestDeliveryPageSize)
 		if err != nil {
 			// Never recover a bad cursor by resetting it or jumping to the head.
@@ -212,38 +226,55 @@ func (d *RequestDispatcher) Dispatch(ctx context.Context, now time.Time, routes 
 			}
 			continue
 		}
+		completed, skipped := true, false
 		for _, notice := range page.Notices {
 			if err := ctx.Err(); err != nil {
 				return report, errors.Join(append(failures, err)...)
 			}
 			if notice.OccurredAt.Before(entry.Since) {
-				report.Skipped++ // Only historical events before this route's cutoff.
-			} else {
-				if len(state.Attempts) >= policy.MaxPerMinute {
-					report.Deferred++
-					break
-				}
-				// Write the attempted-send reservation BEFORE contacting a peer.
-				// A crash/ambiguous send is retried without erasing its budget.
-				entry.Failures = min(5, entry.Failures+1)
-				entry.RetryAt = now.Add(time.Duration(1<<uint(entry.Failures-1)) * 15 * time.Second)
+				// Timestamps need not increase with journal sequence. Batch only
+				// this contiguous historical run, never the rest of the page.
+				entry.Cursor, entry.Sequence = notice.Cursor, notice.Sequence
+				entry.Failures, entry.RetryAt = 0, time.Time{}
+				skipped = true
+				report.Skipped++
+				continue
+			}
+			if skipped {
+				// Persist the excluded prefix before a subsequent send or a
+				// budget stop. A checkpoint failure must prevent that send.
 				state.Destinations[route.ID] = entry
-				state.Attempts = append(state.Attempts, now.UTC())
 				if err := writeRequestDeliveryState(d.StatePath, state); err != nil {
 					return report, err
 				}
-				sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-				err := route.Send(sendCtx, notice)
-				cancel()
-				if err != nil {
-					report.Failed++
-					// Transport errors can contain credentials; expose only a fixed
-					// diagnostic. The failing destination retains this exact event.
-					failures = append(failures, errors.New("request notification delivery failed; retry scheduled"))
-					break
-				}
-				report.Sent++
+				skipped = false
 			}
+			if len(state.Attempts) >= policy.MaxPerMinute {
+				report.Deferred++
+				completed = false
+				break
+			}
+			// Write the attempted-send reservation BEFORE contacting a peer.
+			// A crash/ambiguous send is retried without erasing its budget.
+			entry.Failures = min(5, entry.Failures+1)
+			entry.RetryAt = now.Add(time.Duration(1<<uint(entry.Failures-1)) * 15 * time.Second)
+			state.Destinations[route.ID] = entry
+			state.Attempts = append(state.Attempts, now.UTC())
+			if err := writeRequestDeliveryState(d.StatePath, state); err != nil {
+				return report, err
+			}
+			sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := route.Send(sendCtx, notice)
+			cancel()
+			if err != nil {
+				report.Failed++
+				// Transport errors can contain credentials; expose only a fixed
+				// diagnostic. The failing destination retains this exact event.
+				failures = append(failures, errors.New("request notification delivery failed; retry scheduled"))
+				completed = false
+				break
+			}
+			report.Sent++
 			entry.Cursor, entry.Sequence = notice.Cursor, notice.Sequence
 			entry.Failures, entry.RetryAt = 0, time.Time{}
 			state.Destinations[route.ID] = entry
@@ -252,7 +283,20 @@ func (d *RequestDispatcher) Dispatch(ctx context.Context, now time.Time, routes 
 				return report, err
 			}
 		}
+		if skipped {
+			state.Destinations[route.ID] = entry
+			if err := writeRequestDeliveryState(d.StatePath, state); err != nil {
+				return report, err
+			}
+		}
+		if completed && page.HasMore {
+			queue = append(queue, route)
+		}
 	}
+	// All queued routes passed their backoff/page checks and consumed their
+	// page. With a full send budget, unseen work cannot be promised runnable;
+	// the ordinary poll can still advance excluded history without sending.
+	report.HasMore = len(queue) > 0 && len(state.Attempts) < policy.MaxPerMinute
 	return report, errors.Join(append(failures, ctx.Err())...)
 }
 

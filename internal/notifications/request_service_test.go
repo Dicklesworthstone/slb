@@ -304,6 +304,151 @@ func TestRequestServiceRunCancelsInflightTransport(t *testing.T) {
 	}
 }
 
+func TestRequestServiceRunContinuesBoundedBacklog(t *testing.T) {
+	for _, cancelAfterPass := range []bool{false, true} {
+		t.Run(fmt.Sprint("cancel=", cancelAfterPass), func(t *testing.T) {
+			count := requestDeliveryPageSize*maxRequestDeliveryPages + 1
+			d, journal, _ := noticeFixture(t, count)
+			now := time.Now().UTC()
+			for i := range journal.events {
+				journal.events[i].OccurredAt = now.Add(-48 * time.Hour)
+			}
+			journal.events[count-1].OccurredAt = now
+			d.Policy.MaxPerMinute = 1
+			var delivered []int64
+			service := &RequestService{dispatcher: d, routes: []RequestRoute{{ID: "peer", Send: func(_ context.Context, notice RequestNotice) error {
+				delivered = append(delivered, notice.Sequence)
+				return nil
+			}}}}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			waits := 0
+			service.run(ctx, func(err error) { t.Fatal(err) }, func(_ context.Context, delay time.Duration) bool {
+				waits++
+				switch waits {
+				case 1:
+					if delay <= 0 || delay >= time.Second || len(delivered) != 0 {
+						t.Fatalf("ready backlog was not bounded and promptly continued: delay=%s delivered=%v", delay, delivered)
+					}
+					state, err := readRequestDeliveryState(d.StatePath, d.Project)
+					if err != nil || state.Destinations["peer"].Sequence != int64(count-1) || len(state.Attempts) != 0 {
+						t.Fatalf("historical checkpoint lost progress or consumed send capacity: %+v, %v", state, err)
+					}
+					if cancelAfterPass {
+						cancel()
+					}
+					return true
+				case 2:
+					if delay != 5*time.Second || len(delivered) != 1 || delivered[0] != int64(count) {
+						t.Fatalf("catch-up did not reach the live event and return to idle polling: delay=%s delivered=%v", delay, delivered)
+					}
+					return false
+				default:
+					t.Fatal("worker continued without runnable backlog")
+					return false
+				}
+			})
+			if cancelAfterPass {
+				if waits != 1 || len(delivered) != 0 || journal.calls != maxRequestDeliveryPages {
+					t.Fatal("cancellation started another catch-up pass")
+				}
+			} else if waits != 2 {
+				t.Fatal("worker did not complete its bounded catch-up passes")
+			}
+		})
+	}
+}
+
+func TestRequestServiceRunDoesNotSpinOnDeferredWork(t *testing.T) {
+	for _, kind := range []string{"budget", "backoff", "source error"} {
+		t.Run(kind, func(t *testing.T) {
+			d, journal, _ := noticeFixture(t, 2)
+			now := time.Now().UTC()
+			for i := range journal.events {
+				journal.events[i].OccurredAt = now
+			}
+			switch kind {
+			case "budget":
+				d.Policy.MaxPerMinute = 1
+			case "backoff":
+				state := &requestDeliveryState{Version: 1, Project: d.Project, ObservedAt: now,
+					Destinations: map[string]requestDestination{"peer": {
+						Since: now.Add(-24 * time.Hour), Failures: 5, RetryAt: now.Add(240 * time.Second),
+					}}}
+				if err := writeRequestDeliveryState(d.StatePath, state); err != nil {
+					t.Fatal(err)
+				}
+			case "source error":
+				journal.err = errors.New("journal unavailable")
+			}
+			sent, failures, waits := 0, 0, 0
+			service := &RequestService{dispatcher: d, routes: []RequestRoute{{ID: "peer", Send: func(context.Context, RequestNotice) error {
+				sent++
+				return nil
+			}}}}
+			service.run(context.Background(), func(error) { failures++ }, func(_ context.Context, delay time.Duration) bool {
+				waits++
+				if delay != 5*time.Second {
+					t.Fatalf("deferred work triggered immediate retry: %s", delay)
+				}
+				return false
+			})
+			if waits != 1 || (kind == "budget" && sent != 1) || (kind != "budget" && sent != 0) ||
+				(kind == "backoff" && journal.calls != 0) || (kind == "source error" && failures != 1) ||
+				(kind != "source error" && failures != 0) {
+				t.Fatalf("deferred scheduling changed delivery: waits=%d sent=%d reads=%d errors=%d", waits, sent, journal.calls, failures)
+			}
+		})
+	}
+}
+
+func TestRequestServiceRunContinuesHealthyBacklogAfterPeerFailure(t *testing.T) {
+	count := requestDeliveryPageSize*maxRequestDeliveryPages + 1
+	d, journal, _ := noticeFixture(t, count)
+	now := time.Now().UTC()
+	for i := range journal.events {
+		journal.events[i].OccurredAt = now.Add(-48 * time.Hour)
+	}
+	journal.events[count-1].OccurredAt = now
+	// This earlier subscriber has eligible work immediately; the new healthy
+	// destination must still drain its excluded history after its peer fails.
+	state := &requestDeliveryState{Version: 1, Project: d.Project,
+		Destinations: map[string]requestDestination{"offline": {Since: now.Add(-72 * time.Hour)}}}
+	if err := writeRequestDeliveryState(d.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	failed, delivered, errorsSeen, waits := 0, 0, 0, 0
+	service := &RequestService{dispatcher: d, routes: []RequestRoute{
+		{ID: "offline", Send: func(context.Context, RequestNotice) error {
+			failed++
+			return errors.New("unavailable")
+		}},
+		{ID: "healthy", Send: func(_ context.Context, notice RequestNotice) error {
+			if notice.Sequence != int64(count) {
+				t.Fatalf("historical event was delivered: %d", notice.Sequence)
+			}
+			delivered++
+			return nil
+		}},
+	}}
+	service.run(context.Background(), func(error) { errorsSeen++ }, func(_ context.Context, delay time.Duration) bool {
+		waits++
+		if waits == 1 {
+			if delay <= 0 || delay >= time.Second || errorsSeen != 1 || failed != 1 || delivered != 0 {
+				t.Fatalf("one failed peer stalled ready work: delay=%s errors=%d failed=%d sent=%d", delay, errorsSeen, failed, delivered)
+			}
+			return true
+		}
+		if waits != 2 || delay != 5*time.Second || failed != 1 || delivered != 1 || errorsSeen != 1 {
+			t.Fatalf("healthy catch-up or failed-peer backoff was lost: waits=%d delay=%s failed=%d sent=%d errors=%d", waits, delay, failed, delivered, errorsSeen)
+		}
+		return false
+	})
+	if waits != 2 {
+		t.Fatal("healthy destination did not complete its catch-up")
+	}
+}
+
 func TestSharedMailTransportStillSendsBlockedAlerts(t *testing.T) {
 	var sent atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
