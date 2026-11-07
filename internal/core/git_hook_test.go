@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -100,6 +101,131 @@ func TestSameHostGitHookRechecksCurrentPolicy(t *testing.T) {
 	}
 }
 
+func TestSameHostGitHookRechecksApprovalTTL(t *testing.T) {
+	for _, operation := range []string{"pre-commit", "pre-push", "pre-rebase"} {
+		for _, change := range []string{"unchanged", "tightened-before", "tightened-during", "other-tier-shortened", "expired-then-lengthened"} {
+			t.Run(operation+"/"+change, func(t *testing.T) {
+				database, pending, author, peers := sameHostPolicyFixture(t, 1)
+				intent := GitHookIntent{Operation: operation, ProjectPath: pending.ProjectPath,
+					Snapshot: strings.Repeat("a", 64), Evidence: "disposable Git snapshot; no Git operation runs"}
+				policyText := func(normal, critical int) string {
+					return sameHostReviewSettingsText("first_wins", normal, critical, 1) +
+						"\n[patterns.critical]\nmin_approvals = 2\ndynamic_quorum = false\n"
+				}
+				writeExecutionPolicy(t, intent.ProjectPath, policyText(30, 10))
+				engine, err := LoadCommandPolicy(database, config.LoadOptions{ProjectDir: intent.ProjectPath})
+				if err != nil {
+					t.Fatal(err)
+				}
+				options := DefaultRequestCreatorConfig()
+				options.ApprovalPolicy, options.AgentMailEnabled = db.ApprovalPolicySameHost, false
+				request, err := NewRequestCreator(database, nil, engine, options).CreateGitHookRequest(context.Background(), intent, author.ID, "verify native Git approval lifetime")
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Creation time is signed. Age it before genuine same-host
+				// reviews, then move the resolution/deadline to model elapsed time.
+				created := time.Now().UTC().Add(-5 * time.Minute).Truncate(time.Second)
+				if _, err := database.Exec(`UPDATE requests SET created_at = ? WHERE id = ?`, created.Format(time.RFC3339), request.ID); err != nil {
+					t.Fatal(err)
+				}
+				for _, reviewer := range peers[:request.MinApprovals] {
+					applySameHostFixtureReview(t, database, request, reviewer, db.DecisionApprove)
+				}
+				anchor := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Second)
+				ttl := 30 * time.Minute
+				if request.RiskTier == db.RiskTierCritical {
+					ttl = 10 * time.Minute
+				}
+				if _, err := database.Exec(`UPDATE requests SET resolved_at = ?, approval_expires_at = ? WHERE id = ?`,
+					anchor.Format(time.RFC3339), anchor.Add(ttl).Format(time.RFC3339), request.ID); err != nil {
+					t.Fatal(err)
+				}
+				approved, err := database.VerifyRequestApproval(request.ID)
+				if err != nil {
+					t.Fatalf("original signed approval is invalid: %v", err)
+				}
+				if err := intent.checkPolicy(database, approved, ""); err != nil {
+					t.Fatalf("original TTL rejected valid approval: %v", err)
+				}
+				mutate := func() {
+					normal, critical := 30, 10
+					if change == "expired-then-lengthened" {
+						normal, critical = 60, 60
+					} else {
+						shortenCritical := request.RiskTier == db.RiskTierCritical
+						if change == "other-tier-shortened" {
+							shortenCritical = !shortenCritical
+						}
+						if shortenCritical {
+							critical = 1
+						} else {
+							normal = 1
+						}
+					}
+					writeExecutionPolicy(t, intent.ProjectPath, policyText(normal, critical))
+				}
+				if change == "expired-then-lengthened" {
+					if _, err := database.Exec(`UPDATE requests SET approval_expires_at = ? WHERE id = ?`,
+						time.Now().UTC().Add(-time.Second).Format(time.RFC3339), request.ID); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if change != "unchanged" && change != "tightened-during" {
+					mutate()
+				}
+				before, reviewsBefore, err := database.GetRequestWithReviews(request.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var eventsBefore int
+				if err := database.QueryRow(`SELECT COUNT(*) FROM request_events WHERE request_id = ?`, request.ID).Scan(&eventsBefore); err != nil {
+					t.Fatal(err)
+				}
+				revalidated := false
+				result, err := NewExecutor(database, engine).AuthorizeGitHook(context.Background(), intent, request.ID, author.ID, func(context.Context) error {
+					revalidated = true
+					if change == "tightened-during" {
+						mutate()
+					}
+					return nil
+				})
+				if change == "unchanged" || change == "other-tier-shortened" {
+					if err != nil || result == nil || result.Status != db.StatusExecuted || !revalidated {
+						t.Fatalf("valid native Git approval was not authorized: %+v %v", result, err)
+					}
+					return
+				}
+				wantErr := ErrApprovalPolicyChanged
+				if change == "expired-then-lengthened" {
+					wantErr = db.ErrInvalidApprovalProof
+				}
+				if result != nil || !errors.Is(err, wantErr) {
+					t.Fatalf("native Git ignored approval deadline: result=%+v error=%v, want %v", result, err, wantErr)
+				}
+				if revalidated != (change == "tightened-during") {
+					t.Fatalf("unexpected snapshot revalidation: %v", revalidated)
+				}
+				after, reviewsAfter, err := database.GetRequestWithReviews(request.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if after.Status != db.StatusApproved || after.Execution != nil ||
+					!reflect.DeepEqual(before, after) || !reflect.DeepEqual(reviewsBefore, reviewsAfter) {
+					t.Fatalf("refused native Git authorization changed approval evidence: before=%+v after=%+v", before, after)
+				}
+				var eventsAfter int
+				if err := database.QueryRow(`SELECT COUNT(*) FROM request_events WHERE request_id = ?`, request.ID).Scan(&eventsAfter); err != nil {
+					t.Fatal(err)
+				}
+				if eventsAfter != eventsBefore {
+					t.Fatalf("refused native Git authorization changed audit events: got %d, want %d", eventsAfter, eventsBefore)
+				}
+			})
+		}
+	}
+}
+
 func gitHookApprovalFixture(t *testing.T, operation ...string) (*db.DB, GitHookIntent, *db.Request, *db.Session) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
@@ -144,6 +270,13 @@ func gitHookApprovalFixture(t *testing.T, operation ...string) (*db.DB, GitHookI
 			t.Fatal(err)
 		}
 	}
+	// This fixture inserts an already approved request directly. Give it the
+	// resolution timestamp that the real review transaction always records.
+	resolved := time.Now().UTC().Truncate(time.Second)
+	if _, err := database.Exec(`UPDATE requests SET resolved_at = ? WHERE id = ?`, resolved.Format(time.RFC3339), request.ID); err != nil {
+		t.Fatal(err)
+	}
+	request.ResolvedAt = &resolved
 	return database, intent, request, requester
 }
 

@@ -359,7 +359,8 @@ func classifyNativeHookFallback(command, cwd string) (*daemon.HookQueryResult, e
 		ReviewNotice:   db.ApprovalPolicy(cfg.General.ApprovalPolicy).Label(),
 	}
 	switch {
-	case classified.IsSafe:
+	case classified.IsSafe && !classified.HasUnmatchedSegment:
+		// A safe segment cannot authorize an unclassified part of a compound.
 		result.Action, result.Message = "allow", "Safe command"
 	case classified.Tier == core.RiskTierCritical:
 		result.Action = "block"

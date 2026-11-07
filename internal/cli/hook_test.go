@@ -1486,6 +1486,62 @@ func TestNativeHookGuardProtocolAndFallback(t *testing.T) {
 	}
 }
 
+func TestNativeHookGuardOfflineCompoundCoverage(t *testing.T) {
+	resetHookFlags()
+	t.Cleanup(resetHookFlags)
+	t.Setenv("SLB_HOST", "")
+	t.Setenv("SLB_SESSION_ID", "")
+	const unknown = "slb-unclassified-fixture --report"
+	for _, operator := range []struct{ name, text string }{
+		{"conditional", " && "}, {"semicolon", "; "}, {"pipe", " | "},
+	} {
+		for _, tc := range []struct{ name, first, second, permission, tier string }{
+			{"safe then unknown", "git stash", unknown, "ask", "unknown"},
+			{"unknown then safe", unknown, "git stash", "ask", "unknown"},
+			{"entirely safe", "git stash", "npm cache clean --force", "allow", ""},
+			{"dangerous then unknown", "git reset --hard HEAD", unknown, "deny", "dangerous"},
+			{"unknown then dangerous", unknown, "git reset --hard HEAD", "deny", "dangerous"},
+			{"critical then unknown", "rm -rf /", unknown, "deny", "critical"},
+			{"unknown then critical", unknown, "rm -rf /", "deny", "critical"},
+		} {
+			t.Run(operator.name+"/"+tc.name, func(t *testing.T) {
+				home, project := t.TempDir(), t.TempDir()
+				t.Setenv("USERPROFILE", home)
+				command := tc.first + operator.text + tc.second
+				output := nativeHookOutput(t, map[string]any{
+					"session_id": "provider-session", "cwd": project,
+					"tool_input": map[string]any{"command": command},
+				}, home)
+				permission, specific := nativeHookPermission(t, output)
+				if permission != tc.permission {
+					t.Fatalf("offline permission for %q = %q, want %q: %+v", command, permission, tc.permission, output)
+				}
+				events, err := audit.Query(filepath.Join(home, ".slb", "audit", "blocked"), audit.Filter{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if permission == "allow" {
+					if len(events) != 0 || specific["permissionDecisionReason"] != nil {
+						t.Fatalf("entirely safe compound acquired a prompt or blocked audit: %+v %+v", output, events)
+					}
+					return
+				}
+				action := "block"
+				if permission == "ask" {
+					action = "ask"
+					if reason, _ := specific["permissionDecisionReason"].(string); !strings.Contains(reason, "confirmation required") {
+						t.Fatalf("partial safe classification did not explain confirmation: %q", reason)
+					}
+				}
+				if len(events) != 1 || events[0].Source != "hook_native_offline" || events[0].Action != action ||
+					events[0].Tier != tc.tier || events[0].CommandHash != audit.CommandHash(command, project) {
+					t.Fatalf("offline compound decision lost its audit classification: %+v", events)
+				}
+			})
+		}
+	}
+}
+
 func TestNativeHookGuardExecutionHandoff(t *testing.T) {
 	project := t.TempDir()
 	hookHandoffDatabase(t, project)

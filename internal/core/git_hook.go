@@ -147,6 +147,9 @@ func (intent GitHookIntent) checkPolicy(reader PolicyReader, request *db.Request
 	if err := checkApprovalPolicy(request, cfg.General.ApprovalPolicy); err != nil {
 		return err
 	}
+	if err := checkCurrentApprovalTTL(request, cfg.General, time.Now().UTC()); err != nil {
+		return err
+	}
 	for _, blocked := range cfg.Agents.Blocked {
 		if strings.EqualFold(blocked, request.RequestorAgent) {
 			return fmt.Errorf("%w: requester %q cannot execute an outstanding approval", ErrAgentBlocked, request.RequestorAgent)
@@ -170,7 +173,9 @@ func (intent GitHookIntent) checkPolicy(reader PolicyReader, request *db.Request
 	if request.MinApprovals < max(1, engine.RequiredApprovals(tier, available)) || (engine.RequiresDifferentModel() && !request.RequireDifferentModel) {
 		return ErrApprovalPolicyChanged
 	}
-	return nil
+	// Policy reads and classification can take time. The native Git permit
+	// must respect both the original deadline and a shorter current TTL.
+	return checkCurrentApprovalTTL(request, cfg.General, time.Now().UTC())
 }
 
 // AuthorizeGitHook consumes signed approval exactly once, without running a
@@ -237,7 +242,8 @@ func (e *Executor) AuthorizeGitHook(ctx context.Context, intent GitHookIntent, r
 			return err
 		}
 		// Snapshot revalidation can take time. Recheck configuration after it
-		// so an opt-out or stricter conflict rule cannot use the earlier load.
+		// so an opt-out, stricter conflict rule or shorter approval TTL cannot
+		// use the earlier load.
 		if err := intent.checkPolicy(tx, current, e.configPath); err != nil {
 			return err
 		}
