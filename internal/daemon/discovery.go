@@ -61,6 +61,20 @@ func DiscoverRuntime(cwd string) (RuntimePaths, error) {
 	return record, nil
 }
 
+// Refresh only within the physical project selected at construction. If its
+// marker disappears or its path is redirected, ancestor discovery must not
+// silently move a reusable client into a different project's daemon.
+func refreshRuntime(previous RuntimePaths) (RuntimePaths, error) {
+	if previous.ProjectPath == "" {
+		return previous, fmt.Errorf("%w: original project directory unavailable", ErrDiscoveryInvalid)
+	}
+	paths, err := DiscoverRuntime(previous.ProjectPath)
+	if paths.ProjectPath != previous.ProjectPath {
+		return previous, fmt.Errorf("%w: original project identity changed", ErrDiscoveryInvalid)
+	}
+	return paths, err
+}
+
 func readRuntimeRecord(project string) (RuntimePaths, os.FileInfo, error) {
 	var record RuntimePaths
 	directory := filepath.Join(project, ".slb")

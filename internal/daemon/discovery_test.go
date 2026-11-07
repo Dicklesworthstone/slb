@@ -167,6 +167,300 @@ func TestDiscoverRuntimeMissingRecordKeepsExactProjectDefaults(t *testing.T) {
 	}
 }
 
+func TestProjectClientsRefreshPublishedRuntime(t *testing.T) {
+	t.Setenv("SLB_HOST", "")
+	for _, initial := range []string{"missing", "invalid", "previous_daemon"} {
+		t.Run(initial, func(t *testing.T) {
+			project := discoveryProject(t)
+			dir := shortSocketDir(t)
+			old := discoveryFixture(project, filepath.Join(dir, "old.sock"))
+			old.PID++
+			if initial == "invalid" {
+				old.ProjectPath = filepath.Dir(project)
+			}
+			if initial != "missing" {
+				writeDiscoveryFixture(t, project, old)
+			}
+			ipc := NewProjectIPCClient(project)
+			defer func() { _ = ipc.Close() }()
+			client := NewProjectClient(project, WithLocalOnly())
+			if err := ipc.Connect(context.Background()); err == nil {
+				t.Fatal("connected before a daemon was published")
+			}
+
+			// A service can publish or replace its record after clients have
+			// already failed. Each attempt must select that current generation.
+			for _, name := range []string{"published", "replacement"} {
+				record := discoveryFixture(project, filepath.Join(dir, name+".sock"))
+				record.PIDFile = filepath.Join(dir, name+".pid")
+				writeDiscoveryFixture(t, project, record)
+				if err := os.WriteFile(record.PIDFile, []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := ipc.Connect(context.Background()); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("%s: did not attempt the freshly published missing socket: %v", name, err)
+				}
+				if ipc.SocketPath() != record.SocketPath {
+					t.Fatalf("%s: socket diagnostic is stale: %q", name, ipc.SocketPath())
+				}
+				info := client.GetStatusInfo()
+				if info.SocketPath != record.SocketPath || info.PIDFile != record.PIDFile || info.PID != record.PID || info.Status != DaemonUnresponsive {
+					t.Fatalf("%s: stale status snapshot: %+v", name, info)
+				}
+				if client.GetStatus() != DaemonUnresponsive {
+					t.Fatalf("%s: status did not recover from initial discovery", name)
+				}
+				if err := ipc.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestProjectClientsRejectInvalidReplacementAndRecover(t *testing.T) {
+	t.Setenv("SLB_HOST", "")
+	project := discoveryProject(t)
+	record := discoveryFixture(project, filepath.Join(shortSocketDir(t), "missing.sock"))
+	writeDiscoveryFixture(t, project, record)
+	ipc := NewProjectIPCClient(project)
+	defer func() { _ = ipc.Close() }()
+	client := NewProjectClient(project, WithLocalOnly())
+	invalid := record
+	invalid.ProjectPath = filepath.Dir(project)
+	writeDiscoveryFixture(t, project, invalid)
+	if err := ipc.Connect(context.Background()); !errors.Is(err, ErrDiscoveryInvalid) {
+		t.Fatalf("reused the previous record after invalid replacement: %v", err)
+	}
+	info := client.GetStatusInfo()
+	if info.Status != DaemonNotRunning || !strings.Contains(info.Message, "discovery is invalid") {
+		t.Fatalf("status accepted invalid replacement: %+v", info)
+	}
+	writeDiscoveryFixture(t, project, record)
+	if err := ipc.Connect(context.Background()); !errors.Is(err, os.ErrNotExist) || ipc.SocketPath() != record.SocketPath {
+		t.Fatalf("repaired record did not recover: socket=%q err=%v", ipc.SocketPath(), err)
+	}
+	if info := client.GetStatusInfo(); info.SocketPath != record.SocketPath || strings.Contains(info.Message, "discovery is invalid") {
+		t.Fatalf("status retained a repaired discovery error: %+v", info)
+	}
+}
+
+func TestProjectClientsRefuseProjectRetargeting(t *testing.T) {
+	t.Setenv("SLB_HOST", "")
+	for _, change := range []string{"marker_removed", "physical_path_redirected"} {
+		t.Run(change, func(t *testing.T) {
+			parent := discoveryProject(t)
+			project := filepath.Join(parent, "nested")
+			if err := os.MkdirAll(filepath.Join(project, ".slb"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			record := discoveryFixture(project, filepath.Join(shortSocketDir(t), "original.sock"))
+			writeDiscoveryFixture(t, project, record)
+			writeDiscoveryFixture(t, parent, discoveryFixture(parent, filepath.Join(shortSocketDir(t), "parent.sock")))
+			ipc := NewProjectIPCClient(project)
+			defer func() { _ = ipc.Close() }()
+			client := NewProjectClient(project, WithLocalOnly())
+			if change == "marker_removed" {
+				if err := os.Rename(filepath.Join(project, ".slb"), filepath.Join(project, ".slb.saved")); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.Rename(project, project+".saved"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(parent, project); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := ipc.Connect(context.Background()); !errors.Is(err, ErrDiscoveryInvalid) {
+				t.Fatalf("client followed a different project after %s: %v", change, err)
+			}
+			if ipc.SocketPath() != record.SocketPath {
+				t.Fatalf("diagnostics switched to another project's socket: %q", ipc.SocketPath())
+			}
+			if info := client.GetStatusInfo(); info.SocketPath != record.SocketPath || info.Status != DaemonNotRunning {
+				t.Fatalf("status followed a different project: %+v", info)
+			}
+		})
+	}
+}
+
+func TestProjectClientsPinPhysicalProjectAcrossAliasChanges(t *testing.T) {
+	t.Setenv("SLB_HOST", "")
+	project, other := discoveryProject(t), discoveryProject(t)
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(project, alias); err != nil {
+		t.Fatal(err)
+	}
+	ipc := NewProjectIPCClient(alias)
+	defer func() { _ = ipc.Close() }()
+	client := NewProjectClient(alias, WithLocalOnly())
+	if err := os.Rename(alias, alias+".saved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(other, alias); err != nil {
+		t.Fatal(err)
+	}
+	record := discoveryFixture(project, filepath.Join(shortSocketDir(t), "original-project.sock"))
+	writeDiscoveryFixture(t, project, record)
+	if err := ipc.Connect(context.Background()); !errors.Is(err, os.ErrNotExist) || ipc.SocketPath() != record.SocketPath {
+		t.Fatalf("client followed changed caller alias: socket=%q err=%v", ipc.SocketPath(), err)
+	}
+	if info := client.GetStatusInfo(); info.SocketPath != record.SocketPath || info.PIDFile != record.PIDFile {
+		t.Fatalf("status followed changed caller alias: %+v", info)
+	}
+}
+
+func TestProjectClientRefreshPreservesExplicitPaths(t *testing.T) {
+	t.Setenv("SLB_HOST", "")
+	project := discoveryProject(t)
+	dir := shortSocketDir(t)
+	explicitSocket, explicitPID := filepath.Join(dir, "explicit.sock"), filepath.Join(dir, "explicit.pid")
+	client := NewProjectClient(project, WithSocketPath(explicitSocket), WithPIDFile(explicitPID), WithLocalOnly())
+	pidOverride := NewProjectClient(project, WithPIDFile(explicitPID), WithLocalOnly())
+	record := discoveryFixture(project, filepath.Join(dir, "published.sock"))
+	writeDiscoveryFixture(t, project, record)
+	if info := client.GetStatusInfo(); info.SocketPath != explicitSocket || info.PIDFile != explicitPID {
+		t.Fatalf("project discovery replaced explicit transport: %+v", info)
+	}
+	if info := pidOverride.GetStatusInfo(); info.SocketPath != record.SocketPath || info.PIDFile != explicitPID {
+		t.Fatalf("refresh lost explicit PID override or retained stale socket: %+v", info)
+	}
+}
+
+func TestProjectIPCClientKeepsConnectedGenerationAndNeverReplays(t *testing.T) {
+	t.Setenv("SLB_HOST", "")
+	project := discoveryProject(t)
+	record := discoveryFixture(project, filepath.Join(shortSocketDir(t), "original.sock"))
+	writeDiscoveryFixture(t, project, record)
+	client := NewProjectIPCClient(project)
+	local, peer := net.Pipe()
+	client.conn, client.scanner, client.connDone = local, bufio.NewScanner(local), make(chan struct{})
+	t.Cleanup(func() { _ = client.Close(); _ = peer.Close() })
+	invalid := record
+	invalid.ProjectPath = filepath.Dir(project)
+	writeDiscoveryFixture(t, project, invalid)
+	done := make(chan error, 1)
+	go func() { done <- client.Ping(context.Background()) }()
+	req := receiveIPCRequest(t, peer)
+	if req.Method != "ping" {
+		t.Fatalf("established connection unexpectedly rediscovered: %+v", req)
+	}
+	if err := json.NewEncoder(peer).Encode(RPCResponse{ID: req.ID, Result: map[string]bool{"pong": true}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil || client.SocketPath() != record.SocketPath {
+		t.Fatalf("record replacement disrupted established connection: %v", err)
+	}
+	go func() { _, err := client.request(context.Background(), "claim_execution", nil, true); done <- err }()
+	req = receiveIPCRequest(t, peer)
+	if req.Method != "claim_execution" {
+		t.Fatalf("unexpected RPC: %+v", req)
+	}
+	// The daemon may have committed the claim before its reply was lost. The
+	// original operation must report that loss without rediscovery or replay.
+	if err := peer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err == nil || errors.Is(err, ErrDiscoveryInvalid) {
+		t.Fatalf("failed exchange was retried through invalid replacement: %v", err)
+	}
+	if err := client.Connect(context.Background()); !errors.Is(err, ErrDiscoveryInvalid) {
+		t.Fatalf("subsequent connection did not refresh discovery: %v", err)
+	}
+}
+
+func TestProjectClientsConcurrentRefreshDiagnostics(t *testing.T) {
+	t.Setenv("SLB_HOST", "")
+	project := discoveryProject(t)
+	ipc := NewProjectIPCClient(project)
+	defer func() { _ = ipc.Close() }()
+	client := NewProjectClient(project, WithLocalOnly())
+	record := discoveryFixture(project, filepath.Join(shortSocketDir(t), "missing.sock"))
+	writeDiscoveryFixture(t, project, record)
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 10 {
+				_ = ipc.SocketPath()
+				if err := ipc.Connect(context.Background()); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("refresh missing endpoint: %v", err)
+				}
+				if info := client.GetStatusInfo(); info.SocketPath != record.SocketPath || info.PIDFile != record.PIDFile {
+					t.Errorf("mixed status snapshot: %+v", info)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestProjectIPCClientReconnectsToReplacementDaemon(t *testing.T) {
+	lifecycleEnvironment(t)
+	for _, placement := range []string{"same_path", "new_TMPDIR"} {
+		t.Run(placement, func(t *testing.T) {
+			project := lifecycleProject(t)
+			t.Setenv("TMPDIR", shortSocketDir(t))
+			opts := normalizeServerOptions(ServerOptions{ProjectDir: project})
+			original := startLifecycleChild(t, opts, false)
+			original.ready(t)
+			awaitRecord := func(child *lifecycleChild) {
+				t.Helper()
+				deadline := time.Now().Add(5 * time.Second)
+				for time.Now().Before(deadline) {
+					paths, err := DiscoverRuntime(project)
+					if err == nil && paths.PID == child.cmd.Process.Pid {
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				t.Fatalf("daemon did not publish its runtime: %s", child.logs())
+			}
+			awaitRecord(original)
+			ipc := NewProjectIPCClient(project)
+			defer func() { _ = ipc.Close() }()
+			client := NewProjectClient(project, WithLocalOnly())
+			if err := ipc.Ping(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if err := ipc.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := StopDaemonWithOptions(opts, 5*time.Second); err != nil {
+				t.Fatal(err)
+			}
+			original.wait(t, true)
+			if placement == "new_TMPDIR" {
+				t.Setenv("TMPDIR", shortSocketDir(t))
+				opts = normalizeServerOptions(ServerOptions{ProjectDir: project})
+			}
+			replacement := startLifecycleChild(t, opts, false)
+			replacement.ready(t)
+			awaitRecord(replacement)
+			if replacement.cmd.Process.Pid == original.cmd.Process.Pid {
+				t.Fatal("test did not produce a different kernel peer PID")
+			}
+			// An agent can still inherit a third temporary directory.
+			t.Setenv("TMPDIR", shortSocketDir(t))
+			if err := ipc.Ping(context.Background()); err != nil {
+				t.Fatalf("failed to verify replacement process: %v", err)
+			}
+			if ipc.SocketPath() != opts.SocketPath {
+				t.Fatalf("replacement diagnostic path is stale: %q", ipc.SocketPath())
+			}
+			if info := client.GetStatusInfo(); info.Status != DaemonRunning || info.PID != replacement.cmd.Process.Pid || info.SocketPath != opts.SocketPath {
+				t.Fatalf("status client retained old daemon identity: %+v", info)
+			}
+			if err := StopDaemonWithOptions(opts, 5*time.Second); err != nil {
+				t.Fatal(err)
+			}
+			replacement.wait(t, true)
+		})
+	}
+}
+
 func TestDiscoverRuntimeRejectsInvalidRecords(t *testing.T) {
 	for _, kind := range []string{
 		"malformed", "null", "array", "missing_fields", "wrong_project", "relative_project",

@@ -32,6 +32,7 @@ type IPCClient struct {
 	socketPath    string
 	runtime       *RuntimePaths
 	discoveryErr  error
+	rediscover    bool // Project clients refresh before each new local connection.
 	localOnly     bool
 	conn          net.Conn
 	scanner       *bufio.Scanner
@@ -55,16 +56,21 @@ type ipcClientConnection struct {
 func NewIPCClient(socketPath string) *IPCClient { return &IPCClient{socketPath: socketPath} }
 
 // NewProjectIPCClient discovers and verifies exactly one project's listener.
-// Discovery errors are retained until Connect so callers use their existing
-// fail-closed handling. An explicitly configured TCP transport remains separate.
+// Each new local connection refreshes discovery within the original physical
+// project, including after a failed attempt or daemon restart. An explicitly
+// configured TCP transport remains separate.
 func NewProjectIPCClient(cwd string) *IPCClient {
 	paths, err := DiscoverRuntime(cwd)
-	return &IPCClient{socketPath: paths.SocketPath, runtime: &paths, discoveryErr: err}
+	return &IPCClient{socketPath: paths.SocketPath, runtime: &paths, discoveryErr: err, rediscover: true}
 }
 
 // SocketPath is the selected local endpoint (or expected default on an invalid
 // record). It never exposes an unvalidated path read from a discovery record.
-func (c *IPCClient) SocketPath() string { return c.socketPath }
+func (c *IPCClient) SocketPath() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.socketPath
+}
 
 func (c *IPCClient) acquire(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
@@ -108,6 +114,7 @@ func (c *IPCClient) connect(ctx context.Context) error {
 	generation := c.generation
 	ctx, cancel := context.WithCancel(ctx)
 	c.connectCancel = cancel
+	address, runtime, discoveryErr := c.socketPath, c.runtime, c.discoveryErr
 	c.mu.Unlock()
 	defer func() {
 		cancel()
@@ -118,14 +125,25 @@ func (c *IPCClient) connect(ctx context.Context) error {
 		c.mu.Unlock()
 	}()
 
-	network, address := "unix", c.socketPath
+	network := "unix"
 	if host := strings.TrimSpace(os.Getenv("SLB_HOST")); host != "" && !c.localOnly {
 		network, address = "tcp", host
 	}
 	var socketInfo os.FileInfo
-	if network == "unix" && c.runtime != nil {
-		if c.discoveryErr != nil {
-			return c.discoveryErr
+	if network == "unix" && runtime != nil {
+		if c.rediscover {
+			paths, err := refreshRuntime(*runtime)
+			address, runtime, discoveryErr = paths.SocketPath, &paths, err
+			c.mu.Lock()
+			if c.generation != generation {
+				c.mu.Unlock()
+				return net.ErrClosed
+			}
+			c.socketPath, c.runtime, c.discoveryErr = address, runtime, discoveryErr
+			c.mu.Unlock()
+		}
+		if discoveryErr != nil {
+			return discoveryErr
 		}
 		var err error
 		socketInfo, err = validateRuntimeSocket(address)
@@ -152,8 +170,8 @@ func (c *IPCClient) connect(ctx context.Context) error {
 			err = writeIPCFrame(conn, append(hello, '\n'))
 		}
 	}
-	if err == nil && network == "unix" && c.runtime != nil {
-		err = verifyRuntimeConnection(conn, reader, *c.runtime, socketInfo, true)
+	if err == nil && network == "unix" && runtime != nil {
+		err = verifyRuntimeConnection(conn, reader, *runtime, socketInfo, true)
 	}
 	stop()
 	if err == nil {

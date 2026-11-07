@@ -882,6 +882,8 @@ authoritative and does not fall back to local discovery. These checks protect
 local routing; they do not isolate malicious processes sharing an OS user.
 See [the discovery trust boundary](references/SECURITY.md#local-daemon-discovery-issue-33).
 
+Reusable clients refresh discovery before each new local connection and status query, so a daemon restart or repaired record can recover without recreating the client. Discovery stays bound to the physical project originally selected; removing its marker or redirecting its path cannot move the client into a different project. An established connection keeps its verified identity, and a failed command exchange is never automatically replayed.
+
 Lifecycle commands manage the local project daemon regardless of `SLB_HOST`. A persistent `.slb/daemon.lock` prevents simultaneous daemons for one project even when their temporary directories differ. It and the companion `.pid.lock` and `.sock.lock` files remain after shutdown by design; leave them in place so ownership remains coordinated across starts and stops. The discovery record is removed only by the daemon generation that published it.
 
 The project and socket must be visible in both processes' filesystem namespaces. A systemd `PrivateTmp` setting can isolate `/tmp` itself; a discovery record cannot make an isolated socket reachable. In that setup, choose a short, owned runtime directory visible to both processes (for example the user's `/run/user/<uid>` directory) as the **daemon's** `TMPDIR` before starting it. The hook does not need a matching `TMPDIR` after publication.

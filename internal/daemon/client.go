@@ -52,6 +52,7 @@ type Client struct {
 	pidFile      string
 	runtime      *RuntimePaths
 	discoveryErr error
+	customPID    bool
 	logger       *log.Logger
 	localOnly    bool
 }
@@ -73,6 +74,7 @@ func WithSocketPath(path string) ClientOption {
 func WithPIDFile(path string) ClientOption {
 	return func(c *Client) {
 		c.pidFile = path
+		c.customPID = true
 	}
 }
 
@@ -113,6 +115,22 @@ func NewProjectClient(cwd string, opts ...ClientOption) *Client {
 		opt(c)
 	}
 	return c
+}
+
+// A status query uses one fresh snapshot for its connection and diagnostics.
+// Keep the original client immutable so concurrent queries can safely observe
+// daemon replacement without mixing paths or changing the pinned project.
+func (c *Client) currentRuntime() *Client {
+	if c.runtime == nil {
+		return c
+	}
+	paths, err := refreshRuntime(*c.runtime)
+	current := *c
+	current.socketPath, current.runtime, current.discoveryErr = paths.SocketPath, &paths, err
+	if !c.customPID {
+		current.pidFile = paths.PIDFile
+	}
+	return &current
 }
 
 // DefaultSocketPath returns the current project's recorded socket, or its
@@ -244,6 +262,7 @@ func (c *Client) IsDaemonRunning() bool {
 
 // GetStatus returns the detailed daemon status.
 func (c *Client) GetStatus() DaemonStatus {
+	c = c.currentRuntime()
 	// Prefer real connectivity checks (supports TCP when SLB_HOST is set).
 	if c.canConnectSocket() {
 		return DaemonRunning
@@ -275,6 +294,7 @@ type StatusInfo struct {
 
 // GetStatusInfo returns detailed status information.
 func (c *Client) GetStatusInfo() StatusInfo {
+	c = c.currentRuntime()
 	info := StatusInfo{
 		PIDFile:    c.pidFile,
 		SocketPath: c.socketPath,
