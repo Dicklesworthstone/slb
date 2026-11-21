@@ -238,14 +238,40 @@ func correlateBlocks(events []audit.Event, window time.Duration) []audit.Event {
 	return attempts
 }
 
+func resolveExistingAncestorSymlinks(path string) string {
+	clean := filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+		return resolved
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return clean
+	}
+	var suffix []string
+	cur := clean
+	for {
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return clean
+		}
+		suffix = append(suffix, filepath.Base(cur))
+		cur = parent
+		resolved, err := filepath.EvalSymlinks(cur)
+		if err == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return resolved
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return clean
+		}
+	}
+}
+
 func belongsToProject(cwd, project string) (bool, error) {
 	if !filepath.IsAbs(cwd) {
 		return false, nil
 	}
-	cwd = filepath.Clean(cwd)
-	if resolved, err := filepath.EvalSymlinks(cwd); err == nil {
-		cwd = resolved
-	}
+	cwd = resolveExistingAncestorSymlinks(cwd)
 	rel, err := filepath.Rel(project, cwd)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return false, nil

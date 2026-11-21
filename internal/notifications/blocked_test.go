@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -274,6 +275,28 @@ func TestReadBlockedObservationDoesNotCrossContext(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestReadBlockedResolvesMissingChildUnderSymlinkedProject(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink fixture")
+	}
+	dir := t.TempDir()
+	realRoot := t.TempDir()
+	aliasParent := t.TempDir()
+	aliasRoot := filepath.Join(aliasParent, "project-link")
+	if err := os.Symlink(realRoot, aliasRoot); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	missingChild := filepath.Join(aliasRoot, "deleted-build", "sub")
+	event := observedBlock(missingChild, "ev-symlink-missing", "hook_offline", now)
+	writeObservedBlock(t, dir, event)
+
+	alerts, err := ReadBlocked(context.Background(), dir, realRoot, now, Policy{})
+	if err != nil || len(alerts) != 1 || alerts[0].EventID != event.ID {
+		t.Fatalf("missing child under symlinked project was dropped: %+v %v", alerts, err)
 	}
 }
 
