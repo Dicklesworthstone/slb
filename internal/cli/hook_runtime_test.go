@@ -341,8 +341,8 @@ threading.Thread(target=respond, daemon=True).start()
 }
 
 const hookDiscoveryFixture = `
-fixture_dir = tempfile.TemporaryDirectory(prefix="slb-disc-")
-project = os.path.join(fixture_dir.name, "project")
+fixture_dir = tempfile.TemporaryDirectory(prefix="slb-disc-", dir=os.path.realpath("/tmp") if os.path.isdir("/tmp") else None)
+project = os.path.realpath(os.path.join(fixture_dir.name, "project"))
 os.mkdir(project, 0o700)
 os.chdir(project)
 marker = os.path.join(project, ".slb")

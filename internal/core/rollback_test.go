@@ -409,7 +409,10 @@ func TestRollbackFilesystemRestoreRefusesPlannedNonDirectoryAncestors(t *testing
 	for _, kind := range []byte{tar.TypeReg, tar.TypeSymlink} {
 		for _, parentFirst := range []bool{false, true} {
 			t.Run(fmt.Sprintf("type=%d/parent-first=%v", kind, parentFirst), func(t *testing.T) {
-				project := t.TempDir()
+				project, err := filepath.EvalSymlinks(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
 				outside := filepath.Join(project, "unrelated")
 				if err := os.Mkdir(outside, 0700); err != nil {
 					t.Fatal(err)
@@ -457,7 +460,7 @@ func TestRollbackFilesystemRestoreRefusesPlannedNonDirectoryAncestors(t *testing
 				if err := os.WriteFile(filepath.Join(data.RollbackPath, data.Filesystem.TarGz), encoded.Bytes(), 0600); err != nil {
 					t.Fatal(err)
 				}
-				err := RestoreRollbackState(context.Background(), data, RollbackRestoreOptions{Force: true})
+				err = RestoreRollbackState(context.Background(), data, RollbackRestoreOptions{Force: true})
 				if err == nil || !strings.Contains(err.Error(), "file or symlink parent") {
 					t.Fatalf("planned non-directory ancestor was not rejected: %v", err)
 				}

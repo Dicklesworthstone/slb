@@ -498,8 +498,12 @@ func TestAttachmentContextRechecksSelectedPolicyAndBindsCWD(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "rechecking context command 2") || len(attachments) != 0 {
 		t.Fatalf("changed selected policy was ignored: %+v %v", attachments, err)
 	}
+	wantDir, err := filepath.EvalSymlinks(h.ProjectDir)
+	if err != nil {
+		wantDir = h.ProjectDir
+	}
 	data, err := os.ReadFile(marker)
-	if err != nil || strings.TrimSpace(string(data)) != h.ProjectDir {
-		t.Fatalf("allowed context did not use the checked working directory: %q %v", data, err)
+	if err != nil || strings.TrimSpace(string(data)) != wantDir {
+		t.Fatalf("allowed context did not use the checked working directory: %q (want %q) %v", data, wantDir, err)
 	}
 }

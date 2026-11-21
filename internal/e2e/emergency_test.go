@@ -61,6 +61,10 @@ func TestBuiltCLIEmergencyExecutionIntegration(t *testing.T) {
 		RecordedAt             *time.Time `json:"recorded_at"`
 		StartedAt              *time.Time `json:"started_at"`
 	}
+	physicalProject, err := filepath.EvalSymlinks(h.ProjectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	records := make(map[string]outcome)
 	logs := make(map[string][]byte)
 	for _, tc := range []struct {
@@ -101,7 +105,7 @@ func TestBuiltCLIEmergencyExecutionIntegration(t *testing.T) {
 				view.ReviewNotice != notice || view.ApprovalPolicy != "independent" || !strings.Contains(view.ApprovalPolicyLabel, "BYPASSED") || !view.ApprovalPolicyBypassed ||
 				!view.Executed || view.ExitCode == nil || *view.ExitCode != tc.exit ||
 				view.Status != string(tc.status) || !strings.Contains(view.Output, tc.output) || view.LogPath == "" ||
-				view.ProjectPath != h.ProjectDir || view.CWD != h.ProjectDir || view.Hash != digest || view.ConfirmationMethod != "hash_ack" ||
+				view.ProjectPath != physicalProject || view.CWD != physicalProject || view.Hash != digest || view.ConfirmationMethod != "hash_ack" ||
 				view.AttemptedAt == nil || view.ExecutedAt == nil || view.RecordedAt == nil || view.StartedAt == nil ||
 				!view.AttemptedAt.Equal(*view.RecordedAt) || !view.ExecutedAt.Equal(*view.StartedAt) {
 				t.Fatalf("incorrect emergency outcome or assurance: %+v", view)

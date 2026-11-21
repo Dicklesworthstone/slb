@@ -93,21 +93,21 @@ desktop_enabled = false
 					contexts = append(contexts, attachment)
 				}
 			}
-			if request.Command.Raw != "./reviewed-probe" || request.Command.Cwd != f.ProjectDir ||
-				request.Command.Hash != db.ComputeCommandHash(request.Command) || len(contexts) != 2 {
-				t.Fatalf("request lost the command or its contexts: %+v", request)
-			}
 			physicalCWD, err := filepath.EvalSymlinks(f.ProjectDir)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if request.Command.Raw != "./reviewed-probe" || request.Command.Cwd != physicalCWD ||
+				request.Command.Hash != db.ComputeCommandHash(request.Command) || len(contexts) != 2 {
+				t.Fatalf("request lost the command or its contexts: %+v", request)
 			}
 			for i, context := range []struct{ command, output string }{
 				{"pwd", physicalCWD}, {"echo context-captured", "context-captured"},
 			} {
 				attachment := contexts[i]
-				expectedHash := db.ComputeCommandHash(db.CommandSpec{Raw: context.command, Cwd: f.ProjectDir, Shell: true})
+				expectedHash := db.ComputeCommandHash(db.CommandSpec{Raw: context.command, Cwd: physicalCWD, Shell: true})
 				if attachment.Type != db.AttachmentTypeContext || strings.TrimSpace(attachment.Content) != context.output ||
-					attachment.Metadata["source"] != context.command || attachment.Metadata["cwd"] != f.ProjectDir ||
+					attachment.Metadata["source"] != context.command || attachment.Metadata["cwd"] != physicalCWD ||
 					attachment.Metadata["shell"] != true || attachment.Metadata["command_hash"] != expectedHash ||
 					attachment.Metadata["policy_check"] != "safe" || attachment.Metadata["exit_code"] != float64(0) {
 					t.Fatalf("context %d lost its bound SAFE evidence: %+v", i, attachment)
