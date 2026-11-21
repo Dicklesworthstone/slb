@@ -10,14 +10,14 @@ require (
 	github.com/charmbracelet/log v1.0.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/google/uuid v1.6.0
-	github.com/mattn/go-shellwords v1.0.16
+	github.com/mattn/go-shellwords v1.0.17
 	github.com/spf13/cobra v1.10.2
-	github.com/spf13/pflag v1.0.10
+	github.com/spf13/pflag v1.1.0
 	github.com/spf13/viper v1.21.0
 	go.yaml.in/yaml/v3 v3.0.6
-	golang.org/x/sys v0.49.0
-	golang.org/x/term v0.47.0
-	modernc.org/sqlite v1.61.1
+	golang.org/x/sys v0.50.0
+	golang.org/x/term v0.48.0
+	modernc.org/sqlite v1.62.0
 	mvdan.cc/sh/v3 v3.14.1
 )
 
@@ -25,7 +25,7 @@ require (
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/charmbracelet/colorprofile v0.4.3 // indirect
-	github.com/charmbracelet/x/ansi v0.11.9 // indirect
+	github.com/charmbracelet/x/ansi v0.11.10 // indirect
 	github.com/charmbracelet/x/cellbuf v0.0.15 // indirect
 	github.com/charmbracelet/x/term v0.2.2 // indirect
 	github.com/clipperhouse/displaywidth v0.11.0 // indirect
@@ -50,10 +50,10 @@ require (
 	github.com/spf13/afero v1.15.0 // indirect
 	github.com/spf13/cast v1.10.0 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
-	github.com/xo/terminfo v1.3.0 // indirect
+	github.com/xo/terminfo v1.3.1 // indirect
 	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect
-	golang.org/x/text v0.43.0 // indirect
-	modernc.org/libc v1.80.0 // indirect
+	golang.org/x/text v0.44.0 // indirect
+	modernc.org/libc v1.82.6 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
-	modernc.org/memory v1.12.1 // indirect
+	modernc.org/memory v1.13.0 // indirect
 )
