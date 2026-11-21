@@ -518,6 +518,7 @@ func TestStartDaemonWithOptions_DuplicatePIDFilePreventsStart(t *testing.T) {
 	t.Setenv(daemonModeEnv, "")
 
 	err := StartDaemonWithOptions(ctx, ServerOptions{
+		ProjectDir: tmp,
 		SocketPath: filepath.Join(tmp, "daemon.sock"),
 		PIDFile:    pidFile,
 		Logger:     log.New(io.Discard),

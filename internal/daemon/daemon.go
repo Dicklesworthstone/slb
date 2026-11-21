@@ -414,10 +414,6 @@ func RunDaemon(ctx context.Context, opts ServerOptions) error {
 	}
 	defer stopServices()
 
-	errCh := make(chan error, len(servers))
-	for _, server := range servers {
-		go func(server *IPCServer) { errCh <- server.Start(signalCtx) }(server)
-	}
 	cleanupRuntime, err := publishRuntime(opts)
 	if err != nil {
 		return fmt.Errorf("publishing daemon discovery: %w", err)
@@ -427,6 +423,11 @@ func RunDaemon(ctx context.Context, opts ServerOptions) error {
 			logger.Warn("daemon discovery cleanup", "error", err)
 		}
 	}()
+
+	errCh := make(chan error, len(servers))
+	for _, server := range servers {
+		go func(server *IPCServer) { errCh <- server.Start(signalCtx) }(server)
+	}
 	logger.Info("daemon started", "pid", os.Getpid(), "project", projectPath,
 		"pid_file", opts.PIDFile, "socket", opts.SocketPath)
 	select {
