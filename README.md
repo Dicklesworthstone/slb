@@ -882,6 +882,16 @@ authoritative and does not fall back to local discovery. These checks protect
 local routing; they do not isolate malicious processes sharing an OS user.
 See [the discovery trust boundary](references/SECURITY.md#local-daemon-discovery-issue-33).
 
+On Linux, project and runtime ancestors created with `umask 0002` (typically
+`0775 user:user`) are accepted when the effective user's primary group is a
+verified local user-private group. SLB checks the root-owned account files,
+requires files-only NSS membership, and rejects shared groups and access ACLs.
+Nonsticky world-writable ancestors remain invalid, and `.slb` itself must have
+no group or other write permission. Hosts using additional account providers
+such as SSSD, LDAP, or systemd userdb retain the stricter ancestor check because
+local files cannot establish their full membership. The Go daemon and generated
+Python hook use the same policy ([#34](https://github.com/Dicklesworthstone/slb/issues/34)).
+
 Reusable clients refresh discovery before each new local connection and status query, so a daemon restart or repaired record can recover without recreating the client. Discovery stays bound to the physical project originally selected; removing its marker or redirecting its path cannot move the client into a different project. An established connection keeps its verified identity, and a failed command exchange is never automatically replayed.
 
 Lifecycle commands manage the local project daemon regardless of `SLB_HOST`. A persistent `.slb/daemon.lock` prevents simultaneous daemons for one project even when their temporary directories differ. It and the companion `.pid.lock` and `.sock.lock` files remain after shutdown by design; leave them in place so ownership remains coordinated across starts and stops. During normal shutdown, only the daemon generation that published the discovery record removes it.

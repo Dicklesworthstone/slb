@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -355,6 +356,323 @@ def write_record(data):
     with os.fdopen(os.open(record_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as stream:
         stream.write(data)
 `
+
+func TestHookRuntimeLocalUserPrivateGroup(t *testing.T) {
+	setup := `
+nss = "passwd: files\ngroup: files\n"
+passwd = "root:x:0:0:root:/root:/bin/sh\nalice:x:1000:1000::/home/alice:/bin/sh\n"
+group = "root:x:0:\nalice:x:1000:\n"
+cases = [
+    ("private group", nss, passwd, group, True),
+    ("self member", nss, passwd, group.replace("alice:x:1000:", "alice:x:1000:alice"), True),
+    ("local initgroups and comments", " # local accounts\npasswd: files # users\ngroup: files\ninitgroups: files\nhosts: files dns\n", passwd, group, True),
+    ("empty password", nss, passwd, group.replace("alice:x:", "alice::"), True),
+    ("locked password", nss, passwd, group.replace("alice:x:", "alice:!locked:"), True),
+    ("disabled password", nss, passwd, group.replace("alice:x:", "alice:*:"), True),
+    ("active password", nss, passwd, group.replace("alice:x:", "alice:$6$hash:"), False),
+    ("supplementary member", nss, passwd, group.replace("alice:x:1000:", "alice:x:1000:bob"), False),
+    ("primary member", nss, passwd + "bob:x:1001:1000::/home/bob:/bin/sh\n", group, False),
+    ("UID alias", nss, passwd + "alias:x:1000:1001::/home/alias:/bin/sh\n", group, False),
+    ("username alias", nss, passwd + "alice:x:1001:1001::/home/alias:/bin/sh\n", group, False),
+    ("GID alias", nss, passwd, group + "staff:x:1000:\n", False),
+    ("group name alias", nss, passwd, group + "alice:x:1001:\n", False),
+    ("different group name", nss, passwd, group.replace("alice:", "staff:"), False),
+    ("missing user", nss, "root:x:0:0:root:/root:/bin/sh\n", group, False),
+    ("missing group", nss, passwd, "root:x:0:\n", False),
+    ("different primary GID", nss, passwd.replace(":1000:1000:", ":1000:1001:"), group, False),
+    ("NSS ldap", nss.replace("passwd: files", "passwd: files ldap"), passwd, group, False),
+    ("NSS sss", nss.replace("group: files", "group: files sss"), passwd, group, False),
+    ("NSS systemd", nss.replace("group: files", "group: files systemd"), passwd, group, False),
+    ("NSS compat", nss.replace("passwd: files", "passwd: compat"), passwd, group, False),
+    ("remote initgroups", nss + "initgroups: sss\n", passwd, group, False),
+    ("NSS merge", nss.replace("group: files", "group: files [SUCCESS=merge]"), passwd, group, False),
+    ("NSS duplicate", nss + "group: files\n", passwd, group, False),
+    ("colonless group override", nss + "group ldap\n", passwd, group, False),
+    ("colonless passwd override", nss + "passwd\tldap\n", passwd, group, False),
+    ("colonless initgroups", nss + "initgroups sss\n", passwd, group, False),
+    ("malformed protected name", nss + "group\tldap: files\n", passwd, group, False),
+    ("NSS missing group", "passwd: files\n", passwd, group, False),
+    ("NSS continuation", "passwd: files \\\ngroup: files\n", passwd, group, False),
+    ("compat user", nss, passwd + "+::::::\n", group, False),
+    ("compat group", nss, passwd, group + "+:::alice\n", False),
+    ("malformed user", nss, passwd + "broken\n", group, False),
+    ("malformed group", nss, passwd, group + "broken\n", False),
+    ("signed UID", nss, passwd.replace(":1000:1000:", ":+1000:1000:"), group, False),
+    ("overflow GID", nss, passwd, group.replace(":1000:", ":4294967296:"), False),
+    ("nondecimal UID", nss, passwd.replace(":1000:1000:", ":1_000:1000:"), group, False),
+    ("long leading zeros", nss, passwd.replace(":1000:1000:", ":" + "0" * 5000 + "1000:1000:"), group, True),
+    ("empty member", nss, passwd, group.replace("alice:x:1000:", "alice:x:1000:alice,"), False),
+    ("NUL", nss, passwd + "\x00", group, False),
+    ("oversized", nss, passwd, group + "#" * (MAX_LOCAL_ACCOUNT_BYTES + 1), False),
+]
+for name, sources, users, groups, want in cases:
+    actual = _local_user_private_group(1000, 1000, sources, users, groups)
+    assert actual == want, (name, actual, want)
+assert _local_user_private_group(0xffffffff, 0xffffffff, nss,
+                               "alice:x:4294967295:4294967295::/:/bin/sh\n", "alice:x:4294967295:\n")
+query_slb_daemon = lambda *args: {'action': 'allow'}
+`
+	stdout, stderr := runHookRuntime(t, t.TempDir(), setup, `{"tool_input":{"command":"opaque command"}}`)
+	if hookPermission(t, stdout) != "allow" || stderr != "" {
+		t.Fatalf("local private-group policy failed: %s %s", stdout, stderr)
+	}
+}
+
+func TestHookRuntimePrivateGroupAccountFilesFailClosed(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux local account file checks")
+	}
+	setup := `
+from types import SimpleNamespace
+from unittest.mock import patch
+account_path = os.path.join(os.getcwd(), "accounts")
+real_fstat, real_lstat = os.fstat, os.lstat
+attributes = ("st_mode", "st_uid", "st_gid", "st_size", "st_mtime_ns", "st_ctime_ns", "st_ino", "st_dev")
+for scenario in ("valid", "foreign owner", "group writable", "not regular", "oversized", "invalid UTF8", "NUL", "short read", "changed inode", "changed mode", "changed size", "changed mtime", "changed name"):
+    data = b"passwd: files\ngroup: files\n"
+    if scenario == "oversized":
+        data = b"#" * (MAX_LOCAL_ACCOUNT_BYTES + 1)
+    elif scenario == "invalid UTF8":
+        data = b"\xff"
+    elif scenario == "NUL":
+        data += b"\x00"
+    with os.fdopen(os.open(account_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as stream:
+        stream.write(data)
+    calls = [0]
+    def metadata(info):
+        values = {key: getattr(info, key) for key in attributes}
+        values["st_uid"] = 0
+        if scenario == "foreign owner":
+            values["st_uid"] = 1000
+        elif scenario == "group writable":
+            values["st_mode"] |= 0o020
+        elif scenario == "not regular":
+            values["st_mode"] = stat.S_IFIFO | 0o600
+        elif scenario == "short read":
+            values["st_size"] += 1
+        return values
+    def fixture_fstat(fd):
+        values = metadata(real_fstat(fd))
+        calls[0] += 1
+        if calls[0] > 1:
+            field = {"changed inode": "st_ino", "changed mode": "st_mode",
+                     "changed size": "st_size", "changed mtime": "st_mtime_ns"}.get(scenario)
+            if field:
+                values[field] += 1
+        return SimpleNamespace(**values)
+    def fixture_lstat(path):
+        values = metadata(real_lstat(path))
+        if scenario == "changed name":
+            values["st_ino"] += 1
+        return SimpleNamespace(**values)
+    with patch.object(os, "fstat", fixture_fstat), patch.object(os, "lstat", fixture_lstat):
+        try:
+            result = _read_local_account_file(account_path)
+        except (OSError, ValueError):
+            assert scenario != "valid", scenario
+        else:
+            assert scenario == "valid" and result == data.decode(), scenario
+symlink = account_path + ".link"
+os.symlink(account_path, symlink)
+for path in (symlink, account_path + ".missing"):
+    try:
+        _read_local_account_file(path)
+    except (OSError, ValueError):
+        pass
+    else:
+        raise AssertionError("unsafe account path accepted")
+
+original_read = _read_local_account_file
+for failed_path in ("/etc/nsswitch.conf", "/etc/passwd", "/etc/group"):
+    seen = []
+    def unavailable(path):
+        seen.append(path)
+        if path == failed_path:
+            raise PermissionError("unavailable account data")
+        return ""
+    _read_local_account_file = unavailable
+    assert not _current_user_private_group(os.geteuid(), os.getegid())
+    assert failed_path in seen
+_read_local_account_file = original_read
+query_slb_daemon = lambda *args: {'action': 'allow'}
+`
+	stdout, stderr := runHookRuntime(t, t.TempDir(), setup, `{"tool_input":{"command":"opaque command"}}`)
+	if hookPermission(t, stdout) != "allow" || stderr != "" {
+		t.Fatalf("local account file safety checks failed: %s %s", stdout, stderr)
+	}
+}
+
+// Traverse real project and alias directories, but adapt socket metadata and
+// transport in memory so these policy checks run even where AF_UNIX is denied.
+// This verifies discovery and RPC ordering; it is not a native transport test.
+func TestHookRuntimePrivateGroupAncestorsBeforeRPC(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux private-group runtime discovery")
+	}
+	for _, scenario := range []string{
+		"private group", "self member", "private alias parent", "shared supplementary member", "shared primary member",
+		"remote NSS", "missing NSS", "account read error", "world writable", "foreign owner", "foreign group",
+		"ACL writer", "ACL read error", "writable marker", "writable alias parent", "unsupported platform",
+	} {
+		t.Run(scenario, func(t *testing.T) {
+			setup := hookDiscoveryFixture + fmt.Sprintf(`
+from types import SimpleNamespace
+scenario = %q
+allowed = scenario in ("private group", "self member", "private alias parent")
+SLB_TIMEOUT = 2.0
+uid, gid = os.geteuid(), os.getegid()
+account_files = {
+    "/etc/nsswitch.conf": "passwd: files\ngroup: files\n",
+    "/etc/passwd": f"alice:x:{uid}:{gid}::/home/alice:/bin/sh\n",
+    "/etc/group": f"alice:x:{gid}:\n",
+}
+if scenario == "self member":
+    account_files["/etc/group"] = f"alice:x:{gid}:alice\n"
+elif scenario == "shared supplementary member":
+    account_files["/etc/group"] = f"alice:x:{gid}:bob\n"
+elif scenario == "shared primary member":
+    account_files["/etc/passwd"] += f"bob:x:{uid+1}:{gid}::/home/bob:/bin/sh\n"
+elif scenario == "remote NSS":
+    account_files["/etc/nsswitch.conf"] += "initgroups: sss\n"
+elif scenario == "missing NSS":
+    account_files["/etc/nsswitch.conf"] = "passwd: files\n"
+def read_accounts(path):
+    if scenario == "account read error":
+        raise PermissionError("account-reader-secret")
+    return account_files[path]
+_read_local_account_file = read_accounts
+def fixture_getxattr(path, name, **kwargs):
+    assert name == "system.posix_acl_access"
+    if scenario == "ACL writer":
+        return b"extended-access-acl"
+    if scenario == "ACL read error":
+        raise OSError(errno.EACCES, "acl-reader-secret")
+    raise OSError(errno.ENODATA, "no access ACL")
+os.getxattr = fixture_getxattr
+os.chmod(project, 0o777 if scenario == "world writable" else 0o775)
+if scenario == "writable marker":
+    os.chmod(marker, 0o770)
+with os.fdopen(os.open(record["socket_path"], os.O_WRONLY | os.O_CREAT, 0o600), "wb"):
+    pass
+if scenario in ("private alias parent", "writable alias parent"):
+    alias_parent = os.path.join(fixture_dir.name, "alias-parent")
+    os.mkdir(alias_parent, 0o700)
+    os.chmod(alias_parent, 0o775 if allowed else 0o777)
+    alias = os.path.join(alias_parent, "alias")
+    os.symlink(fixture_dir.name, alias)
+    record["socket_path"] = os.path.join(alias, "daemon.sock")
+write_record(json.dumps(record))
+original_lstat = os.lstat
+def fixture_lstat(path, *args, **kwargs):
+    info = original_lstat(path, *args, **kwargs)
+    if path == project and scenario in ("foreign owner", "foreign group"):
+        return SimpleNamespace(st_mode=info.st_mode,
+                               st_uid=uid+1 if scenario == "foreign owner" else uid,
+                               st_gid=gid+1 if scenario == "foreign group" else gid)
+    if path == record["socket_path"]:
+        return SimpleNamespace(st_mode=stat.S_IFSOCK | stat.S_IMODE(info.st_mode),
+                               st_uid=info.st_uid, st_gid=info.st_gid,
+                               st_dev=info.st_dev, st_ino=info.st_ino)
+    return info
+os.lstat = fixture_lstat
+if scenario == "unsupported platform":
+    sys.platform = "darwin"
+frames = [json.dumps({"id": 0, "result": {"project_path": project, "pid": os.getpid(), "state_ready": True}}).encode() + b'\n',
+          b'{"id":1,"result":{"action":"allow"}}\n']
+class ScriptedLocalSocket:
+    def __init__(self):
+        self.requests = []
+        self.connected = self.closed = False
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        self.closed = True
+    def settimeout(self, timeout):
+        pass
+    def connect(self, path):
+        assert allowed and path == record["socket_path"]
+        self.connected = True
+    def getsockopt(self, level, option, length):
+        assert self.connected and not self.requests
+        assert (level, option, length) == (socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        return struct.pack("iII", os.getpid(), uid, gid)
+    def sendall(self, frame):
+        request = json.loads(frame)
+        self.requests.append(request["method"])
+        if request["method"] == "status":
+            assert request["params"] == {} and request["id"] == 0
+        else:
+            assert request["method"] == "hook_query" and request["id"] == 1
+    def recv(self, length):
+        if not frames:
+            return b""
+        frame = frames.pop(0)
+        if len(frame) > length:
+            frames.insert(0, frame[length:])
+        return frame[:length]
+connection = ScriptedLocalSocket()
+def create_connection(*args, **kwargs):
+    assert allowed, "unsafe ancestor reached a daemon connection"
+    return connection
+socket.socket = create_connection
+classify = lambda command: ('unknown', 0)
+original_main = main
+def main():
+    original_main()
+    assert connection.requests == (["status", "hook_query"] if allowed else [])
+    assert connection.connected == allowed and connection.closed == allowed
+`, scenario)
+			stdout, stderr := runHookRuntime(t, t.TempDir(), setup, `{"tool_input":{"command":"opaque token=command-secret"}}`)
+			want := "ask"
+			if scenario == "private group" || scenario == "self member" || scenario == "private alias parent" {
+				want = "allow"
+			}
+			if hookPermission(t, stdout) != want || stderr != "" || strings.Contains(stdout, "secret") {
+				t.Fatalf("private-group path policy failed: %s %s", stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestHookRuntimePrivateGroupMembershipIsRechecked(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux private-group runtime discovery")
+	}
+	setup := hookDiscoveryFixture + `
+uid, gid = os.geteuid(), os.getegid()
+account_files = {"/etc/nsswitch.conf": "passwd: files\ngroup: files\n",
+                 "/etc/passwd": f"alice:x:{uid}:{gid}::/home/alice:/bin/sh\n",
+                 "/etc/group": f"alice:x:{gid}:\n"}
+reads = []
+def read_accounts(path):
+    reads.append(path)
+    return account_files[path]
+_read_local_account_file = read_accounts
+def no_acl(*args, **kwargs):
+    raise OSError(errno.ENODATA, "no access ACL")
+os.getxattr = no_acl
+os.chmod(project, 0o775)
+os.chmod(fixture_dir.name, 0o775)
+_validate_runtime_parents(project)
+assert len(reads) == 3, reads
+account_files["/etc/group"] = f"alice:x:{gid}:bob\n"
+try:
+    _validate_runtime_parents(project)
+except _DaemonDiscoveryError:
+    pass
+else:
+    raise AssertionError("membership revocation was hidden by a persistent cache")
+assert len(reads) == 6, reads
+account_files["/etc/group"] = f"alice:x:{gid}:\n"
+_validate_runtime_parents(project)
+assert len(reads) == 9, reads
+query_slb_daemon = lambda *args: {'action': 'allow'}
+`
+	stdout, stderr := runHookRuntime(t, t.TempDir(), setup, `{"tool_input":{"command":"opaque command"}}`)
+	if hookPermission(t, stdout) != "allow" || stderr != "" {
+		t.Fatalf("private-group membership refresh failed: %s %s", stdout, stderr)
+	}
+}
 
 // The optional JSON accelerator has different nesting limits across Python
 // versions. Exercise the standard-library fallback with a predictable limit.

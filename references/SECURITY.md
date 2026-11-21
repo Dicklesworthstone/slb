@@ -277,6 +277,27 @@ Missing old runtime directories are not recreated merely to obtain
 obsolete locks. Legacy live-PID files without a valid project record keep their
 conservative checks, and recovery never terminates a process from stale metadata.
 
+On Linux, a nonsticky group-writable ancestor is accepted only when its owner
+and group match the effective UID/GID, it is not world writable, and it has no
+POSIX access ACL. Bounded, stable, root-owned `/etc/nsswitch.conf`, `/etc/passwd`,
+and `/etc/group` reads must establish a conventional user-private group: the
+user's primary group has the same name, no other primary or supplementary
+members appear, and no active public group password is configured. Both
+`passwd` and `group`, plus `initgroups` if configured, must use only `files`.
+Unknown providers, NSS actions, ambiguous records, and unavailable or unsafe
+files deny the exception. This includes `systemd`, which can provide additional
+userdb memberships. Membership is checked anew for each ancestor traversal;
+only repeated checks within that traversal share a result.
+
+This exception trusts the administrator's private-group configuration. Public
+account files do not enumerate shadow-only group grants, credentials assigned
+directly by privileged processes, or groups retained by already-running
+processes. Administrators must not grant other identities this private GID.
+Shared-group deployments must instead use ancestors without group write or
+appropriate sticky directories. The exception never changes the stricter
+permissions on `.slb`, sockets, discovery records, PID files, or leases, and
+both lexical symlink parents and their target chains are still checked.
+
 Local clients check socket ownership and permissions and authenticate the OS
 peer on the connection that will carry the command. They recheck the socket
 identity and verify the selected project, positive PID, and readiness through

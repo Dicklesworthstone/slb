@@ -5,6 +5,7 @@ package daemon
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,6 +22,226 @@ import (
 
 	"github.com/charmbracelet/log"
 )
+
+func TestLocalUserPrivateGroup(t *testing.T) {
+	const nsswitch = "passwd: files\ngroup: files\n"
+	const passwd = "root:x:0:0:root:/root:/bin/sh\nalice:x:1000:1000:Alice:/home/alice:/bin/sh\n"
+	const group = "root:x:0:\nalice:x:1000:\n"
+	type fixture struct {
+		Name     string `json:"name"`
+		NSS      string `json:"nss"`
+		Passwd   string `json:"passwd"`
+		Group    string `json:"group"`
+		Expected bool   `json:"expected"`
+	}
+	cases := []fixture{
+		{"private primary group", nsswitch, passwd, group, true},
+		{"self listed explicitly", nsswitch, passwd, "alice:x:1000:alice\n", true},
+		{"comments and local initgroups", "# local only\npasswd: files # accounts\ngroup:\tfiles\ninitgroups: files\nhosts: files dns\n", passwd, group, true},
+		{"no group password", nsswitch, passwd, "alice::1000:\n", true},
+		{"locked group password", nsswitch, passwd, "alice:!locked:1000:\n", true},
+		{"disabled group password", nsswitch, passwd, "alice:*:1000:\n", true},
+		{"active group password", nsswitch, passwd, "alice:$6$hash:1000:\n", false},
+		{"shared primary group", nsswitch, passwd + "bob:x:1001:1000:Bob:/home/bob:/bin/sh\n", group, false},
+		{"shared supplementary group", nsswitch, passwd, "alice:x:1000:alice,bob\n", false},
+		{"empty member in list", nsswitch, passwd, "alice:x:1000:alice,\n", false},
+		{"different primary GID", nsswitch, strings.ReplaceAll(passwd, "1000:1000", "1000:1001"), group, false},
+		{"different group name", nsswitch, passwd, "developers:x:1000:\n", false},
+		{"duplicate UID", nsswitch, passwd + "alias:x:1000:1001::/:/bin/sh\n", group, false},
+		{"duplicate username", nsswitch, passwd + "alice:x:1001:1001::/:/bin/sh\n", group, false},
+		{"duplicate GID", nsswitch, passwd, group + "other:x:1000:\n", false},
+		{"duplicate group name", nsswitch, passwd, group + "alice:x:1001:\n", false},
+		{"unknown UID", nsswitch, "root:x:0:0:root:/root:/bin/sh\n", group, false},
+		{"unknown GID", nsswitch, passwd, "root:x:0:\n", false},
+		{"LDAP passwd provider", "passwd: files ldap\ngroup: files\n", passwd, group, false},
+		{"SSSD group provider", "passwd: files\ngroup: files sss\n", passwd, group, false},
+		{"systemd extra memberships", "passwd: files systemd\ngroup: files systemd\n", passwd, group, false},
+		{"remote initgroups", nsswitch + "initgroups: sss files\n", passwd, group, false},
+		{"NSS merge action", "passwd: files\ngroup: files [SUCCESS=merge]\n", passwd, group, false},
+		{"duplicate NSS entry", nsswitch + "group: files\n", passwd, group, false},
+		{"colonless group override", nsswitch + "group ldap\n", passwd, group, false},
+		{"colonless passwd override", nsswitch + "passwd\tldap\n", passwd, group, false},
+		{"colonless initgroups", nsswitch + "initgroups sss\n", passwd, group, false},
+		{"missing NSS entry", "passwd: files\n", passwd, group, false},
+		{"missing NSS config", "", passwd, group, false},
+		{"NIS passwd entry", nsswitch, passwd + "+::::::\n", group, false},
+		{"NIS group entry", nsswitch, passwd, group + "+:::\n", false},
+		{"malformed passwd", nsswitch, passwd + "broken\n", group, false},
+		{"malformed group", nsswitch, passwd, group + "broken\n", false},
+		{"signed UID", nsswitch, strings.ReplaceAll(passwd, "1000:1000", "+1000:1000"), group, false},
+		{"overflow GID", nsswitch, passwd, "alice:x:4294967296:\n", false},
+		{"non-ASCII UID", nsswitch, strings.ReplaceAll(passwd, "1000:1000", "１０００:1000"), group, false},
+		{"leading zero UID", nsswitch, strings.ReplaceAll(passwd, "1000:1000", strings.Repeat("0", 5000)+"1000:1000"), group, true},
+		{"NUL account data", nsswitch, passwd + "\x00", group, false},
+		{"oversized account data", nsswitch, passwd + strings.Repeat("#", maxLocalAccountBytes), group, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			if got := localUserPrivateGroup(1000, 1000, tc.NSS, tc.Passwd, tc.Group); got != tc.Expected {
+				t.Fatalf("private group = %v, want %v", got, tc.Expected)
+			}
+		})
+	}
+
+	// Run the same independent acceptance cases through the standalone Python
+	// hook. A Go-only fix would leave existing generated hooks offline (#34).
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 is required for private-group parser parity")
+	}
+	source, err := os.ReadFile(filepath.Join("..", "cli", "hook_runtime.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := "__name__ = 'slb_upg_test'\n" + string(source) + `
+cases = json.load(sys.stdin)
+for case in cases:
+    actual = _local_user_private_group(1000, 1000, case["nss"], case["passwd"], case["group"])
+    assert actual == case["expected"], (case["name"], actual, case["expected"])
+`
+	input, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(python, "-c", script)
+	cmd.Stdin = strings.NewReader(string(input))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Python private-group decisions differ: %v\n%s", err, output)
+	}
+}
+
+func TestReadLocalAccountFileRejectsUntrustedSources(t *testing.T) {
+	for _, kind := range []string{"missing", "user_owned", "symlink", "directory", "fifo"} {
+		t.Run(kind, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "accounts")
+			switch kind {
+			case "user_owned", "symlink":
+				if err := os.WriteFile(path, []byte("passwd: files\ngroup: files\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "symlink" {
+					alias := path + ".alias"
+					if err := os.Symlink(path, alias); err != nil {
+						t.Fatal(err)
+					}
+					path = alias
+				} else if os.Geteuid() == 0 {
+					if err := os.Chmod(path, 0666); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "directory":
+				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			case "fifo":
+				if err := syscall.Mkfifo(path, 0600); err != nil {
+					t.Skipf("FIFO unavailable: %v", err)
+				}
+			}
+			if _, err := readLocalAccountFile(path); err == nil {
+				t.Fatal("untrusted account source was accepted")
+			}
+		})
+	}
+}
+
+func TestRuntimeParentsPrivateGroupPermissions(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux private-group ancestor policy")
+	}
+	path := t.TempDir()
+	for _, tc := range []struct {
+		name    string
+		mode    os.FileMode
+		private bool
+		accept  bool
+	}{
+		{"private group writable", 0775, true, true},
+		{"shared group writable", 0775, false, false},
+		{"world writable private group", 0777, true, false},
+		{"sticky shared directory", 0777 | os.ModeSticky, false, true},
+		{"ordinary owned directory", 0755, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.Chmod(path, tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := runtimeAncestorPermissions(path, info, func() bool { return tc.private }); got != tc.accept {
+				t.Fatalf("ancestor accepted = %v, want %v", got, tc.accept)
+			}
+		})
+	}
+	if err := os.Chmod(path, 0775); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"foreign user", "other group"} {
+		t.Run(kind, func(t *testing.T) {
+			stat := *info.Sys().(*syscall.Stat_t)
+			if kind == "foreign user" {
+				stat.Uid++
+			} else {
+				stat.Gid++
+			}
+			if runtimeAncestorPermissions(path, runtimeAncestorTestInfo{info, stat}, func() bool { return true }) {
+				t.Fatal("private group exception accepted a different identity")
+			}
+		})
+	}
+}
+
+func TestRuntimeParentsPrivateGroupAncestorTraversal(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux private-group ancestor policy")
+	}
+	parent := t.TempDir()
+	project := filepath.Join(parent, "project")
+	if err := os.Mkdir(project, 0775); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{parent, project} {
+		if err := os.Chmod(path, 0775); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alias := filepath.Join(parent, "alias")
+	if err := os.Symlink(project, alias); err != nil {
+		t.Fatal(err)
+	}
+	// Exercise the real recursive path/ACL checks with explicit account-file
+	// evidence. Unlike the native integration test, this does not require the
+	// test host's /etc files to qualify (e.g. inside a UID-mapped sandbox).
+	uid, gid := uint32(os.Geteuid()), uint32(os.Getegid())
+	passwd := fmt.Sprintf("alice:x:%d:%d::/:/bin/sh\n", uid, gid)
+	group := fmt.Sprintf("alice:x:%d:\n", gid)
+	privateGroup := func() bool {
+		return localUserPrivateGroup(uid, gid, "passwd: files\ngroup: files\n", passwd, group)
+	}
+	remaining := 512
+	if err := validateRuntimeAncestors(alias, &remaining, privateGroup); err != nil {
+		t.Fatalf("0775 private-group ancestors rejected: %v", err)
+	}
+	group = fmt.Sprintf("alice:x:%d:bob\n", gid)
+	remaining = 512
+	if err := validateRuntimeAncestors(alias, &remaining, privateGroup); err == nil {
+		t.Fatal("shared group accepted after membership changed")
+	}
+}
+
+type runtimeAncestorTestInfo struct {
+	os.FileInfo
+	stat syscall.Stat_t
+}
+
+func (info runtimeAncestorTestInfo) Sys() any { return &info.stat }
 
 func ownershipTestDir(t *testing.T) string {
 	t.Helper()

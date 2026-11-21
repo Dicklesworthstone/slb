@@ -1034,6 +1034,51 @@ func TestRuntimeParentsRejectWritableLexicalSymlinkAncestor(t *testing.T) {
 	}
 }
 
+func TestDiscoverRuntimeUserPrivateGroupAncestors(t *testing.T) {
+	if !currentUserPrivateGroup() {
+		t.Skip("integration requires Linux with an administrator-configured files-only UPG")
+	}
+	project := discoveryProject(t)
+	if err := os.Chmod(project, 0775); err != nil {
+		t.Fatal(err)
+	}
+	socketDir := shortSocketDir(t)
+	if err := os.Chmod(socketDir, 0775); err != nil {
+		t.Fatal(err)
+	}
+	record := discoveryFixture(project, filepath.Join(socketDir, "daemon.sock"))
+	writeDiscoveryFixture(t, project, record)
+	paths, err := DiscoverRuntime(project)
+	if err != nil || paths != record {
+		t.Fatalf("0775 private-group project rejected: %+v, %v", paths, err)
+	}
+	if err := validateRuntimeParents(socketDir); err != nil {
+		t.Fatalf("0775 private-group socket directory rejected: %v", err)
+	}
+	alias := filepath.Join(socketDir, "alias")
+	if err := os.Symlink(project, alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateRuntimeParents(alias); err != nil {
+		t.Fatalf("private-group lexical symlink ancestor rejected: %v", err)
+	}
+	// The exception must never extend to the state marker itself.
+	if err := os.Chmod(filepath.Join(project, ".slb"), 0775); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DiscoverRuntime(project); !errors.Is(err, ErrDiscoveryInvalid) {
+		t.Fatalf("group-writable .slb accepted: %v", err)
+	}
+	// Revalidate every path on each call; accepting the earlier UPG must not
+	// let a newly world-writable alias parent redirect future connections.
+	if err := os.Chmod(socketDir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateRuntimeParents(alias); err == nil {
+		t.Fatal("world-writable lexical symlink ancestor accepted after a valid UPG")
+	}
+}
+
 func TestProjectRuntimeLeaseFencesDifferentTMPDIRs(t *testing.T) {
 	project := discoveryProject(t)
 	t.Setenv("TMPDIR", shortSocketDir(t))

@@ -2,6 +2,7 @@
 # === SLB Hook Integration ===
 # Appended to the generated classifier and AUDIT_REDACTION_PATTERNS by Go.
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -22,6 +23,7 @@ from typing import Optional
 SLB_TIMEOUT = 0.05
 MAX_DISCOVERY_BYTES = 8192
 MAX_UNIX_SOCKET_BYTES = 103
+MAX_LOCAL_ACCOUNT_BYTES = 1024 * 1024
 
 
 # Project discovery and execution use the nearest .slb marker, except slb's
@@ -155,25 +157,181 @@ def _valid_runtime_path(value):
     return not any(unicodedata.category(character) == "Cc" for character in value)
 
 
+def _local_user_private_group(uid, gid, nsswitch, passwd, group):
+    """Recognize an administrator-defined UPG using only local account files.
+
+    NSS providers such as systemd, sss, compat, and ldap can add identities or
+    memberships absent from these files. Ambiguous configuration is not proof
+    that a writable group is private.
+    """
+    whitespace = " \t\r\v\f"
+
+    def lines(text):
+        if "\x00" in text or len(text.encode("utf-8")) > MAX_LOCAL_ACCOUNT_BYTES:
+            raise ValueError("invalid local account data")
+        return [line.strip(whitespace) for line in text.split("\n")
+                if line.strip(whitespace) and not line.lstrip(whitespace).startswith("#")]
+
+    def account_name(name):
+        return (bool(name) and not name.startswith(("+", "-"))
+                and not any(character in whitespace + "\n," for character in name))
+
+    def number(value):
+        if not value or any(character < "0" or character > "9" for character in value):
+            raise ValueError("invalid local account ID")
+        value = value.lstrip("0") or "0"
+        if len(value) > 10:
+            raise ValueError("invalid local account ID")
+        result = int(value)
+        if result > 0xffffffff:
+            raise ValueError("invalid local account ID")
+        return result
+
+    try:
+        sources = {}
+        for line in lines(nsswitch):
+            line = line.split("#", 1)[0].strip(whitespace)
+            end = 0
+            while end < len(line) and line[end] not in whitespace + ":":
+                end += 1
+            name = line[:end]
+            value = line[end:].lstrip(whitespace)
+            if name in ("passwd", "group", "initgroups"):
+                # glibc can interpret colonless rules. Do not ignore a later
+                # malformed protected entry that overrides a files-only rule.
+                if (not value.startswith(":") or name in sources
+                        or value[1:].strip(whitespace) != "files"):
+                    return False
+                sources[name] = "files"
+        if sources.get("passwd") != "files" or sources.get("group") != "files":
+            return False
+
+        users = []
+        names = set()
+        for line in lines(passwd):
+            fields = line.split(":")
+            if len(fields) != 7 or not account_name(fields[0]) or fields[0] in names:
+                return False
+            names.add(fields[0])
+            users.append((fields[0], number(fields[2]), number(fields[3])))
+        matches = [user for user in users if user[1] == uid]
+        if len(matches) != 1 or matches[0][2] != gid:
+            return False
+        username = matches[0][0]
+        if (sum(user[0] == username for user in users) != 1
+                or sum(user[2] == gid for user in users) != 1):
+            return False
+
+        groups = []
+        names = set()
+        for line in lines(group):
+            fields = line.split(":")
+            if len(fields) != 4 or not account_name(fields[0]) or fields[0] in names:
+                return False
+            names.add(fields[0])
+            members = fields[3].split(",") if fields[3] else []
+            if any(not account_name(member) for member in members):
+                return False
+            groups.append((fields[0], number(fields[2]), fields[1], members))
+        matches = [entry for entry in groups if entry[1] == gid]
+        if len(matches) != 1 or matches[0][0] != username:
+            return False
+        _, _, password, members = matches[0]
+        return (sum(entry[0] == username for entry in groups) == 1
+                and (password in ("", "x") or password.startswith(("!", "*")))
+                and all(member == username for member in members))
+    except (ValueError, UnicodeError):
+        return False
+
+
+def _read_local_account_file(path):
+    """Read a bounded, stable, root-owned account file without following links."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0
+                or before.st_mode & 0o022 or not 0 <= before.st_size <= MAX_LOCAL_ACCOUNT_BYTES):
+            raise ValueError("unsafe local account file")
+        encoded = stream.read(MAX_LOCAL_ACCOUNT_BYTES + 1)
+        after = os.fstat(stream.fileno())
+        current = os.lstat(path)
+        attributes = ("st_mode", "st_uid", "st_gid", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if (len(encoded) != before.st_size or len(encoded) > MAX_LOCAL_ACCOUNT_BYTES
+                or not os.path.samestat(before, after)
+                or not os.path.samestat(before, current)
+                or any(getattr(before, name) != getattr(after, name)
+                       or getattr(before, name) != getattr(current, name) for name in attributes)):
+            raise ValueError("local account file changed")
+        text = encoded.decode("utf-8")
+        if "\x00" in text:
+            raise ValueError("invalid local account data")
+        return text
+
+
+def _current_user_private_group(uid, gid):
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        return _local_user_private_group(uid, gid,
+                                         _read_local_account_file("/etc/nsswitch.conf"),
+                                         _read_local_account_file("/etc/passwd"),
+                                         _read_local_account_file("/etc/group"))
+    except (OSError, ValueError, AttributeError, NotImplementedError):
+        return False
+
+
+def _runtime_directory_has_no_acl(path, original):
+    # A group-write mode bit can be an ACL mask granting a named user write
+    # access even when the owning group is private. Do not admit that case.
+    try:
+        os.getxattr(path, "system.posix_acl_access", follow_symlinks=False)
+    except OSError as error:
+        if error.errno not in (errno.ENODATA, errno.ENOTSUP):
+            return False
+    except (AttributeError, NotImplementedError):
+        return False
+    else:
+        return False
+    try:
+        current = os.lstat(path)
+        return (os.path.samestat(original, current) and original.st_mode == current.st_mode
+                and original.st_uid == current.st_uid and original.st_gid == current.st_gid)
+    except OSError:
+        return False
+
+
 def _validate_runtime_parents(directory):
     remaining = [512]
+    uid = os.geteuid()
+    private_group = None
+
     def ancestors(path):
+        nonlocal private_group
         path = os.path.normpath(path)
         while True:
             remaining[0] -= 1
             if remaining[0] < 0:
                 raise _DaemonDiscoveryError("too many runtime ancestors")
             info = os.lstat(path)
-            if info.st_uid not in (0, os.geteuid()):
+            if info.st_uid not in (0, uid):
                 raise _DaemonDiscoveryError("unsafe daemon runtime directory")
             if stat.S_ISLNK(info.st_mode):
                 target = os.readlink(path)
                 if not os.path.isabs(target):
                     target = os.path.join(os.path.dirname(path), target)
                 ancestors(target)
-            elif (not stat.S_ISDIR(info.st_mode)
-                    or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+            elif not stat.S_ISDIR(info.st_mode):
                 raise _DaemonDiscoveryError("unsafe daemon runtime directory")
+            elif info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+                if (info.st_mode & 0o002 or info.st_uid != uid
+                        or not callable(getattr(os, "getegid", None)) or info.st_gid != os.getegid()):
+                    raise _DaemonDiscoveryError("unsafe daemon runtime directory")
+                if private_group is None:
+                    # Cache only during this walk; later queries must observe
+                    # account membership or NSS configuration changes.
+                    private_group = _current_user_private_group(uid, os.getegid())
+                if not private_group or not _runtime_directory_has_no_acl(path, info):
+                    raise _DaemonDiscoveryError("unsafe daemon runtime directory")
             parent = os.path.dirname(path)
             if parent == path:
                 return
