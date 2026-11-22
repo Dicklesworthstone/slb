@@ -179,6 +179,117 @@ func TestExecutionFeedsUnknownProgramsAreAtLeastCaution(t *testing.T) {
 	}
 }
 
+func TestExecutionFeedsExplicitCodeLoadingInputs(t *testing.T) {
+	engine := NewPatternEngine()
+	cwd := t.TempDir()
+	marker := filepath.Join(cwd, "executed")
+	startup := filepath.Join(cwd, "startup.sh")
+	if err := os.WriteFile(startup, []byte("printf executed > "+shellQuote(marker)+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range []string{
+		"BASH_ENV=" + shellQuote(startup) + " bash -c 'git stash'",
+		`ENV=/tmp/startup sh -ic 'git stash'`,
+		`ZDOTDIR=/tmp/startup zsh -c 'git stash'`,
+		`ZDOTDIR= zsh -c 'git stash'`,
+		`env ZDOTDIR= zsh -c 'git stash'`,
+		`export 'ZDOTDIR='; zsh -c 'git stash'`,
+		`LD_PRELOAD=/tmp/plugin.so git stash`,
+		`LD_AUDIT=/tmp/plugin.so git stash`,
+		`LD_LIBRARY_PATH=/tmp/libraries git stash`,
+		`LD_LIBRARY_PATH=: git stash`,
+		`DYLD_INSERT_LIBRARIES=/tmp/plugin.dylib git stash`,
+		`DYLD_LIBRARY_PATH=/tmp/libraries git stash`,
+		`DYLD_LIBRARY_PATH= git stash`,
+		`env DYLD_LIBRARY_PATH='' git stash`,
+		`export DYLD_LIBRARY_PATH=; git stash`,
+		`env LD_PRELOAD=/tmp/plugin.so git stash`,
+		`env -i BASH_ENV=/tmp/startup /bin/bash -c 'git stash'`,
+		`/usr/bin/env -u OTHER LD_PRELOAD=/tmp/plugin.so git stash`,
+		`sudo BASH_ENV=/tmp/startup bash -c 'git stash'`,
+		`timeout 2 env LD_PRELOAD=/tmp/plugin.so git stash`,
+		`LD_PRELOAD="$LIBRARY" git stash`,
+		`env LD_PRELOAD="$LIBRARY" git stash`,
+		`export BASH_ENV=/tmp/startup; bash -c 'git stash'`,
+		`export "BASH_ENV=/tmp/startup"; bash -c 'git stash'`,
+		`builtin export BASH_ENV=/tmp/startup; bash -c 'git stash'`,
+		`command export "LD_PRELOAD=$LIBRARY"; git stash`,
+		`export "BASH_ENV+=/tmp/startup"; bash -c 'git stash'`,
+		`BASH_ENV=/tmp/startup; export BASH_ENV; bash -c 'git stash'`,
+		`BASH_ENV+=/tmp/startup bash -c 'git stash'`,
+		`bash --rcfile /tmp/startup -ic 'git stash'`,
+		`bash --init-file /tmp/startup -ic 'git stash'`,
+		`bash --rcfile "$STARTUP" -ic 'git stash'`,
+		`sh -c 'env LD_PRELOAD=/tmp/plugin.so git stash'`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			got := engine.ClassifyCommand(command, cwd)
+			if got.Tier != RiskTierCaution || !got.Opaque || !got.NeedsApproval || got.IsSafe {
+				t.Fatalf("explicit code loader borrowed SAFE classification: %#v", got)
+			}
+		})
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("classification executed the supplied startup file: %v", err)
+	}
+}
+
+func TestExecutionFeedsCodeLoadingInputsPreserveStrongerRisk(t *testing.T) {
+	engine := NewPatternEngine()
+	cwd := t.TempDir()
+	for command, tier := range map[string]RiskTier{
+		`BASH_ENV=/tmp/startup bash -c 'git reset --hard'`:      RiskTierDangerous,
+		`env LD_PRELOAD=/tmp/plugin.so git push --force origin`: RiskTierCritical,
+		`bash --rcfile /tmp/startup -ic 'git push --force'`:     RiskTierCritical,
+		`export LD_AUDIT=/tmp/plugin.so; git reset --hard`:      RiskTierDangerous,
+	} {
+		t.Run(command, func(t *testing.T) {
+			got := engine.ClassifyCommand(command, cwd)
+			if got.Tier != tier || !got.Opaque || !got.NeedsApproval || got.IsSafe {
+				t.Fatalf("explicit code loader lost the visible payload's %s risk: %#v", tier, got)
+			}
+		})
+	}
+}
+
+func TestExecutionFeedsCodeLoadingSyntaxKeepsDataInert(t *testing.T) {
+	engine := NewPatternEngine()
+	cwd := t.TempDir()
+	for _, command := range []string{
+		`echo BASH_ENV=/tmp/startup`,
+		`printf '%s\n' 'LD_PRELOAD=/tmp/plugin.so'`,
+		`echo --rcfile /tmp/startup`,
+		`git stash --message BASH_ENV=/tmp/startup`,
+		`env -u BASH_ENV git stash`,
+		`env --unset LD_PRELOAD git stash`,
+		`env -C LD_PRELOAD=some-directory git stash`,
+		`sudo -p LD_PRELOAD=/tmp/plugin.so git stash`,
+		`BASH_ENV= bash -c 'git stash'`,
+		`BASH_ENV='' bash -c 'git stash'`,
+		`BASH_ENV="" bash -c 'git stash'`,
+		`env LD_PRELOAD= git stash`,
+		`LD_LIBRARY_PATH= git stash`,
+		`env LD_LIBRARY_PATH='' git stash`,
+		`export BASH_ENV=; bash -c 'git stash'`,
+		`export 'BASH_ENV='; bash -c 'git stash'`,
+		`builtin export BASH_ENV=; bash -c 'git stash'`,
+		`BASH_ENV=; export BASH_ENV; bash -c 'git stash'`,
+		`unset BASH_ENV; git stash`,
+		`bash --norc --noprofile -c 'git stash'`,
+		`bash -c 'git stash' --rcfile /tmp/startup`,
+		`bash script.sh --rcfile /tmp/startup`,
+		`FOO=/tmp/startup bash -c 'git stash'`,
+		`bash_env=/tmp/startup bash -c 'git stash'`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			got := engine.ClassifyCommand(command, cwd)
+			if got.Opaque || got.NeedsApproval {
+				t.Fatalf("inert data, a reset, or an ordinary variable became executable input: %#v", got)
+			}
+		})
+	}
+}
+
 // Ordinary commands must not change: data consumers of here-strings/pipes,
 // literal command words, scripts from files, inline -c/-e code and plain
 // variable use in arguments.

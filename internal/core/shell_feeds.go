@@ -20,6 +20,8 @@ import (
 //     classified recursively, anything else is opaque;
 //   - a shell -c operand or eval argument built by expansion
 //     (`sh -c "$(printf ...)"`): classified when statically known, else opaque.
+//   - an explicit startup file or library-loading environment assignment:
+//     its code is not visible in a literal shell body or command name.
 //   - a file-writing redirection, including one attached to a simple command:
 //     `git stash > important.sql` truncates the file before git even starts.
 //
@@ -30,6 +32,18 @@ import (
 const maxStaticPayload = 1 << 20
 
 var stdinShells = map[string]bool{"sh": true, "bash": true, "dash": true, "zsh": true, "ksh": true, "mksh": true, "ash": true}
+
+// These explicit inputs select startup code or shared libraries. Classifying
+// the visible command cannot establish that their contents are safe. Only
+// assignment positions are inspected; an ordinary argument naming one of
+// these variables is data. ZDOTDIR's empty directory still selects startup
+// files at the filesystem root. An empty DYLD_LIBRARY_PATH also stays opaque:
+// do not assume that an empty dyld search path disables library selection.
+var codeLoadingEnvironment = map[string]bool{
+	"BASH_ENV": true, "ENV": true, "ZDOTDIR": true,
+	"LD_PRELOAD": true, "LD_AUDIT": true, "LD_LIBRARY_PATH": true,
+	"DYLD_INSERT_LIBRARIES": true, "DYLD_LIBRARY_PATH": true,
+}
 
 // Interpreters that read a program from stdin when given no script operand
 // (or "-"), mapped to the options that instead take inline code or a module.
@@ -203,8 +217,67 @@ func (a *feedAnalysis) visitNested(node syntax.Node, feed *stdinFeed) {
 			a.visitStmt(stmt, feed)
 			return false
 		}
+		if assign, ok := child.(*syntax.Assign); ok {
+			a.checkCodeLoadingAssignment(assign)
+		}
 		return true
 	})
+}
+
+func codeLoadingAssignment(text string) bool {
+	name, value, assigned := strings.Cut(text, "=")
+	name = strings.TrimSuffix(name, "+")
+	return assigned && codeLoadingEnvironment[name] && (value != "" || name == "ZDOTDIR" || name == "DYLD_LIBRARY_PATH")
+}
+
+// Assign nodes include prefix assignments, standalone assignments, and
+// declaration operands such as export NAME=value. Quoted declaration operands
+// have no Name; their value is still interpreted as an assignment by the shell.
+func (a *feedAnalysis) checkCodeLoadingAssignment(assign *syntax.Assign) {
+	if assign.Name == nil {
+		a.opaque = a.opaque || codeLoadingAssignment(a.markedWordText(assign.Value))
+		return
+	}
+	if !codeLoadingEnvironment[assign.Name.Value] || assign.Naked {
+		return
+	}
+	if assign.Array != nil || assign.Name.Value == "ZDOTDIR" || assign.Name.Value == "DYLD_LIBRARY_PATH" {
+		a.opaque = true
+		return
+	}
+	if assign.Value != nil {
+		value, _, literal := a.staticWord(assign.Value)
+		a.opaque = a.opaque || !literal || value != ""
+	}
+}
+
+// Wrapper assignments are argv rather than Assign nodes. Walk only the prefix
+// consumed by recognized wrappers, using their option arities so a prompt,
+// directory, or unset operand containing NAME=value does not become code.
+func (a *feedAnalysis) checkCodeLoadingEnvironment(tokens []string) {
+	for depth := 0; len(tokens) > 0 && depth < maxCommandNesting; depth++ {
+		if isEnvAssignment(tokens[0]) {
+			a.opaque = a.opaque || codeLoadingAssignment(tokens[0])
+			tokens = tokens[1:]
+			continue
+		}
+		name := filepath.Base(tokens[0])
+		spec, wrapped := executionWrappers[name]
+		if !wrapped || (name == "command" && len(tokens) > 1 && (tokens[1] == "-v" || tokens[1] == "-V")) {
+			return
+		}
+		start, valid := wrapperCommandStart(tokens, spec)
+		if !valid {
+			return
+		}
+		if name == "timeout" {
+			start++
+		}
+		if start >= len(tokens) {
+			return
+		}
+		tokens = tokens[start:]
+	}
 }
 
 // staticWord returns a word's value when it is provably literal, resolving
@@ -380,6 +453,7 @@ func (a *feedAnalysis) checkCall(call *syntax.CallExpr, feed *stdinFeed) {
 		a.addPayload(expanded)
 	}
 
+	a.checkCodeLoadingEnvironment(tokens)
 	rest, _, _ := unwrapCommandTokens(tokens)
 	if len(rest) == 0 {
 		return
@@ -392,6 +466,12 @@ func (a *feedAnalysis) checkCall(call *syntax.CallExpr, feed *stdinFeed) {
 	name := filepath.Base(rest[0])
 	args := call.Args[offset:]
 	switch {
+	case declBuiltins[name]:
+		// A declaration behind command/builtin wrappers is parsed as argv,
+		// so its assignment operands do not have Assign nodes.
+		for _, word := range args[1:] {
+			a.opaque = a.opaque || codeLoadingAssignment(a.markedWordText(word))
+		}
 	case name == "eval":
 		// eval parses its expanded arguments as code: an unknown value is
 		// unknown code.
@@ -469,7 +549,12 @@ func (a *feedAnalysis) checkShell(tokens []string, words []*syntax.Word, feed *s
 			}
 			return // script file operand: its contents are not visible here
 		}
-		if arg == "-o" || arg == "-O" || arg == "+o" || arg == "+O" || arg == "--rcfile" || arg == "--init-file" {
+		if arg == "--rcfile" || arg == "--init-file" {
+			a.opaque = true // startup code runs in addition to the visible body
+			i++
+			continue
+		}
+		if arg == "-o" || arg == "-O" || arg == "+o" || arg == "+O" {
 			i++
 			continue
 		}
