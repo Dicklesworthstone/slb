@@ -932,6 +932,47 @@ func TestProjectIPCClientDoesNotFallbackFromInvalidOrMissingEndpoint(t *testing.
 	}
 }
 
+func TestProjectIPCClientClassifiesInvalidEndpointBeforeDial(t *testing.T) {
+	t.Setenv("SLB_HOST", "")
+	// These filesystem fixtures need no listener. A rejected endpoint is an
+	// invalid discovery boundary, not an ordinarily unavailable daemon; native
+	// hooks use that distinction in both their explanation and audit record.
+	for _, kind := range []string{"regular_file", "directory", "symlink", "fifo"} {
+		t.Run(kind, func(t *testing.T) {
+			project := discoveryProject(t)
+			socket := filepath.Join(shortSocketDir(t), "daemon.sock")
+			var err error
+			switch kind {
+			case "regular_file":
+				err = os.WriteFile(socket, []byte("not a socket"), 0600)
+			case "directory":
+				err = os.Mkdir(socket, 0700)
+			case "symlink":
+				err = os.Symlink("absent-target.sock", socket)
+			case "fifo":
+				err = syscall.Mkfifo(socket, 0600)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeDiscoveryFixture(t, project, discoveryFixture(project, socket))
+			if paths, err := DiscoverRuntime(project); err != nil || paths.SocketPath != socket {
+				t.Fatalf("fixture must advertise its endpoint through valid discovery: %+v, %v", paths, err)
+			}
+			client := NewProjectIPCClient(project)
+			defer func() { _ = client.Close() }()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := client.Ping(ctx); !errors.Is(err, ErrDiscoveryInvalid) {
+				t.Fatalf("unsafe %s endpoint must report invalid discovery: %v", kind, err)
+			}
+			if client.SocketPath() != socket {
+				t.Fatalf("selected endpoint changed after rejection: %q, want %q", client.SocketPath(), socket)
+			}
+		})
+	}
+}
+
 func TestProjectIPCClientRejectsUnsafeSocketBeforeDial(t *testing.T) {
 	t.Setenv("SLB_HOST", "")
 	for _, kind := range []string{"symlink", "public_socket", "writable_parent", "foreign_owner"} {
@@ -963,8 +1004,8 @@ func TestProjectIPCClientRejectsUnsafeSocketBeforeDial(t *testing.T) {
 			defer func() { _ = client.Close() }()
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			if err := client.Ping(ctx); err == nil {
-				t.Fatal("unsafe socket accepted")
+			if err := client.Ping(ctx); !errors.Is(err, ErrDiscoveryInvalid) {
+				t.Fatalf("unsafe socket must report invalid discovery: %v", err)
 			}
 			probe.stop()
 			if probe.accepted != 0 {
@@ -987,8 +1028,8 @@ func TestDiscoverRuntimeMissingSocketRetainsDiagnosticPath(t *testing.T) {
 	defer func() { _ = client.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := client.Ping(ctx); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("missing socket should fail before dialing: %v", err)
+	if err := client.Ping(ctx); !errors.Is(err, os.ErrNotExist) || errors.Is(err, ErrDiscoveryInvalid) {
+		t.Fatalf("missing socket should remain unavailable without dialing: %v", err)
 	}
 	if client.SocketPath() != socket {
 		t.Fatalf("diagnostic path = %q, want %q", client.SocketPath(), socket)

@@ -148,7 +148,14 @@ func (c *IPCClient) connect(ctx context.Context) error {
 		var err error
 		socketInfo, err = validateRuntimeSocket(address)
 		if err != nil {
-			return fmt.Errorf("validating daemon socket: %w", err)
+			// An absent endpoint is ordinary unavailability. An endpoint or
+			// ancestor that fails its trust checks is invalid discovery, just
+			// like a rejected record or peer identity. Keep this distinction
+			// available to native hook diagnostics and audit records.
+			if errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("validating daemon socket: %w", err)
+			}
+			return fmt.Errorf("%w: validating daemon socket: %w", ErrDiscoveryInvalid, err)
 		}
 	}
 	var dialer net.Dialer
