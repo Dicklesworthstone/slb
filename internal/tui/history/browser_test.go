@@ -311,13 +311,14 @@ func TestBrowserModelUpdateKeyClearSearchWhenEmpty(t *testing.T) {
 	m := New("")
 	m.searchQuery = ""
 
-	backCalled := false
-	m.OnBack = func() { backCalled = true }
+	m.OnBack = func() tea.Cmd {
+		return func() tea.Msg { return "back" }
+	}
 
-	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 
-	if !backCalled {
-		t.Error("OnBack should be called when search is empty")
+	if cmd == nil || cmd() != "back" {
+		t.Error("OnBack command should be returned when search is empty")
 	}
 }
 
@@ -387,20 +388,17 @@ func TestBrowserModelUpdateKeySelect(t *testing.T) {
 	m.rows = []HistoryRow{{ID: "REQ-123"}}
 	m.selectedIdx = 0
 
-	selectCalled := false
-	selectedID := ""
-	m.OnSelect = func(id string) {
-		selectCalled = true
-		selectedID = id
+	m.OnSelect = func(id string) tea.Cmd {
+		return func() tea.Msg { return id }
 	}
 
-	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 
-	if !selectCalled {
-		t.Error("OnSelect should be called")
+	if cmd == nil {
+		t.Fatal("OnSelect command should be returned")
 	}
-	if selectedID != "REQ-123" {
-		t.Errorf("expected selectedID 'REQ-123', got %q", selectedID)
+	if selectedID := cmd(); selectedID != "REQ-123" {
+		t.Errorf("expected selectedID 'REQ-123', got %v", selectedID)
 	}
 }
 
@@ -409,7 +407,10 @@ func TestBrowserModelUpdateKeySelectEmptyRows(t *testing.T) {
 	m.rows = nil
 
 	selectCalled := false
-	m.OnSelect = func(id string) { selectCalled = true }
+	m.OnSelect = func(id string) tea.Cmd {
+		selectCalled = true
+		return nil
+	}
 
 	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 

@@ -115,6 +115,7 @@ type Model struct {
 
 	// Navigation state
 	selectedRequestID     string
+	detailReturnView      View
 	detailGeneration      uint64
 	detailRefreshToken    uint64
 	detailRevision        uint64
@@ -201,6 +202,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// History owns its search and back keys. Esc cancels an edit or clears
+		// the current query before it navigates away; b and q can be search text.
+		if m.view == ViewHistory {
+			return m.forwardUpdate(msg)
+		}
 		// Form input owns ALL keys until submission/cancellation. In particular,
 		// typing 'b' in a reason is not global navigation and Esc cancels the
 		// form before it leaves the detail view.
@@ -227,9 +233,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		if m.view == ViewHistory || m.view == ViewPatterns || m.view == ViewRequestDetail {
+		if m.view == ViewPatterns || m.view == ViewRequestDetail {
 			switch msg.String() {
 			case "esc", "b":
+				if m.view == ViewRequestDetail {
+					return m.handleNavigation(navigateMsg{view: m.detailReturnView})
+				}
 				return m.handleNavigation(navigateMsg{view: ViewDashboard})
 			}
 		}
@@ -287,6 +296,7 @@ func (m Model) forwardUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 // handleNavigation handles view navigation. New views inherit the last known
 // terminal size rather than waiting until the terminal is resized again.
 func (m Model) handleNavigation(nav navigateMsg) (tea.Model, tea.Cmd) {
+	previousView := m.view
 	m.navigationError = ""
 	m.detailGeneration++
 	m.detailRefreshInFlight = false
@@ -301,6 +311,12 @@ func (m Model) handleNavigation(nav navigateMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(sizeCmd, m.dashboard.Init())
 
 	case ViewRequestDetail:
+		if previousView != ViewRequestDetail {
+			m.detailReturnView = ViewDashboard
+			if previousView == ViewHistory {
+				m.detailReturnView = ViewHistory
+			}
+		}
 		if nav.requestID != "" {
 			m.selectedRequestID = nav.requestID
 			detail := m.loadRequestDetail(nav.requestID)
@@ -312,11 +328,15 @@ func (m Model) handleNavigation(nav navigateMsg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(sizeCmd, m.detail.Init(), refresh)
 			}
 		}
-		m.view = ViewDashboard
+		m.view = m.detailReturnView
 		return m, nil
 
 	case ViewHistory:
-		m.history = history.New(m.options.ProjectPath).WithDatabasePath(m.options.DatabasePath)
+		// Returning from a request retains the browser's query, filters, page,
+		// and selected row. Reload its data without replacing that view state.
+		if previousView != ViewRequestDetail || m.detailReturnView != ViewHistory {
+			m.history = history.New(m.options.ProjectPath).WithDatabasePath(m.options.DatabasePath)
+		}
 		m.setupHistoryCallbacks()
 		m, sizeCmd := m.seedViewSize()
 		return m, tea.Batch(sizeCmd, m.history.Init())
@@ -358,8 +378,9 @@ func (m *Model) setupDetailCallbacks() {
 	if m.detail == nil {
 		return
 	}
+	returnView := m.detailReturnView
 	m.detail.OnBack = func() tea.Cmd {
-		return func() tea.Msg { return navigateMsg{view: ViewDashboard} }
+		return func() tea.Msg { return navigateMsg{view: returnView} }
 	}
 	// Snapshot the model values used to build a submission. The returned
 	// workers capture only options/command identity, never the mutable model.
@@ -373,8 +394,12 @@ func (m *Model) setupDetailCallbacks() {
 
 // setupHistoryCallbacks wires up history browser callbacks.
 func (m *Model) setupHistoryCallbacks() {
-	m.history.OnBack = func() {}
-	m.history.OnSelect = func(requestID string) {}
+	m.history.OnBack = func() tea.Cmd {
+		return func() tea.Msg { return navigateMsg{view: ViewDashboard} }
+	}
+	m.history.OnSelect = func(requestID string) tea.Cmd {
+		return func() tea.Msg { return navigateMsg{view: ViewRequestDetail, requestID: requestID} }
+	}
 }
 
 // setupPatternsCallbacks wires up patterns view callbacks.

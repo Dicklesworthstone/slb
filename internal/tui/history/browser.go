@@ -63,8 +63,8 @@ func DefaultBrowserKeyMap() BrowserKeyMap {
 			key.WithHelp("enter", "view"),
 		),
 		Back: key.NewBinding(
-			key.WithKeys("esc", "q"),
-			key.WithHelp("esc", "back"),
+			key.WithKeys("esc", "b", "q"),
+			key.WithHelp("esc/b/q", "back"),
 		),
 		Quit: key.NewBinding(
 			key.WithKeys("ctrl+c"),
@@ -135,8 +135,8 @@ type Model struct {
 	filters Filters
 
 	// Callbacks
-	OnBack   func()
-	OnSelect func(requestID string)
+	OnBack   func() tea.Cmd
+	OnSelect func(requestID string) tea.Cmd
 
 	// Error state
 	lastErr     error
@@ -227,12 +227,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				m.searchQuery = m.searchInput.Value()
 				m.searching = false
+				m.searchInput.Blur()
 				m.page = 0
 				m.selectedIdx = 0
 				return m, loadDataCmd(m.projectPath, m.databasePath, m.searchQuery, m.filters, m.page)
 			case "esc":
 				m.searching = false
 				m.searchInput.SetValue(m.searchQuery)
+				m.searchInput.Blur()
 				return m, nil
 			default:
 				var cmd tea.Cmd
@@ -258,7 +260,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, loadDataCmd(m.projectPath, m.databasePath, m.searchQuery, m.filters, m.page)
 			}
 			if m.OnBack != nil {
-				m.OnBack()
+				return m, m.OnBack()
+			}
+			return m, nil
+
+		case key.Matches(msg, m.keyMap.Back):
+			if m.OnBack != nil {
+				return m, m.OnBack()
 			}
 			return m, nil
 
@@ -296,7 +304,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, m.keyMap.Select):
 			if len(m.rows) > 0 && m.selectedIdx < len(m.rows) {
 				if m.OnSelect != nil {
-					m.OnSelect(m.rows[m.selectedIdx].ID)
+					return m, m.OnSelect(m.rows[m.selectedIdx].ID)
 				}
 			}
 			return m, nil
@@ -470,7 +478,7 @@ func (m Model) renderFooter() string {
 		"[s] status",
 		"[←→] page",
 		"[enter] view",
-		"[esc] back",
+		"[esc] clear/back",
 	}
 	hint := lipgloss.NewStyle().
 		Foreground(th.Subtext).

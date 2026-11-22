@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -142,8 +143,8 @@ func TestNavigateBackFromHistory(t *testing.T) {
 	m.view = ViewHistory
 
 	// Simulate 'b' key press to navigate back
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
-	um := updated.(Model)
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	um := runCmdInto(t, updated.(Model), cmd)
 	if um.view != ViewDashboard {
 		t.Errorf("expected view to be ViewDashboard, got %d", um.view)
 	}
@@ -342,8 +343,8 @@ func TestNavigateBackFromHistoryEsc(t *testing.T) {
 	m.view = ViewHistory
 
 	// Simulate 'esc' key press to navigate back
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	um := updated.(Model)
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	um := runCmdInto(t, updated.(Model), cmd)
 	if um.view != ViewDashboard {
 		t.Errorf("expected view to be ViewDashboard, got %d", um.view)
 	}
@@ -787,8 +788,8 @@ func TestNavigationSeedsSizeIntoHistoryAndPatterns(t *testing.T) {
 		t.Error("history view created on navigation is stuck at Loading...")
 	}
 
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	m = updated.(Model)
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = runCmdInto(t, updated.(Model), cmd)
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
 	m = updated.(Model)
 	if m.view != ViewPatterns {
@@ -809,5 +810,172 @@ func TestNavigationWithoutKnownSizeDoesNotPanic(t *testing.T) {
 	}
 	if um.history.View() == "" {
 		t.Error("history view should still render something")
+	}
+}
+
+func TestHistoryNavigationOpensSelectedRequestAndReturnsToResults(t *testing.T) {
+	fallback, target, _, opts := interactiveReviewFixture(t, 1, db.ApprovalPolicySameHost)
+	selected, err := db.OpenAndMigrate(filepath.Join(t.TempDir(), "history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = selected.Close() })
+	author, err := fallback.GetSession(target.RequestorSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := selected.CreateSession(author); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 25; i++ {
+		row := *target
+		row.ID = fmt.Sprintf("history-%02d", i)
+		row.Command = db.CommandSpec{Raw: fmt.Sprintf("echo navigation %02d", i), Cwd: opts.ProjectPath, Shell: true}
+		row.Status = db.StatusCancelled
+		row.Justification.Reason = "Historical request from the selected database"
+		if err := selected.CreateRequest(&row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	opts.DatabasePath = selected.Path()
+	m := NewWithOptions(opts)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = updated.(Model)
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'H'}})
+	m = runCmdInto(t, updated.(Model), cmd)
+
+	// Search, filter, paginate, then select a noninitial row through the same
+	// key messages the terminal sends. None of this reaches into browser state.
+	for _, key := range []tea.KeyMsg{
+		{Type: tea.KeyRunes, Runes: []rune{'/'}},
+		{Type: tea.KeyRunes, Runes: []rune("navigation")},
+	} {
+		updated, _ = m.Update(key)
+		m = updated.(Model)
+	}
+	for _, key := range []tea.KeyMsg{
+		{Type: tea.KeyEnter},
+		{Type: tea.KeyRunes, Runes: []rune{'t'}},
+		{Type: tea.KeyRunes, Runes: []rune{'t'}},
+		{Type: tea.KeyRight},
+		{Type: tea.KeyDown},
+	} {
+		updated, cmd = m.Update(key)
+		m = runCmdInto(t, updated.(Model), cmd)
+	}
+	before := m.View()
+	if !strings.Contains(before, "Page 2/2") || !strings.Contains(before, string(db.RiskTierDangerous)) || !strings.Contains(before, "navigation") {
+		t.Fatalf("history fixture did not reach the requested results: %s", before)
+	}
+	updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = runCmdInto(t, updated.(Model), cmd)
+	if m.view != ViewRequestDetail || m.detail == nil || m.detail.Request == nil {
+		t.Fatalf("Enter on a historical request did not open details: view=%d", m.view)
+	}
+	openedID := m.detail.Request.ID
+	if m.detail.Request.Status != db.StatusCancelled || m.detail.Request.ProjectPath != opts.ProjectPath ||
+		m.detail.Request.Justification.Reason != "Historical request from the selected database" ||
+		m.options.DatabasePath != selected.Path() {
+		t.Fatalf("history detail lost its selected request/store/project: %+v", m.detail.Request)
+	}
+	if m.detail.Width != 120 || m.detail.Height != 40 || strings.Contains(m.View(), "Loading...") {
+		t.Fatal("history detail was not rendered at the existing terminal size")
+	}
+	// Both global back keys and the detail view's callback must return to the
+	// same history results. Reopening must retain the selected row as well.
+	for _, key := range []tea.KeyMsg{
+		{Type: tea.KeyEsc},
+		{Type: tea.KeyRunes, Runes: []rune{'b'}},
+		{Type: tea.KeyRunes, Runes: []rune{'q'}},
+	} {
+		updated, cmd = m.Update(key)
+		m = runCmdInto(t, updated.(Model), cmd)
+		if m.view != ViewHistory || m.View() != before {
+			t.Fatalf("%s did not restore the same history results: view=%d\n%s", key.String(), m.view, m.View())
+		}
+		updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m = runCmdInto(t, updated.(Model), cmd)
+		if m.view != ViewRequestDetail || m.detail == nil || m.detail.Request.ID != openedID {
+			t.Fatalf("returning to history lost the selected request: view=%d", m.view)
+		}
+	}
+	if unchanged, err := fallback.GetRequest(target.ID); err != nil || unchanged.Status != db.StatusPending {
+		t.Fatalf("history navigation changed the default database: %+v %v", unchanged, err)
+	}
+}
+
+func TestHistorySearchOwnsNavigationKeys(t *testing.T) {
+	for _, query := range []string{"b", "q"} {
+		t.Run(query, func(t *testing.T) {
+			project, _ := newNavTestProject(t)
+			m := NewWithOptions(Options{ProjectPath: project})
+			updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+			m = updated.(Model)
+			updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'H'}})
+			m = runCmdInto(t, updated.(Model), cmd)
+			before := m.View()
+
+			// Esc first cancels the edit. It must not navigate away, and the
+			// ordinary back keys are searchable text while the input is focused.
+			for _, key := range []tea.KeyMsg{
+				{Type: tea.KeyRunes, Runes: []rune{'/'}},
+				{Type: tea.KeyRunes, Runes: []rune(query)},
+				{Type: tea.KeyEsc},
+			} {
+				updated, _ = m.Update(key)
+				m = updated.(Model)
+				if m.view != ViewHistory {
+					t.Fatalf("history search lost focus on %q: view=%d", key.String(), m.view)
+				}
+			}
+			if m.View() != before {
+				t.Fatalf("cancelling history search changed its results: %s", m.View())
+			}
+			for _, key := range []tea.KeyMsg{
+				{Type: tea.KeyRunes, Runes: []rune{'/'}},
+				{Type: tea.KeyRunes, Runes: []rune(query)},
+			} {
+				updated, _ = m.Update(key)
+				m = updated.(Model)
+			}
+			updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			m = runCmdInto(t, updated.(Model), cmd)
+			if m.view != ViewHistory || !strings.Contains(m.View(), "No results for \""+query+"\"") {
+				t.Fatalf("submitting history search did not keep the typed query: %s", m.View())
+			}
+			updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			m = runCmdInto(t, updated.(Model), cmd)
+			if m.view != ViewHistory || m.detail != nil {
+				t.Fatal("Enter on empty search results opened a stale request")
+			}
+			updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			m = runCmdInto(t, updated.(Model), cmd)
+			if m.view != ViewHistory || m.View() != before {
+				t.Fatalf("Esc did not clear the query before navigation: view=%d\n%s", m.view, m.View())
+			}
+			updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			m = runCmdInto(t, updated.(Model), cmd)
+			if m.view != ViewDashboard {
+				t.Fatalf("Esc with no active search did not go back: view=%d", m.view)
+			}
+		})
+	}
+}
+
+func TestHistoryNavigationBackKeys(t *testing.T) {
+	for _, key := range []tea.KeyMsg{
+		{Type: tea.KeyEsc},
+		{Type: tea.KeyRunes, Runes: []rune{'b'}},
+		{Type: tea.KeyRunes, Runes: []rune{'q'}},
+	} {
+		t.Run(key.String(), func(t *testing.T) {
+			m := New()
+			m.view = ViewHistory
+			updated, cmd := m.Update(key)
+			m = runCmdInto(t, updated.(Model), cmd)
+			if m.view != ViewDashboard {
+				t.Fatalf("%s did not leave history: view=%d", key.String(), m.view)
+			}
+		})
 	}
 }
