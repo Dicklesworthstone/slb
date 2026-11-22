@@ -217,6 +217,11 @@ func TestGitGlobalOptionsPreserveCommandSpecification(t *testing.T) {
 
 func TestGitGlobalOptionsRetainCustomRiskPolicies(t *testing.T) {
 	engine := NewPatternEngine()
+	// Git's pre-existing original-option protection ignores an overlapping
+	// SAFE rule. Generalizing those views to cloud commands must preserve it.
+	if err := engine.AddPattern(RiskTier(RiskSafe), `^git\s+-C\s+/production\b`, "overlapping allowlist", "test"); err != nil {
+		t.Fatal(err)
+	}
 	pattern := `^git\s+-C\s+/production\s+stash$`
 	if err := engine.AddPattern(RiskTierCritical, pattern, "production repository requires review", "test"); err != nil {
 		t.Fatal(err)
@@ -241,7 +246,7 @@ func TestGitGlobalOptionsRetainCustomRiskPolicies(t *testing.T) {
 	}
 	normalized := NormalizeCommand(`git -C /production stash`)
 	if normalized.IsCompound || !reflect.DeepEqual(normalized.Segments, []string{"git stash"}) ||
-		!reflect.DeepEqual(normalized.OriginalGitSegments, []string{"git -C /production stash"}) {
+		!reflect.DeepEqual(normalized.OriginalOptionSegments, []string{"git -C /production stash"}) {
 		t.Fatalf("original policy view became another executed command: %+v", normalized)
 	}
 }

@@ -249,6 +249,9 @@ print(json.dumps([{'tier': classify(command)[0], 'needs_approval': needs_approva
 func TestExportClaudeHook_GitOptionsPreserveProjectRisk(t *testing.T) {
 	python := findPython3(t)
 	engine := NewPatternEngine()
+	if err := engine.AddPattern(RiskTier(RiskSafe), `^git\s+-C\s+/production\b`, "overlapping allowlist", "test"); err != nil {
+		t.Fatal(err)
+	}
 	if err := engine.AddPattern(RiskTierCritical, `^git\s+-C\s+/production(?:\s|$)`, "protect production repository", "test"); err != nil {
 		t.Fatal(err)
 	}

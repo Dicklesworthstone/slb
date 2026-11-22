@@ -31,6 +31,7 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 	// Each redirection's statement, so a here-string can be judged by the
 	// command that consumes it.
 	redirectOwner := map[*syntax.Redirect]*syntax.Stmt{}
+	callOwner := map[*syntax.CallExpr]*syntax.Stmt{}
 	var stack []bool
 	nesting := depth
 	hasControlFlow := false
@@ -47,6 +48,9 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 		case *syntax.Stmt:
 			// Negation changes an exit status, not the effects of the command.
 			hasControlFlow = hasControlFlow || node.Negated
+			if call, ok := node.Cmd.(*syntax.CallExpr); ok {
+				callOwner[call] = node
+			}
 			for _, redirect := range node.Redirs {
 				redirectOwner[redirect] = node
 			}
@@ -94,11 +98,61 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 		return nil, false
 	}
 	literals := collectLiteralVariables(file, raw)
+	callText := func(call *syntax.CallExpr) (string, bool) {
+		var words []string
+		valid := true
+		for _, assign := range call.Assigns {
+			text, ok := caseNodeText(raw, assign, literals)
+			valid = valid && ok
+			words = append(words, text)
+		}
+		for _, arg := range call.Args {
+			text, ok := caseNodeText(raw, arg, literals)
+			valid = valid && ok
+			words = append(words, text)
+		}
+		return strings.Join(words, " "), valid
+	}
+	// CallExpr words exclude redirections. Reattach owned cloud here-strings
+	// before recursive normalization, which keeps real argv and input policy
+	// views separate. Precompute ownership so handling does not depend on the
+	// AST walk visiting the call before its redirects.
+	cloudInputCalls := map[*syntax.CallExpr]string{}
+	cloudHereStrings := map[*syntax.Redirect]bool{}
+	for call, stmt := range callOwner {
+		var redirects []*syntax.Redirect
+		for _, redirect := range stmt.Redirs {
+			if redirect.Op == syntax.WordHdoc {
+				redirects = append(redirects, redirect)
+			}
+		}
+		if len(redirects) == 0 {
+			continue
+		}
+		command, valid := callText(call)
+		if !valid || !isCloudCommandArgv(command) {
+			continue
+		}
+		parts := []string{command}
+		for _, redirect := range redirects {
+			text, ok := caseNodeText(raw, redirect, literals)
+			valid = valid && ok
+			parts = append(parts, text)
+		}
+		if !valid {
+			result.ParseError = true
+			continue
+		}
+		cloudInputCalls[call] = strings.Join(parts, " ")
+		for _, redirect := range redirects {
+			cloudHereStrings[redirect] = true
+		}
+	}
 
 	appendCommand := func(command string, executable bool) {
 		inner := normalizeCommandDepth(command, depth+1)
 		result.Segments = append(result.Segments, inner.Segments...)
-		result.OriginalGitSegments = append(result.OriginalGitSegments, inner.OriginalGitSegments...)
+		result.OriginalOptionSegments = append(result.OriginalOptionSegments, inner.OriginalOptionSegments...)
 		result.StrippedWrappers = append(result.StrippedWrappers, inner.StrippedWrappers...)
 		result.HasSubshell = result.HasSubshell || inner.HasSubshell
 		result.ParseError = result.ParseError || inner.ParseError
@@ -136,18 +190,13 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 		case *syntax.CallExpr:
 			// Build from words, not the call's source range: redirections can
 			// occur between arguments but are not children of CallExpr.
-			var words []string
-			for _, assign := range node.Assigns {
-				text, valid := caseNodeText(raw, assign, literals)
-				result.ParseError = result.ParseError || !valid
-				words = append(words, text)
+			if command, ok := cloudInputCalls[node]; ok {
+				appendCommand(command, true)
+				continue
 			}
-			for _, arg := range node.Args {
-				text, valid := caseNodeText(raw, arg, literals)
-				result.ParseError = result.ParseError || !valid
-				words = append(words, text)
-			}
-			appendCommand(strings.Join(words, " "), true)
+			command, valid := callText(node)
+			result.ParseError = result.ParseError || !valid
+			appendCommand(command, true)
 		case *syntax.DeclClause:
 			text, valid := caseNodeText(raw, node, literals)
 			result.ParseError = result.ParseError || !valid
@@ -176,7 +225,12 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 				// unless the command reading it only treats stdin as data
 				// (`read -r a b <<< "$line"`). Substitutions inside the word are
 				// visited and classified independently by the walk above.
-				if !hereStringDataConsumer(redirectOwner[node]) {
+				if cloudHereStrings[node] {
+					// Input content was retained for policy matching, so the
+					// syntax is understood. Cloud forwarding/unknown consumers
+					// still cannot borrow a SAFE rule for executing that input.
+					result.Opaque = true
+				} else if !hereStringDataConsumer(redirectOwner[node]) {
 					result.ParseError = true
 				}
 			case syntax.DplIn, syntax.DplOut:

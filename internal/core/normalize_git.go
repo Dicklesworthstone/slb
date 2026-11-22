@@ -54,7 +54,7 @@ func normalizeGitTokens(tokens []string) (normalized []string, opaque, valid boo
 	for i := 1; i < len(tokens); i++ {
 		option := tokens[i]
 		if !strings.HasPrefix(option, "-") {
-			if option == "" || gitTokenIsDynamic(option) {
+			if option == "" || optionTokenIsDynamic(option) {
 				return tokens, true, false
 			}
 			result := make([]string, 1, len(tokens)-i+1)
@@ -68,7 +68,7 @@ func normalizeGitTokens(tokens []string) (normalized []string, opaque, valid boo
 		if gitGlobalInformationOptions[option] || strings.HasPrefix(option, "--list-cmds=") {
 			// These print information or select help/version; the following
 			// operands are not another Git subcommand to execute.
-			return []string{tokens[0], option}, opaque || gitTokenIsDynamic(option), true
+			return []string{tokens[0], option}, opaque || optionTokenIsDynamic(option), true
 		}
 		if strings.HasPrefix(option, "--exec-path=") {
 			opaque = true
@@ -88,7 +88,7 @@ func normalizeGitTokens(tokens []string) (normalized []string, opaque, valid boo
 			// value, not a second option or an executable subcommand.
 			value = tokens[i]
 		}
-		opaque = opaque || spec.Opaque || gitTokenIsDynamic(value)
+		opaque = opaque || spec.Opaque || optionTokenIsDynamic(value)
 	}
 	// A bare `git` is handled above. Once options have been supplied, the
 	// absence of a known subcommand cannot authorize an implicit operation.
@@ -97,9 +97,10 @@ func normalizeGitTokens(tokens []string) (normalized []string, opaque, valid boo
 
 // The shell tokenizer deliberately does not evaluate expansion. Quote removal
 // loses whether a metacharacter was literal, so ambiguity stays conservative.
-func gitTokenIsDynamic(token string) bool {
+func optionTokenIsDynamic(token string) bool {
 	return strings.ContainsAny(token, "$`*?{\x00") ||
 		(strings.Contains(token, "[") && strings.Contains(token, "]")) ||
 		strings.Contains(token, "__slb_substitution__") ||
-		strings.Contains(token, xargsArgumentsPlaceholder)
+		strings.Contains(token, xargsArgumentsPlaceholder) ||
+		strings.Contains(token, findPathPlaceholder)
 }

@@ -19,10 +19,10 @@ type NormalizedCommand struct {
 	Primary string
 	// Segments contains individual command segments for compound commands.
 	Segments []string
-	// OriginalGitSegments preserves option-bearing Git commands for risk
-	// rules that deliberately target those options. These are alternative
+	// OriginalOptionSegments preserves original option/input views for risk
+	// rules that deliberately target that content. These are alternative
 	// policy views, not additional executed or unmatched commands.
-	OriginalGitSegments []string
+	OriginalOptionSegments []string
 	// IsCompound indicates if this is a compound command.
 	IsCompound bool
 	// HasSubshell indicates if the command contains subshells.
@@ -429,11 +429,11 @@ func normalizeWithFeeds(cmd string, depth int) *NormalizedCommand {
 	if strings.TrimSpace(cmd) == "" {
 		return result
 	}
-	segments, originalGitSegments, opaque, parseErr, writesFiles := analyzeExecutionFeeds(strings.TrimSpace(cmd), depth)
-	if len(segments) == 0 && len(originalGitSegments) == 0 && !opaque && !parseErr && !writesFiles {
+	segments, originalOptionSegments, opaque, parseErr, writesFiles := analyzeExecutionFeeds(strings.TrimSpace(cmd), depth)
+	if len(segments) == 0 && len(originalOptionSegments) == 0 && !opaque && !parseErr && !writesFiles {
 		return result
 	}
-	result.OriginalGitSegments = append(result.OriginalGitSegments, originalGitSegments...)
+	result.OriginalOptionSegments = append(result.OriginalOptionSegments, originalOptionSegments...)
 	seen := make(map[string]bool, len(result.Segments))
 	for _, segment := range result.Segments {
 		seen[segment] = true
@@ -506,7 +506,7 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 	result.HasSubshell = len(substitutions) > 0
 	appendInner := func(inner *NormalizedCommand) {
 		result.Segments = append(result.Segments, inner.Segments...)
-		result.OriginalGitSegments = append(result.OriginalGitSegments, inner.OriginalGitSegments...)
+		result.OriginalOptionSegments = append(result.OriginalOptionSegments, inner.OriginalOptionSegments...)
 		result.StrippedWrappers = append(result.StrippedWrappers, inner.StrippedWrappers...)
 		result.ParseError = result.ParseError || inner.ParseError
 		result.HasSubshell = result.HasSubshell || inner.HasSubshell
@@ -533,10 +533,16 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 			parser.ParseBacktick = false
 			// The tokenizer stops at the first unquoted redirection, so
 			// `git push >/dev/null --force origin main` used to classify as
-			// plain `git push`. Remove redirections first; a here-string's
-			// word is kept because it is the command's input
-			// (`psql <<< 'TRUNCATE users'`).
-			part = stripRedirections(part)
+			// plain `git push`. Remove redirections first. Here-string data
+			// remains visible for SQL matching, but it is never a cloud CLI
+			// option: stdin '--help' cannot cancel a namespace deletion, and
+			// stdin '-target=...' cannot narrow a full Terraform destruction.
+			argumentPart, inputPart := stripRedirectionParts(part)
+			part = argumentPart + inputPart
+			cloudArgumentOnly := inputPart != "" && isCloudCommandArgv(argumentPart)
+			if cloudArgumentOnly {
+				part = argumentPart
+			}
 			tokens, err := parser.Parse(part)
 			if err != nil {
 				result.ParseError = true
@@ -568,16 +574,33 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 				result.ParseError = true
 			}
 			tokens[0] = canonicalExecutable(tokens[0])
-			originalGit := ""
-			if tokens[0] == "git" && len(tokens) > 1 {
-				originalGit = joinNormalizedTokens(tokens)
+			if cloudArgumentOnly {
+				// Preserve prior input-content hazards (for example kubectl
+				// exec ... -- psql reading a SQL here-string) without allowing
+				// that input to masquerade as flags. This view is never another
+				// executed or unmatched command, and cannot lower argv risk.
+				inputTokens, inputErr := parser.Parse(inputPart)
+				if inputErr != nil || parser.Position >= 0 {
+					result.ParseError = true
+					result.Opaque = true
+				} else {
+					inputView := append(append([]string(nil), tokens...), inputTokens...)
+					result.OriginalOptionSegments = append(result.OriginalOptionSegments, joinNormalizedTokens(inputView))
+				}
+			}
+			originalOptionCommand := ""
+			if (tokens[0] == "git" || cloudGlobalOptions[tokens[0]] != nil) && len(tokens) > 1 {
+				originalOptionCommand = joinNormalizedTokens(tokens)
 			}
 			tokens, opaque, valid := normalizeGitTokens(tokens)
 			result.Opaque = result.Opaque || opaque
 			result.ParseError = result.ParseError || !valid
+			tokens, opaque, valid = normalizeCloudTokens(tokens)
+			result.Opaque = result.Opaque || opaque
+			result.ParseError = result.ParseError || !valid
 			normalized := joinNormalizedTokens(tokens)
-			if originalGit != "" && originalGit != normalized {
-				result.OriginalGitSegments = append(result.OriginalGitSegments, originalGit)
+			if originalOptionCommand != "" && originalOptionCommand != normalized {
+				result.OriginalOptionSegments = append(result.OriginalOptionSegments, originalOptionCommand)
 			}
 			result.Segments = append(result.Segments, normalized)
 		}
@@ -613,6 +636,14 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 // unchanged, so the tokenizer still reports the parse error. The scan is
 // linear in the length of the command.
 func stripRedirections(part string) string {
+	arguments, input := stripRedirectionParts(part)
+	return arguments + input
+}
+
+// stripRedirectionParts keeps real argv separate from data supplied on stdin.
+// stripRedirections preserves the historical combined policy view for callers
+// that inspect input text; option parsers must use the actual argv instead.
+func stripRedirectionParts(part string) (arguments, input string) {
 	runes := []rune(part)
 	out := make([]rune, 0, len(runes))
 	var hereStrings [][]rune
@@ -696,7 +727,7 @@ func stripRedirections(part string) string {
 			}
 		}
 		if wSingle || wDouble {
-			return part
+			return part, ""
 		}
 		out = append(out, ' ')
 		if op == "<<<" {
@@ -705,11 +736,12 @@ func stripRedirections(part string) string {
 		i-- // the loop increment resumes at the terminator
 		wordStart = len(out)
 	}
+	var inputRunes []rune
 	for _, word := range hereStrings {
-		out = append(out, ' ')
-		out = append(out, word...)
+		inputRunes = append(inputRunes, ' ')
+		inputRunes = append(inputRunes, word...)
 	}
-	return string(out)
+	return string(out), string(inputRunes)
 }
 
 // isRedirectionFD reports whether a word glued to a redirection operator is

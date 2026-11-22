@@ -113,17 +113,25 @@ func (e *PatternEngine) ClassifyCommand(cmd, cwd string) (result *MatchResult) {
 		result.NeedsApproval = !result.IsSafe
 		return e.finalizeClassification(result, normalized)
 	}
-	lowerRaw := strings.ToLower(cmd)
-	if strings.Contains(lowerRaw, "delete from") {
-		result.Tier = RiskTierDangerous
+	if tier, pattern := sqlDeleteFallback(cmd); pattern != "" {
+		result.Tier, result.MatchedPattern = tier, pattern
 		result.NeedsApproval = true
-		result.MatchedPattern = "fallback_sql_delete_with_where"
-		if !strings.Contains(lowerRaw, "where") {
-			result.Tier = RiskTierCritical
-			result.MatchedPattern = "fallback_sql_delete_no_where"
-		}
 	}
 	return e.finalizeClassification(result, normalized)
+}
+
+// sqlDeleteFallback preserves the existing raw-text DELETE/WHERE fallback when
+// no configured pattern matched. Keep the same literal checks for every policy
+// view, including input text kept separate from a cloud command's real argv.
+func sqlDeleteFallback(command string) (RiskTier, string) {
+	lower := strings.ToLower(command)
+	if !strings.Contains(lower, "delete from") {
+		return "", ""
+	}
+	if strings.Contains(lower, "where") {
+		return RiskTierDangerous, "fallback_sql_delete_with_where"
+	}
+	return RiskTierCritical, "fallback_sql_delete_no_where"
 }
 
 // classifyCompoundCommand keeps the highest risk segment, never allowing one
@@ -138,13 +146,7 @@ func (e *PatternEngine) classifyCompoundCommand(normalized *NormalizedCommand, c
 		segmentMatch := SegmentMatch{Segment: segment}
 		segmentMatch.Tier, segmentMatch.MatchedPattern = e.classifySegment(segment)
 		if segmentMatch.MatchedPattern == "" {
-			lowerRaw := strings.ToLower(segment)
-			if strings.Contains(lowerRaw, "delete from") {
-				segmentMatch.Tier, segmentMatch.MatchedPattern = RiskTierDangerous, "fallback_sql_delete_with_where"
-				if !strings.Contains(lowerRaw, "where") {
-					segmentMatch.Tier, segmentMatch.MatchedPattern = RiskTierCritical, "fallback_sql_delete_no_where"
-				}
-			}
+			segmentMatch.Tier, segmentMatch.MatchedPattern = sqlDeleteFallback(segment)
 		}
 		switch segmentMatch.Tier {
 		case RiskTierCritical:
@@ -254,13 +256,26 @@ func (e *PatternEngine) matchPatterns(cmd string, patterns []*Pattern) *Pattern 
 // floors: opaque code and file-writing shell redirections can never borrow
 // a SAFE program rule or escape as "no pattern". Stronger risk matches remain.
 func (e *PatternEngine) finalizeClassification(res *MatchResult, normalized *NormalizedCommand) *MatchResult {
-	// Global Git options can themselves be the subject of a project rule
-	// (for example, every command targeting a production repository). Keep
-	// those prior hazardous matches as well as the exposed subcommand risk.
-	// Alternative policy views cannot introduce a SAFE exemption or another
-	// executed/unmatched segment.
-	for _, original := range normalized.OriginalGitSegments {
-		if tier, pattern := e.matchSegment(original, false); pattern != "" && tierHigher(tier, res.Tier) {
+	// Options can themselves be the subject of a project rule, such as a
+	// production repository or cluster. Git's existing option-policy views
+	// ignore SAFE rules; preserve that protection. For newly normalized cloud
+	// commands, retain the original view's prior SAFE-first verdict so a broad
+	// hazard does not reactivate on an already exempted pod deletion. Original
+	// SAFE results never lower the exposed operation's risk. classifySegment
+	// also prevents unknown find/xargs operands from regaining SAFE here.
+	// These views are not extra executed or unmatched commands.
+	for _, original := range normalized.OriginalOptionSegments {
+		var tier RiskTier
+		var pattern string
+		if ExtractCommandName(original) == "git" {
+			tier, pattern = e.matchSegment(original, false)
+		} else {
+			tier, pattern = e.classifySegment(original)
+			if pattern == "" {
+				tier, pattern = sqlDeleteFallback(original)
+			}
+		}
+		if pattern != "" && tierHigher(tier, res.Tier) {
 			res.Tier, res.MatchedPattern = tier, pattern
 			res.IsSafe, res.NeedsApproval = false, true
 		}
@@ -585,6 +600,16 @@ func (e *PatternEngine) ExportClaudeHook() string {
 	sb.WriteString(fmt.Sprintf("GIT_GLOBAL_FLAGS = json.loads(%q)\n", string(gitFlags)))
 	sb.WriteString(fmt.Sprintf("GIT_GLOBAL_VALUE_OPTIONS = json.loads(%q)\n", string(gitValues)))
 	sb.WriteString(fmt.Sprintf("GIT_GLOBAL_INFORMATION_OPTIONS = json.loads(%q)\n\n", string(gitInformation)))
+	cloudGlobals, _ := json.Marshal(cloudGlobalOptions)
+	deleteOptions, _ := json.Marshal(kubectlDeleteOptions)
+	terraformOptions, _ := json.Marshal(terraformExecutionOptions)
+	protectedResources, _ := json.Marshal(kubectlProtectedResources)
+	unresolvedMarkers, _ := json.Marshal([]string{xargsArgumentsPlaceholder, findPathPlaceholder})
+	_, _ = fmt.Fprintf(&sb, "CLOUD_GLOBAL_OPTIONS = json.loads(%q)\n", string(cloudGlobals))
+	_, _ = fmt.Fprintf(&sb, "KUBECTL_DELETE_OPTIONS = json.loads(%q)\n", string(deleteOptions))
+	_, _ = fmt.Fprintf(&sb, "TERRAFORM_EXECUTION_OPTIONS = json.loads(%q)\n", string(terraformOptions))
+	_, _ = fmt.Fprintf(&sb, "KUBECTL_PROTECTED_RESOURCES = json.loads(%q)\n", string(protectedResources))
+	sb.WriteString("UNRESOLVED_ARGUMENT_MARKERS = " + string(unresolvedMarkers) + "\n\n")
 	sb.WriteString(`# Python's re backtracks, so a rule that is linear in Go can take seconds on a
 # long command here. Longer commands are not scanned; they need the strictest
 # approval instead of being allowed unclassified.
@@ -597,6 +622,8 @@ def _literal_simple_command(command: str) -> bool:
     # non-ASCII/control characters all require native analysis or confirmation.
     # A SAFE regex prefix must never hide another command or an expanded target.
     if re.fullmatch(r'[A-Za-z0-9_./:@%+=, \t-]+', command) is None:
+        return False
+    if any(marker in command for marker in UNRESOLVED_ARGUMENT_MARKERS):
         return False
     words = command.split()
     executable = words[0].rsplit('/', 1)[-1].lower()
@@ -642,31 +669,206 @@ def _normalize_literal_git(command: str) -> Tuple[str, bool]:
     return (command, True)
 
 
+def _cloud_bool(value: str) -> Optional[bool]:
+    if value in ('1', 't', 'T', 'TRUE', 'true', 'True'):
+        return True
+    if value in ('0', 'f', 'F', 'FALSE', 'false', 'False'):
+        return False
+    return None
+
+
+def _scan_cloud_option(words, index, tables):
+    """Consume one known literal option without guessing another word's role."""
+    word = words[index]
+    name, equals, value = word.partition('=')
+    spec = next((table[name] for table in tables if name in table), None)
+    attached = False
+    if spec is None and len(word) > 2 and word[0] == '-' and word[1] != '-':
+        short = next((table[word[:2]] for table in tables if word[:2] in table), None)
+        if short is not None and short['attached']:
+            name, value, spec, attached, equals = word[:2], word[2:], short, True, ''
+    if spec is None or (equals and not spec['equals']):
+        return None
+    next_index = index + 1
+    if spec['value']:
+        if not equals and not attached:
+            if spec['default']:
+                value = spec['default']
+            elif spec['separate'] and next_index < len(words):
+                value = words[next_index]
+                next_index += 1
+            else:
+                return None
+    else:
+        if not equals:
+            value = 'true'
+        if _cloud_bool(value) is None:
+            return None
+    return (name, value, next_index, spec['opaque'], spec['information'])
+
+
+def _observe_cloud_option(state, option):
+    name, value, _, opaque, information = option
+    state['opaque'] = state['opaque'] or opaque
+    if information:
+        # Cobra/pflag's last Boolean value wins, even after a subcommand.
+        state['information'] = name if _cloud_bool(value) else None
+
+
+def _inspect_cloud_global_suffix(words, options, state):
+    index = 2
+    while index < len(words):
+        word = words[index]
+        if word == '--':
+            return
+        if not word.startswith('-'):
+            index += 1
+            continue
+        option = _scan_cloud_option(words, index, (options,))
+        if option is None:
+            # Unknown grammar may consume later apparent flags as data.
+            state['opaque'], state['uncertain'] = True, True
+            return
+        _observe_cloud_option(state, option)
+        index = option[2]
+
+
+def _protected_kubectl_resource(resource: str) -> Optional[str]:
+    parts = resource.split(',')
+    for index, part in enumerate(parts):
+        kind, slash, suffix = part.partition('/')
+        base = kind.split('.', 1)[0]
+        if base in KUBECTL_PROTECTED_RESOURCES:
+            parts[index] = KUBECTL_PROTECTED_RESOURCES[base] + kind[len(base):] + slash + suffix
+            parts[0], parts[index] = parts[index], parts[0]
+            return ','.join(parts)
+    return None
+
+
+def _normalize_literal_kubectl_delete(words, state):
+    resources = []
+    options_done, index = False, 2
+    while index < len(words):
+        word = words[index]
+        if not options_done and word == '--':
+            options_done, index = True, index + 1
+            continue
+        if not options_done and word.startswith('-'):
+            option = _scan_cloud_option(words, index, (KUBECTL_DELETE_OPTIONS, CLOUD_GLOBAL_OPTIONS['kubectl']))
+            if option is None:
+                state['opaque'], state['uncertain'] = True, True
+                return (words, True)
+            _observe_cloud_option(state, option)
+            index = option[2]
+            continue
+        resources.append(word)
+        index += 1
+    for index, resource in enumerate(resources):
+        if index > 0 and '/' not in resource:
+            continue
+        protected = _protected_kubectl_resource(resource)
+        if protected is not None:
+            resources[index] = protected
+            resources[0], resources[index] = resources[index], resources[0]
+            break
+    return ([words[0], 'delete'] + resources, False)
+
+
+def _normalize_literal_terraform_execution(words, state):
+    destroy, invalid, index = words[1] == 'destroy', False, 2
+    targets = []
+    while index < len(words):
+        word = words[index]
+        # Like Go flag parsing, operands and -- stop option parsing.
+        if word == '--' or not word.startswith('-'):
+            break
+        option = _scan_cloud_option(words, index, (TERRAFORM_EXECUTION_OPTIONS,))
+        if option is None:
+            state['opaque'], state['uncertain'], invalid = True, True, True
+            break
+        _observe_cloud_option(state, option)
+        name, value, index, _, _ = option
+        if name == '-target':
+            if value:
+                targets.append('-target=' + value)
+            else:
+                state['opaque'], state['uncertain'], invalid = True, True, True
+        if name == '-destroy' and words[1] == 'apply':
+            destroy = _cloud_bool(value)
+    if destroy:
+        words = [words[0], 'destroy'] + targets
+    return (words, invalid)
+
+
+def _normalize_literal_cloud(command: str):
+    """Classify known cloud argv; never read config or execute a cloud client."""
+    words = command.split()
+    name = words[0].rsplit('/', 1)[-1]
+    options = CLOUD_GLOBAL_OPTIONS.get(name)
+    if len(words) < 2 or options is None:
+        return (command, False, False)
+    state = {'opaque': False, 'information': None, 'uncertain': False}
+    index = 1
+    while index < len(words):
+        if words[index].startswith('-'):
+            option = _scan_cloud_option(words, index, (options,))
+            if option is None:
+                return (command, True, True)
+            _observe_cloud_option(state, option)
+            index = option[2]
+            continue
+        words = [name] + words[index:]
+        invalid = False
+        if name == 'kubectl' and words[1] == 'delete':
+            words, invalid = _normalize_literal_kubectl_delete(words, state)
+        elif name == 'terraform' and words[1] in ('destroy', 'apply'):
+            words, invalid = _normalize_literal_terraform_execution(words, state)
+        elif name in ('kubectl', 'helm'):
+            _inspect_cloud_global_suffix(words, options, state)
+        if not invalid and state['information'] is not None and not state['uncertain']:
+            words = [name, state['information']]
+        return (' '.join(words), state['opaque'], invalid)
+    if state['information'] is not None and not state['uncertain']:
+        return (' '.join([name, state['information']]), state['opaque'], False)
+    return (command, True, True)
+
+
 def classify(command: str) -> Tuple[str, int]:
     """Classify against the exported policy; return (tier, min_approvals)."""
     command = command.strip()
     if len(command) > MAX_CLASSIFIED_LENGTH:
         return ('critical', MIN_APPROVALS['critical'])
-    literal = _literal_simple_command(command)
-    opaque = False
+    literal = bool(command) and _literal_simple_command(command)
+    opaque, invalid = False, False
     original_commands = [command]
     if literal:
         words = command.split()
-        if words[0].rsplit('/', 1)[-1] == 'git':
-            canonical_original = ' '.join(['git'] + words[1:])
+        executable = words[0].rsplit('/', 1)[-1]
+        if executable == 'git' or executable in CLOUD_GLOBAL_OPTIONS:
+            canonical_original = ' '.join([executable] + words[1:])
             if canonical_original != command:
                 original_commands.append(canonical_original)
         command, opaque = _normalize_literal_git(command)
+        command, cloud_opaque, invalid = _normalize_literal_cloud(command)
+        opaque = opaque or cloud_opaque
     # A custom rule can target global options, such as -C /production.
     # Retain raw spellings too: exported policies previously saw absolute
     # executable paths and literal whitespace before this normalization.
-    original_tier = None
+    rank = {'unknown': 0, 'safe': 0, 'caution': 1, 'dangerous': 2, 'critical': 3}
+    original_tier = 'unknown'
     original_commands = [view for view in original_commands if view != command]
-    if original_commands:
-        for tier, patterns in (('critical', CRITICAL_PATTERNS),
-                               ('dangerous', DANGEROUS_PATTERNS), ('caution', CAUTION_PATTERNS)):
-            if any(pattern.search(view) for view in original_commands for pattern in patterns):
-                original_tier = tier
+    for view in original_commands:
+        # New cloud views retain prior SAFE-first results; Git's existing
+        # option-policy views continue to apply hazardous rules regardless
+        # of SAFE matches. No original SAFE result lowers canonical risk.
+        cloud_view = view.split()[0].rsplit('/', 1)[-1] in CLOUD_GLOBAL_OPTIONS
+        if literal and cloud_view and any(pattern.search(view) for pattern in SAFE_PATTERNS):
+            continue
+        for tier, patterns in (('critical', CRITICAL_PATTERNS), ('dangerous', DANGEROUS_PATTERNS),
+                               ('caution', CAUTION_PATTERNS)):
+            if any(pattern.search(view) for pattern in patterns):
+                if rank[tier] > rank[original_tier]:
+                    original_tier = tier
                 break
     matched_tier = 'unknown'
     for tier, patterns in (('safe', SAFE_PATTERNS), ('critical', CRITICAL_PATTERNS),
@@ -678,9 +880,11 @@ def classify(command: str) -> Tuple[str, int]:
             break
     # Keep native SAFE-first policy precedence for the normalized command,
     # then apply original-option risk and unknown-code floors independently.
-    rank = {'unknown': 0, 'safe': 0, 'caution': 1, 'dangerous': 2, 'critical': 3}
-    if original_tier is not None and rank[original_tier] > rank[matched_tier]:
+    if rank[original_tier] > rank[matched_tier]:
         matched_tier = original_tier
+    if invalid:
+        matched_tier = {'unknown': 'caution', 'safe': 'caution', 'caution': 'dangerous',
+                        'dangerous': 'critical', 'critical': 'critical'}[matched_tier]
     if opaque and matched_tier in ('safe', 'unknown'):
         matched_tier = 'caution'
     return (matched_tier, MIN_APPROVALS.get(matched_tier, 0))

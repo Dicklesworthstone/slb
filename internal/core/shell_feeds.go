@@ -86,20 +86,20 @@ type stdinFeed struct {
 func (f *stdinFeed) present() bool { return f != nil && (f.producer != nil || f.redirect != nil) }
 
 type feedAnalysis struct {
-	raw                 string
-	depth               int
-	literals            literalVariables
-	aliases             map[string][]string // static alias bodies defined anywhere in the script
-	segments            []string
-	originalGitSegments []string
-	opaque              bool
-	parseErr            bool
-	writesFiles         bool
+	raw                    string
+	depth                  int
+	literals               literalVariables
+	aliases                map[string][]string // static alias bodies defined anywhere in the script
+	segments               []string
+	originalOptionSegments []string
+	opaque                 bool
+	parseErr               bool
+	writesFiles            bool
 }
 
-// analyzeExecutionFeeds returns extra segments and original Git policy views
+// analyzeExecutionFeeds returns extra segments and original option policy views
 // to classify, whether executed code is unknown, and shell file writes.
-func analyzeExecutionFeeds(raw string, depth int) (segments, originalGitSegments []string, opaque, parseErr, writesFiles bool) {
+func analyzeExecutionFeeds(raw string, depth int) (segments, originalOptionSegments []string, opaque, parseErr, writesFiles bool) {
 	if depth >= maxCommandNesting || len(raw) > 1<<20 || strings.IndexByte(raw, 0) >= 0 {
 		return nil, nil, false, true, false
 	}
@@ -119,7 +119,7 @@ func analyzeExecutionFeeds(raw string, depth int) (segments, originalGitSegments
 	for _, stmt := range file.Stmts {
 		a.visitStmt(stmt, nil)
 	}
-	return a.segments, a.originalGitSegments, a.opaque, a.parseErr, a.writesFiles
+	return a.segments, a.originalOptionSegments, a.opaque, a.parseErr, a.writesFiles
 }
 
 func (a *feedAnalysis) addPayload(payload string) {
@@ -128,7 +128,7 @@ func (a *feedAnalysis) addPayload(payload string) {
 	}
 	inner := normalizeWithFeeds(payload, a.depth+1)
 	a.segments = append(a.segments, inner.Segments...)
-	a.originalGitSegments = append(a.originalGitSegments, inner.OriginalGitSegments...)
+	a.originalOptionSegments = append(a.originalOptionSegments, inner.OriginalOptionSegments...)
 	a.opaque = a.opaque || inner.Opaque
 	a.parseErr = a.parseErr || inner.ParseError
 	a.writesFiles = a.writesFiles || inner.WritesFiles
