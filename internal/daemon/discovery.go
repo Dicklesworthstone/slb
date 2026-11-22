@@ -168,6 +168,17 @@ func validateDiscoveryDirectory(path string) error {
 	return validateRuntimeParents(filepath.Dir(path))
 }
 
+// Validate an uninitialized project without creating its .slb marker. A failed
+// startup must not leave an empty marker that makes the next attempt require a
+// state.db that was never created. Existing markers retain all discovery checks.
+func validateProjectRuntimeDirectory(project string) error {
+	err := validateDiscoveryDirectory(filepath.Join(project, ".slb"))
+	if os.IsNotExist(err) {
+		return validateRuntimeParents(project)
+	}
+	return err
+}
+
 func validateRuntimeSocket(path string) (os.FileInfo, error) {
 	if !validRuntimePath(path) || len(path) > maxUnixSocketPathBytes {
 		return nil, errors.New("invalid Unix socket path (maximum 103 bytes)")
@@ -232,6 +243,9 @@ func (owner *projectRuntimeOwner) verifyRecord() error {
 // claimProjectRuntime prevents daemons with different socket/PID environments
 // from owning the same project. Like other leases, daemon.lock is never removed.
 func claimProjectRuntime(opts ServerOptions) (*projectRuntimeOwner, error) {
+	if err := validateProjectRuntimeDirectory(opts.ProjectDir); err != nil {
+		return nil, err
+	}
 	directory := filepath.Join(opts.ProjectDir, ".slb")
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		return nil, err

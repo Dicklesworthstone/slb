@@ -73,6 +73,9 @@ func StartDaemonWithOptions(ctx context.Context, opts ServerOptions) error {
 	if err != nil {
 		return err
 	}
+	if err := validateProjectRuntimeDirectory(opts.ProjectDir); err != nil {
+		return fmt.Errorf("%w: %w", ErrDiscoveryInvalid, err)
+	}
 	if _, err := db.ProjectDatabasePath(opts.ProjectDir); err != nil {
 		return fmt.Errorf("resolving daemon database: %w", err)
 	}
@@ -318,6 +321,11 @@ func RunDaemon(ctx context.Context, opts ServerOptions) error {
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	// Check before the logger as well: when the project is the user's home,
+	// initializing daemon.log would itself create the .slb project marker.
+	if err := validateProjectRuntimeDirectory(opts.ProjectDir); err != nil {
+		return fmt.Errorf("%w: %w", ErrDiscoveryInvalid, err)
 	}
 	dbPath, err := db.ProjectDatabasePath(opts.ProjectDir)
 	if err != nil {

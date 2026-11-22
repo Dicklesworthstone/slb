@@ -1120,6 +1120,72 @@ func TestDiscoverRuntimeUserPrivateGroupAncestors(t *testing.T) {
 	}
 }
 
+func TestDaemonLifecycleUserPrivateGroupAncestors(t *testing.T) {
+	if !currentUserPrivateGroup() {
+		t.Skip("integration requires Linux with an administrator-configured files-only UPG")
+	}
+	lifecycleEnvironment(t)
+	project := lifecycleProject(t)
+	serviceTemp, callerTemp := shortSocketDir(t), shortSocketDir(t)
+	// Reproduce the permissions produced by umask 0002 without changing the
+	// process-wide umask while other tests may be running.
+	writableAncestors := []string{filepath.Dir(project), project, serviceTemp}
+	for _, path := range writableAncestors {
+		if err := os.Chmod(path, 0775); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("TMPDIR", serviceTemp)
+	opts := normalizeServerOptions(ServerOptions{ProjectDir: project})
+	child := startLifecycleChild(t, opts, false)
+	child.ready(t)
+
+	// Exercise the actual daemon's published record and authenticated status
+	// after the caller's environment diverges from the running daemon's.
+	t.Setenv("TMPDIR", callerTemp)
+	paths, err := DiscoverRuntime(project)
+	want := RuntimePaths{Version: 1, ProjectPath: project, SocketPath: opts.SocketPath,
+		PIDFile: opts.PIDFile, PID: child.cmd.Process.Pid}
+	if err != nil || paths != want {
+		t.Fatalf("private-group daemon discovery = %+v, %v; want %+v", paths, err, want)
+	}
+	info := NewProjectClient(project, WithLocalOnly()).GetStatusInfo()
+	if info.Status != DaemonRunning || info.PID != want.PID || !info.SocketAlive ||
+		info.SocketPath != want.SocketPath || info.PIDFile != want.PIDFile {
+		t.Fatalf("private-group daemon status = %+v\n%s", info, child.logs())
+	}
+	marker := filepath.Join(project, ".slb")
+	for _, path := range []string{marker, filepath.Join(marker, runtimeRecordName),
+		filepath.Join(marker, "daemon.lock"), opts.PIDFile, opts.PIDFile + ".lock",
+		opts.SocketPath, opts.SocketPath + ".lock"} {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ownedByCurrentUser(path, info) || info.Mode().Perm()&0077 != 0 {
+			t.Fatalf("daemon runtime path is not private and owned: %s (%s)", path, info.Mode())
+		}
+	}
+	if err := StopDaemonWithOptions(ServerOptions{ProjectDir: project}, 5*time.Second); err != nil {
+		t.Fatalf("stopping private-group daemon: %v", err)
+	}
+	child.wait(t, true)
+	for _, path := range []string{filepath.Join(marker, runtimeRecordName), opts.PIDFile, opts.SocketPath} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("stopped private-group daemon left %s: %v", path, err)
+		}
+	}
+	for _, path := range writableAncestors {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0775 {
+			t.Fatalf("daemon changed private-group ancestor permissions: %s (%s)", path, info.Mode())
+		}
+	}
+}
+
 func TestProjectRuntimeLeaseFencesDifferentTMPDIRs(t *testing.T) {
 	project := discoveryProject(t)
 	t.Setenv("TMPDIR", shortSocketDir(t))

@@ -678,3 +678,94 @@ func TestDaemonStartupRefusesMissingStateInMarkedProject(t *testing.T) {
 		})
 	}
 }
+
+func TestDaemonStartupRefusesUnsafeAncestorsWithoutCreatingState(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux runtime directory permissions")
+	}
+	for _, entry := range []string{"foreground", "detached", "project claim"} {
+		for _, location := range []string{"project", "parent", "home"} {
+			t.Run(entry+"/"+location, func(t *testing.T) {
+				unsafe := t.TempDir()
+				project := unsafe
+				if location == "parent" {
+					project = filepath.Join(unsafe, "project")
+					if err := os.Mkdir(project, 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				home := t.TempDir()
+				if location == "home" {
+					home = project
+				}
+				t.Setenv("HOME", home)
+				t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+				t.Setenv(daemonModeEnv, "")
+				if err := os.Chmod(unsafe, 0777); err != nil {
+					t.Fatal(err)
+				}
+
+				resources := shortSocketDir(t)
+				opts := ServerOptions{ProjectDir: project, SocketPath: filepath.Join(resources, "s.sock"),
+					PIDFile: filepath.Join(resources, "slb.pid")}
+				// Keep Logger nil: when the project is HOME, logger creation can
+				// itself create the .slb marker before the project lease is claimed.
+				var previousPID []byte
+				if entry == "detached" {
+					// A live legacy PID makes the unfixed parent stop without
+					// launching this test binary. Unsafe ancestry must be rejected
+					// before it reaches that fallback, and leave the PID unchanged.
+					previousPID = []byte(fmt.Sprintf("%d\n", os.Getpid()))
+					if err := os.WriteFile(opts.PIDFile, previousPID, 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				var err error
+				switch entry {
+				case "foreground":
+					err = RunDaemon(ctx, opts)
+				case "detached":
+					err = StartDaemonWithOptions(ctx, opts)
+				case "project claim":
+					var owner *projectRuntimeOwner
+					owner, err = claimProjectRuntime(opts)
+					if owner != nil {
+						_ = owner.Close()
+					}
+				}
+				if err == nil || !strings.Contains(err.Error(), "unsafe daemon runtime directory") {
+					t.Errorf("unsafe ancestry was not rejected before startup: %v", err)
+				}
+				if entry != "project claim" && !errors.Is(err, ErrDiscoveryInvalid) {
+					t.Errorf("startup did not identify invalid project discovery: %v", err)
+				}
+				for _, path := range []string{filepath.Join(project, ".slb"), filepath.Join(home, ".slb"),
+					opts.SocketPath, opts.SocketPath + ".lock", opts.PIDFile + ".lock"} {
+					if _, err := os.Lstat(path); !os.IsNotExist(err) {
+						t.Errorf("refused startup created %s: %v", path, err)
+					}
+				}
+				if entry == "detached" {
+					data, err := os.ReadFile(opts.PIDFile)
+					if err != nil || string(data) != string(previousPID) {
+						t.Errorf("refused startup changed the existing PID file: %q, %v", data, err)
+					}
+				} else if _, err := os.Lstat(opts.PIDFile); !os.IsNotExist(err) {
+					t.Errorf("refused startup published a PID file: %v", err)
+				}
+
+				// An empty marker left by a failed first start would turn this
+				// into a damaged initialized project and block a repaired retry.
+				if err := os.Chmod(unsafe, 0700); err != nil {
+					t.Fatal(err)
+				}
+				wantDB := filepath.Join(project, ".slb", "state.db")
+				if path, err := db.ProjectDatabasePath(project); err != nil || path != wantDB {
+					t.Errorf("refused startup poisoned the repaired project: path=%q, error=%v", path, err)
+				}
+			})
+		}
+	}
+}
