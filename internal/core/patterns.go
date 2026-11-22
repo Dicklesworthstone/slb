@@ -198,7 +198,7 @@ func (e *PatternEngine) classifyCompoundCommand(normalized *NormalizedCommand, c
 // wins. For that comparison an unmatched result ranks above SAFE, so neither
 // reading's allowlist match may clear the other.
 func (e *PatternEngine) classifySegment(segment string) (RiskTier, string) {
-	allowSafe := !strings.Contains(segment, xargsArgumentsPlaceholder)
+	allowSafe := !strings.Contains(segment, xargsArgumentsPlaceholder) && !strings.Contains(segment, findPathPlaceholder)
 	tier, pattern := e.matchSegment(segment, allowSafe)
 	if xargsCmd := ExtractXargsCommand(segment); xargsCmd != "" {
 		if xTier, xPattern := e.matchSegment(xargsCmd, false); xargsRank(xTier, xPattern) > xargsRank(tier, pattern) {
@@ -555,7 +555,7 @@ func (e *PatternEngine) ExportClaudeHook() string {
 	// to duplicate its shell parser in Python. A custom safe regex matching a
 	// wrapper, interpreter or evaluator cannot prove its payload is safe.
 	normalizationCommands := map[string]bool{
-		".": true, "alias": true, "eval": true, "hash": true, "source": true, "python": true,
+		".": true, "alias": true, "eval": true, "hash": true, "source": true, "python": true, "find": true,
 		"if": true, "then": true, "else": true, "elif": true, "fi": true,
 		"for": true, "in": true, "do": true, "done": true, "case": true, "esac": true,
 		"while": true, "until": true, "select": true, "function": true, "coproc": true,

@@ -508,6 +508,8 @@ func (a *feedAnalysis) checkCall(call *syntax.CallExpr, feed *stdinFeed) {
 		if len(args) > 1 && a.addRemoteScript(args[1], "sh") {
 			a.opaque = true
 		}
+	case name == "find":
+		a.checkFind(rest, args)
 	case stdinShells[name]:
 		a.checkShell(rest, args, feed)
 	default:
