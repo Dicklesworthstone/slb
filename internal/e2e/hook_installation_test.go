@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,168 @@ import (
 	"github.com/Dicklesworthstone/slb/internal/daemon"
 	"github.com/Dicklesworthstone/slb/internal/db"
 )
+
+// Exercise the installed hooks and daemon with real account files and kernel
+// credentials. A private user/mount/PID namespace contains the fixture; its
+// UID 0 owns a conventional private group, without changing the host's /etc.
+func TestBuiltCLIPrivateGroupRuntimeIntegration(t *testing.T) {
+	if testing.Short() || runtime.GOOS != "linux" {
+		t.Skip("requires a production CLI and Linux user/mount/PID namespaces")
+	}
+	find := func(name string) string {
+		t.Helper()
+		path, err := exec.LookPath(name)
+		if err != nil {
+			t.Skipf("namespace integration requires %s: %v", name, err)
+		}
+		return path
+	}
+	unshare, mount, python := find("unshare"), find("mount"), find("python3")
+	namespaceArgs := []string{"--user", "--map-root-user", "--mount", "--pid", "--fork", "--kill-child", "--"}
+	probeCtx, cancelProbe := context.WithTimeout(context.Background(), 10*time.Second)
+	probe := exec.CommandContext(probeCtx, unshare, append(append([]string{}, namespaceArgs...), mount, "--make-rprivate", "/")...)
+	probeOutput, probeErr := probe.CombinedOutput()
+	cancelProbe()
+	if probeErr != nil {
+		for _, unavailable := range []string{"Operation not permitted", "Permission denied", "not supported", "unrecognized option"} {
+			if strings.Contains(string(probeOutput), unavailable) {
+				t.Skipf("user/mount/PID namespaces unavailable: %v: %s", probeErr, probeOutput)
+			}
+		}
+		t.Fatalf("namespace capability probe failed: %v: %s", probeErr, probeOutput)
+	}
+	binary := buildIdentityBoundaryCLI(t)
+	root := t.TempDir()
+	// The chroot gives every runtime ancestor, including /, a mapped owner on
+	// ordinary hosts. System executable/library mounts are read-only. A fresh
+	// proc mount gives the detached daemon its own PID-namespace identity, and
+	// namespace teardown kills all descendants even if an assertion fails.
+	const script = `
+import glob, json, os, pathlib, shutil, stat, subprocess, sys
+binary, root, mount = sys.argv[1:]
+subprocess.run([mount, "--make-rprivate", "/"], check=True)
+for name in ("usr", "bin", "lib", "lib64", "opt"):
+    source, target = "/" + name, root + "/" + name
+    if os.path.isdir(source):
+        os.mkdir(target)
+        subprocess.run([mount, "--bind", source, target], check=True)
+        subprocess.run([mount, "-o", "remount,bind,ro", target], check=True)
+for name in ("etc", "dev", "proc", "work"):
+    os.mkdir(root + "/" + name, 0o755)
+pathlib.Path(root + "/dev/null").touch(mode=0o600)
+subprocess.run([mount, "--bind", "/dev/null", root + "/dev/null"], check=True)
+subprocess.run([mount, "-t", "proc", "proc", root + "/proc"], check=True)
+shutil.copyfile(binary, root + "/slb")
+os.chmod(root + "/slb", 0o755)
+os.chroot(root)
+os.chdir("/")
+assert os.geteuid() == 0 and os.getegid() == 0
+passwd = "upg:x:0:0::/work/home:/bin/sh\n"
+group = "upg:x:0:\n"
+nss = "passwd: files\ngroup: files\ninitgroups: files\n"
+def accounts(users=passwd, groups=group, sources=nss):
+    for name, data in (("passwd", users), ("group", groups), ("nsswitch.conf", sources)):
+        path = "/etc/" + name
+        pathlib.Path(path).write_text(data)
+        os.chmod(path, 0o644)
+        assert os.stat(path).st_uid == 0
+accounts()
+os.umask(0o002)
+for name in ("home", "runtime", "project"):
+    os.mkdir("/work/" + name)
+    assert stat.S_IMODE(os.stat("/work/" + name).st_mode) == 0o775
+os.environ.update(HOME="/work/home", USERPROFILE="/work/home", TMPDIR="/work/runtime",
+                  TMP="/work/runtime", TEMP="/work/runtime",
+                  XDG_CONFIG_HOME="/work/home/.config", XDG_CACHE_HOME="/work/home/.cache")
+project = "/work/project"
+def run(args, input=None):
+    result = subprocess.run(args, input=input, text=True, capture_output=True,
+                            cwd=project, timeout=20)
+    assert result.returncode == 0, (args, result.returncode, result.stdout, result.stderr)
+    return json.loads(result.stdout)
+def cli(*args):
+    return run(["/slb", "-o", "json", *args])
+cli("init")
+pathlib.Path(project + "/.slb/config.toml").write_text(
+    "[daemon]\nuse_file_watcher = false\n[notifications]\ndesktop_enabled = false\n"
+    "[integrations]\nagent_mail_enabled = false\n")
+installed = cli("hook", "install")
+guards = [("native", ["/bin/sh", "-c", installed["hook_command"]]),
+          ("python", [sys.executable, installed["hook_script"]])]
+started = cli("daemon", "start")
+assert started["pid"] > 0 and not started["foreground"], started
+def running():
+    result = cli("daemon", "status")
+    assert result["running"] and result["socket_alive"] and result["pid"] == started["pid"], result
+    return result
+status = running()
+state = project + "/.slb"
+record = state + "/daemon.json"
+assert stat.S_IMODE(os.stat(state).st_mode) & 0o022 == 0
+for path in (record, status["socket_path"], status["pid_file"]):
+    assert stat.S_IMODE(os.stat(path).st_mode) & 0o077 == 0, path
+
+def check_hooks(label, online):
+    for name, invocation in guards:
+        for command, decision in (("slb-upg-unknown-probe", "allow" if online else "ask"),
+                                  ("git push --force upg-" + label + "-" + name, "deny")):
+            before = set(glob.glob("/work/home/.slb/audit/blocked/*.jsonl"))
+            response = run(invocation, json.dumps({"tool_name": "Bash", "cwd": project,
+                                                  "tool_input": {"command": command}}))
+            output = response["hookSpecificOutput"]
+            assert output["permissionDecision"] == decision, (label, name, response)
+            if online:
+                assert "used local policy" not in json.dumps(response), (label, name, response)
+            else:
+                assert "discovery or identity validation failed" in json.dumps(response), (label, name, response)
+            if decision == "deny":
+                after = set(glob.glob("/work/home/.slb/audit/blocked/*.jsonl"))
+                events = [json.loads(pathlib.Path(path).read_text()) for path in after - before]
+                assert len(events) == 1, (label, name, events)
+                event = events[0]
+                assert event["command_redacted"] == command, event
+                if online:
+                    assert event["source"] == "daemon", (label, name, event)
+                else:
+                    assert event["source"] != "daemon" and event["daemon_error"] == "discovery_invalid", event
+    print("PASS", label, "online" if online else "refused", flush=True)
+
+check_hooks("private-group-0775", True)
+cases = [("shared-supplementary", lambda: accounts(groups="upg:x:0:other\n"), accounts),
+         ("shared-primary", lambda: accounts(users=passwd + "other:x:1001:0::/:/bin/sh\n"), accounts),
+         ("remote-NSS", lambda: accounts(sources="passwd: files\ngroup: files sss\n"), accounts),
+         ("world-writable-project", lambda: os.chmod(project, 0o777), lambda: os.chmod(project, 0o775)),
+         ("world-writable-runtime", lambda: os.chmod("/work/runtime", 0o777), lambda: os.chmod("/work/runtime", 0o775)),
+         ("group-writable-state", lambda: os.chmod(state, 0o775), lambda: os.chmod(state, 0o700)),
+         ("public-record", lambda: os.chmod(record, 0o644), lambda: os.chmod(record, 0o600)),
+         ("writable-socket", lambda: os.chmod(status["socket_path"], 0o666),
+                             lambda: os.chmod(status["socket_path"], 0o600))]
+for label, make_unsafe, restore in cases:
+    make_unsafe()
+    refused = cli("daemon", "status")
+    assert not refused["running"] and not refused["socket_alive"], (label, refused)
+    check_hooks(label, False)
+    restore()
+    running()
+check_hooks("restored-private-group", True)
+cli("daemon", "stop")
+stopped = cli("daemon", "status")
+assert not stopped["running"] and not stopped["socket_alive"], stopped
+for path in (record, status["socket_path"], status["pid_file"]):
+    assert not os.path.lexists(path), ("stopped daemon left runtime resource", path)
+print("PASS daemon start/status/stop under umask 0002 (namespace UID/GID 0)", flush=True)
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	args := append(append([]string{}, namespaceArgs...), python, "-c", script, binary, root, mount)
+	cmd := exec.CommandContext(ctx, unshare, args...)
+	cmd.Env = identityCLIEnvironment(t.TempDir())
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("private-group CLI/hook integration failed: %v\n%s", err, output)
+	}
+	t.Logf("%s", output)
+}
 
 // Use the installed registration and its generated fallback with a real daemon
 // and executor. Only the selected file opts in to same-host review; dropping it
