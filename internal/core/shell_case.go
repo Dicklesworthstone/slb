@@ -98,9 +98,12 @@ func normalizeCaseCommand(raw string, depth int) (*NormalizedCommand, bool) {
 	appendCommand := func(command string, executable bool) {
 		inner := normalizeCommandDepth(command, depth+1)
 		result.Segments = append(result.Segments, inner.Segments...)
+		result.OriginalGitSegments = append(result.OriginalGitSegments, inner.OriginalGitSegments...)
 		result.StrippedWrappers = append(result.StrippedWrappers, inner.StrippedWrappers...)
 		result.HasSubshell = result.HasSubshell || inner.HasSubshell
 		result.ParseError = result.ParseError || inner.ParseError
+		result.Opaque = result.Opaque || inner.Opaque
+		result.WritesFiles = result.WritesFiles || inner.WritesFiles
 		if executable {
 			for _, segment := range inner.Segments {
 				words := strings.Fields(segment)

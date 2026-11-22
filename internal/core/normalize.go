@@ -19,6 +19,10 @@ type NormalizedCommand struct {
 	Primary string
 	// Segments contains individual command segments for compound commands.
 	Segments []string
+	// OriginalGitSegments preserves option-bearing Git commands for risk
+	// rules that deliberately target those options. These are alternative
+	// policy views, not additional executed or unmatched commands.
+	OriginalGitSegments []string
 	// IsCompound indicates if this is a compound command.
 	IsCompound bool
 	// HasSubshell indicates if the command contains subshells.
@@ -425,10 +429,11 @@ func normalizeWithFeeds(cmd string, depth int) *NormalizedCommand {
 	if strings.TrimSpace(cmd) == "" {
 		return result
 	}
-	segments, opaque, parseErr, writesFiles := analyzeExecutionFeeds(strings.TrimSpace(cmd), depth)
-	if len(segments) == 0 && !opaque && !parseErr && !writesFiles {
+	segments, originalGitSegments, opaque, parseErr, writesFiles := analyzeExecutionFeeds(strings.TrimSpace(cmd), depth)
+	if len(segments) == 0 && len(originalGitSegments) == 0 && !opaque && !parseErr && !writesFiles {
 		return result
 	}
+	result.OriginalGitSegments = append(result.OriginalGitSegments, originalGitSegments...)
 	seen := make(map[string]bool, len(result.Segments))
 	for _, segment := range result.Segments {
 		seen[segment] = true
@@ -501,9 +506,12 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 	result.HasSubshell = len(substitutions) > 0
 	appendInner := func(inner *NormalizedCommand) {
 		result.Segments = append(result.Segments, inner.Segments...)
+		result.OriginalGitSegments = append(result.OriginalGitSegments, inner.OriginalGitSegments...)
 		result.StrippedWrappers = append(result.StrippedWrappers, inner.StrippedWrappers...)
 		result.ParseError = result.ParseError || inner.ParseError
 		result.HasSubshell = result.HasSubshell || inner.HasSubshell
+		result.Opaque = result.Opaque || inner.Opaque
+		result.WritesFiles = result.WritesFiles || inner.WritesFiles
 	}
 	for _, seg := range splitCompoundShellAware(outer) {
 		for _, part := range splitPipesShellAware(seg) {
@@ -560,7 +568,18 @@ func normalizeCommandDepth(cmd string, depth int) *NormalizedCommand {
 				result.ParseError = true
 			}
 			tokens[0] = canonicalExecutable(tokens[0])
-			result.Segments = append(result.Segments, joinNormalizedTokens(tokens))
+			originalGit := ""
+			if tokens[0] == "git" && len(tokens) > 1 {
+				originalGit = joinNormalizedTokens(tokens)
+			}
+			tokens, opaque, valid := normalizeGitTokens(tokens)
+			result.Opaque = result.Opaque || opaque
+			result.ParseError = result.ParseError || !valid
+			normalized := joinNormalizedTokens(tokens)
+			if originalGit != "" && originalGit != normalized {
+				result.OriginalGitSegments = append(result.OriginalGitSegments, originalGit)
+			}
+			result.Segments = append(result.Segments, normalized)
 		}
 	}
 	// Analyze expansions independently so an allowlisted outer command cannot

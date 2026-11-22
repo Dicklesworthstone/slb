@@ -72,26 +72,27 @@ type stdinFeed struct {
 func (f *stdinFeed) present() bool { return f != nil && (f.producer != nil || f.redirect != nil) }
 
 type feedAnalysis struct {
-	raw         string
-	depth       int
-	literals    literalVariables
-	aliases     map[string][]string // static alias bodies defined anywhere in the script
-	segments    []string
-	opaque      bool
-	parseErr    bool
-	writesFiles bool
+	raw                 string
+	depth               int
+	literals            literalVariables
+	aliases             map[string][]string // static alias bodies defined anywhere in the script
+	segments            []string
+	originalGitSegments []string
+	opaque              bool
+	parseErr            bool
+	writesFiles         bool
 }
 
-// analyzeExecutionFeeds returns extra segments to classify, whether some
-// executed code could not be determined statically, and shell file writes.
-func analyzeExecutionFeeds(raw string, depth int) (segments []string, opaque, parseErr, writesFiles bool) {
+// analyzeExecutionFeeds returns extra segments and original Git policy views
+// to classify, whether executed code is unknown, and shell file writes.
+func analyzeExecutionFeeds(raw string, depth int) (segments, originalGitSegments []string, opaque, parseErr, writesFiles bool) {
 	if depth >= maxCommandNesting || len(raw) > 1<<20 || strings.IndexByte(raw, 0) >= 0 {
-		return nil, false, true, false
+		return nil, nil, false, true, false
 	}
 	file, err := syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(raw), "")
 	if err != nil {
 		// The line-oriented normalizer reports its own parse errors.
-		return nil, false, false, false
+		return nil, nil, false, false, false
 	}
 	a := &feedAnalysis{raw: raw, depth: depth, literals: collectLiteralVariables(file, raw)}
 	// Writing these arrays defines an alias body or rebinds a command name to
@@ -104,7 +105,7 @@ func analyzeExecutionFeeds(raw string, depth int) (segments []string, opaque, pa
 	for _, stmt := range file.Stmts {
 		a.visitStmt(stmt, nil)
 	}
-	return a.segments, a.opaque, a.parseErr, a.writesFiles
+	return a.segments, a.originalGitSegments, a.opaque, a.parseErr, a.writesFiles
 }
 
 func (a *feedAnalysis) addPayload(payload string) {
@@ -113,6 +114,7 @@ func (a *feedAnalysis) addPayload(payload string) {
 	}
 	inner := normalizeWithFeeds(payload, a.depth+1)
 	a.segments = append(a.segments, inner.Segments...)
+	a.originalGitSegments = append(a.originalGitSegments, inner.OriginalGitSegments...)
 	a.opaque = a.opaque || inner.Opaque
 	a.parseErr = a.parseErr || inner.ParseError
 	a.writesFiles = a.writesFiles || inner.WritesFiles

@@ -14,10 +14,12 @@ failed because the executor denied Unix-domain socket creation. This record
 does not claim a successful end-to-end run, a full race-suite pass, or release
 qualification.
 
-This follow-up adds `TestBuiltCLIPrivateGroupRuntimeIntegration` to
+The initial validation commit,
+[345def651b18da6e7556534420efa89917c51ac2](https://github.com/Dicklesworthstone/slb/commit/345def651b18da6e7556534420efa89917c51ac2),
+added `TestBuiltCLIPrivateGroupRuntimeIntegration` to
 [hook_installation_test.go](../internal/e2e/hook_installation_test.go), alongside
-this validation record. It changes no production permissions, discovery policy,
-or dependencies. The exact test-file blob compiled during the attempted run is
+this validation record. That commit changed no production permissions,
+discovery policy, or dependencies. The exact test-file blob compiled during the attempted run is
 `1a92daa23b1322456264147f8fcfe885b8818f07`; its base blob was
 `bcec5bf904a0a492eceb9bd4e4c27eee4e0ee404`.
 
@@ -163,16 +165,66 @@ restricted executor because `sandbox_approval` is disabled. The executor
 subsequently disconnected and became unavailable. No alternate path was used
 to evade that restriction.
 
-## Unresolved gates and reproduction
+## Follow-up validation and endpoint diagnostics
+
+After the executor reconnected, DSR reran the native account-file and discovery
+checks inside a Linux user/mount namespace under `umask 0002`, with trusted,
+root-owned, files-only account fixtures. The namespace's effective UID and GID
+were both `0`; this is not evidence from a nonroot host account.
+
+`TestDiscoverRuntimeUserPrivateGroupAncestors` **passed**, resolving its earlier
+unmapped-account-owner skip for this controlled namespace. The focused daemon
+run recorded **5 top-level passes, 56 passing parent/subtest results, and one
+skip**. These results overlap the earlier tests and must not be added together
+as independent coverage. The ACL fixture still returned `ENOTSUP`, including
+on the available tmpfs filesystem.
+
+The DSR receipt was `20261122T010231-o0dA1PdX`; source fingerprints were unchanged
+throughout the run. The snapshot contained the initial validation commit plus
+the endpoint-diagnostic fix below and Git-classifier regression tests. Its UPG
+production implementation was unchanged from `3bc6801`.
+
+The command was:
+
+```sh
+go test -count=1 -v \
+  -run 'Test(LocalUserPrivateGroup|ReadLocalAccountFile|RuntimeParentsPrivateGroup|RuntimeParentsRejectPrivateGroup|DiscoverRuntimeUserPrivateGroup)' \
+  ./internal/daemon
+```
+
+The review also exposed a real diagnostic mismatch: the native IPC client
+rejected unsafe socket paths without wrapping `ErrDiscoveryInvalid`, causing
+hooks to report ordinary unavailability rather than invalid discovery. Commit
+[71d49fdfeb97ff3d04535022edfc595608b8e938](https://github.com/Dicklesworthstone/slb/commit/71d49fdfeb97ff3d04535022edfc595608b8e938)
+corrects that classification while retaining ordinary unavailability for a
+genuinely missing endpoint.
+
+Real filesystem regressions put a regular file, directory, symlink, and FIFO
+behind a valid discovery record. All four failed the typed-error assertion
+before the fix and passed afterward; the missing-endpoint control passed in
+both runs. They exercise the actual client before dialing and require no
+socket creation. DSR receipts `20261122T005618-ZGtCoUbX` and
+`20261122T005744-5F3ZCapL` also record successful whole-module build, vet,
+formatting, and diff checks for that fix. The first receipt intentionally has
+a failing aggregate because it separately reproduced the then-unfixed Git
+classification regression; its IPC check passed.
+
+The bounded linter was killed with exit `137` before reporting findings. UBS
+could not complete its Go helper checks and flagged a pre-existing PID fixture
+as security-token randomness; that is not a passing scanner result. A fresh
+socket capability probe continued to return `EPERM` for `AF_UNIX`, so the live
+daemon/hook lifecycle remains unverified.
+
+## Remaining gates and reproduction
 
 | Gate | Status |
 | --- | --- |
 | Native daemon/hook lifecycle test | Attempted; FAILED at denied socket creation |
 | Actual POSIX ACL rejection fixture | SKIPPED; filesystem lacks fixture support |
 | Full race suite under `umask 0002` and `0022` | NOT VERIFIED |
-| Final `golangci-lint run ./...` | Run started; completion could not be read after disconnection |
-| UBS | NOT RUN before the executor disconnected |
-| Final module formatting gate | NOT VERIFIED after disconnection |
+| Final `golangci-lint run ./...` | NOT VERIFIED; follow-up run killed with exit 137 |
+| UBS | INCOMPLETE; Go helper failures and a pre-existing PID-fixture finding |
+| Module formatting gate for the endpoint fix | PASS through DSR |
 | Nonroot Linux UPG host validation | NOT PERFORMED |
 | macOS/Windows runtime validation | NOT PERFORMED |
 

@@ -1287,21 +1287,20 @@ func extractFirstNLines(s string, n int) string {
 // Regression test for issue #4 (regex matching in the embedded
 // Python classifier). The exported hook used p.match() which is
 // anchored to position 0; patterns like DROP\s+DATABASE that match
-// mid-command would never fire. Verify the generated Python source
-// uses .search() instead.
+// mid-command would never fire. Execute the exported classifier so this
+// checks the matching behavior rather than a particular loop spelling.
 func TestExportClaudeHook_UsesSearchNotMatch(t *testing.T) {
+	python := findPython3(t)
 	engine := NewPatternEngine()
-	out := engine.ExportClaudeHook()
-
-	// .search is the unanchored matcher; .match is anchored to
-	// position 0. The hook should use .search.
-	// 6c2bdd7 renamed the loop variable from p to pattern.
-	if strings.Contains(out, ".match(command)") {
-		t.Errorf("ExportClaudeHook still uses .match(); should use .search() (issue #4 follow-on).\n" +
-			"Anchored matching loses mid-command hits like `DROP DATABASE` inside `psql -c '...'`.")
+	if err := engine.AddPattern(RiskTierCritical, `danger-marker`, "unanchored regression", "test"); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(out, "if pattern.search(command):") {
-		t.Errorf("ExportClaudeHook does not use pattern.search(); generated classify() may be broken.")
+	program := engine.ExportClaudeHook() + `
+print(classify('custom-tool --flag danger-marker')[0], classify('custom-tool --flag ordinary')[0])
+`
+	out, err := exec.Command(python, "-c", program).CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "critical unknown" {
+		t.Fatalf("exported classifier lost unanchored regex matching: %v\n%s", err, out)
 	}
 }
 

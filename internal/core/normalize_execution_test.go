@@ -98,3 +98,150 @@ func TestShellAnalysisBoundsNesting(t *testing.T) {
 		t.Fatal("unbounded wrapper nesting accepted")
 	}
 }
+
+// These are classification inputs only; no Git command or shell is executed.
+func TestGitGlobalOptionsPreserveRisk(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		tier    RiskTier
+	}{
+		{`git -C /tmp reset --hard`, RiskTierDangerous},
+		{`git -C '' -C 'repository with spaces' reset --hard`, RiskTierDangerous},
+		{`git --git-dir /tmp/repo.git --work-tree=/tmp/work reset --hard`, RiskTierDangerous},
+		{`git --bare --git-dir=/tmp/repo.git push --force origin main`, RiskTierCritical},
+		{`git --namespace=team --no-pager push --force origin main`, RiskTierCritical},
+		{`git -P --no-optional-locks --literal-pathspecs clean -fd`, RiskTierDangerous},
+		{`git --glob-pathspecs --no-lazy-fetch --no-replace-objects reset --hard`, RiskTierDangerous},
+		{`git --attr-source=HEAD reset --hard`, RiskTierDangerous},
+		{`git --shallow-file /tmp/shallow reset --hard`, RiskTierDangerous},
+		{`/usr/bin/git -C /tmp reset --hard`, RiskTierDangerous},
+		{`sudo -u root git -C /tmp reset --hard`, RiskTierDangerous},
+		{`if true; then git -C /tmp reset --hard; fi`, RiskTierDangerous},
+		{`sh -c 'git -C /tmp reset --hard'`, RiskTierDangerous},
+		{`git -C "$REPO" reset --hard`, RiskTierDangerous},
+		{`git --git-dir=${REPO} reset --hard`, RiskTierDangerous},
+		{`git -c core.fsmonitor=/tmp/monitor reset --hard`, RiskTierDangerous},
+		{`git --config-env=core.sshCommand=SSH_COMMAND push --force origin main`, RiskTierCritical},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			result := NewPatternEngine().ClassifyCommand(tc.command, "")
+			if result.Tier != tc.tier || !result.NeedsApproval || result.IsSafe || result.ParseError {
+				t.Fatalf("Git global options hid the subcommand: %+v; normalized=%+v", result, NormalizeCommand(tc.command))
+			}
+		})
+	}
+}
+
+func TestGitGlobalOptionsDoNotBorrowSafeClassification(t *testing.T) {
+	for _, command := range []string{
+		`git -c core.fsmonitor=/tmp/monitor stash`,
+		`git -c 'alias.wipe=!rm -rf /' wipe`,
+		`git --config-env=core.fsmonitor=MONITOR stash`,
+		`git --config-env core.fsmonitor=MONITOR stash`,
+		`git --exec-path=/tmp/programs stash`,
+		`git -p stash`,
+		`git --paginate stash`,
+		`git -C "$REPO" stash`,
+		`git --git-dir=${REPO} stash`,
+		`if true; then git -c core.fsmonitor=/tmp/monitor stash; fi`,
+		`(git -c core.fsmonitor=/tmp/monitor stash)`,
+		`sh -c 'git -c core.fsmonitor=/tmp/monitor stash'`,
+		`git -c core.pager=/tmp/pager --help stash`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			result := NewPatternEngine().ClassifyCommand(command, "")
+			if !result.Opaque || !result.NeedsApproval || result.IsSafe || result.Tier == "" {
+				t.Fatalf("unknown Git code or expansion borrowed SAFE: %+v; normalized=%+v", result, NormalizeCommand(command))
+			}
+		})
+	}
+}
+
+func TestGitGlobalOptionsFailClosedWhenAmbiguous(t *testing.T) {
+	for _, command := range []string{
+		`git -C`, `git --git-dir`, `git --work-tree`, `git -c`, `git --config-env`,
+		`git --unknown-option /tmp stash`, `git -C/tmp stash`, `git -ccolor.ui=false stash`,
+		`git -- stash`, `git "$OPTIONS" stash`, `git $ACTION --hard`, `git re* --hard`,
+		`git -C /tmp`, `git -P`,
+		`xargs git -C /tmp`, `xargs git -C`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			result := NewPatternEngine().ClassifyCommand(command, "")
+			if !result.NeedsApproval || result.IsSafe || result.Tier == "" {
+				t.Fatalf("ambiguous Git invocation escaped classification: %+v", result)
+			}
+		})
+	}
+}
+
+func TestGitGlobalOptionsPreserveBenignAndInformationalCommands(t *testing.T) {
+	for _, command := range []string{
+		`git -C /tmp stash`, `git --no-pager stash`, `git -P --bare stash`,
+		`git --git-dir=/tmp/repo.git --work-tree /tmp/work stash`,
+	} {
+		result := NewPatternEngine().ClassifyCommand(command, "")
+		if !result.IsSafe || result.NeedsApproval || result.Opaque || result.ParseError || result.HasUnmatchedSegment {
+			t.Errorf("literal Git options changed an ordinary safe command: %q: %+v", command, result)
+		}
+	}
+	for _, command := range []string{
+		`git`, `git --help reset --hard`, `git -C /tmp -h push --force`,
+		`git -P --version reset --hard`, `git --exec-path reset --hard`,
+		`git --html-path reset --hard`, `git --list-cmds=builtins reset --hard`,
+		`git log -C /tmp -- reset --hard`,
+	} {
+		result := NewPatternEngine().ClassifyCommand(command, "")
+		if result.NeedsApproval || result.Opaque || result.ParseError {
+			t.Errorf("inert Git operands became an executable subcommand: %q: %+v", command, result)
+		}
+	}
+}
+
+func TestGitGlobalOptionsPreserveCommandSpecification(t *testing.T) {
+	spec := CommandSpec{
+		Raw: "display text is not authoritative in argv mode", Cwd: "/tmp",
+		Argv: []string{"/usr/bin/git", "-C", "repository with spaces", "reset", "--hard"},
+		Hash: "the-original-reviewed-command-hash",
+	}
+	before := spec
+	before.Argv = append([]string(nil), spec.Argv...)
+	result := NewPatternEngine().ClassifyCommandSpec(spec)
+	if result.Tier != RiskTierDangerous || !result.NeedsApproval || !reflect.DeepEqual(spec, before) {
+		t.Fatalf("classification changed execution input or missed argv: result=%+v, spec=%+v", result, spec)
+	}
+	command := `git -C 'repository with spaces' reset --hard`
+	if normalized := NormalizeCommand(command); normalized.Original != command {
+		t.Fatalf("classification changed the original command: %+v", normalized)
+	}
+}
+
+func TestGitGlobalOptionsRetainCustomRiskPolicies(t *testing.T) {
+	engine := NewPatternEngine()
+	pattern := `^git\s+-C\s+/production\s+stash$`
+	if err := engine.AddPattern(RiskTierCritical, pattern, "production repository requires review", "test"); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range []string{
+		`git -C /production stash`,
+		`/usr/bin/git -C /production stash`,
+		`sudo -u root git -C /production stash`,
+		`if true; then git -C /production stash; fi`,
+		`(git -C /production stash)`,
+		`sh -c 'git -C /production stash'`,
+		`eval 'git -C /production stash'`,
+		`printf 'git -C /production stash' | sh`,
+		`bash <<< 'git -C /production stash'`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			result := engine.ClassifyCommand(command, "")
+			if result.Tier != RiskTierCritical || result.IsSafe || !result.NeedsApproval || result.MinApprovals < 2 || result.MatchedPattern != pattern {
+				t.Fatalf("normalizing Git options weakened a custom policy: %+v; normalized=%+v", result, NormalizeCommand(command))
+			}
+		})
+	}
+	normalized := NormalizeCommand(`git -C /production stash`)
+	if normalized.IsCompound || !reflect.DeepEqual(normalized.Segments, []string{"git stash"}) ||
+		!reflect.DeepEqual(normalized.OriginalGitSegments, []string{"git -C /production stash"}) {
+		t.Fatalf("original policy view became another executed command: %+v", normalized)
+	}
+}

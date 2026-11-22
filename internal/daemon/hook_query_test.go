@@ -40,6 +40,41 @@ func TestHookQueryDeletionRiskAndQuorum(t *testing.T) {
 	}
 }
 
+func TestHookQueryGitGlobalOptionsRiskAndQuorum(t *testing.T) {
+	t.Setenv("HOME", testutil.NonSystemTempDir(t))
+	server := &IPCServer{}
+	project := testutil.NonSystemTempDir(t)
+	for _, tc := range []struct {
+		command, tier string
+		approvals     int
+	}{
+		{"git -C /tmp reset --hard", "dangerous", 1},
+		{"git --git-dir=/tmp/repo.git reset --hard", "dangerous", 1},
+		{"git --no-pager push --force origin main", "critical", 2},
+		{"/usr/bin/git -P -C /tmp push origin +main", "critical", 2},
+		{"sh -c 'git -C /tmp clean -fd'", "dangerous", 1},
+		{"if true; then git -C /tmp reset --hard; fi", "dangerous", 1},
+		{"git -c core.fsmonitor=/tmp/monitor stash", "caution", 0},
+		{"git --unknown-option stash", "caution", 0},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			got := server.classifyCommand(HookQueryParams{Command: tc.command, CWD: project})
+			if got.Action != "block" || got.Tier != tc.tier || got.MinApprovals != tc.approvals {
+				t.Errorf("got action=%s tier=%s approvals=%d; want block/%s/%d", got.Action, got.Tier, got.MinApprovals, tc.tier, tc.approvals)
+			}
+			if got.ExecutionHandoff != nil {
+				t.Fatal("unapproved Git command received an execution handoff")
+			}
+		})
+	}
+	// A recognized harmless option does not make the existing safe command
+	// require approval. No Git command is executed by this policy test.
+	got := server.classifyCommand(HookQueryParams{Command: "git --no-pager -C /tmp stash", CWD: project})
+	if got.Action != "allow" || got.Tier != "safe" {
+		t.Fatalf("safe Git command with harmless options: %+v", got)
+	}
+}
+
 func TestIPCServer_HookQuery_RequiresCommand(t *testing.T) {
 	t.Parallel()
 
