@@ -783,13 +783,17 @@ func TestHookGenerateCommand_GeneratedScriptShapeIsCorrect(t *testing.T) {
 	}
 
 	// (b) #4 follow-on: classify() must use search, not match. Anchored
-	// matching loses every mid-command hit. 33e54f2 renamed the loop
-	// variable from p to pattern.
+	// matching loses every mid-command hit. Check both the generated
+	// matcher call and actual unanchored mid-command classification.
 	if strings.Contains(script, ".match(command)") {
 		t.Errorf("regression #4 follow-on: classify() uses anchored .match; should use unanchored .search")
 	}
-	if !strings.Contains(script, "if pattern.search(command):") {
+	if !strings.Contains(script, "pattern.search(command)") {
 		t.Errorf("expected pattern.search in classify(); not found")
+	}
+	if got := strings.TrimSpace(runGeneratedHookPython(t, filepath.Join(tmpDir, "slb_guard.py"),
+		"print(g['classify'](\"psql -c 'DROP DATABASE prod'\")[0])")); got != "critical" {
+		t.Errorf("classify() lost unanchored mid-command match: got %q, want %q", got, "critical")
 	}
 
 	// (c) #5: hookSpecificOutput shape is the only one Claude Code
