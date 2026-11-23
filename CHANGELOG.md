@@ -12,6 +12,25 @@ SLB is a cross-platform CLI that implements a **two-person rule** for running po
 
 ---
 
+## [v0.6.2] -- 2026-11-23
+
+Compare: [`v0.6.1...v0.6.2`](https://github.com/Dicklesworthstone/slb/compare/v0.6.1...v0.6.2)
+
+Patch release: restores Linux `umask 0002` (`0775` User Private Group) daemon runtime discovery with strict local-account and POSIX ACL verification across Go and Python ([#34](https://github.com/Dicklesworthstone/slb/issues/34)), validates project ancestry before startup writes, classifies unsafe runtime endpoints as invalid discovery, enforces approval rules through Git global options, cloud CLI global options (`kubectl`, `helm`, `terraform`), `find` actions, and explicit shell startup code, fixes TUI history browser navigation and state retention, and updates Go dependencies.
+
+### Fixed
+
+- **Linux `umask 0002` (`0775` User Private Group) runtime discovery** ([#34](https://github.com/Dicklesworthstone/slb/issues/34)): `validateRuntimeAncestors` (`internal/daemon/ownership_unix.go`) and `_validate_runtime_parents` (`internal/cli/hook_runtime.py`) now allow nonsticky `0775` ancestor directories on Linux only when owned by the effective UID and primary GID, world-write is clear, no extended POSIX access ACL is present, and bounded root-owned `/etc/nsswitch.conf`, `/etc/passwd`, and `/etc/group` reads prove a files-only single-user private group whose name matches the username ([`3bc6801`](https://github.com/Dicklesworthstone/slb/commit/3bc68010693c52bba9b4e0745cb7f4d66aa3a522)). Unsafe runtime endpoints behind discovery records are classified as `ErrDiscoveryInvalid` matching the Python hook ([`71d49fd`](https://github.com/Dicklesworthstone/slb/commit/71d49fdfeb97ff3d04535022edfc595608b8e938)), daemon startup validates project ancestry before spawning or creating `.slb` markers ([`4012ed5`](https://github.com/Dicklesworthstone/slb/commit/4012ed52e3aa423dab91bcda1dc218692c742d02)), and Linux namespace UPG lifecycle regression tests cover the full Go/Python daemon flow ([`345def6`](https://github.com/Dicklesworthstone/slb/commit/345def651b18da6e7556534420efa89917c51ac2)). `.slb`, discovery records, sockets, PID files, and leases retain their stricter permissions. Regenerate standalone Python hooks after upgrading.
+- **Git global options, cloud CLI options, `find` actions, and shell startup code**: approval rules are now enforced through Git global options such as `git -C` and `--no-pager` ([`3cbaa48`](https://github.com/Dicklesworthstone/slb/commit/3cbaa48fbb957fe2bed699c1099119dd18d71468)), explicit startup/library overrides such as `BASH_ENV`, `bash --rcfile`, and `LD_PRELOAD` are kept out of SAFE classifications ([`14704fc`](https://github.com/Dicklesworthstone/slb/commit/14704fcf06b52d5f455d4bef70485dde0894e1dc)), `find` deletion/output/execution actions are analyzed across argument boundaries ([`e60a371`](https://github.com/Dicklesworthstone/slb/commit/e60a37105baf18da0abb2678fac6968434425840)), and `kubectl`, `helm`, and `terraform` global options preserve destructive approval risk across both native Go and exported Python classifiers ([`32604d4`](https://github.com/Dicklesworthstone/slb/commit/32604d40247f1ed3089d188ddf8fd828db5cda0c)). Updated `TestHookGenerateCommand_GeneratedScriptShapeIsCorrect` to verify unanchored `pattern.search` matching behavior in the generated Python hook ([`41b8825`](https://github.com/Dicklesworthstone/slb/commit/41b8825907d50c1b82f702967cb9f3b87b7489f1)).
+- **TUI history browser**: selecting a historical request now opens request details and preserves search, filter, page, and selection state when returning ([`30014ca`](https://github.com/Dicklesworthstone/slb/commit/30014ca7f0ba9239944d1c7c5c003561ceb85514)).
+
+### Dependencies and Toolchain
+
+- Updated Go modules: `modernc.org/sqlite` v1.62.0 → v1.63.0, `modernc.org/libc` v1.82.6 → v1.82.12, and `golang.org/x/exp` to `v0.0.0-20261121134650-e1094eeca1b5` ([`cd99b3b`](https://github.com/Dicklesworthstone/slb/commit/cd99b3bbac6a71b2bdac6f6d5d2f0a42e7b0ecd8)).
+- Release binaries are built with Go 1.26.11 (`CGO_ENABLED=0`, `-trimpath`, `govulncheck ./...` clean).
+
+---
+
 ## [v0.6.1] -- 2026-11-21
 
 Compare: [`v0.6.0...v0.6.1`](https://github.com/Dicklesworthstone/slb/compare/v0.6.0...v0.6.1)
