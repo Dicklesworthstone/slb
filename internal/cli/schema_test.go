@@ -1079,3 +1079,247 @@ func schemaMatchesSingleType(t string, value any) bool {
 		return false
 	}
 }
+
+func TestWrapCommandForSchema_RepeatedAndPanicRestore(t *testing.T) {
+	oldSchema := flagSchema
+	oldJSON, oldTOON, oldOutput, oldStats := flagJSON, flagTOON, flagOutput, flagStats
+	defer func() {
+		flagSchema = oldSchema
+		flagJSON, flagTOON, flagOutput, flagStats = oldJSON, oldTOON, oldOutput, oldStats
+	}()
+	flagSchema = false
+	flagJSON, flagTOON, flagOutput, flagStats = false, false, "text", false
+
+	root := &cobra.Command{
+		Use:           "slb",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		PersistentPreRunE: func(*cobra.Command, []string) error {
+			return nil
+		},
+	}
+	root.PersistentFlags().Bool("schema", false, "emit schema")
+
+	panicOnRun := false
+	child := &cobra.Command{
+		Use: "pending",
+		PreRunE: func(*cobra.Command, []string) error {
+			return nil
+		},
+		RunE: func(*cobra.Command, []string) error {
+			if panicOnRun {
+				panic("simulated panic")
+			}
+			return nil
+		},
+		PostRunE: func(*cobra.Command, []string) error {
+			return nil
+		},
+		PersistentPostRunE: func(*cobra.Command, []string) error {
+			return nil
+		},
+	}
+	child.Flags().String("req", "", "required flag")
+	if err := child.MarkFlagRequired("req"); err != nil {
+		t.Fatalf("MarkFlagRequired: %v", err)
+	}
+	root.AddCommand(child)
+
+	// A command that intentionally had DisableFlagParsing=true before wrapping
+	// must keep DisableFlagParsing=true even after --schema runs.
+	passThrough := &cobra.Command{
+		Use:                "status",
+		DisableFlagParsing: true,
+		Run:                func(*cobra.Command, []string) {},
+	}
+	root.AddCommand(passThrough)
+
+	// Group command with no Run/RunE.
+	groupCmd := &cobra.Command{Use: "daemon"}
+	groupCmd.AddCommand(&cobra.Command{Use: "status", RunE: func(*cobra.Command, []string) error { return nil }})
+	root.AddCommand(groupCmd)
+
+	// Calling installSchemaFlagSupport twice and with nil must be safe/idempotent.
+	installSchemaFlagSupport(nil)
+	installSchemaFlagSupport(root)
+	installSchemaFlagSupport(root)
+
+	resetFlags := func() {
+		root.PersistentFlags().VisitAll(func(f *pflag.Flag) {
+			_ = f.Value.Set(f.DefValue)
+			f.Changed = false
+		})
+		child.Flags().VisitAll(func(f *pflag.Flag) {
+			_ = f.Value.Set(f.DefValue)
+			f.Changed = false
+		})
+	}
+
+	// 1. Repeated alternating invocations: --schema succeeds, then normal call
+	//    missing --req MUST fail every single time.
+	for round := 0; round < 3; round++ {
+		resetFlags()
+		var outBuf bytes.Buffer
+		root.SetOut(&outBuf)
+		root.SetErr(&bytes.Buffer{})
+		root.SetArgs([]string{"pending", "--schema"})
+		if err := root.Execute(); err != nil {
+			t.Fatalf("round %d: pending --schema failed: %v", round, err)
+		}
+		if child.DisableFlagParsing {
+			t.Fatalf("round %d: child.DisableFlagParsing leaked as true after --schema", round)
+		}
+
+		resetFlags()
+		root.SetArgs([]string{"pending"})
+		err := root.Execute()
+		if err == nil || !strings.Contains(err.Error(), `required flag(s) "req" not set`) {
+			t.Fatalf("round %d: expected required flag error after --schema, got: %v", round, err)
+		}
+	}
+
+	// 2. Simulated early exit between PreRunE and RunE: invoke PreRunE under --schema
+	//    without calling RunE, then invoke normal execution — DisableFlagParsing must be
+	//    restored via restoreAllBypassedFlagValidation (OnFinalize) AND non-schema PreRunE.
+	resetFlags()
+	_ = root.PersistentFlags().Set("schema", "true")
+	if err := child.PreRunE(child, nil); err != nil {
+		t.Fatalf("direct PreRunE --schema failed: %v", err)
+	}
+	if !child.DisableFlagParsing {
+		t.Fatalf("expected PreRunE --schema to temporarily set DisableFlagParsing")
+	}
+	// Simulate Cobra finalizer unwinding after panic/early-exit.
+	restoreAllBypassedFlagValidation()
+	if child.DisableFlagParsing {
+		t.Fatalf("restoreAllBypassedFlagValidation did not clear DisableFlagParsing")
+	}
+	resetFlags()
+	root.SetArgs([]string{"pending"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), `required flag(s) "req" not set`) {
+		t.Fatalf("expected required flag enforcement after early-exit restore, got: %v", err)
+	}
+
+	// 3. Direct PreRunE --schema leak restored by non-schema PreRunE path too.
+	resetFlags()
+	_ = root.PersistentFlags().Set("schema", "true")
+	_ = child.PreRunE(child, nil)
+	resetFlags()
+	if err := child.PreRunE(child, nil); err != nil {
+		t.Fatalf("non-schema PreRunE failed: %v", err)
+	}
+	if child.DisableFlagParsing {
+		t.Fatalf("non-schema PreRunE failed to restore leaked DisableFlagParsing")
+	}
+
+	// 4. Panic during RunE still leaves DisableFlagParsing=false.
+	resetFlags()
+	panicOnRun = true
+	func() {
+		defer func() { _ = recover() }()
+		root.SetArgs([]string{"pending", "--req", "ok"})
+		_ = root.Execute()
+	}()
+	panicOnRun = false
+	if child.DisableFlagParsing {
+		t.Fatalf("DisableFlagParsing leaked after panic in RunE")
+	}
+	resetFlags()
+	root.SetArgs([]string{"pending"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), `required flag(s) "req" not set`) {
+		t.Fatalf("required flag check failed after panic recovery: %v", err)
+	}
+
+	// 5. Normal run with --req exercises PreRunE, RunE, PostRunE, PersistentPostRunE.
+	resetFlags()
+	root.SetArgs([]string{"pending", "--req", "ok"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("normal pending --req ok failed: %v", err)
+	}
+
+	// 6. Command with pre-existing DisableFlagParsing=true preserves it.
+	resetFlags()
+	_ = root.PersistentFlags().Set("schema", "true")
+	_ = passThrough.PreRunE(passThrough, nil)
+	_ = passThrough.RunE(passThrough, nil)
+	if !passThrough.DisableFlagParsing {
+		t.Fatalf("pre-existing DisableFlagParsing=true was clobbered")
+	}
+	resetFlags()
+	if err := passThrough.RunE(passThrough, nil); err != nil {
+		t.Fatalf("normal passThrough RunE failed: %v", err)
+	}
+
+	// 7. Group command without --schema prints help; aliased group --schema emits target schema;
+	//    unaliased group --schema returns lookup error.
+	unaliasedGrp := &cobra.Command{Use: "integrations"}
+	unaliasedGrp.AddCommand(&cobra.Command{Use: "cursor-rules", RunE: func(*cobra.Command, []string) error { return nil }})
+	root.AddCommand(unaliasedGrp)
+	installSchemaFlagSupport(unaliasedGrp)
+
+	resetFlags()
+	var grpBuf bytes.Buffer
+	root.SetOut(&grpBuf)
+	root.SetArgs([]string{"daemon"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("group command help failed: %v", err)
+	}
+	if !strings.Contains(grpBuf.String(), "status") {
+		t.Fatalf("group command help missing subcommand: %q", grpBuf.String())
+	}
+	resetFlags()
+	grpBuf.Reset()
+	root.SetArgs([]string{"daemon", "--schema"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("aliased group daemon --schema failed: %v", err)
+	}
+	if !strings.Contains(grpBuf.String(), "slb daemon status") {
+		t.Fatalf("daemon --schema did not emit daemon status schema: %q", grpBuf.String())
+	}
+	resetFlags()
+	root.SetArgs([]string{"integrations", "--schema"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "no JSON schema defined") {
+		t.Fatalf("expected no JSON schema defined error for unaliased group integrations --schema, got: %v", err)
+	}
+
+	// 8. canonicalCommandKey(nil) returns empty string safely.
+	if got := canonicalCommandKey(nil); got != "" {
+		t.Fatalf("canonicalCommandKey(nil) = %q, want empty", got)
+	}
+}
+
+func TestSchemaHelpers_HasCommandSchemaAndFormatPrecedence(t *testing.T) {
+	if !HasCommandSchema("pending") || !HasCommandSchema("slb patterns test") || !HasCommandSchema("daemon-status") {
+		t.Fatalf("expected HasCommandSchema true for registered keys/aliases")
+	}
+	if HasCommandSchema("") || HasCommandSchema("does-not-exist") {
+		t.Fatalf("expected HasCommandSchema false for empty/unknown keys")
+	}
+	if _, err := LookupCommandSchema(""); err == nil {
+		t.Fatalf("expected error from LookupCommandSchema empty key")
+	}
+
+	// Verify schemaOutputFormat flag precedence: --json > --toon > -o yaml/toon > default json.
+	for _, tc := range []struct {
+		name   string
+		args   []string
+		prefix string
+	}{
+		{"json flag overrides yaml", []string{"pending", "--schema", "-o", "yaml", "--json"}, "{"},
+		{"toon flag overrides yaml", []string{"pending", "--schema", "-o", "yaml", "--toon"}, ""},
+		{"output toon", []string{"pending", "--schema", "-o", "toon"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := runRootWithArgs(t, tc.args...)
+			if err != nil {
+				t.Fatalf("slb %v failed: %v", tc.args, err)
+			}
+			if tc.prefix != "" && !strings.HasPrefix(strings.TrimSpace(out), tc.prefix) {
+				t.Fatalf("slb %v output did not start with %q: %s", tc.args, tc.prefix, out)
+			}
+			if !strings.Contains(out, "slb pending") {
+				t.Fatalf("slb %v missing command marker: %s", tc.args, out)
+			}
+		})
+	}
+}

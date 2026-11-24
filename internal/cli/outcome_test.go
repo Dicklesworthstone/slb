@@ -347,3 +347,67 @@ func TestOutcomeCommand_Help(t *testing.T) {
 		t.Error("expected help to mention 'stats' subcommand")
 	}
 }
+
+func TestOutcomeCommands_ProblemsFilterAndErrorPaths(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	resetOutcomeFlags()
+	t.Cleanup(resetOutcomeFlags)
+
+	// 1. Nonexistent request ID returns getting request error.
+	cmdMissing := newTestOutcomeCmd(h.DBPath)
+	if _, _, err := executeCommand(cmdMissing, "outcome", "record", "req-does-not-exist", "-j"); err == nil || !strings.Contains(err.Error(), "getting request") {
+		t.Fatalf("expected getting request error, got: %v", err)
+	}
+
+	// 2. Record problematic outcome on executed request, then filter with `outcome list --problems`.
+	sess := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("OutcomeProbAgent"))
+	req := testutil.MakeRequest(t, h.DB, sess, testutil.WithCommand("chmod -R 777 ./prob", h.ProjectDir, true))
+	if _, err := h.DB.Exec(`UPDATE requests SET status = 'executed' WHERE id = ?`, req.ID); err != nil {
+		t.Fatal(err)
+	}
+	resetOutcomeFlags()
+	cmdRec := newTestOutcomeCmd(h.DBPath)
+	if _, err := executeCommandCapture(t, cmdRec, "outcome", "record", req.ID, "--problems", "--description", "broke perms", "--rating", "1", "-j"); err != nil {
+		t.Fatalf("outcome record --problems failed: %v", err)
+	}
+
+	resetOutcomeFlags()
+	cmdList := newTestOutcomeCmd(h.DBPath)
+	listOut, err := executeCommandCapture(t, cmdList, "outcome", "list", "--problems-only", "-j")
+	if err != nil {
+		t.Fatalf("outcome list --problems failed: %v", err)
+	}
+	var listPayload map[string]any
+	if err := json.Unmarshal([]byte(listOut), &listPayload); err != nil {
+		t.Fatalf("invalid outcome list JSON: %v\n%s", err, listOut)
+	}
+	outcomes, _ := listPayload["outcomes"].([]any)
+	if listPayload["count"].(float64) != 1 || len(outcomes) != 1 || outcomes[0].(map[string]any)["caused_problems"] != true {
+		t.Fatalf("expected 1 problematic outcome, got: %+v", listPayload)
+	}
+
+	// 3. Invalid DB (directory) triggers opening database error on record, list, stats, agent-stats.
+	dirDB := t.TempDir()
+	for _, args := range [][]string{
+		{"outcome", "record", req.ID, "-j"},
+		{"outcome", "list", "-j"},
+		{"outcome", "stats", "-j"},
+	} {
+		resetOutcomeFlags()
+		cmdBad := newTestOutcomeCmd(dirDB)
+		if _, _, err := executeCommand(cmdBad, args...); err == nil || !strings.Contains(err.Error(), "opening database") {
+			t.Fatalf("outcome %v expected opening database error, got: %v", args, err)
+		}
+	}
+	resetOutcomeFlags()
+	badAgentRoot := &cobra.Command{Use: "slb", SilenceUsage: true, SilenceErrors: true}
+	badAgentRoot.PersistentFlags().StringVar(&flagDB, "db", dirDB, "db")
+	badAgentRoot.PersistentFlags().BoolVarP(&flagJSON, "json", "j", false, "json")
+	badOutGrp := &cobra.Command{Use: "outcome"}
+	badOutGrp.AddCommand(&cobra.Command{Use: "agent-stats <agent>", Args: cobra.ExactArgs(1), RunE: outcomeAgentStatsCmd.RunE})
+	badAgentRoot.AddCommand(badOutGrp)
+	if _, _, err := executeCommand(badAgentRoot, "outcome", "agent-stats", "OutcomeProbAgent", "-j"); err == nil || !strings.Contains(err.Error(), "opening database") {
+		t.Fatalf("outcome agent-stats expected opening database error, got: %v", err)
+	}
+}

@@ -500,3 +500,29 @@ func TestAddToGitignore_EmptyExistingFile(t *testing.T) {
 		t.Error(".gitignore missing .slb/ entry")
 	}
 }
+
+func TestInitCommand_BlockedByExistingFile(t *testing.T) {
+	oldProject, oldForce, oldOutput, oldJSON := flagProject, flagInitForce, flagOutput, flagJSON
+	t.Cleanup(func() { flagProject, flagInitForce, flagOutput, flagJSON = oldProject, oldForce, oldOutput, oldJSON })
+	flagOutput, flagJSON = "text", false
+
+	// 1. Target directory has regular file named .slb -> init fails cleanly.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".slb"), []byte("not-a-dir"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	flagProject, flagInitForce = dir, true
+	if err := runInit(nil, nil); err == nil {
+		t.Fatalf("expected error when .slb is a regular file")
+	}
+
+	// 2. Target -C is a file rather than a directory -> init fails cleanly.
+	fileTarget := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(fileTarget, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	flagProject, flagInitForce = fileTarget, false
+	if err := runInit(nil, nil); err == nil {
+		t.Fatalf("expected error when -C points to a regular file")
+	}
+}

@@ -507,3 +507,96 @@ func TestWatchPollingUpgradesExistingVersionSevenDatabase(t *testing.T) {
 		t.Fatalf("schema upgrade changed the workflow category or invented execution evidence: %s", buf.String())
 	}
 }
+
+func TestRunWatch_CancelRemoteFailureAndLiveDaemonAutoApprove(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix daemon transport")
+	}
+	h := testutil.NewHarness(t)
+	project, err := filepath.EvalSymlinks(h.ProjectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	savedDB, savedProj, savedAuto, savedInterval, savedSess := flagDB, flagProject, flagWatchAutoApproveCaution, flagWatchPollInterval, flagSessionID
+	t.Cleanup(func() {
+		flagDB, flagProject, flagWatchAutoApproveCaution, flagWatchPollInterval, flagSessionID = savedDB, savedProj, savedAuto, savedInterval, savedSess
+	})
+
+	// 1. Pre-cancelled context exits cleanly with nil.
+	flagDB, flagProject, flagWatchAutoApproveCaution, flagWatchPollInterval = h.DBPath, project, false, 10*time.Millisecond
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cmdCancel := &cobra.Command{Use: "watch"}
+	cmdCancel.SetContext(cancelCtx)
+	cmdCancel.SetOut(&bytes.Buffer{})
+	if err := runWatch(cmdCancel, nil); err != nil {
+		t.Fatalf("runWatch with pre-cancelled ctx failed: %v", err)
+	}
+
+	// 2. Unreachable remote SLB_HOST returns remote watch error (never silently falls back to local DB).
+	flagDB = ""
+	t.Setenv("SLB_HOST", "127.0.0.1:1")
+	cmdRemote := &cobra.Command{Use: "watch"}
+	remoteCtx, remoteCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer remoteCancel()
+	cmdRemote.SetContext(remoteCtx)
+	cmdRemote.SetOut(&bytes.Buffer{})
+	if err := runWatch(cmdRemote, nil); err == nil || !strings.Contains(err.Error(), "remote watch ended") {
+		t.Fatalf("expected remote watch error, got: %v", err)
+	}
+	t.Setenv("SLB_HOST", "")
+
+	// 3. Invalid project path returns resolveWatchState error.
+	flagDB, flagProject = "", filepath.Join(t.TempDir(), "missing-watch-proj")
+	cmdBadProj := &cobra.Command{Use: "watch"}
+	cmdBadProj.SetContext(context.Background())
+	cmdBadProj.SetOut(&bytes.Buffer{})
+	if err := runWatch(cmdBadProj, nil); err == nil {
+		t.Fatalf("expected error for missing watch project")
+	}
+
+	// 4. Live daemon stream receives events and handles --auto-approve-caution error event cleanly.
+	flagDB, flagProject, flagWatchAutoApproveCaution, flagSessionID = "", project, true, ""
+	srvCtx, stopSrv := context.WithCancel(context.Background())
+	srvDone := make(chan error, 1)
+	go func() {
+		srvDone <- daemon.RunDaemon(srvCtx, daemon.ServerOptions{ProjectDir: project, Logger: log.New(io.Discard)})
+	}()
+	defer func() {
+		stopSrv()
+		if err := <-srvDone; err != nil {
+			t.Errorf("daemon shutdown: %v", err)
+		}
+	}()
+	if !testutil.WaitForCondition(func() bool {
+		return daemon.NewProjectClient(project, daemon.WithLocalOnly()).IsDaemonRunning()
+	}, 10*time.Millisecond, 3*time.Second) {
+		t.Fatal("daemon did not become ready")
+	}
+
+	reqSess := testutil.MakeSession(t, h.DB, testutil.WithProject(project))
+	cautionReq := testutil.MakeRequest(t, h.DB, reqSess,
+		testutil.WithCommand("rm build.log", project, true),
+		testutil.WithRisk(db.RiskTierCaution),
+	)
+	watchCtx, watchCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer watchCancel()
+	var watchBuf syncBuffer
+	cmdLive := &cobra.Command{Use: "watch"}
+	cmdLive.SetContext(watchCtx)
+	cmdLive.SetOut(&watchBuf)
+	watchDone := make(chan error, 1)
+	go func() { watchDone <- runWatch(cmdLive, nil) }()
+
+	if !testutil.WaitForCondition(func() bool {
+		return strings.Contains(watchBuf.String(), cautionReq.ID)
+	}, 10*time.Millisecond, 2*time.Second) {
+		watchCancel()
+		<-watchDone
+		t.Fatalf("live daemon watch did not stream caution request %s; got %q", cautionReq.ID, watchBuf.String())
+	}
+	watchCancel()
+	if err := <-watchDone; err != nil {
+		t.Fatalf("live daemon watch returned error on cancel: %v", err)
+	}
+}

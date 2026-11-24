@@ -378,3 +378,88 @@ func TestConfigCommand_Help(t *testing.T) {
 		t.Error("expected help to mention '--global' flag")
 	}
 }
+
+func TestConfigEditCommand_ProjectGlobalAndEditorFailure(t *testing.T) {
+	resetConfigFlags()
+	t.Cleanup(resetConfigFlags)
+
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	logFile := filepath.Join(t.TempDir(), "edited.txt")
+	okEditor := filepath.Join(t.TempDir(), "ok-editor.sh")
+	if err := os.WriteFile(okEditor, []byte("#!/bin/sh\nprintf '%s\n' \"$1\" >> "+logFile+"\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	failEditor := filepath.Join(t.TempDir(), "fail-editor.sh")
+	if err := os.WriteFile(failEditor, []byte("#!/bin/sh\nexit 3\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	newEditRoot := func() *cobra.Command {
+		root := &cobra.Command{Use: "slb", SilenceUsage: true, SilenceErrors: true}
+		root.PersistentFlags().StringVarP(&flagProject, "project", "C", "", "project directory")
+		root.PersistentFlags().StringVarP(&flagConfig, "config", "c", "", "config file")
+		cfg := &cobra.Command{Use: "config"}
+		edit := &cobra.Command{Use: "edit", RunE: configEditCmd.RunE}
+		edit.Flags().BoolVar(&flagConfigGlobal, "global", false, "global config")
+		cfg.AddCommand(edit)
+		root.AddCommand(cfg)
+		return root
+	}
+
+	projectCfg := filepath.Join(h.ProjectDir, ".slb", "config.toml")
+	_ = os.Remove(projectCfg)
+	t.Setenv("EDITOR", okEditor)
+	if _, _, err := executeCommand(newEditRoot(), "config", "edit", "-C", h.ProjectDir); err != nil {
+		t.Fatalf("config edit (project) failed: %v", err)
+	}
+	if _, err := os.Stat(projectCfg); err != nil {
+		t.Fatalf("config edit did not bootstrap missing project config: %v", err)
+	}
+
+	resetConfigFlags()
+	if _, _, err := executeCommand(newEditRoot(), "config", "edit", "--global", "-C", h.ProjectDir); err != nil {
+		t.Fatalf("config edit --global failed: %v", err)
+	}
+	userCfg := filepath.Join(fakeHome, ".slb", "config.toml")
+	if _, err := os.Stat(userCfg); err != nil {
+		t.Fatalf("config edit --global did not bootstrap user config: %v", err)
+	}
+	editedRaw, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(editedRaw), projectCfg) || !strings.Contains(string(editedRaw), userCfg) {
+		t.Fatalf("EDITOR did not receive expected config targets: %q", string(editedRaw))
+	}
+
+	// Planted negative: non-zero $EDITOR exit must propagate an error.
+	resetConfigFlags()
+	t.Setenv("EDITOR", failEditor)
+	if _, _, err := executeCommand(newEditRoot(), "config", "edit", "-C", h.ProjectDir); err == nil {
+		t.Fatalf("expected error when $EDITOR exits non-zero")
+	}
+}
+
+func TestConfigCommands_MalformedConfigErrorPaths(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	badCfg := filepath.Join(h.ProjectDir, ".slb", "config.toml")
+	if err := os.WriteFile(badCfg, []byte("[general\nmin_approvals = [unclosed"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(resetConfigFlags)
+	for _, args := range [][]string{
+		{"config", "-C", h.ProjectDir, "-j"},
+		{"config", "get", "general.min_approvals", "-C", h.ProjectDir, "-j"},
+	} {
+		resetConfigFlags()
+		cmd := newTestConfigCmd(h.DBPath)
+		if _, _, err := executeCommand(cmd, args...); err == nil {
+			t.Fatalf("config %v expected error for malformed config file", args)
+		}
+	}
+}

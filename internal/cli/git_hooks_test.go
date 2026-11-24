@@ -11,8 +11,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
+	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	gitutil "github.com/Dicklesworthstone/slb/internal/git"
+	"github.com/Dicklesworthstone/slb/internal/testutil"
+	"github.com/spf13/cobra"
 )
 
 func nativeCLIGit(t *testing.T, repo string, args ...string) string {
@@ -336,5 +340,220 @@ func TestNativeGitRebaseDiagnosticsAndArguments(t *testing.T) {
 		if err := command.Args(command, args); err == nil {
 			t.Fatalf("invalid native rebase arity accepted: %v", args)
 		}
+	}
+}
+
+func TestAssessNativeGitAndOutputEdgePaths(t *testing.T) {
+	gitDir := t.TempDir()
+	cmdInit := exec.Command("git", "init", gitDir)
+	if out, err := cmdInit.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, string(out))
+	}
+	t.Chdir(gitDir)
+
+	// 1. Unknown operation rejected.
+	if _, _, err := assessNativeGit(context.Background(), "merge", "", "", nil); err == nil || !strings.Contains(err.Error(), "operation must be") {
+		t.Fatalf("expected invalid operation error, got: %v", err)
+	}
+
+	// 2. Push with nil stdin rejected.
+	if _, _, err := assessNativeGit(context.Background(), "push", "origin", "https://example.invalid/repo.git", nil); err == nil || !strings.Contains(err.Error(), "pre-push stdin is required") {
+		t.Fatalf("expected nil push stdin error, got: %v", err)
+	}
+
+	// 3. Push with oversized >1MiB stdin rejected.
+	oversized := strings.NewReader(strings.Repeat("a", 1024*1024+16))
+	if _, _, err := assessNativeGit(context.Background(), "push", "origin", "https://example.invalid/repo.git", oversized); err == nil || !strings.Contains(err.Error(), "exceeds 1 MiB") {
+		t.Fatalf("expected oversized push stdin error, got: %v", err)
+	}
+
+	// 4. Commit assessment + revalidate detects changed staged snapshot!
+	assess, revalidate, err := assessNativeGit(context.Background(), "commit", "", "", nil)
+	if err != nil || assess == nil {
+		t.Fatalf("assessNativeGit commit failed: %v", err)
+	}
+	if err := revalidate(context.Background()); err != nil {
+		t.Fatalf("revalidate unchanged repo failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "newfile.txt"), []byte("hello\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "add", "newfile.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, string(out))
+	}
+	if err := revalidate(context.Background()); err == nil || !strings.Contains(err.Error(), "snapshot changed") {
+		t.Fatalf("expected snapshot changed error after staging new file, got: %v", err)
+	}
+
+	// 5. writeGitHookOutput honors YAML output format.
+	savedOut, savedJSON, savedTOON := flagOutput, flagJSON, flagTOON
+	t.Cleanup(func() { flagOutput, flagJSON, flagTOON = savedOut, savedJSON, savedTOON })
+	flagOutput, flagJSON, flagTOON = "yaml", false, false
+	yamlOut := captureStdout(t, func() {
+		if err := writeGitHookOutput(&cobra.Command{Use: "git-check"}, map[string]any{"allowed": true}); err != nil {
+			t.Errorf("writeGitHookOutput yaml failed: %v", err)
+		}
+	})
+	if !strings.Contains(yamlOut, "allowed: true") {
+		t.Fatalf("writeGitHookOutput yaml missing allowed: true, got %q", yamlOut)
+	}
+}
+
+func TestGitCheckCommand_RequestExitCodeAndValidation(t *testing.T) {
+	h := testutil.NewHarness(t)
+	gitDir := h.ProjectDir
+	for _, args := range [][]string{
+		{"init", gitDir},
+		{"-C", gitDir, "config", "user.email", "test@example.invalid"},
+		{"-C", gitDir, "config", "user.name", "Test User"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, string(out))
+		}
+	}
+	fPath := filepath.Join(gitDir, "tracked.txt")
+	if err := os.WriteFile(fPath, []byte("keep\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"-C", gitDir, "add", "tracked.txt"},
+		{"-C", gitDir, "commit", "-m", "initial"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, string(out))
+		}
+	}
+	t.Chdir(gitDir)
+
+	cmdBad := newGitCheckCmd()
+	cmdBad.SetArgs([]string{"--new-request"})
+	cmdBad.SetOut(&bytes.Buffer{})
+	cmdBad.SetErr(&bytes.Buffer{})
+	if err := cmdBad.Execute(); err == nil || !strings.Contains(err.Error(), "--new-request requires --request") {
+		t.Fatalf("expected --new-request requires --request error, got: %v", err)
+	}
+
+	cmdClean := newGitCheckCmd()
+	var cleanOut bytes.Buffer
+	cmdClean.SetArgs([]string{"--request"})
+	cmdClean.SetOut(&cleanOut)
+	if err := cmdClean.Execute(); err != nil {
+		t.Fatalf("git-check --request on clean repo failed: %v", err)
+	}
+	var dec gitHookDecision
+	if err := json.Unmarshal(cleanOut.Bytes(), &dec); err != nil || !dec.Allowed {
+		t.Fatalf("expected Allowed=true decision on clean commit, got dec=%+v err=%v raw=%s", dec, err, cleanOut.String())
+	}
+
+	if out, err := exec.Command("git", "-C", gitDir, "rm", "tracked.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git rm: %v\n%s", err, string(out))
+	}
+	cmdExit := newGitCheckCmd()
+	var exitOut bytes.Buffer
+	cmdExit.SetArgs([]string{"--exit-code"})
+	cmdExit.SetOut(&exitOut)
+	if err := cmdExit.Execute(); err == nil || !strings.Contains(err.Error(), "Git operation requires approval") {
+		t.Fatalf("expected approval required error with --exit-code on staged delete, got: %v", err)
+	}
+	if !strings.Contains(exitOut.String(), `"requires_approval":true`) {
+		t.Fatalf("expected requires_approval=true JSON before exit error, got: %s", exitOut.String())
+	}
+
+	nonGit := t.TempDir()
+	t.Chdir(nonGit)
+	cmdHooks := newGitHooksCmd()
+	cmdHooks.SetArgs([]string{"status"})
+	cmdHooks.SetOut(&bytes.Buffer{})
+	cmdHooks.SetErr(&bytes.Buffer{})
+	if err := cmdHooks.Execute(); err == nil {
+		t.Fatalf("expected error running git-hooks status outside git repo")
+	}
+}
+
+func TestNativeGitHookPreCommitBlockAndConsumeApproval(t *testing.T) {
+	h := testutil.NewHarness(t)
+	gitDir := h.ProjectDir
+	cfgPath := filepath.Join(gitDir, ".slb", "config.toml")
+	if err := config.WriteValue(cfgPath, "general.approval_policy", "same_host"); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"init", gitDir},
+		{"-C", gitDir, "config", "user.email", "test@example.invalid"},
+		{"-C", gitDir, "config", "user.name", "Test User"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, string(out))
+		}
+	}
+	fPath := filepath.Join(gitDir, "delete-me.txt")
+	if err := os.WriteFile(fPath, []byte("hello\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"-C", gitDir, "add", "delete-me.txt"},
+		{"-C", gitDir, "commit", "-m", "initial"},
+		{"-C", gitDir, "rm", "delete-me.txt"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, string(out))
+		}
+	}
+	t.Chdir(gitDir)
+
+	reqSess := testutil.MakeSession(t, h.DB, testutil.WithProject(gitDir), testutil.WithAgent("GitAuthor"), testutil.WithModel("model-a"))
+	revSess := testutil.MakeSession(t, h.DB, testutil.WithProject(gitDir), testutil.WithAgent("GitReviewer"), testutil.WithModel("model-b"))
+	t.Setenv("SLB_SESSION_ID", reqSess.ID)
+	savedDB, savedProj, savedSess := flagDB, flagProject, flagSessionID
+	t.Cleanup(func() { flagDB, flagProject, flagSessionID = savedDB, savedProj, savedSess })
+	flagDB, flagProject, flagSessionID = "", "", ""
+
+	// 1. First pre-commit attempt blocks staged deletion and creates a pending request.
+	cmd1 := newNativeGitHookCmd("pre-commit")
+	cmd1.SetContext(context.Background())
+	cmd1.SetArgs([]string{})
+	cmd1.SetOut(&bytes.Buffer{})
+	cmd1.SetErr(&bytes.Buffer{})
+	err := cmd1.Execute()
+	if err == nil || !strings.Contains(err.Error(), "SLB:") || !strings.Contains(err.Error(), "Do not use slb execute") {
+		t.Fatalf("expected SLB block error from pre-commit, got: %v", err)
+	}
+
+	// 2. Approve the created request under same_host policy.
+	pending, err := h.DB.ListPendingRequests(gitDir)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("expected 1 pending git hook request, got len=%d err=%v", len(pending), err)
+	}
+	svc := core.NewReviewService(h.DB, core.ReviewConfig{ApprovalPolicy: db.ApprovalPolicySameHost})
+	if _, err := svc.SubmitReview(core.ReviewOptions{
+		RequestID: pending[0].ID, SessionID: revSess.ID, SessionKey: revSess.SessionKey,
+		Decision: db.DecisionApprove, Comments: "approved deletion",
+	}); err != nil {
+		t.Fatalf("approving git hook request: %v", err)
+	}
+
+	// 3. Second pre-commit attempt consumes the approval and prints notice to stderr.
+	cmd2 := newNativeGitHookCmd("pre-commit")
+	cmd2.SetContext(context.Background())
+	cmd2.SetArgs([]string{})
+	var stderr bytes.Buffer
+	cmd2.SetOut(&bytes.Buffer{})
+	cmd2.SetErr(&stderr)
+	if err := cmd2.Execute(); err != nil {
+		t.Fatalf("approved pre-commit hook failed: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "SLB: consumed Git hook review") {
+		t.Fatalf("expected consumed notice on stderr, got: %q", stderr.String())
+	}
+
+	// 4. Native pre-push with empty stdin (no ref updates) succeeds cleanly.
+	cmdPush := newNativeGitHookCmd("pre-push")
+	cmdPush.SetContext(context.Background())
+	cmdPush.SetArgs([]string{"origin", "https://example.invalid/repo.git"})
+	cmdPush.SetIn(strings.NewReader(""))
+	cmdPush.SetOut(&bytes.Buffer{})
+	cmdPush.SetErr(&bytes.Buffer{})
+	if err := cmdPush.Execute(); err != nil {
+		t.Fatalf("empty pre-push failed: %v", err)
 	}
 }

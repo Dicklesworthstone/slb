@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
@@ -468,5 +470,156 @@ func TestRequestCommand_WithRedaction(t *testing.T) {
 		if strings.Contains(redacted, "secret123") {
 			t.Error("expected redacted command to not contain 'secret123'")
 		}
+	}
+}
+
+func TestRequestCommand_WaitTimeoutRejectedAndApprovedExecute(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	resetRequestFlags()
+	t.Cleanup(resetRequestFlags)
+
+	cfgPath := filepath.Join(h.ProjectDir, ".slb", "config.toml")
+	if err := config.WriteValue(cfgPath, "general.approval_policy", "same_host"); err != nil {
+		t.Fatal(err)
+	}
+	cfgBytes, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgBytes = append(cfgBytes, []byte("\n[patterns.dangerous]\npatterns = [\"^echo wait-exec-ok$\"]\n")...)
+	if err := os.WriteFile(cfgPath, cfgBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	sess := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("ReqWaitAgent"), testutil.WithModel("model-a"))
+	revSess := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("RevWaitAgent"), testutil.WithModel("model-b"))
+
+	// 1. Wait timeout: emits wait_timed_out=true and returns timeout error.
+	cmdTO := newTestRequestCmd(h.DBPath)
+	ctxTO, cancelTO := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancelTO()
+	cmdTO.SetContext(ctxTO)
+	toOut, toErr := executeCommandCapture(t, cmdTO, "request", "chmod -R 777 ./timeout-target",
+		"-s", sess.ID, "-C", h.ProjectDir, "--wait", "--timeout", "1", "-j",
+	)
+	if toErr == nil || !strings.Contains(toErr.Error(), "waiting for request") {
+		t.Fatalf("expected wait timeout error, got: %v", toErr)
+	}
+	var toPayload map[string]any
+	if err := json.Unmarshal([]byte(toOut), &toPayload); err != nil {
+		t.Fatalf("invalid wait timeout JSON: %v\n%s", err, toOut)
+	}
+	if timedOut, _ := toPayload["wait_timed_out"].(bool); !timedOut {
+		t.Fatalf("expected wait_timed_out=true, got: %+v", toPayload)
+	}
+
+	// 2. Wait + execute when request gets rejected: returns not approved error + executed=false.
+	resetRequestFlags()
+	go func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			db2, err := db.Open(h.DBPath)
+			if err == nil {
+				pending, _ := db2.ListPendingRequests(h.ProjectDir)
+				for _, r := range pending {
+					if r.Command.Raw == "chmod -R 777 ./reject-wait-target" {
+						_ = db2.UpdateRequestStatus(r.ID, db.StatusRejected)
+						_ = db2.Close()
+						return
+					}
+				}
+				_ = db2.Close()
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+	}()
+	cmdRej := newTestRequestCmd(h.DBPath)
+	rejOut, rejErr := executeCommandCapture(t, cmdRej, "request", "chmod -R 777 ./reject-wait-target",
+		"-s", sess.ID, "-C", h.ProjectDir, "--wait", "--execute", "--timeout", "5", "-j",
+	)
+	if rejErr == nil || !strings.Contains(rejErr.Error(), "not approved for execution") {
+		t.Fatalf("expected not approved for execution error, got: %v", rejErr)
+	}
+	var rejPayload map[string]any
+	if err := json.Unmarshal([]byte(rejOut), &rejPayload); err != nil {
+		t.Fatalf("invalid rejected wait JSON: %v\n%s", err, rejOut)
+	}
+	if rejPayload["executed"] != false {
+		t.Fatalf("expected executed=false on rejection, got: %+v", rejPayload)
+	}
+
+	// 3. Wait + execute when request gets approved: executes command and reports exit_code=0.
+	resetRequestFlags()
+	go func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			db2, err := db.Open(h.DBPath)
+			if err == nil {
+				pending, _ := db2.ListPendingRequests(h.ProjectDir)
+				for _, r := range pending {
+					if r.Command.Raw == "echo wait-exec-ok" {
+						svc := core.NewReviewService(db2, core.ReviewConfig{ApprovalPolicy: db.ApprovalPolicySameHost})
+						_, _ = svc.SubmitReview(core.ReviewOptions{
+							RequestID: r.ID, SessionID: revSess.ID, SessionKey: revSess.SessionKey,
+							Decision: db.DecisionApprove, Comments: "approved",
+						})
+						_ = db2.Close()
+						return
+					}
+				}
+				_ = db2.Close()
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+	}()
+	cmdExec := newTestRequestCmd(h.DBPath)
+	execOut, execErr := executeCommandCapture(t, cmdExec, "request", "echo wait-exec-ok",
+		"-s", sess.ID, "-C", h.ProjectDir, "--wait", "--execute", "--timeout", "5", "-j",
+	)
+	if execErr != nil {
+		t.Fatalf("request --wait --execute approved failed: %v\n%s", execErr, execOut)
+	}
+	var execPayload map[string]any
+	if err := json.Unmarshal([]byte(execOut), &execPayload); err != nil {
+		t.Fatalf("invalid wait-execute JSON: %v\n%s", err, execOut)
+	}
+	if execPayload["executed"] != true || execPayload["exit_code"].(float64) != 0 {
+		t.Fatalf("expected executed=true exit_code=0, got: %+v", execPayload)
+	}
+}
+
+func TestRequestCommand_ValidationAndConfigErrorPaths(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	resetRequestFlags()
+	savedCfg := flagConfig
+	t.Cleanup(func() {
+		flagConfig = savedCfg
+		resetRequestFlags()
+	})
+
+	// 1. Non-positive --timeout rejected.
+	cmdBadTO := newTestRequestCmd(h.DBPath)
+	if _, _, err := executeCommand(cmdBadTO, "request", "chmod -R 777 ./x", "-s", "s1", "--timeout", "0"); err == nil || !strings.Contains(err.Error(), "--timeout must be a positive") {
+		t.Fatalf("expected positive timeout error, got: %v", err)
+	}
+
+	// 2. Directory as DB returns opening database error.
+	resetRequestFlags()
+	cmdBadDB := newTestRequestCmd(t.TempDir())
+	if _, _, err := executeCommand(cmdBadDB, "request", "chmod -R 777 ./x", "-s", "s1", "-C", h.ProjectDir); err == nil || !strings.Contains(err.Error(), "opening database") {
+		t.Fatalf("expected opening database error, got: %v", err)
+	}
+
+	// 3. Malformed config returns loading config error.
+	badCfg := filepath.Join(h.ProjectDir, ".slb", "config.toml")
+	if err := os.WriteFile(badCfg, []byte("[general\nmin_approvals = [broken"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	resetRequestFlags()
+	cmdBadCfg := newTestRequestCmd(h.DBPath)
+	if _, _, err := executeCommand(cmdBadCfg, "request", "chmod -R 777 ./x", "-s", "s1", "-C", h.ProjectDir); err == nil || !strings.Contains(err.Error(), "loading config") {
+		t.Fatalf("expected loading config error, got: %v", err)
 	}
 }

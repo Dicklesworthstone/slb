@@ -1,6 +1,7 @@
 package output
 
 import (
+	"encoding"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -194,9 +195,37 @@ func SchemaFromType(t reflect.Type, fieldDescriptions map[string]string) *JSONSc
 	return schemaFromType(t, "", fieldDescriptions, make(map[reflect.Type]bool))
 }
 
-var timeType = reflect.TypeOf(time.Time{})
+var (
+	timeType          = reflect.TypeOf(time.Time{})
+	rawMessageType    = reflect.TypeOf(json.RawMessage(nil))
+	jsonMarshalerType = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
+	textMarshalerType = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
+)
+
+func implementsJSONMarshaler(t reflect.Type) bool {
+	if t == nil {
+		return false
+	}
+	if t.Implements(jsonMarshalerType) {
+		return true
+	}
+	return t.Kind() != reflect.Pointer && reflect.PointerTo(t).Implements(jsonMarshalerType)
+}
+
+func implementsTextMarshaler(t reflect.Type) bool {
+	if t == nil {
+		return false
+	}
+	if t.Implements(textMarshalerType) {
+		return true
+	}
+	return t.Kind() != reflect.Pointer && reflect.PointerTo(t).Implements(textMarshalerType)
+}
 
 func schemaFromType(t reflect.Type, path string, descs map[string]string, visiting map[reflect.Type]bool) *JSONSchema {
+	if t == nil {
+		return AnySchema(lookupDescription(path, "", descs))
+	}
 	for t.Kind() == reflect.Pointer {
 		inner := schemaFromType(t.Elem(), path, descs, visiting)
 		return makeNullable(inner)
@@ -204,6 +233,15 @@ func schemaFromType(t reflect.Type, path string, descs map[string]string, visiti
 
 	if t == timeType {
 		return DateTimeSchema(lookupDescription(path, t.Name(), descs))
+	}
+	if t == rawMessageType || implementsJSONMarshaler(t) {
+		return AnySchema(lookupDescription(path, t.Name(), descs))
+	}
+	if implementsTextMarshaler(t) {
+		if t.Kind() == reflect.Interface {
+			return NullableStringSchema(lookupDescription(path, t.Name(), descs))
+		}
+		return StringSchema(lookupDescription(path, t.Name(), descs))
 	}
 
 	switch t.Kind() {
@@ -316,6 +354,8 @@ func collectStructFields(
 				for ft.Kind() == reflect.Pointer {
 					ft = ft.Elem()
 				}
+				// Match encoding/json/encode.go typeFields: anonymous untagged structs
+				// are traversed when the enclosing struct itself did not promote a custom marshaler.
 				if ft.Kind() == reflect.Struct && ft != timeType {
 					if visiting[ft] || containsType(node.ancestors, ft) {
 						continue
@@ -419,6 +459,81 @@ func hasJSONTagOption(opts, target string) bool {
 	return false
 }
 
+func schemaAcceptsNull(s *JSONSchema) bool {
+	if s == nil {
+		return true
+	}
+	if len(s.AnyOf) > 0 {
+		accepted := false
+		for _, sub := range s.AnyOf {
+			if schemaAcceptsNull(sub) {
+				accepted = true
+				break
+			}
+		}
+		if !accepted {
+			return false
+		}
+	}
+	if len(s.OneOf) > 0 {
+		matches := 0
+		for _, sub := range s.OneOf {
+			if schemaAcceptsNull(sub) {
+				matches++
+			}
+		}
+		if matches != 1 {
+			return false
+		}
+	}
+	if s.Const != nil {
+		return false
+	}
+	if len(s.Enum) > 0 {
+		hasNil := false
+		for _, ev := range s.Enum {
+			if ev == nil {
+				hasNil = true
+				break
+			}
+		}
+		if !hasNil {
+			return false
+		}
+	}
+	switch tv := s.Type.(type) {
+	case nil:
+		return true
+	case string:
+		return tv == "" || tv == "null"
+	case []string:
+		for _, item := range tv {
+			if item == "null" {
+				return true
+			}
+		}
+		return false
+	case []any:
+		for _, item := range tv {
+			if str, ok := item.(string); ok && str == "null" {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func schemaBranchesAcceptNull(branches []*JSONSchema) bool {
+	for _, b := range branches {
+		if schemaAcceptsNull(b) {
+			return true
+		}
+	}
+	return false
+}
+
 func makeNullable(s *JSONSchema) *JSONSchema {
 	if s == nil {
 		return &JSONSchema{Type: "null"}
@@ -440,6 +555,17 @@ func makeNullable(s *JSONSchema) *JSONSchema {
 		if !hasNull {
 			cp.Type = append(append([]string(nil), tv...), "null")
 		}
+	case []any:
+		hasNull := false
+		for _, item := range tv {
+			if str, ok := item.(string); ok && str == "null" {
+				hasNull = true
+				break
+			}
+		}
+		if !hasNull {
+			cp.Type = append(append([]any(nil), tv...), "null")
+		}
 	}
 	if len(cp.Enum) > 0 {
 		hasNil := false
@@ -458,6 +584,20 @@ func makeNullable(s *JSONSchema) *JSONSchema {
 			cp.Enum = []any{cp.Const, nil}
 		}
 		cp.Const = nil
+	}
+	if len(cp.AnyOf) > 0 {
+		cloned := append([]*JSONSchema(nil), cp.AnyOf...)
+		if !schemaBranchesAcceptNull(cloned) {
+			cloned = append(cloned, &JSONSchema{Type: "null"})
+		}
+		cp.AnyOf = cloned
+	}
+	if len(cp.OneOf) > 0 {
+		cloned := append([]*JSONSchema(nil), cp.OneOf...)
+		if !schemaBranchesAcceptNull(cloned) {
+			cloned = append(cloned, &JSONSchema{Type: "null"})
+		}
+		cp.OneOf = cloned
 	}
 	return &cp
 }

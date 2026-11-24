@@ -244,3 +244,45 @@ func TestCompleteSessionIDs_SessionMinimalInfo(t *testing.T) {
 		t.Error("expected to find session with MinimalAgent")
 	}
 }
+
+func TestCompletionCommand_AllShellsAndInvalidShell(t *testing.T) {
+	for _, shell := range []string{"bash", "zsh", "fish", "powershell"} {
+		t.Run(shell, func(t *testing.T) {
+			root := newTestRootCmd()
+			comp := &cobra.Command{
+				Use:       completionCmd.Use,
+				ValidArgs: completionCmd.ValidArgs,
+				Args:      completionCmd.Args,
+				RunE:      completionCmd.RunE,
+			}
+			root.AddCommand(comp)
+			out, err := executeCommandCapture(t, root, "completion", shell)
+			if err != nil {
+				t.Fatalf("completion %s failed: %v", shell, err)
+			}
+			if !strings.Contains(out, "slb") {
+				t.Fatalf("completion %s script missing slb command name", shell)
+			}
+		})
+	}
+
+	root := newTestRootCmd()
+	comp := &cobra.Command{
+		Use:       completionCmd.Use,
+		ValidArgs: completionCmd.ValidArgs,
+		Args:      completionCmd.Args,
+		RunE:      completionCmd.RunE,
+	}
+	root.AddCommand(comp)
+	if _, _, err := executeCommand(root, "completion", "csh"); err == nil {
+		t.Fatalf("expected error for unsupported shell 'csh'")
+	}
+
+	savedDB := flagDB
+	t.Cleanup(func() { flagDB = savedDB })
+	flagDB = "/nonexistent/slb-completion-test/state.db"
+	items, dir := completeSessionIDs(nil, nil, "")
+	if len(items) != 0 || dir != cobra.ShellCompDirectiveNoFileComp {
+		t.Fatalf("expected empty completions for missing DB, got items=%v dir=%v", items, dir)
+	}
+}

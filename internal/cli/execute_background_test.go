@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,8 +16,10 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/background"
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
+	"github.com/spf13/cobra"
 )
 
 // Invoke the real worker handler in a separate test process. This exercises
@@ -461,5 +464,69 @@ func TestBackgroundExecutionSessionShorthandDoesNotShadowTOON(t *testing.T) {
 	}
 	if got := executeCmd.Flags().Lookup("session-id"); got == nil || got.Shorthand != "s" {
 		t.Fatal("execute does not accept -s for the root --session-id")
+	}
+}
+
+func TestLaunchBackgroundExecution_HashMismatchAndErrorFormatting(t *testing.T) {
+	conn, job := backgroundExecutionFixture(t, "echo bg-hash-test", db.ApprovalPolicySameHost)
+	req, err := conn.GetRequest(job.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	savedOut, savedJSON, savedTOON, savedCfg := flagOutput, flagJSON, flagTOON, flagConfig
+	t.Cleanup(func() { flagOutput, flagJSON, flagTOON, flagConfig = savedOut, savedJSON, savedTOON, savedCfg })
+
+	// 1. Structured JSON error output on command hash mismatch (never spawns child).
+	flagOutput, flagJSON, flagTOON, flagConfig = "text", true, false, ""
+	var jsonBuf bytes.Buffer
+	cmdJSON := &cobra.Command{Use: "execute"}
+	cmdJSON.SetOut(&jsonBuf)
+	cmdJSON.SetContext(context.Background())
+	err = launchBackgroundExecution(cmdJSON, conn, req, job.SessionID, "wrong-hash", 10*time.Second, config.DefaultConfig(), job.LogDir)
+	if !errors.Is(err, core.ErrCommandHashMismatch) {
+		t.Fatalf("expected ErrCommandHashMismatch, got: %v", err)
+	}
+	var payload map[string]any
+	if jerr := json.Unmarshal(jsonBuf.Bytes(), &payload); jerr != nil {
+		t.Fatalf("expected structured JSON failure payload, got %q: %v", jsonBuf.String(), jerr)
+	}
+	if payload["status"] != "not_launched" || payload["request_id"] != req.ID {
+		t.Fatalf("unexpected failure payload: %+v", payload)
+	}
+
+	// 2. Text mode error output prints Approval policy line.
+	flagOutput, flagJSON, flagTOON = "text", false, false
+	var textBuf bytes.Buffer
+	cmdText := &cobra.Command{Use: "execute"}
+	cmdText.SetOut(&textBuf)
+	cmdText.SetContext(context.Background())
+	err = launchBackgroundExecution(cmdText, conn, req, job.SessionID, "wrong-hash", 10*time.Second, config.DefaultConfig(), job.LogDir)
+	if !errors.Is(err, core.ErrCommandHashMismatch) {
+		t.Fatalf("expected ErrCommandHashMismatch in text mode, got: %v", err)
+	}
+	if !strings.Contains(textBuf.String(), "Approval policy:") {
+		t.Fatalf("expected Approval policy text diagnostic, got: %q", textBuf.String())
+	}
+
+	// 3. Real Launch attempt with relative flagConfig resolves config path and reports StartError cleanly
+	//    when invoked against non-worker test binary (exercises startup_unconfirmed / launch path).
+	flagOutput, flagJSON, flagTOON = "text", true, false
+	flagConfig = filepath.Join(job.Project, ".slb", "config.toml")
+	var launchBuf bytes.Buffer
+	cmdLaunch := &cobra.Command{Use: "execute"}
+	cmdLaunch.SetOut(&launchBuf)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmdLaunch.SetContext(ctx)
+	launchErr := launchBackgroundExecution(cmdLaunch, conn, req, job.SessionID, req.Command.Hash, 10*time.Second, config.DefaultConfig(), job.LogDir)
+	if launchErr == nil {
+		t.Fatalf("expected background launch with test binary without worker flag to return error")
+	}
+	var launchPayload map[string]any
+	if jerr := json.Unmarshal(launchBuf.Bytes(), &launchPayload); jerr != nil {
+		t.Fatalf("expected JSON launch error payload, got %q: %v", launchBuf.String(), jerr)
+	}
+	if launchPayload["status"] != "not_launched" && launchPayload["status"] != "startup_unconfirmed" {
+		t.Fatalf("unexpected launch error status: %+v", launchPayload)
 	}
 }

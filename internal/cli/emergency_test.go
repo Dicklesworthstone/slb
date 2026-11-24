@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/slb/internal/config"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 	"github.com/spf13/cobra"
@@ -639,4 +640,129 @@ func runEmergencyJSON(t *testing.T, h *testutil.Harness, ctx context.Context, co
 		t.Fatalf("emergency output is not clean JSON: %s (%v; execution error %v)", stdout, err, runErr)
 	}
 	return view, runErr
+}
+
+func TestEmergencyExecute_TextOutputAndRollbackCapturePaths(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	resetEmergencyFlags()
+	t.Cleanup(resetEmergencyFlags)
+
+	// 1. Text output on successful emergency override.
+	cmdStr := "echo emergency-text-ok"
+	sum := sha256.Sum256([]byte(cmdStr))
+	ack := hex.EncodeToString(sum[:])[:8]
+	cmd := newTestEmergencyCmd(h.DBPath)
+	out, stderr, err := executeCommand(cmd, "emergency-execute", cmdStr,
+		"-C", h.ProjectDir, "--reason", "incident recovery", "--yes", "--ack", ack,
+		"--log-dir", filepath.Join(h.SLBDir, "logs"),
+	)
+	if err != nil {
+		t.Fatalf("emergency-execute text failed: %v\nstderr=%s", err, stderr)
+	}
+	for _, want := range []string{"Emergency execution:", "Configured policy (bypassed):", "Status: succeeded", "Exit code: 0", "Log:"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("emergency text output missing %q:\n%s", want, out)
+		}
+	}
+
+	// 2. Text output on failing emergency override prints failure message to stderr.
+	resetEmergencyFlags()
+	failCmdStr := "exit 9"
+	failSum := sha256.Sum256([]byte(failCmdStr))
+	failAck := hex.EncodeToString(failSum[:])[:8]
+	failCmd := newTestEmergencyCmd(h.DBPath)
+	failOut, failErrOut, failErr := executeCommand(failCmd, "emergency-execute", failCmdStr,
+		"-C", h.ProjectDir, "--reason", "failure path test", "--yes", "--ack", failAck,
+		"--log-dir", filepath.Join(h.SLBDir, "logs"),
+	)
+	if failErr == nil {
+		t.Fatalf("expected non-zero error for 'exit 9'")
+	}
+	if !strings.Contains(failOut, "Exit code: 9") || !strings.Contains(failErrOut, "Emergency execution failed:") {
+		t.Fatalf("expected exit 9 and stderr failure notice, got out=%q err=%q", failOut, failErrOut)
+	}
+
+	// 3. --capture-rollback with unsupported command prints warning to stderr and still executes.
+	resetEmergencyFlags()
+	capCmd := newTestEmergencyCmd(h.DBPath)
+	_, capErrOut, capErr := executeCommand(capCmd, "emergency-execute", cmdStr,
+		"-C", h.ProjectDir, "--reason", "capture test", "--yes", "--ack", ack,
+		"--capture-rollback", "--log-dir", filepath.Join(h.SLBDir, "logs"),
+	)
+	if capErr != nil {
+		t.Fatalf("emergency-execute --capture-rollback failed: %v", capErr)
+	}
+	if !strings.Contains(capErrOut, "rollback capture unsupported") {
+		t.Fatalf("expected unsupported rollback warning on stderr, got: %q", capErrOut)
+	}
+
+	// 4. Planted negative: --capture-rollback fails when disabled in config.
+	cfgPath := filepath.Join(h.ProjectDir, ".slb", "config.toml")
+	if err := config.WriteValue(cfgPath, "general.enable_rollback_capture", false); err != nil {
+		t.Fatal(err)
+	}
+	resetEmergencyFlags()
+	disCmd := newTestEmergencyCmd(h.DBPath)
+	if _, _, disErr := executeCommand(disCmd, "emergency-execute", cmdStr,
+		"-C", h.ProjectDir, "--reason", "disabled capture", "--yes", "--ack", ack, "--capture-rollback",
+	); disErr == nil || !strings.Contains(disErr.Error(), "rollback capture is disabled") {
+		t.Fatalf("expected disabled rollback capture error, got: %v", disErr)
+	}
+}
+
+func TestEmergencyExecute_InteractiveConfirmationAndValidation(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	resetEmergencyFlags()
+	t.Cleanup(resetEmergencyFlags)
+
+	cmdBlank := newTestEmergencyCmd(h.DBPath)
+	if _, _, err := executeCommand(cmdBlank, "emergency-execute", "   ", "--reason", "test"); err == nil || !strings.Contains(err.Error(), "command is required") {
+		t.Fatalf("expected blank command error, got: %v", err)
+	}
+
+	resetEmergencyFlags()
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cmdCtx := newTestEmergencyCmd(h.DBPath)
+	cmdCtx.SetContext(cancelCtx)
+	if _, _, err := executeCommand(cmdCtx, "emergency-execute", "echo hi", "--reason", "test"); err == nil {
+		t.Fatalf("expected cancelled context error")
+	}
+
+	resetEmergencyFlags()
+	cmdEOF := newTestEmergencyCmd(h.DBPath)
+	cmdEOF.SetIn(strings.NewReader(""))
+	if _, _, err := executeCommand(cmdEOF, "emergency-execute", "echo eof", "-C", h.ProjectDir, "--reason", "interactive eof"); err == nil || !strings.Contains(err.Error(), "reading confirmation") {
+		t.Fatalf("expected reading confirmation error on EOF, got: %v", err)
+	}
+
+	resetEmergencyFlags()
+	marker := filepath.Join(h.ProjectDir, "should-not-exist")
+	cmdNo := newTestEmergencyCmd(h.DBPath)
+	cmdNo.SetIn(strings.NewReader("NO\n"))
+	if _, _, err := executeCommand(cmdNo, "emergency-execute", "touch "+marker, "-C", h.ProjectDir, "--reason", "cancel test"); err == nil || !strings.Contains(err.Error(), "execution cancelled") {
+		t.Fatalf("expected execution cancelled error, got: %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("cancelled emergency command still ran")
+	}
+
+	resetEmergencyFlags()
+	cmdYes := newTestEmergencyCmd(h.DBPath)
+	cmdYes.SetIn(strings.NewReader("EXECUTE\n"))
+	out, err := executeCommandCapture(t, cmdYes, "emergency-execute", "echo interactive-ok",
+		"-C", h.ProjectDir, "--reason", "interactive confirm", "--log-dir", filepath.Join(h.SLBDir, "logs"), "--json",
+	)
+	if err != nil {
+		t.Fatalf("interactive emergency execute failed: %v\n%s", err, out)
+	}
+	var payload emergencyExecutionOutcome
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("invalid emergency JSON: %v\n%s", err, out)
+	}
+	if payload.ConfirmationMethod != db.EmergencyConfirmationInteractive || payload.ExitCode != 0 {
+		t.Fatalf("expected interactive confirmation exit 0, got: %+v", payload)
+	}
 }

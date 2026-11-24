@@ -3,6 +3,7 @@ package output
 import (
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"reflect"
 	"strings"
 	"testing"
@@ -334,6 +335,222 @@ func TestMakeNullable_EnumAndConst(t *testing.T) {
 	// Planted negative: other string must fail.
 	if err := ValidateDocumentAgainstSchema(docConst, "bad"); err == nil {
 		t.Fatalf("nullable const accepted invalid value 'bad'")
+	}
+}
+
+type CustomJSONStamp struct {
+	InternalSecret string `json:"internal_secret"`
+}
+
+func (c CustomJSONStamp) MarshalJSON() ([]byte, error) {
+	return json.Marshal("stamp:" + c.InternalSecret)
+}
+
+type CustomTextTokenA struct {
+	HiddenA string `json:"hidden_a"`
+}
+
+func (c CustomTextTokenA) MarshalText() ([]byte, error) {
+	return []byte("tokA:" + c.HiddenA), nil
+}
+
+type CustomTextTokenB struct {
+	HiddenB string `json:"hidden_b"`
+}
+
+func (c CustomTextTokenB) MarshalText() ([]byte, error) {
+	return []byte("tokB:" + c.HiddenB), nil
+}
+
+func TestSchemaFromType_JSONAndTextMarshalers(t *testing.T) {
+	// 1. json.RawMessage must allow arbitrary JSON values (not base64 string).
+	type rawEnvelope struct {
+		Payload json.RawMessage `json:"payload"`
+		Addr    netip.Addr      `json:"addr"`
+		Stamp   CustomJSONStamp `json:"stamp"`
+	}
+	sEnv := SchemaFromType(reflect.TypeOf(rawEnvelope{}), nil)
+	docEnv := mustSchemaDoc(t, sEnv)
+
+	addr := netip.MustParseAddr("192.0.2.10")
+	for _, rawVal := range []json.RawMessage{
+		json.RawMessage(`{"nested":true}`),
+		json.RawMessage(`[1,2,3]`),
+		json.RawMessage(`42`),
+		json.RawMessage(`"raw-str"`),
+	} {
+		v := mustJSONRoundTrip(t, rawEnvelope{
+			Payload: rawVal,
+			Addr:    addr,
+			Stamp:   CustomJSONStamp{InternalSecret: "v1"},
+		})
+		if err := ValidateDocumentAgainstSchema(docEnv, v); err != nil {
+			t.Fatalf("rawEnvelope with payload=%s failed validation: %v", string(rawVal), err)
+		}
+	}
+	// Planted negative: non-string for encoding.TextMarshaler field (addr) must fail.
+	if err := ValidateDocumentAgainstSchema(docEnv, map[string]any{
+		"payload": map[string]any{"ok": true},
+		"addr":    float64(12345),
+		"stamp":   "stamp:v1",
+	}); err == nil {
+		t.Fatalf("expected numeric value for netip.Addr TextMarshaler to fail validation")
+	}
+
+	// 2. Single embedded TextMarshaler promotes MarshalText onto the outer struct,
+	//    so encoding/json marshals the outer struct as a JSON string (never flattening fields).
+	type singleEmbedText struct {
+		CustomTextTokenA
+		Extra string `json:"extra"`
+	}
+	sSingleText := SchemaFromType(reflect.TypeOf(singleEmbedText{}), nil)
+	docSingleText := mustSchemaDoc(t, sSingleText)
+	if err := ValidateDocumentAgainstSchema(docSingleText, mustJSONRoundTrip(t, singleEmbedText{
+		CustomTextTokenA: CustomTextTokenA{HiddenA: "x"},
+		Extra:            "ignored-by-promoted-MarshalText",
+	})); err != nil {
+		t.Fatalf("singleEmbedText failed validation: %v", err)
+	}
+	// Planted negative: an object with flattened internal fields must fail.
+	if err := ValidateDocumentAgainstSchema(docSingleText, map[string]any{"hidden_a": "x", "extra": "y"}); err == nil {
+		t.Fatalf("expected object payload to fail single-embedded TextMarshaler string schema")
+	}
+
+	// 3. Tagged embedded TextMarshaler is NOT flattened; it becomes a string property.
+	type taggedEmbedText struct {
+		CustomTextTokenA `json:"token_a"`
+		CustomTextTokenB `json:"token_b"`
+		Extra            string `json:"extra"`
+	}
+	sTagged := SchemaFromType(reflect.TypeOf(taggedEmbedText{}), nil)
+	if _, leaked := sTagged.Properties["hidden_a"]; leaked {
+		t.Fatalf("tagged embedded TextMarshaler leaked hidden_a into properties: %v", sTagged.Properties)
+	}
+	docTagged := mustSchemaDoc(t, sTagged)
+	if err := ValidateDocumentAgainstSchema(docTagged, mustJSONRoundTrip(t, taggedEmbedText{
+		CustomTextTokenA: CustomTextTokenA{HiddenA: "a"},
+		CustomTextTokenB: CustomTextTokenB{HiddenB: "b"},
+		Extra:            "ok",
+	})); err != nil {
+		t.Fatalf("taggedEmbedText failed validation: %v", err)
+	}
+	// Planted negative: object for tagged TextMarshaler must fail string schema.
+	if err := ValidateDocumentAgainstSchema(docTagged, map[string]any{"token_a": map[string]any{"hidden_a": "a"}, "token_b": "tokB:b", "extra": "ok"}); err == nil {
+		t.Fatalf("expected object payload for tagged TextMarshaler to fail string schema")
+	}
+
+	// 4. Dual untagged embedded TextMarshalers cancel MarshalText promotion in Go,
+	//    so encoding/json traverses both embedded structs; SchemaFromType must match json.Marshal.
+	type dualEmbedText struct {
+		CustomTextTokenA
+		CustomTextTokenB
+		Extra string `json:"extra"`
+	}
+	docDual := mustSchemaDoc(t, SchemaFromType(reflect.TypeOf(dualEmbedText{}), nil))
+	if err := ValidateDocumentAgainstSchema(docDual, mustJSONRoundTrip(t, dualEmbedText{
+		CustomTextTokenA: CustomTextTokenA{HiddenA: "a"},
+		CustomTextTokenB: CustomTextTokenB{HiddenB: "b"},
+		Extra:            "ok",
+	})); err != nil {
+		t.Fatalf("dualEmbedText failed validation against real json.Marshal output: %v", err)
+	}
+
+	// 4. Single embedded json.Marshaler promotes MarshalJSON onto outer struct.
+	type singleEmbedJSON struct {
+		CustomJSONStamp
+		Extra string `json:"extra"`
+	}
+	sSingleJSON := SchemaFromType(reflect.TypeOf(singleEmbedJSON{}), nil)
+	if len(sSingleJSON.Properties) != 0 {
+		t.Fatalf("embedded json.Marshaler must not flatten struct fields into Properties, got %v", sSingleJSON.Properties)
+	}
+	if err := ValidateDocumentAgainstSchema(mustSchemaDoc(t, sSingleJSON), mustJSONRoundTrip(t, singleEmbedJSON{
+		CustomJSONStamp: CustomJSONStamp{InternalSecret: "s"},
+		Extra:           "ignored",
+	})); err != nil {
+		t.Fatalf("singleEmbedJSON failed validation: %v", err)
+	}
+}
+
+func TestMakeNullable_AnyOfAndOneOf(t *testing.T) {
+	// 1. AnyOf becomes nullable without mutating original slice.
+	origAny := &JSONSchema{
+		Description: "string or int",
+		AnyOf:       []*JSONSchema{StringSchema("s"), IntSchema("n")},
+	}
+	nullAny := makeNullable(origAny)
+	if len(origAny.AnyOf) != 2 {
+		t.Fatalf("makeNullable mutated original AnyOf slice: len=%d", len(origAny.AnyOf))
+	}
+	if len(nullAny.AnyOf) != 3 {
+		t.Fatalf("expected 3 AnyOf branches after makeNullable, got %d", len(nullAny.AnyOf))
+	}
+	docAny := mustSchemaDoc(t, nullAny)
+	for _, valid := range []any{"hello", float64(7), nil} {
+		if err := ValidateDocumentAgainstSchema(docAny, valid); err != nil {
+			t.Fatalf("nullable AnyOf rejected valid value %#v: %v", valid, err)
+		}
+	}
+	// Planted negative: boolean must still fail.
+	if err := ValidateDocumentAgainstSchema(docAny, true); err == nil {
+		t.Fatalf("nullable AnyOf accepted invalid boolean")
+	}
+	// Idempotency: second makeNullable must not duplicate null branch.
+	if twice := makeNullable(nullAny); len(twice.AnyOf) != 3 {
+		t.Fatalf("double makeNullable duplicated null branch in AnyOf: len=%d", len(twice.AnyOf))
+	}
+
+	// 2. OneOf becomes nullable without adding duplicate null branches.
+	origOne := &JSONSchema{
+		Description: "string or int",
+		OneOf:       []*JSONSchema{StringSchema("s"), IntSchema("n")},
+	}
+	nullOne := makeNullable(origOne)
+	if len(origOne.OneOf) != 2 {
+		t.Fatalf("makeNullable mutated original OneOf slice: len=%d", len(origOne.OneOf))
+	}
+	if len(nullOne.OneOf) != 3 {
+		t.Fatalf("expected 3 OneOf branches after makeNullable, got %d", len(nullOne.OneOf))
+	}
+	docOne := mustSchemaDoc(t, nullOne)
+	for _, valid := range []any{"hello", float64(7), nil} {
+		if err := ValidateDocumentAgainstSchema(docOne, valid); err != nil {
+			t.Fatalf("nullable OneOf rejected valid value %#v: %v", valid, err)
+		}
+	}
+	// Planted negative: boolean must fail.
+	if err := ValidateDocumentAgainstSchema(docOne, true); err == nil {
+		t.Fatalf("nullable OneOf accepted invalid boolean")
+	}
+	// Idempotency: second makeNullable must NOT add a second null branch (which would break oneOf!).
+	twiceOne := makeNullable(nullOne)
+	if len(twiceOne.OneOf) != 3 {
+		t.Fatalf("double makeNullable duplicated null branch in OneOf: len=%d", len(twiceOne.OneOf))
+	}
+	if err := ValidateDocumentAgainstSchema(mustSchemaDoc(t, twiceOne), nil); err != nil {
+		t.Fatalf("double makeNullable broke oneOf null matching: %v", err)
+	}
+
+	// 3. OneOf where a branch already accepts null must not add another null branch.
+	alreadyNullOne := &JSONSchema{
+		Description: "nullable string or int",
+		OneOf:       []*JSONSchema{NullableStringSchema("s"), IntSchema("n")},
+	}
+	afterNullOne := makeNullable(alreadyNullOne)
+	if len(afterNullOne.OneOf) != 2 {
+		t.Fatalf("makeNullable added redundant null branch to already-nullable OneOf: len=%d", len(afterNullOne.OneOf))
+	}
+	if err := ValidateDocumentAgainstSchema(mustSchemaDoc(t, afterNullOne), nil); err != nil {
+		t.Fatalf("already-nullable OneOf failed null after makeNullable: %v", err)
+	}
+
+	// 4. Nil input and []any Type slice.
+	if got := makeNullable(nil); got.Type != "null" {
+		t.Fatalf("makeNullable(nil).Type=%v, want null", got.Type)
+	}
+	anyTypeSchema := makeNullable(&JSONSchema{Type: []any{"string"}})
+	if err := ValidateDocumentAgainstSchema(mustSchemaDoc(t, anyTypeSchema), nil); err != nil {
+		t.Fatalf("[]any Type schema failed null after makeNullable: %v", err)
 	}
 }
 

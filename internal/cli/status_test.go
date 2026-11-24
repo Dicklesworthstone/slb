@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
@@ -34,6 +36,10 @@ func resetStatusFlags() {
 	flagJSON = false
 	flagProject = ""
 	flagStatusWait = false
+	if f := statusCmd.Flags().Lookup("help"); f != nil {
+		_ = f.Value.Set("false")
+		f.Changed = false
+	}
 }
 
 func TestStatusCommand_RequiresRequestID(t *testing.T) {
@@ -197,5 +203,113 @@ func TestStatusCommand_Help(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "--wait") {
 		t.Error("expected help to mention '--wait' flag")
+	}
+}
+
+func TestStatusCommand_WaitUntilApprovedAndCancel(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	resetStatusFlags()
+	t.Cleanup(func() {
+		statusCmd.SetContext(nil)
+		resetStatusFlags()
+	})
+
+	sess := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("StatusWaitAgent"))
+	req := testutil.MakeRequest(t, h.DB, sess, testutil.WithCommand("chmod -R 777 ./wait-status-target", h.ProjectDir, true))
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	statusCmd.SetContext(cancelCtx)
+	cmdCancel := newTestStatusCmd(h.DBPath)
+	cmdCancel.SetArgs([]string{"status", req.ID, "--wait", "-j"})
+	var cancelErr error
+	_ = captureStdout(t, func() {
+		cancelErr = cmdCancel.ExecuteContext(cancelCtx)
+	})
+	if cancelErr == nil || !strings.Contains(cancelErr.Error(), "waiting for request") {
+		t.Fatalf("expected waiting error on cancelled context, got: %v", cancelErr)
+	}
+
+	resetStatusFlags()
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		db2, err := db.Open(h.DBPath)
+		if err != nil {
+			return
+		}
+		defer db2.Close()
+		_ = db2.UpdateRequestStatus(req.ID, db.StatusApproved)
+	}()
+
+	ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+	statusCmd.SetContext(ctx)
+	cmd := newTestStatusCmd(h.DBPath)
+	cmd.SetArgs([]string{"status", req.ID, "--wait", "-j"})
+	var err error
+	out := captureStdout(t, func() {
+		err = cmd.ExecuteContext(ctx)
+	})
+	if err != nil {
+		t.Fatalf("status --wait failed: %v\n%s", err, out)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out)
+	}
+	if payload["status"] != "approved" {
+		t.Fatalf("status --wait status=%v, want approved", payload["status"])
+	}
+}
+
+func TestStatusCommand_RejectedWithTimestamps(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	resetStatusFlags()
+	t.Cleanup(func() {
+		statusCmd.SetContext(nil)
+		resetStatusFlags()
+	})
+
+	reqSess := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("Req"), testutil.WithModel("model-a"))
+	revSess := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("Rev"), testutil.WithModel("model-b"))
+	req := testutil.MakeRequest(t, h.DB, reqSess, testutil.WithCommand("chmod -R 777 ./rej-status", h.ProjectDir, true))
+	now := time.Now().UTC()
+	exp := now.Add(time.Hour)
+	if _, err := h.DB.Exec(`UPDATE requests SET status = 'rejected', resolved_at = ?, approval_expires_at = ? WHERE id = ?`,
+		now.Format(time.RFC3339), exp.Format(time.RFC3339), req.ID); err != nil {
+		t.Fatal(err)
+	}
+	rev := &db.Review{
+		RequestID: req.ID, ReviewerSessionID: revSess.ID, ReviewerAgent: revSess.AgentName, ReviewerModel: revSess.Model,
+		Decision: db.DecisionReject, Comments: "unsafe", SignatureTimestamp: now,
+		Signature: db.ComputeReviewSignature(revSess.SessionKey, req.ID, db.DecisionReject, now),
+	}
+	if err := h.DB.CreateReview(rev); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := newTestStatusCmd(h.DBPath)
+	out, err := executeCommandCapture(t, cmd, "status", req.ID, "-j")
+	if err != nil {
+		t.Fatalf("status rejected failed: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("invalid status JSON: %v\n%s", err, out)
+	}
+	if payload["rejection_count"].(float64) != 1 || payload["resolved_at"] == "" || payload["approval_expires_at"] == "" {
+		t.Fatalf("expected rejection_count=1 and timestamps, got: %+v", payload)
+	}
+}
+
+func TestStatusCommand_InvalidDatabaseError(t *testing.T) {
+	resetStatusFlags()
+	t.Cleanup(resetStatusFlags)
+	dirAsDB := t.TempDir()
+	cmd := newTestStatusCmd(dirAsDB)
+	if _, _, err := executeCommand(cmd, "status", "req-any", "-j"); err == nil || !strings.Contains(err.Error(), "opening database") {
+		t.Fatalf("expected opening database error for directory DB path, got: %v", err)
 	}
 }

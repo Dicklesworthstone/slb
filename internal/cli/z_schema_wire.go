@@ -3,14 +3,58 @@ package cli
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/spf13/cobra"
 )
+
+var (
+	schemaBypassMu     sync.Mutex
+	schemaBypassedCmds = make(map[*cobra.Command]struct{})
+	schemaFinalizeOnce sync.Once
+)
+
+func markBypassedFlagValidation(c *cobra.Command) {
+	if c == nil {
+		return
+	}
+	schemaBypassMu.Lock()
+	defer schemaBypassMu.Unlock()
+	if c.DisableFlagParsing {
+		return
+	}
+	schemaBypassedCmds[c] = struct{}{}
+	c.DisableFlagParsing = true
+}
+
+func restoreBypassedFlagValidation(c *cobra.Command) {
+	if c == nil {
+		return
+	}
+	schemaBypassMu.Lock()
+	defer schemaBypassMu.Unlock()
+	if _, bypassed := schemaBypassedCmds[c]; bypassed {
+		delete(schemaBypassedCmds, c)
+		c.DisableFlagParsing = false
+	}
+}
+
+func restoreAllBypassedFlagValidation() {
+	schemaBypassMu.Lock()
+	defer schemaBypassMu.Unlock()
+	for c := range schemaBypassedCmds {
+		c.DisableFlagParsing = false
+		delete(schemaBypassedCmds, c)
+	}
+}
 
 // z_schema_wire.go initializes after all command registration init() functions
 // (Go initializes files in lexical order within a package) and installs the
 // global --schema flag interceptor across the command tree.
 func init() {
+	schemaFinalizeOnce.Do(func() {
+		cobra.OnFinalize(restoreAllBypassedFlagValidation)
+	})
 	if rootCmd.PersistentFlags().Lookup("schema") == nil {
 		rootCmd.PersistentFlags().BoolVar(&flagSchema, "schema", false, "emit JSON Schema for this command's structured output and exit")
 	}
@@ -52,6 +96,9 @@ func installSchemaFlagSupport(cmd *cobra.Command) {
 	if cmd == nil {
 		return
 	}
+	schemaFinalizeOnce.Do(func() {
+		cobra.OnFinalize(restoreAllBypassedFlagValidation)
+	})
 	wrapCommandForSchema(cmd)
 	for _, sub := range cmd.Commands() {
 		installSchemaFlagSupport(sub)
@@ -66,14 +113,6 @@ func wrapCommandForSchema(cmd *cobra.Command) {
 		cmd.Annotations = make(map[string]string)
 	}
 	cmd.Annotations["slb.schema.wrapped"] = "1"
-
-	bypassedFlagValidation := false
-	restoreFlagValidation := func(c *cobra.Command) {
-		if bypassedFlagValidation {
-			bypassedFlagValidation = false
-			c.DisableFlagParsing = false
-		}
-	}
 
 	isGroupCmd := cmd != rootCmd && cmd.RunE == nil && cmd.Run == nil && len(cmd.Commands()) > 0
 	origArgs := cmd.Args
@@ -98,6 +137,7 @@ func wrapCommandForSchema(cmd *cobra.Command) {
 			if schemaFlagEnabled(c) {
 				return nil
 			}
+			restoreBypassedFlagValidation(c)
 			return origPersistentPreRunE(c, args)
 		}
 	} else if cmd.PersistentPreRun != nil {
@@ -107,6 +147,7 @@ func wrapCommandForSchema(cmd *cobra.Command) {
 			if schemaFlagEnabled(c) {
 				return nil
 			}
+			restoreBypassedFlagValidation(c)
 			origPersistentPreRun(c, args)
 			return nil
 		}
@@ -114,18 +155,18 @@ func wrapCommandForSchema(cmd *cobra.Command) {
 
 	// Always install PreRunE so --schema bypasses Cobra's ValidateRequiredFlags
 	// and ValidateFlagGroups (which run between PreRunE and RunE and return nil
-	// when DisableFlagParsing is set). RunE immediately restores DisableFlagParsing.
+	// when DisableFlagParsing is set). RunE, non-schema PreRunE, and Cobra's
+	// OnFinalize hook ensure DisableFlagParsing is always restored even on panic
+	// or early exit.
 	origPreRunE := cmd.PreRunE
 	origPreRun := cmd.PreRun
 	cmd.PreRun = nil
 	cmd.PreRunE = func(c *cobra.Command, args []string) error {
 		if schemaFlagEnabled(c) {
-			if !c.DisableFlagParsing {
-				bypassedFlagValidation = true
-				c.DisableFlagParsing = true
-			}
+			markBypassedFlagValidation(c)
 			return nil
 		}
+		restoreBypassedFlagValidation(c)
 		if origPreRunE != nil {
 			return origPreRunE(c, args)
 		}
@@ -142,13 +183,15 @@ func wrapCommandForSchema(cmd *cobra.Command) {
 		// schema catalog's own JSON Schema.
 		origRunE := cmd.RunE
 		cmd.RunE = func(c *cobra.Command, args []string) error {
-			restoreFlagValidation(c)
+			defer restoreBypassedFlagValidation(c)
+			restoreBypassedFlagValidation(c)
 			return origRunE(c, args)
 		}
 	} else if cmd.RunE != nil {
 		origRunE := cmd.RunE
 		cmd.RunE = func(c *cobra.Command, args []string) error {
-			restoreFlagValidation(c)
+			defer restoreBypassedFlagValidation(c)
+			restoreBypassedFlagValidation(c)
 			if schemaFlagEnabled(c) {
 				return emitSchemaForCommand(c)
 			}
@@ -158,7 +201,8 @@ func wrapCommandForSchema(cmd *cobra.Command) {
 		origRun := cmd.Run
 		cmd.Run = nil
 		cmd.RunE = func(c *cobra.Command, args []string) error {
-			restoreFlagValidation(c)
+			defer restoreBypassedFlagValidation(c)
+			restoreBypassedFlagValidation(c)
 			if schemaFlagEnabled(c) {
 				return emitSchemaForCommand(c)
 			}
@@ -168,7 +212,8 @@ func wrapCommandForSchema(cmd *cobra.Command) {
 	} else if cmd != rootCmd {
 		// Group command (e.g. `slb patterns --schema`, `slb daemon --schema`) with no Run/RunE.
 		cmd.RunE = func(c *cobra.Command, args []string) error {
-			restoreFlagValidation(c)
+			defer restoreBypassedFlagValidation(c)
+			restoreBypassedFlagValidation(c)
 			if schemaFlagEnabled(c) {
 				return emitSchemaForCommand(c)
 			}

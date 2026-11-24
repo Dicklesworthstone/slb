@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -977,5 +978,115 @@ func TestPatternsVersionCommand_DeterministicHash(t *testing.T) {
 	// Hash should be identical for same patterns
 	if result1["sha256"] != result2["sha256"] {
 		t.Errorf("hash not deterministic: %v != %v", result1["sha256"], result2["sha256"])
+	}
+}
+
+func TestPatternsTestCommand_TextOutputCompoundAndParseError(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	resetPatternsFlags()
+	t.Cleanup(resetPatternsFlags)
+
+	// 1. Dangerous compound command text output prints tier, approval, pattern, and segments.
+	cmd := newTestPatternsCmd(h.DBPath)
+	out, err := executeCommandCapture(t, cmd, "patterns", "test", "ls -la && chmod -R 777 ./build")
+	if err != nil {
+		t.Fatalf("patterns test text failed: %v", err)
+	}
+	for _, want := range []string{"Command:", "Tier:       DANGEROUS", "Approval:   true", "Min Approvals:", "Pattern:", "Segments:"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("patterns test text missing %q:\n%s", want, out)
+		}
+	}
+
+	// 2. Unmatched safe command prints Tier and Approval: false.
+	resetPatternsFlags()
+	cmdSafe := newTestPatternsCmd(h.DBPath)
+	safeOut, err := executeCommandCapture(t, cmdSafe, "patterns", "test", "echo hello-world")
+	if err != nil {
+		t.Fatalf("patterns test safe text failed: %v", err)
+	}
+	if !strings.Contains(safeOut, "Tier:") || !strings.Contains(safeOut, "Approval:   false") {
+		t.Fatalf("unexpected safe patterns test output:\n%s", safeOut)
+	}
+
+	// 3. Malformed shell quoting sets parse_error=true in JSON output.
+	resetPatternsFlags()
+	cmdBad := newTestPatternsCmd(h.DBPath)
+	badOut, err := executeCommandCapture(t, cmdBad, "patterns", "test", "chmod -R 777 'unterminated", "-j")
+	if err != nil {
+		t.Fatalf("patterns test malformed shell failed: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(badOut), &payload); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, badOut)
+	}
+	if pe, _ := payload["parse_error"].(bool); !pe {
+		t.Fatalf("expected parse_error=true for unterminated quote, got: %+v", payload)
+	}
+}
+
+func TestPatternsExportCommand_FormatsAndErrors(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	resetPatternsFlags()
+	t.Cleanup(resetPatternsFlags)
+
+	cmdYAML := newTestPatternsCmd(h.DBPath)
+	yamlOut, err := executeCommandCapture(t, cmdYAML, "patterns", "export", "--format", "yaml")
+	if err != nil {
+		t.Fatalf("patterns export yaml failed: %v", err)
+	}
+	if !strings.Contains(yamlOut, "metadata") {
+		t.Fatalf("patterns export yaml missing metadata")
+	}
+
+	resetPatternsFlags()
+	cmdHook := newTestPatternsCmd(h.DBPath)
+	hookOut, err := executeCommandCapture(t, cmdHook, "patterns", "export", "--format", "claude-hook")
+	if err != nil {
+		t.Fatalf("patterns export claude-hook failed: %v", err)
+	}
+	if !strings.Contains(hookOut, "PATTERNS") && !strings.Contains(hookOut, "python") && !strings.Contains(hookOut, "def ") {
+		t.Fatalf("patterns export claude-hook did not emit Python hook code")
+	}
+
+	resetPatternsFlags()
+	cmdBad := newTestPatternsCmd(h.DBPath)
+	if _, err := executeCommandCapture(t, cmdBad, "patterns", "export", "--format", "xml"); err == nil || !strings.Contains(err.Error(), "unknown format") {
+		t.Fatalf("expected unknown format error, got: %v", err)
+	}
+
+	resetPatternsFlags()
+	cmdWriteErr := newTestPatternsCmd(h.DBPath)
+	badPath := filepath.Join(t.TempDir(), "no-such-dir", "out.json")
+	if _, err := executeCommandCapture(t, cmdWriteErr, "patterns", "export", "--format", "json", "--output-file", badPath); err == nil {
+		t.Fatalf("expected write error for nonexistent parent directory")
+	}
+}
+
+func TestPatternsValidationErrors(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	t.Cleanup(resetPatternsFlags)
+
+	cases := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{"add invalid regex", []string{"patterns", "add", "[unclosed", "--tier", "dangerous", "-C", h.ProjectDir}, "regex"},
+		{"add invalid tier", []string{"patterns", "add", "^foo$", "--tier", "bogus", "-C", h.ProjectDir}, "tier"},
+		{"request-removal missing reason", []string{"patterns", "request-removal", "^foo$", "-C", h.ProjectDir}, "--reason is required"},
+		{"suggest missing tier", []string{"patterns", "suggest", "^foo$", "-C", h.ProjectDir}, "--tier is required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetPatternsFlags()
+			cmd := newTestPatternsCmd(h.DBPath)
+			if _, _, err := executeCommand(cmd, tc.args...); err == nil || !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tc.wantErr)) {
+				t.Fatalf("%s: expected error containing %q, got: %v", tc.name, tc.wantErr, err)
+			}
+		})
 	}
 }

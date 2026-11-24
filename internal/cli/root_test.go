@@ -968,3 +968,190 @@ func TestUnknownFlag(t *testing.T) {
 		t.Error("expected error for unknown flag")
 	}
 }
+
+func TestVersionCommand_TextUnavailableAndUnsupportedFormat(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+
+	savedOut, savedJSON, savedTOON, savedProj, savedDB := flagOutput, flagJSON, flagTOON, flagProject, flagDB
+	t.Cleanup(func() {
+		flagOutput, flagJSON, flagTOON, flagProject, flagDB = savedOut, savedJSON, savedTOON, savedProj, savedDB
+	})
+
+	newVerRoot := func() *cobra.Command {
+		root := &cobra.Command{Use: "slb", SilenceUsage: true, SilenceErrors: true}
+		root.PersistentFlags().StringVarP(&flagOutput, "output", "o", "text", "output format")
+		root.PersistentFlags().BoolVarP(&flagJSON, "json", "j", false, "json output")
+		root.PersistentFlags().BoolVarP(&flagTOON, "toon", "t", false, "toon output")
+		root.PersistentFlags().StringVarP(&flagProject, "project", "C", "", "project dir")
+		root.PersistentFlags().StringVar(&flagDB, "db", "", "db path")
+		ver := &cobra.Command{Use: "version", RunE: versionCmd.RunE}
+		root.AddCommand(ver)
+		return root
+	}
+
+	flagOutput, flagJSON, flagTOON, flagProject, flagDB = "text", false, false, "", ""
+	out, err := executeCommandCapture(t, newVerRoot(), "version")
+	if err != nil {
+		t.Fatalf("version text failed: %v", err)
+	}
+	for _, want := range []string{"slb ", "commit:", "built:", "go:", "config:", "db:", "project:"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("version text output missing %q: %s", want, out)
+		}
+	}
+
+	missingDir := filepath.Join(t.TempDir(), "does-not-exist")
+	flagOutput, flagJSON, flagTOON, flagProject, flagDB = "text", false, false, "", ""
+	outUnavail, err := executeCommandCapture(t, newVerRoot(), "version", "-C", missingDir)
+	if err != nil {
+		t.Fatalf("version text with unavailable project failed: %v", err)
+	}
+	if !strings.Contains(outUnavail, "unavailable (") {
+		t.Fatalf("expected unavailable marker in text output: %s", outUnavail)
+	}
+
+	flagOutput, flagJSON, flagTOON, flagProject, flagDB = "text", false, false, "", ""
+	jsonUnavail, err := executeCommandCapture(t, newVerRoot(), "version", "-C", missingDir, "--json")
+	if err != nil {
+		t.Fatalf("version json with unavailable project failed: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(jsonUnavail), &payload); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if _, ok := payload["project_error"].(string); !ok {
+		t.Fatalf("expected project_error in JSON version output: %+v", payload)
+	}
+
+	flagOutput, flagJSON, flagTOON, flagProject, flagDB = "bogus", false, false, "", ""
+	if _, err := executeCommandCapture(t, newVerRoot(), "version", "-o", "bogus"); err == nil || !strings.Contains(err.Error(), "unsupported format") {
+		t.Fatalf("expected unsupported format error, got: %v", err)
+	}
+}
+
+func TestGetOutput_FlagAndEnvPrecedence(t *testing.T) {
+	savedOut, savedJSON, savedTOON := flagOutput, flagJSON, flagTOON
+	t.Cleanup(func() { flagOutput, flagJSON, flagTOON = savedOut, savedJSON, savedTOON })
+
+	t.Setenv("SLB_OUTPUT_FORMAT", "")
+	t.Setenv("TOON_DEFAULT_FORMAT", "")
+
+	flagOutput, flagJSON, flagTOON = "text", false, true
+	if got := GetOutput(); got != "toon" {
+		t.Fatalf("flagTOON GetOutput() = %q, want toon", got)
+	}
+
+	flagOutput, flagJSON, flagTOON = "text", false, false
+	t.Setenv("TOON_DEFAULT_FORMAT", "yaml")
+	if got := GetOutput(); got != "yaml" {
+		t.Fatalf("TOON_DEFAULT_FORMAT GetOutput() = %q, want yaml", got)
+	}
+
+	t.Setenv("SLB_OUTPUT_FORMAT", "json")
+	if got := GetOutput(); got != "json" {
+		t.Fatalf("SLB_OUTPUT_FORMAT should beat TOON_DEFAULT_FORMAT, got %q", got)
+	}
+
+	t.Setenv("SLB_OUTPUT_FORMAT", "invalid")
+	t.Setenv("TOON_DEFAULT_FORMAT", "also-invalid")
+	if got := GetOutput(); got != "text" {
+		t.Fatalf("invalid env formats should fall back to text, got %q", got)
+	}
+}
+
+func TestResolveTUIOptions_ValidAndInvalidRefreshInterval(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+
+	savedDB, savedProj, savedCfg := flagDB, flagProject, flagConfig
+	savedRefresh, savedTheme, savedNoMouse := flagTuiRefreshSeconds, flagTuiTheme, flagTuiNoMouse
+	savedSess, savedKey := flagTuiSessionID, flagTuiSessionKey
+	t.Cleanup(func() {
+		flagDB, flagProject, flagConfig = savedDB, savedProj, savedCfg
+		flagTuiRefreshSeconds, flagTuiTheme, flagTuiNoMouse = savedRefresh, savedTheme, savedNoMouse
+		flagTuiSessionID, flagTuiSessionKey = savedSess, savedKey
+	})
+
+	flagDB, flagProject, flagConfig = h.DBPath, h.ProjectDir, ""
+	flagTuiTheme, flagTuiNoMouse, flagTuiSessionID, flagTuiSessionKey = "", true, "", ""
+
+	flagTuiRefreshSeconds = 0
+	if _, err := resolveTUIOptions(); err == nil || !strings.Contains(err.Error(), "--refresh-interval must be positive") {
+		t.Fatalf("expected positive refresh interval error, got: %v", err)
+	}
+
+	flagTuiRefreshSeconds = 5
+	opts, err := resolveTUIOptions()
+	if err != nil {
+		t.Fatalf("resolveTUIOptions failed: %v", err)
+	}
+	if opts.RefreshInterval != 5 || !opts.DisableMouse || opts.DatabasePath != h.DBPath {
+		t.Fatalf("unexpected resolved TUI options: %+v", opts)
+	}
+}
+
+func TestExecuteEntryPoint_VersionJSON(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	origArgs := rootCmd.Args
+	t.Cleanup(func() {
+		rootCmd.SetArgs(nil)
+		rootCmd.Args = origArgs
+		flagJSON = false
+		flagOutput = "text"
+		flagSchema = false
+		flagProject = ""
+		flagDB = ""
+		rootCmd.PersistentFlags().VisitAll(func(f *pflag.Flag) {
+			_ = f.Value.Set(f.DefValue)
+			f.Changed = false
+		})
+	})
+
+	rootCmd.SetArgs([]string{"version", "--json"})
+	var execErr error
+	stdout := captureStdout(t, func() {
+		execErr = Execute()
+	})
+	if execErr != nil {
+		t.Fatalf("Execute() version --json failed: %v", execErr)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		t.Fatalf("Execute() did not emit valid JSON: %v\n%s", err, stdout)
+	}
+	if _, ok := payload["go_version"].(string); !ok {
+		t.Fatalf("Execute() version payload missing go_version: %+v", payload)
+	}
+}
+
+func TestRootQuickRefTUIRunEAndEnterProjectDirError(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+
+	savedProj, savedDB, savedRefresh := flagProject, flagDB, flagTuiRefreshSeconds
+	t.Cleanup(func() {
+		flagProject, flagDB, flagTuiRefreshSeconds = savedProj, savedDB, savedRefresh
+	})
+
+	// 1. Bare rootCmd prints quick reference card.
+	quickRef := captureStdout(t, func() {
+		showQuickReference()
+	})
+	if !strings.Contains(quickRef, "slb") {
+		t.Fatalf("quick reference missing slb text")
+	}
+
+	// 2. tuiCmd.RunE rejects non-positive --refresh-interval before launching Bubble Tea.
+	flagProject, flagDB, flagTuiRefreshSeconds = h.ProjectDir, h.DBPath, 0
+	if err := tuiCmd.RunE(tuiCmd, nil); err == nil || !strings.Contains(err.Error(), "--refresh-interval must be positive") {
+		t.Fatalf("expected tuiCmd.RunE refresh interval error, got: %v", err)
+	}
+
+	// 3. enterProjectDir returns error for nonexistent directory.
+	flagProject = filepath.Join(t.TempDir(), "nonexistent-project-dir")
+	if err := enterProjectDir(); err == nil || !strings.Contains(err.Error(), "changing directory") {
+		t.Fatalf("expected changing directory error from enterProjectDir, got: %v", err)
+	}
+}

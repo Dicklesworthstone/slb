@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -24,6 +25,7 @@ import (
 	"github.com/Dicklesworthstone/slb/internal/daemon"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
+	"github.com/charmbracelet/log"
 	"github.com/spf13/cobra"
 )
 
@@ -2583,5 +2585,329 @@ func TestHookQueryTimeoutUsesPhysicalProject(t *testing.T) {
 	}
 	if got := hookQueryTimeout(alias); got != 900*time.Millisecond {
 		t.Fatalf("query timeout selected the lexical parent's policy: %s", got)
+	}
+}
+
+func TestHookCommands_LiveDaemonStatusHealthTestAndHelpers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix IPC daemon test")
+	}
+	h := testutil.NewHarness(t)
+	project, err := filepath.EvalSymlinks(h.ProjectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(project)
+	t.Setenv("SLB_HOST", "")
+	t.Setenv("SLB_PROJECT", "")
+	resetHookFlags()
+	t.Cleanup(resetHookFlags)
+
+	// Start a real project daemon in-process.
+	srvCtx, stopSrv := context.WithCancel(context.Background())
+	srvDone := make(chan error, 1)
+	go func() {
+		srvDone <- daemon.RunDaemon(srvCtx, daemon.ServerOptions{
+			ProjectDir: project,
+			Logger:     log.New(io.Discard),
+		})
+	}()
+	defer func() {
+		stopSrv()
+		if err := <-srvDone; err != nil {
+			t.Errorf("daemon shutdown error: %v", err)
+		}
+	}()
+	if !testutil.WaitForCondition(func() bool {
+		return daemon.NewProjectClient(project, daemon.WithLocalOnly()).IsDaemonRunning()
+	}, 10*time.Millisecond, 3*time.Second) {
+		t.Fatal("project daemon did not become ready")
+	}
+
+	// 1. Install hook, then check hook status against live daemon.
+	cmdInst := newTestHookCmd(h.DBPath)
+	if _, err := executeCommandCapture(t, cmdInst, "hook", "install", "-C", project, "-j"); err != nil {
+		t.Fatalf("hook install failed: %v", err)
+	}
+	resetHookFlags()
+	cmdStatus := newTestHookCmd(h.DBPath)
+	statusOut, err := executeCommandCapture(t, cmdStatus, "hook", "status", "-C", project, "-j")
+	if err != nil {
+		t.Fatalf("hook status failed: %v", err)
+	}
+	var statusPayload map[string]any
+	if err := json.Unmarshal([]byte(statusOut), &statusPayload); err != nil {
+		t.Fatalf("hook status JSON invalid: %v\n%s", err, statusOut)
+	}
+	if statusPayload["daemon_reachable"] != true || statusPayload["daemon_status"] != "ok" || statusPayload["daemon_pattern_hash_matches"] != true {
+		t.Fatalf("expected healthy live daemon in hook status, got: %+v", statusPayload)
+	}
+
+	// 2. hook health against live daemon reports healthy=true and uptime/pattern_count.
+	resetHookFlags()
+	cmdHealth := newTestHookCmd(h.DBPath)
+	healthOut, err := executeCommandCapture(t, cmdHealth, "hook", "health", "-C", project, "-j")
+	if err != nil {
+		t.Fatalf("hook health failed: %v", err)
+	}
+	var healthPayload map[string]any
+	if err := json.Unmarshal([]byte(healthOut), &healthPayload); err != nil {
+		t.Fatalf("hook health JSON invalid: %v\n%s", err, healthOut)
+	}
+	if healthPayload["daemon_reachable"] != true || healthPayload["healthy"] != true || healthPayload["status"] != "ok" {
+		t.Fatalf("expected healthy live daemon in hook health, got: %+v", healthPayload)
+	}
+
+	// 3. hook test against live daemon returns source="daemon" and fallback=false.
+	resetHookFlags()
+	cmdTest := newTestHookCmd(h.DBPath)
+	testOut, err := executeCommandCapture(t, cmdTest, "hook", "test", "chmod -R 777 ./build", "-C", project, "-j")
+	if err != nil {
+		t.Fatalf("hook test live daemon failed: %v", err)
+	}
+	var testPayload map[string]any
+	if err := json.Unmarshal([]byte(testOut), &testPayload); err != nil {
+		t.Fatalf("hook test JSON invalid: %v\n%s", err, testOut)
+	}
+	if testPayload["source"] != "daemon" || testPayload["fallback"] != false || testPayload["action"] != "block" {
+		t.Fatalf("expected daemon block decision from hook test, got: %+v", testPayload)
+	}
+
+	// 4. localHookTestResult and sameHookPolicyConfig helpers.
+	localRes := localHookTestResult("chmod -R 777 ./build", project)
+	if localRes["action"] != "block" {
+		t.Fatalf("localHookTestResult expected block, got: %+v", localRes)
+	}
+	cfgFile := filepath.Join(project, ".slb", "config.toml")
+	if err := os.WriteFile(cfgFile, []byte("[general]\nmin_approvals = 1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	symCfg := filepath.Join(t.TempDir(), "cfg-link.toml")
+	if err := os.Symlink(cfgFile, symCfg); err == nil {
+		if !sameHookPolicyConfig(cfgFile, symCfg) {
+			t.Fatalf("sameHookPolicyConfig should match symlink to same file")
+		}
+	}
+	if sameHookPolicyConfig(cfgFile, "") || sameHookPolicyConfig("", cfgFile) {
+		t.Fatalf("sameHookPolicyConfig should reject empty vs non-empty")
+	}
+	if sameHookPolicyConfig(cfgFile, filepath.Join(t.TempDir(), "missing.toml")) {
+		t.Fatalf("sameHookPolicyConfig should reject nonexistent file")
+	}
+
+	// 5. daemon stop against the live running daemon succeeds and emits stopped_at.
+	resetDaemonFlags()
+	rootStop := newTestDaemonLifecycleCommand("stop", daemonStopCmd.RunE)
+	stopOut, err := executeCommandCapture(t, rootStop, "daemon", "stop", "-C", project, "--json")
+	if err != nil {
+		t.Fatalf("daemon stop against live daemon failed: %v", err)
+	}
+	var stopPayload map[string]any
+	if err := json.Unmarshal([]byte(stopOut), &stopPayload); err != nil {
+		t.Fatalf("invalid daemon stop JSON: %v\n%s", err, stopOut)
+	}
+	if _, ok := stopPayload["stopped_at"].(string); !ok {
+		t.Fatalf("daemon stop missing stopped_at: %+v", stopPayload)
+	}
+}
+
+func TestHookGuard_InputValidationHandoffAndFallbackErrors(t *testing.T) {
+	h := testutil.NewHarness(t)
+	project, err := filepath.EvalSymlinks(h.ProjectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(project)
+	resetHookFlags()
+	t.Cleanup(resetHookFlags)
+
+	runGuard := func(stdin string, q func(context.Context, string, daemon.HookQueryParams) (*daemon.HookQueryResult, hookDaemonDiagnostic, error)) (map[string]any, error) {
+		cmd := &cobra.Command{Use: "guard"}
+		cmd.SetContext(context.Background())
+		cmd.SetIn(strings.NewReader(stdin))
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		err := runHookGuardWithQuery(cmd, q)
+		if err != nil {
+			return nil, err
+		}
+		var parsed map[string]any
+		if jerr := json.Unmarshal(out.Bytes(), &parsed); jerr != nil {
+			t.Fatalf("guard output invalid JSON: %v\n%s", jerr, out.String())
+		}
+		return parsed, nil
+	}
+	dummyQuery := func(context.Context, string, daemon.HookQueryParams) (*daemon.HookQueryResult, hookDaemonDiagnostic, error) {
+		return nil, hookDaemonDiagnostic{}, errors.New("offline")
+	}
+	decisionOf := func(m map[string]any) string {
+		hso, _ := m["hookSpecificOutput"].(map[string]any)
+		d, _ := hso["permissionDecision"].(string)
+		return d
+	}
+
+	for _, tc := range []struct{ name, body string }{
+		{"malformed json", "{not-json"},
+		{"non-object json", "[]"},
+		{"trailing json", `{"tool_input":{"command":"ls"}} {"extra":1}`},
+		{"missing tool_input", `{"session_id":"s1"}`},
+		{"missing command", `{"tool_input":{}}`},
+		{"relative cwd", `{"cwd":"relative/dir","tool_input":{"command":"ls"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := runGuard(tc.body, dummyQuery)
+			if err != nil {
+				t.Fatalf("runGuard %s error: %v", tc.name, err)
+			}
+			if dec := decisionOf(got); dec != "ask" {
+				t.Fatalf("%s decision=%q, want ask: %+v", tc.name, dec, got)
+			}
+		})
+	}
+
+	emptyRes, err := runGuard(`{"tool_input":{"command":""}}`, dummyQuery)
+	if err != nil || decisionOf(emptyRes) != "allow" {
+		t.Fatalf("empty command should allow, got res=%+v err=%v", emptyRes, err)
+	}
+
+	noCWD, err := runGuard(`{"tool_input":{"command":"git status"}}`, func(_ context.Context, cwd string, p daemon.HookQueryParams) (*daemon.HookQueryResult, hookDaemonDiagnostic, error) {
+		if cwd == "" {
+			t.Errorf("expected non-empty fallback cwd")
+		}
+		return &daemon.HookQueryResult{Action: "allow", Tier: "safe"}, hookDaemonDiagnostic{}, nil
+	})
+	if err != nil || decisionOf(noCWD) != "allow" {
+		t.Fatalf("omitted cwd allow failed: res=%+v err=%v", noCWD, err)
+	}
+
+	badHandoff, err := runGuard(fmt.Sprintf(`{"cwd":%q,"tool_input":{"command":"chmod -R 777 ./x"}}`, project),
+		func(context.Context, string, daemon.HookQueryParams) (*daemon.HookQueryResult, hookDaemonDiagnostic, error) {
+			return &daemon.HookQueryResult{
+				Action: "execute", Tier: "dangerous", MinApprovals: 1, ApprovalPolicy: db.ApprovalPolicySameHost,
+				ExecutionHandoff: nil,
+			}, hookDaemonDiagnostic{}, nil
+		})
+	if err != nil || decisionOf(badHandoff) != "deny" {
+		t.Fatalf("invalid execution handoff must fail closed with deny, got res=%+v err=%v", badHandoff, err)
+	}
+
+	corruptProj := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(corruptProj, ".slb", "state.db"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	corruptRes, err := runGuard(fmt.Sprintf(`{"cwd":%q,"tool_input":{"command":"ls"}}`, corruptProj), dummyQuery)
+	if err != nil || decisionOf(corruptRes) != "deny" {
+		t.Fatalf("corrupt state.db directory must fail closed with deny, got res=%+v err=%v", corruptRes, err)
+	}
+
+	otherProj := testutil.NewHarness(t)
+	if err := hookTestDaemonScopeError(project, otherProj.ProjectDir); err == nil || !strings.Contains(err.Error(), "selected project differs") {
+		t.Fatalf("expected project scope mismatch error, got: %v", err)
+	}
+	savedDB := flagDB
+	t.Cleanup(func() { flagDB = savedDB })
+	flagDB = otherProj.DBPath
+	if err := hookTestDaemonScopeError(project, project); err == nil || !strings.Contains(err.Error(), "selected database differs") {
+		t.Fatalf("expected DB scope mismatch error, got: %v", err)
+	}
+	flagDB = filepath.Join(t.TempDir(), "missing.db")
+	if err := hookTestDaemonScopeError(project, project); err == nil || !strings.Contains(err.Error(), "reading selected database") {
+		t.Fatalf("expected missing DB stat error, got: %v", err)
+	}
+}
+
+func TestHookPolicyHelpersAndInstallErrors(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	resetHookFlags()
+	t.Cleanup(resetHookFlags)
+
+	// 1. selectedHookPolicy rejects missing file and directory.
+	if _, _, err := selectedHookPolicy(h.ProjectDir, filepath.Join(t.TempDir(), "missing.toml")); err == nil || !strings.Contains(err.Error(), "reading selected hook config") {
+		t.Fatalf("expected missing config error, got: %v", err)
+	}
+	if _, _, err := selectedHookPolicy(h.ProjectDir, t.TempDir()); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("expected non-regular config error, got: %v", err)
+	}
+
+	// 2. embeddedHookPatternHash / embeddedHookApprovalPolicy / embeddedHookCautionAction missing/invalid values.
+	if got := embeddedHookPatternHash([]byte("# no hash here\n")); got != "" {
+		t.Fatalf("expected empty hash, got %q", got)
+	}
+	if got := embeddedHookApprovalPolicy([]byte(`HOOK_APPROVAL_POLICY = "bogus"
+`)); got != "" {
+		t.Fatalf("expected empty approval policy for bogus value, got %q", got)
+	}
+	if got := embeddedHookCautionAction([]byte("# no caution action\n")); got != "" {
+		t.Fatalf("expected empty caution action, got %q", got)
+	}
+	if got := embeddedHookString([]byte("# no key\n"), "MISSING"); got != "" {
+		t.Fatalf("expected empty embedded string, got %q", got)
+	}
+	if _, _, native := configuredHookPolicy("echo not-slb"); native {
+		t.Fatalf("expected non-native hook command")
+	}
+
+	// 3. installClaudeHook rejects non-regular .slb/state.db directory.
+	badProj := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(badProj, ".slb", "state.db"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	savedProj, savedDB := flagProject, flagDB
+	t.Cleanup(func() { flagProject, flagDB = savedProj, savedDB })
+	flagProject, flagDB = badProj, filepath.Join(badProj, ".slb", "state.db")
+	if err := installClaudeHook(&cobra.Command{Use: "install"}, false, false); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("expected non-regular project DB error, got: %v", err)
+	}
+
+	// 4. installClaudeHook rejects --db pointing to a different database than project state.db.
+	otherH := testutil.NewHarness(t)
+	flagProject, flagDB = h.ProjectDir, otherH.DBPath
+	if err := installClaudeHook(&cobra.Command{Use: "install"}, false, false); err == nil || !strings.Contains(err.Error(), "cannot select a different policy database") {
+		t.Fatalf("expected different policy database error, got: %v", err)
+	}
+}
+
+func TestHookGenerateUninstallAndSimulateFailureEdgePaths(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	t.Setenv("HOME", t.TempDir())
+	resetHookFlags()
+	t.Cleanup(resetHookFlags)
+
+	// 1. hook test --simulate-failure forces local fallback with simulated_failure=true.
+	cmdSim := newTestHookCmd(h.DBPath)
+	simOut, err := executeCommandCapture(t, cmdSim, "hook", "test", "chmod -R 777 ./x", "--simulate-failure", "-C", h.ProjectDir, "-j")
+	if err != nil {
+		t.Fatalf("hook test --simulate-failure failed: %v", err)
+	}
+	var simPayload map[string]any
+	if err := json.Unmarshal([]byte(simOut), &simPayload); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, simOut)
+	}
+	if simPayload["simulated_failure"] != true || simPayload["source"] != "local" || simPayload["fallback"] != true {
+		t.Fatalf("unexpected simulate-failure payload: %+v", simPayload)
+	}
+
+	// 2. hook generate with output dir blocked by regular file fails cleanly.
+	resetHookFlags()
+	fileAsDir := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(fileAsDir, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmdGen := newTestHookCmd(h.DBPath)
+	if _, _, err := executeCommand(cmdGen, "hook", "generate", "--output-dir", fileAsDir, "-C", h.ProjectDir, "-j"); err == nil {
+		t.Fatalf("expected error generating hook into regular file path")
+	}
+
+	// 3. hook uninstall when not installed returns clean not_installed JSON.
+	resetHookFlags()
+	cmdUninst := newTestHookCmd(h.DBPath)
+	unOut, err := executeCommandCapture(t, cmdUninst, "hook", "uninstall", "-C", h.ProjectDir, "-j")
+	if err != nil {
+		t.Fatalf("hook uninstall when absent failed: %v", err)
+	}
+	if !strings.Contains(unOut, "not_installed") {
+		t.Fatalf("expected not_installed status, got: %s", unOut)
 	}
 }

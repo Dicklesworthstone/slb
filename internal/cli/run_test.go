@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/config"
+	"github.com/Dicklesworthstone/slb/internal/core"
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/testutil"
 	"github.com/spf13/cobra"
@@ -672,5 +674,112 @@ func TestCreateRunLogFile_FileCreationError(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "creating log file") {
 		t.Errorf("expected error about creating log file, got: %v", err)
+	}
+}
+
+func TestRunCommand_SafeExitCodeWaitCancelRejectedAndApproved(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	resetRunFlags()
+	t.Cleanup(resetRunFlags)
+
+	cfgPath := filepath.Join(h.ProjectDir, ".slb", "config.toml")
+	if err := config.WriteValue(cfgPath, "general.approval_policy", "same_host"); err != nil {
+		t.Fatal(err)
+	}
+	cfgBytes, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgBytes = append(cfgBytes, []byte("\n[patterns.safe]\npatterns = [\"^false$\"]\n[patterns.dangerous]\npatterns = [\"^echo run-approved-ok$\"]\n")...)
+	if err := os.WriteFile(cfgPath, cfgBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	sess := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("RunAgent"), testutil.WithModel("model-a"))
+	revSess := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("RunRev"), testutil.WithModel("model-b"))
+
+	cmdBadTO := newTestRunCmd(h.DBPath)
+	if _, _, err := executeCommand(cmdBadTO, "run", "echo x", "-s", sess.ID, "--timeout", "0"); err == nil || !strings.Contains(err.Error(), "--timeout must be a positive") {
+		t.Fatalf("expected invalid timeout error, got: %v", err)
+	}
+
+	resetRunFlags()
+	cmdSafeFail := newTestRunCmd(h.DBPath)
+	_, safeErr := executeCommandCapture(t, cmdSafeFail, "run", "false", "-s", sess.ID, "-C", h.ProjectDir, "--timeout", "5", "-j")
+	if safeErr == nil {
+		t.Fatalf("expected non-zero exit error for safe 'false' command")
+	}
+
+	resetRunFlags()
+	cancelCtx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	cmdCancel := newTestRunCmd(h.DBPath)
+	cmdCancel.SetArgs([]string{"run", "chmod -R 777 ./run-cancel", "-s", sess.ID, "-C", h.ProjectDir, "--timeout", "10", "-j"})
+	var cancelErr error
+	cancelOut := captureStdout(t, func() {
+		cancelErr = cmdCancel.ExecuteContext(cancelCtx)
+	})
+	if cancelErr == nil {
+		t.Fatalf("expected error on cancelled/timed-out run wait")
+	}
+	if !strings.Contains(cancelOut, `"status":`) {
+		t.Fatalf("expected structured status JSON on wait end, got: %s", cancelOut)
+	}
+
+	resetRunFlags()
+	go func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			db2, err := db.Open(h.DBPath)
+			if err == nil {
+				pending, _ := db2.ListPendingRequests(h.ProjectDir)
+				for _, r := range pending {
+					if r.Command.Raw == "chmod -R 777 ./run-reject" {
+						_ = db2.UpdateRequestStatus(r.ID, db.StatusRejected)
+						_ = db2.Close()
+						return
+					}
+				}
+				_ = db2.Close()
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+	}()
+	cmdRej := newTestRunCmd(h.DBPath)
+	if _, err := executeCommandCapture(t, cmdRej, "run", "chmod -R 777 ./run-reject", "-s", sess.ID, "-C", h.ProjectDir, "--timeout", "5", "-j"); err == nil || !strings.Contains(err.Error(), "not approved for execution") {
+		t.Fatalf("expected not approved for execution error, got: %v", err)
+	}
+
+	resetRunFlags()
+	go func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			db2, err := db.Open(h.DBPath)
+			if err == nil {
+				pending, _ := db2.ListPendingRequests(h.ProjectDir)
+				for _, r := range pending {
+					if r.Command.Raw == "echo run-approved-ok" {
+						svc := core.NewReviewService(db2, core.ReviewConfig{ApprovalPolicy: db.ApprovalPolicySameHost})
+						_, _ = svc.SubmitReview(core.ReviewOptions{
+							RequestID: r.ID, SessionID: revSess.ID, SessionKey: revSess.SessionKey,
+							Decision: db.DecisionApprove, Comments: "lgtm",
+						})
+						_ = db2.Close()
+						return
+					}
+				}
+				_ = db2.Close()
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+	}()
+	cmdApp := newTestRunCmd(h.DBPath)
+	appOut, appErr := executeCommandCapture(t, cmdApp, "run", "echo run-approved-ok", "-s", sess.ID, "-C", h.ProjectDir, "--timeout", "5")
+	if appErr != nil {
+		t.Fatalf("run approved command failed: %v\n%s", appErr, appOut)
+	}
+	if !strings.Contains(appOut, "Review policy:") {
+		t.Fatalf("expected Review policy notice in text output: %q", appOut)
 	}
 }

@@ -805,3 +805,54 @@ func TestReviewListCommand_ReviewPoolUsesAgentAllowlist(t *testing.T) {
 		t.Fatalf("review-pool agent filtering wrong: seen=%v", seen)
 	}
 }
+
+func TestReviewCommand_DirectRequestIDShorthandAndEmptyText(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	resetReviewFlags()
+	t.Cleanup(resetReviewFlags)
+
+	cmdEmpty := newTestReviewCmd(h.DBPath)
+	emptyOut, err := executeCommandCapture(t, cmdEmpty, "review", "list", "-C", h.ProjectDir)
+	if err != nil {
+		t.Fatalf("review list empty text failed: %v", err)
+	}
+	if !strings.Contains(emptyOut, "No pending or escalated requests found.") {
+		t.Fatalf("unexpected empty review list output: %q", emptyOut)
+	}
+
+	sess := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("RevShort"))
+	req := testutil.MakeRequest(t, h.DB, sess, testutil.WithCommand("chmod -R 777 ./review-short", h.ProjectDir, true))
+
+	resetReviewFlags()
+	cmdDirect := newTestReviewCmd(h.DBPath)
+	directOut, err := executeCommandCapture(t, cmdDirect, "review", req.ID, "-C", h.ProjectDir, "-j")
+	if err != nil {
+		t.Fatalf("review <id> shorthand failed: %v", err)
+	}
+	var detail map[string]any
+	if err := json.Unmarshal([]byte(directOut), &detail); err != nil {
+		t.Fatalf("review <id> invalid JSON: %v\n%s", err, directOut)
+	}
+	if detail["id"] != req.ID {
+		t.Fatalf("review <id> returned id=%v, want %s", detail["id"], req.ID)
+	}
+}
+
+func TestReviewCommands_InvalidDatabaseErrors(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	dirDB := t.TempDir()
+	t.Cleanup(resetReviewFlags)
+
+	for _, args := range [][]string{
+		{"review", "list", "-C", h.ProjectDir, "-j"},
+		{"review", "show", "req-any", "-C", h.ProjectDir, "-j"},
+	} {
+		resetReviewFlags()
+		cmd := newTestReviewCmd(dirDB)
+		if _, _, err := executeCommand(cmd, args...); err == nil || !strings.Contains(err.Error(), "opening database") {
+			t.Fatalf("review %v expected opening database error, got: %v", args, err)
+		}
+	}
+}

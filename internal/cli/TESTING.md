@@ -530,19 +530,16 @@ This pattern is used throughout the CLI package (see `shouldAutoApproveCaution`,
 
 ## Coverage Acceptance Matrix
 
-Some functions are intentionally excluded from unit test coverage due to their nature:
+The package meets the `>= 90%` statement coverage target with zero functions at `0%`.
+Critical safety functions (`shouldAutoApproveCaution`, `autoApproveCaution`, `Execute`,
+`daemonLogPath`, `followFile`) are unit-tested at `100%`.
 
-| Function | Coverage | Rationale |
-|----------|----------|-----------|
-| `Execute` | 0% | Main entry point, calls `os.Exit`. Integration tested only. |
-| `runWatch` | 0% | Long-running daemon, signal handling. Integration tested. |
-| `runWatchDaemon` | 0% | Spawns daemon process. Integration tested. |
-| `runWatchPolling` | 0% | Infinite loop with DB polling. Integration tested. |
-| `autoApproveCaution` | 0% | Complex global state (DB, session flags). Core logic in `shouldAutoApproveCaution` is 100%. |
-| `followFile` | 0% | Signal handling, os.Stdin interaction. |
-| `runSafeCommand` | 0% | Executes shell commands with exec.Command. |
-| `runApprovedRequest` | 0% | Command execution with side effects. |
-| `writeError` | 0% | Simple error output helper. |
+Remaining `<100%` branches are concentrated in OS/TTY/signal/process error paths
+(such as `detectWidth` TTY ioctl, `followFileWithInterval` non-EOF read errors,
+`tui.RunWithOptions` interactive terminal launch, atomic filesystem sync failures in
+`claude_settings.go`, and direct `os.Exit(1)` branches). See
+[`COVERAGE_ACCEPTANCE.md`](COVERAGE_ACCEPTANCE.md) for the complete per-function
+acceptance table, rationale, and E2E verification mapping.
 
 ### Pure Function Extraction Strategy
 

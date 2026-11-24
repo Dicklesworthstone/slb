@@ -554,3 +554,38 @@ func TestSettingsJSONRoundTripPreservesOrderAndLiterals(t *testing.T) {
 		t.Fatal("non-object settings must be rejected")
 	}
 }
+
+func TestClaudeSettingsDecodeAndLoadErrors(t *testing.T) {
+	for _, tc := range []struct{ name, raw string }{
+		{"truncated object", `{"a":`},
+		{"truncated key", `{"a"`},
+		{"truncated array", `{"a":[1,`},
+		{"unexpected closing delim", `}`},
+		{"unclosed object", `{"a": 1`},
+		{"unclosed array", `{"a": [1`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := decodeSettingsJSON([]byte(tc.raw)); err == nil {
+				t.Fatalf("expected decode error for %s (%q)", tc.name, tc.raw)
+			}
+		})
+	}
+
+	// Directory path fails loadClaudeSettings cleanly.
+	if _, err := loadClaudeSettings(t.TempDir()); err == nil {
+		t.Fatalf("expected error loading directory as settings.json")
+	}
+
+	// Empty object and empty array round-trip cleanly.
+	root, err := decodeSettingsJSON([]byte(`{"emptyObj":{},"emptyArr":[]}`))
+	if err != nil {
+		t.Fatalf("decode empty containers: %v", err)
+	}
+	encoded, err := encodeSettingsJSON(root, "  ")
+	if err != nil {
+		t.Fatalf("encode empty containers: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"emptyObj": {}`) || !strings.Contains(string(encoded), `"emptyArr": []`) {
+		t.Fatalf("unexpected encoded empty containers: %s", encoded)
+	}
+}

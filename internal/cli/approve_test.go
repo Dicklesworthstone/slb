@@ -905,3 +905,45 @@ func TestApproveCommand_Help_IncludesTargetProject(t *testing.T) {
 		t.Error("expected help to mention 'cross-project'")
 	}
 }
+
+func TestApproveCommand_TextOutputSameHost(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	resetApproveFlags()
+	t.Cleanup(resetApproveFlags)
+
+	cfgPath := filepath.Join(h.ProjectDir, ".slb", "config.toml")
+	if err := config.WriteValue(cfgPath, "general.approval_policy", "same_host"); err != nil {
+		t.Fatal(err)
+	}
+	reqSess := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("Req"), testutil.WithModel("model-a"))
+	revSess := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("Rev"), testutil.WithModel("model-b"))
+	req := testutil.MakeRequest(t, h.DB, reqSess, testutil.WithCommand("chmod -R 777 ./tmp-approve-text", h.ProjectDir, true))
+	if _, err := h.DB.Exec(`UPDATE requests SET approval_policy = ? WHERE id = ?`, string(db.ApprovalPolicySameHost), req.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := newTestApproveCmd(h.DBPath)
+	out, err := executeCommandCapture(t, cmd, "approve", req.ID,
+		"--session-id", revSess.ID,
+		"--session-key", revSess.SessionKey,
+		"-C", h.ProjectDir,
+	)
+	if err != nil {
+		t.Fatalf("approve text failed: %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"Same-host review accepted for request " + req.ID,
+		"Request status:",
+		"Approval policy:",
+		"Evidence assurance:",
+		"Review ID:",
+		"Approvals: 1, Rejections: 0",
+		"Request status changed to: approved",
+		"ready for execution",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("approve text output missing %q:\n%s", want, out)
+		}
+	}
+}

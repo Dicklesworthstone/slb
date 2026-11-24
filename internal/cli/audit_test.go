@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -56,5 +57,34 @@ func TestParseAuditTime(t *testing.T) {
 	}
 	if parsed, err := parseAuditTime(""); err != nil || parsed != (time.Time{}) {
 		t.Errorf("empty time: %v, %v", parsed, err)
+	}
+}
+
+func TestAuditCommand_FilterValidationAndCWD(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+
+	cmdBadBefore := newAuditCommand()
+	cmdBadBefore.SetOut(&bytes.Buffer{})
+	cmdBadBefore.SetErr(&bytes.Buffer{})
+	cmdBadBefore.SetArgs([]string{"--directory", dir, "query", "--before", "not-a-date"})
+	if err := cmdBadBefore.Execute(); err == nil || !strings.Contains(err.Error(), "invalid --before") {
+		t.Fatalf("expected invalid --before error, got: %v", err)
+	}
+
+	cmdCWD := newAuditCommand()
+	var out bytes.Buffer
+	cmdCWD.SetOut(&out)
+	cmdCWD.SetErr(&bytes.Buffer{})
+	cmdCWD.SetArgs([]string{"query", "--cwd", ".", "--jsonl"})
+	if err := cmdCWD.Execute(); err != nil {
+		t.Fatalf("audit query with default directory and --cwd . failed: %v", err)
+	}
+
+	cmdPrune := newAuditCommand()
+	cmdPrune.SetOut(&bytes.Buffer{})
+	cmdPrune.SetErr(&bytes.Buffer{})
+	if _, err := executeCommandCapture(t, cmdPrune, "--directory", dir, "prune", "--before", "2030-01-01", "--dry-run"); err != nil {
+		t.Fatalf("audit prune --dry-run failed: %v", err)
 	}
 }

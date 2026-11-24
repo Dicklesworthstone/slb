@@ -10,6 +10,7 @@ import (
 
 	"github.com/Dicklesworthstone/slb/internal/db"
 	"github.com/Dicklesworthstone/slb/internal/integrations"
+	"github.com/Dicklesworthstone/slb/internal/testutil"
 	"github.com/spf13/cobra"
 )
 
@@ -494,5 +495,66 @@ func assertClaudeNativeSettings(t *testing.T, data []byte) {
 	}
 	if count != 1 {
 		t.Fatalf("expected one registration for the current executable, found %d: %s", count, data)
+	}
+}
+
+func TestIntegrationsCursorRulesAndClaudeHooksEdgePaths(t *testing.T) {
+	h := testutil.NewHarness(t)
+	proj := h.ProjectDir
+	t.Chdir(proj)
+	savedProj, savedCfg := flagProject, flagConfig
+	t.Cleanup(func() { flagProject, flagConfig = savedProj, savedCfg })
+	flagProject, flagConfig = proj, ""
+
+	newIntRoot := func() *cobra.Command {
+		root := newTestRootCmd()
+		intCmd := &cobra.Command{Use: "integrations"}
+		cr := &cobra.Command{Use: "cursor-rules", RunE: cursorRulesCmd.RunE}
+		cr.Flags().Bool("install", false, "install")
+		cr.Flags().Bool("preview", false, "preview")
+		cr.Flags().Bool("append", true, "append")
+		cr.Flags().Bool("replace", false, "replace")
+		ch := &cobra.Command{Use: "claude-hooks", Args: cobra.NoArgs, RunE: claudeHooksCmd.RunE}
+		ch.Flags().Bool("install", false, "install")
+		ch.Flags().Bool("preview", false, "preview")
+		ch.Flags().Bool("merge", true, "merge")
+		ch.Flags().Bool("global", false, "global")
+		intCmd.AddCommand(cr, ch)
+		root.AddCommand(intCmd)
+		return root
+	}
+
+	previewOut, err := executeCommandCapture(t, newIntRoot(), "integrations", "cursor-rules")
+	if err != nil {
+		t.Fatalf("cursor-rules default preview failed: %v", err)
+	}
+	if !strings.Contains(previewOut, "Dangerous Command Policy (slb)") {
+		t.Fatalf("cursor-rules preview missing SLB content: %q", previewOut)
+	}
+	if _, err := os.Stat(filepath.Join(proj, ".cursorrules")); !os.IsNotExist(err) {
+		t.Fatalf("preview mode should not write .cursorrules")
+	}
+
+	if _, err := executeCommandCapture(t, newIntRoot(), "integrations", "cursor-rules", "--install", "--replace"); err != nil {
+		t.Fatalf("cursor-rules --install --replace failed: %v", err)
+	}
+	if _, err := executeCommandCapture(t, newIntRoot(), "integrations", "cursor-rules", "--install", "--append=false"); err != nil {
+		t.Fatalf("cursor-rules --install --append=false failed: %v", err)
+	}
+
+	badProj := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(badProj, ".slb"), 0700)
+	_ = os.MkdirAll(filepath.Join(badProj, ".cursorrules"), 0700)
+	if _, err := executeCommandCapture(t, newIntRoot(), "integrations", "cursor-rules", "--preview", "-C", badProj); err == nil {
+		t.Fatalf("expected error reading directory .cursorrules")
+	}
+
+	flagProject = proj
+	if _, _, err := executeCommand(newIntRoot(), "integrations", "claude-hooks", "--install", "--preview"); err == nil || !strings.Contains(err.Error(), "cannot be used together") {
+		t.Fatalf("expected conflicting flags error, got: %v", err)
+	}
+	chPreview, _, err := executeCommand(newIntRoot(), "integrations", "claude-hooks")
+	if err != nil || !strings.Contains(chPreview, "PreToolUse") {
+		t.Fatalf("claude-hooks default preview failed: err=%v out=%q", err, chPreview)
 	}
 }

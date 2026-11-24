@@ -1,13 +1,17 @@
 package cli
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -500,7 +504,7 @@ func TestDaemonProjectPath_PrecedenceOrder(t *testing.T) {
 // TestFollowFile_FileNotFound tests error handling when file doesn't exist.
 func TestFollowFile_FileNotFound(t *testing.T) {
 	var buf strings.Builder
-	err := followFile("/nonexistent/path/to/file.log", &buf)
+	err := followFile(context.Background(), "/nonexistent/path/to/file.log", &buf)
 	if err == nil {
 		t.Error("expected error for nonexistent file")
 	}
@@ -531,7 +535,7 @@ func TestFollowFile_PermissionDenied(t *testing.T) {
 	}
 
 	var buf strings.Builder
-	err := followFile(testFile, &buf)
+	err := followFile(context.Background(), testFile, &buf)
 	if err == nil {
 		t.Fatal("expected error for unreadable file")
 	}
@@ -913,5 +917,254 @@ func TestDaemonStatusSymlinkProjectMatchesWorkingDirectory(t *testing.T) {
 				t.Fatalf("project alias selected a different database: %+v", result)
 			}
 		})
+	}
+}
+
+type daemonFollowBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *daemonFollowBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *daemonFollowBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+type daemonFailWriter struct {
+	err error
+}
+
+func (w daemonFailWriter) Write([]byte) (int, error) {
+	return 0, w.err
+}
+
+func TestFollowFile_LiveAppendsPartialLinesAndContextCancel(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "daemon.log")
+	if err := os.WriteFile(logPath, []byte("initial-tail-line\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var out daemonFollowBuffer
+	done := make(chan error, 1)
+	go func() {
+		done <- followFileWithInterval(ctx, logPath, &out, 10*time.Millisecond)
+	}()
+
+	// Give follower time to open and seek to EOF.
+	time.Sleep(30 * time.Millisecond)
+
+	f, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Write a complete line, then a partial line split across two writes.
+	if _, err := f.WriteString("live-line-1\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("partial-"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(35 * time.Millisecond)
+	if _, err := f.WriteString("completed\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(out.String(), "partial-completed\n") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("followFile returned unexpected error on cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("followFile did not exit after context cancellation")
+	}
+
+	got := out.String()
+	if strings.Contains(got, "initial-tail-line") {
+		t.Fatalf("followFile re-emitted pre-seek content: %q", got)
+	}
+	want := "live-line-1\npartial-completed\n"
+	if got != want {
+		t.Fatalf("followFile output = %q, want %q", got, want)
+	}
+}
+
+func TestFollowFile_WriterErrorPropagates(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "daemon.log")
+	if err := os.WriteFile(logPath, []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- followFileWithInterval(ctx, logPath, daemonFailWriter{err: errors.New("broken pipe")}, 10*time.Millisecond)
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	f, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.WriteString("boom\n")
+	_ = f.Close()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "broken pipe") {
+			t.Fatalf("expected broken pipe write error, got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("followFile did not exit on write error")
+	}
+}
+
+func TestDaemonLogsCommand_TextJSONFollowAndErrors(t *testing.T) {
+	resetDaemonFlags()
+	t.Cleanup(resetDaemonFlags)
+
+	h := testutil.NewHarness(t)
+	h.ProjectDir = physicalDaemonTestPath(t, h.ProjectDir)
+	t.Chdir(h.ProjectDir)
+	t.Setenv("SLB_PROJECT", "")
+
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	slbDir := filepath.Join(fakeHome, ".slb")
+	if err := os.MkdirAll(slbDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(slbDir, "daemon.log")
+
+	// 1. Planted negative: missing log file fails cleanly.
+	rootMissing := newTestDaemonLifecycleCommand("logs", daemonLogsCmd.RunE)
+	if _, _, err := executeCommand(rootMissing, "daemon", "logs"); err == nil {
+		t.Fatalf("expected error when daemon.log does not exist")
+	}
+
+	if err := os.WriteFile(logPath, []byte("line-1\nline-2\nline-3\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Planted negative: --follow with --json must be rejected.
+	resetDaemonFlags()
+	flagDaemonLogsFollow = true
+	rootBadFollow := newTestDaemonLifecycleCommand("logs", daemonLogsCmd.RunE)
+	if _, _, err := executeCommand(rootBadFollow, "daemon", "logs", "--json"); err == nil || !strings.Contains(err.Error(), "--follow is only supported with text output") {
+		t.Fatalf("expected --follow/--json rejection, got: %v", err)
+	}
+
+	// 3. JSON output mode returns log_path and tailed lines.
+	resetDaemonFlags()
+	flagDaemonLogsLines = 2
+	rootJSON := newTestDaemonLifecycleCommand("logs", daemonLogsCmd.RunE)
+	jsonOut, err := executeCommandCapture(t, rootJSON, "daemon", "logs", "--json")
+	if err != nil {
+		t.Fatalf("daemon logs --json failed: %v", err)
+	}
+	var payload struct {
+		LogPath string   `json:"log_path"`
+		Lines   []string `json:"lines"`
+	}
+	if err := json.Unmarshal([]byte(jsonOut), &payload); err != nil {
+		t.Fatalf("invalid JSON from daemon logs: %v\n%s", err, jsonOut)
+	}
+	if payload.LogPath != logPath || len(payload.Lines) != 2 || payload.Lines[0] != "line-2" || payload.Lines[1] != "line-3" {
+		t.Fatalf("unexpected daemon logs JSON payload: %+v", payload)
+	}
+
+	// 4. Text output mode prints tailed lines.
+	resetDaemonFlags()
+	flagDaemonLogsLines = 2
+	rootText := newTestDaemonLifecycleCommand("logs", daemonLogsCmd.RunE)
+	textOut, err := executeCommandCapture(t, rootText, "daemon", "logs")
+	if err != nil {
+		t.Fatalf("daemon logs text failed: %v", err)
+	}
+	if !strings.Contains(textOut, "line-2\nline-3\n") || strings.Contains(textOut, "line-1") {
+		t.Fatalf("unexpected daemon logs text output: %q", textOut)
+	}
+
+	// 5. Text --follow streams appended lines and exits cleanly on context cancel.
+	resetDaemonFlags()
+	flagDaemonLogsLines = 1
+	flagDaemonLogsFollow = true
+	rootFollow := newTestDaemonLifecycleCommand("logs", daemonLogsCmd.RunE)
+	followCtx, followCancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer followCancel()
+	rootFollow.SetContext(followCtx)
+	followOut, err := executeCommandCapture(t, rootFollow, "daemon", "logs")
+	if err != nil {
+		t.Fatalf("daemon logs --follow failed: %v", err)
+	}
+	if !strings.Contains(followOut, "line-3") {
+		t.Fatalf("daemon logs --follow missing initial tail line: %q", followOut)
+	}
+}
+
+func TestDaemonStopAndStatusUptime(t *testing.T) {
+	resetDaemonFlags()
+	t.Cleanup(resetDaemonFlags)
+	h := testutil.NewHarness(t)
+	h.ProjectDir = physicalDaemonTestPath(t, h.ProjectDir)
+	t.Chdir(h.ProjectDir)
+	t.Setenv("SLB_PROJECT", "")
+	t.Setenv("SLB_HOST", "")
+
+	// Planted negative: daemon stop when no daemon is running must fail closed
+	// instead of claiming a daemon was stopped.
+	flagDaemonStopTimeoutSecs = 0 // exercises <=0 default clamping to 10s
+	rootStop := newTestDaemonLifecycleCommand("stop", daemonStopCmd.RunE)
+	if _, err := executeCommandCapture(t, rootStop, "daemon", "stop", "--json"); err == nil {
+		t.Fatalf("expected error stopping absent daemon, got nil")
+	}
+
+	// Status with a PID file exercises uptime_seconds / uptime formatting.
+	pidFile := daemon.PIDFileForCWD(h.ProjectDir)
+	if err := os.WriteFile(pidFile, []byte("999999\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-5 * time.Second)
+	_ = os.Chtimes(pidFile, past, past)
+	t.Cleanup(func() { _ = os.Remove(pidFile) })
+
+	resetDaemonFlags()
+	rootStatus := newTestDaemonLifecycleCommand("status", daemonStatusCmd.RunE)
+	statusOut, err := executeCommandCapture(t, rootStatus, "daemon", "status", "--json")
+	if err != nil {
+		t.Fatalf("daemon status failed: %v", err)
+	}
+	var statusPayload struct {
+		Uptime        string `json:"uptime"`
+		UptimeSeconds int64  `json:"uptime_seconds"`
+	}
+	if err := json.Unmarshal([]byte(statusOut), &statusPayload); err != nil {
+		t.Fatalf("invalid JSON from daemon status: %v", err)
+	}
+	if statusPayload.UptimeSeconds < 4 || statusPayload.Uptime == "" {
+		t.Fatalf("expected non-zero daemon uptime from PID file mtime, got %+v", statusPayload)
 	}
 }

@@ -909,3 +909,89 @@ func TestSessionCommands_WithDBFlag(t *testing.T) {
 		t.Errorf("session not found in specified DB, got %v", sessions)
 	}
 }
+
+func TestSessionGCCommand_InteractiveConfirmAndCancel(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	resetSessionFlags()
+	t.Cleanup(resetSessionFlags)
+
+	sess := testutil.MakeSession(t, h.DB,
+		testutil.WithProject(h.ProjectDir),
+		testutil.WithAgent("StaleAgent"),
+		testutil.WithProgram("claude-code"),
+		testutil.WithModel("opus"),
+	)
+	staleTime := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
+	if _, err := h.DB.Exec(`UPDATE sessions SET last_active_at = ? WHERE id = ?`, staleTime, sess.ID); err != nil {
+		t.Fatalf("backdating session: %v", err)
+	}
+
+	withStdin := func(input string, fn func()) {
+		oldIn := os.Stdin
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.WriteString(input)
+		_ = w.Close()
+		os.Stdin = r
+		defer func() {
+			os.Stdin = oldIn
+			_ = r.Close()
+		}()
+		fn()
+	}
+
+	var cancelErr error
+	withStdin("NO\n", func() {
+		resetSessionFlags()
+		cmd := newTestSessionCmd(h.DBPath)
+		_, cancelErr = executeCommandCapture(t, cmd, "session", "gc", "--threshold", "1m", "-C", h.ProjectDir)
+	})
+	if cancelErr == nil || !strings.Contains(cancelErr.Error(), "gc cancelled") {
+		t.Fatalf("expected gc cancelled error, got: %v", cancelErr)
+	}
+	active, err := h.DB.ListActiveSessions(h.ProjectDir)
+	if err != nil || len(active) != 1 {
+		t.Fatalf("cancelled GC should leave stale session active, got len=%d err=%v", len(active), err)
+	}
+
+	var confirmOut string
+	var confirmErr error
+	withStdin("END\n", func() {
+		resetSessionFlags()
+		cmd := newTestSessionCmd(h.DBPath)
+		confirmOut, confirmErr = executeCommandCapture(t, cmd, "session", "gc", "--threshold", "1m", "-C", h.ProjectDir)
+	})
+	if confirmErr != nil {
+		t.Fatalf("confirmed session gc failed: %v\n%s", confirmErr, confirmOut)
+	}
+	activeAfter, err := h.DB.ListActiveSessions(h.ProjectDir)
+	if err != nil || len(activeAfter) != 0 {
+		t.Fatalf("confirmed GC should end stale session, remaining=%d err=%v", len(activeAfter), err)
+	}
+}
+
+func TestSessionCommands_InvalidDatabaseErrors(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	dirDB := t.TempDir()
+	cases := [][]string{
+		{"session", "start", "--agent", "BadDBAgent", "-C", h.ProjectDir, "-j"},
+		{"session", "end", "--session-id", "sess-any", "-C", h.ProjectDir, "-j"},
+		{"session", "resume", "--agent", "BadDBAgent", "-C", h.ProjectDir, "-j"},
+		{"session", "list", "-C", h.ProjectDir, "-j"},
+		{"session", "heartbeat", "--session-id", "sess-any", "-C", h.ProjectDir, "-j"},
+		{"session", "reset-limits", "--session-id", "sess-any", "-C", h.ProjectDir, "-j"},
+		{"session", "gc", "--dry-run", "-C", h.ProjectDir, "-j"},
+	}
+	for _, args := range cases {
+		resetSessionFlags()
+		cmd := newTestSessionCmd(dirDB)
+		if _, _, err := executeCommand(cmd, args...); err == nil || (!strings.Contains(err.Error(), "opening database") && !strings.Contains(err.Error(), "creating database")) {
+			t.Fatalf("session %v expected database error, got: %v", args, err)
+		}
+	}
+	resetSessionFlags()
+}

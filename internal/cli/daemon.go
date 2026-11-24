@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Dicklesworthstone/slb/internal/daemon"
@@ -204,7 +207,13 @@ var daemonLogsCmd = &cobra.Command{
 			return nil
 		}
 
-		return followFile(path, os.Stdout)
+		baseCtx := cmd.Context()
+		if baseCtx == nil {
+			baseCtx = context.Background()
+		}
+		ctx, stop := signal.NotifyContext(baseCtx, os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return followFile(ctx, path, os.Stdout)
 	},
 }
 
@@ -282,7 +291,20 @@ func tailFileLines(path string, n int) ([]string, error) {
 	return buf, nil
 }
 
-func followFile(path string, w io.Writer) error {
+const defaultFollowPollInterval = 250 * time.Millisecond
+
+func followFile(ctx context.Context, path string, w io.Writer) error {
+	return followFileWithInterval(ctx, path, w, defaultFollowPollInterval)
+}
+
+func followFileWithInterval(ctx context.Context, path string, w io.Writer, pollInterval time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if pollInterval <= 0 {
+		pollInterval = defaultFollowPollInterval
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("opening %s: %w", path, err)
@@ -295,15 +317,36 @@ func followFile(path string, w io.Writer) error {
 	}
 
 	reader := bufio.NewReader(f)
+	var pending strings.Builder
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
 		line, err := reader.ReadString('\n')
 		if err == nil {
-			_, _ = io.WriteString(w, line)
+			if pending.Len() > 0 {
+				pending.WriteString(line)
+				line = pending.String()
+				pending.Reset()
+			}
+			if _, werr := io.WriteString(w, line); werr != nil {
+				return fmt.Errorf("writing %s: %w", path, werr)
+			}
 			continue
 		}
 		if errors.Is(err, io.EOF) {
-			time.Sleep(250 * time.Millisecond)
-			continue
+			if line != "" {
+				pending.WriteString(line)
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-ticker.C:
+				continue
+			}
 		}
 		return fmt.Errorf("tail %s: %w", path, err)
 	}

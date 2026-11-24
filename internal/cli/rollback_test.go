@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -319,4 +320,133 @@ func rollbackRequestFixture(t *testing.T) (*testutil.Harness, *db.Request, *core
 		t.Fatal(err)
 	}
 	return h, request, capture, target
+}
+
+func TestRollbackCommand_TextOutputAndSnapshotListText(t *testing.T) {
+	h, req, _, target := rollbackRequestFixture(t)
+	t.Chdir(h.ProjectDir)
+
+	cmd := newTestRollbackCmd(h.DBPath)
+	out, err := executeCommandCapture(t, cmd, "rollback", req.ID, "--force", "-C", h.ProjectDir)
+	if err != nil {
+		t.Fatalf("rollback text failed: %v\n%s", err, out)
+	}
+	for _, want := range []string{"Rollback for request " + req.ID, "Rollback data:", "Rollback completed."} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("rollback text missing %q:\n%s", want, out)
+		}
+	}
+	restored, err := os.ReadFile(target)
+	if err != nil || string(restored) != "captured state" {
+		t.Fatalf("file not restored: content=%q err=%v", string(restored), err)
+	}
+
+	if err := checkRollbackProject("relative/path"); err == nil || !strings.Contains(err.Error(), "not absolute") {
+		t.Fatalf("expected non-absolute project error, got: %v", err)
+	}
+	if err := checkRollbackProject(filepath.Join(t.TempDir(), "missing-proj")); err == nil {
+		t.Fatalf("expected missing recorded project error")
+	}
+
+	gitDir := t.TempDir()
+	if outGit, err := exec.Command("git", "init", gitDir).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, string(outGit))
+	}
+	t.Chdir(gitDir)
+	resetRollbackFlags()
+	newSnapRoot := func() *cobra.Command {
+		root := &cobra.Command{Use: "slb", SilenceUsage: true, SilenceErrors: true}
+		root.PersistentFlags().StringVarP(&flagOutput, "output", "o", "text", "output format")
+		root.PersistentFlags().BoolVarP(&flagJSON, "json", "j", false, "json output")
+		root.PersistentFlags().StringVarP(&flagProject, "project", "C", "", "project dir")
+		rb := &cobra.Command{Use: "rollback [request-id]", Args: cobra.MaximumNArgs(1), RunE: rollbackCmd.RunE}
+		rb.Flags().BoolVar(&flagRollbackForce, "force", false, "force")
+		rb.Flags().Bool("list", false, "list")
+		rb.Flags().String("from", "", "from")
+		root.AddCommand(rb)
+		return root
+	}
+	listOut, _, err := executeCommand(newSnapRoot(), "rollback", "--list")
+	if err != nil {
+		t.Fatalf("rollback --list text failed: %v", err)
+	}
+	if !strings.Contains(listOut, "No Git recovery snapshots found.") {
+		t.Fatalf("expected empty snapshot message, got: %q", listOut)
+	}
+
+	resetRollbackFlags()
+	if _, _, err := executeCommand(newSnapRoot(), "rollback", "--list", "-o", "bogus"); err == nil || !strings.Contains(err.Error(), "unsupported output format") {
+		t.Fatalf("expected unsupported output format error, got: %v", err)
+	}
+}
+
+func TestRollbackCommand_GitSnapshotListAndRestoreTextOutput(t *testing.T) {
+	gitDir := t.TempDir()
+	for _, args := range [][]string{
+		{"init", gitDir},
+		{"-C", gitDir, "config", "user.email", "test@example.invalid"},
+		{"-C", gitDir, "config", "user.name", "Test User"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, string(out))
+		}
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "app.txt"), []byte("v1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"-C", gitDir, "add", "app.txt"},
+		{"-C", gitDir, "commit", "-m", "init"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, string(out))
+		}
+	}
+	t.Chdir(gitDir)
+
+	req := &db.Request{
+		ID:          "req-gitsnap1",
+		ProjectPath: gitDir,
+		Command:     db.CommandSpec{Raw: "git " + "clean -fdx", Cwd: gitDir, Shell: true},
+	}
+	capData, err := core.CaptureRollbackState(context.Background(), req, core.RollbackCaptureOptions{MaxSizeBytes: 1 << 20})
+	if err != nil || capData == nil {
+		t.Fatalf("CaptureRollbackState git failed: data=%+v err=%v", capData, err)
+	}
+	corruptSnap := filepath.Join(filepath.Dir(capData.RollbackPath), "req-corrupt99")
+	if err := os.MkdirAll(corruptSnap, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	newSnapRoot := func() *cobra.Command {
+		root := &cobra.Command{Use: "slb", SilenceUsage: true, SilenceErrors: true}
+		root.PersistentFlags().StringVarP(&flagOutput, "output", "o", "text", "output format")
+		root.PersistentFlags().BoolVarP(&flagJSON, "json", "j", false, "json output")
+		root.PersistentFlags().StringVarP(&flagProject, "project", "C", "", "project dir")
+		rb := &cobra.Command{Use: "rollback [request-id]", Args: cobra.MaximumNArgs(1), RunE: rollbackCmd.RunE}
+		rb.Flags().BoolVar(&flagRollbackForce, "force", false, "force")
+		rb.Flags().Bool("list", false, "list")
+		rb.Flags().String("from", "", "from")
+		root.AddCommand(rb)
+		return root
+	}
+
+	resetRollbackFlags()
+	t.Cleanup(resetRollbackFlags)
+	listOut, _, err := executeCommand(newSnapRoot(), "rollback", "--list")
+	if err != nil {
+		t.Fatalf("rollback --list with snapshots failed: %v", err)
+	}
+	if !strings.Contains(listOut, "req-gitsnap1") || !strings.Contains(listOut, "Unavailable:") {
+		t.Fatalf("expected valid + corrupt snapshot lines in text list, got:\n%s", listOut)
+	}
+
+	resetRollbackFlags()
+	restoreOut, _, err := executeCommand(newSnapRoot(), "rollback", "--from", capData.RollbackPath, "--force")
+	if err != nil {
+		t.Fatalf("rollback --from text failed: %v", err)
+	}
+	if !strings.Contains(restoreOut, "completed from") || !strings.Contains(restoreOut, "Recovery receipt:") {
+		t.Fatalf("expected text recovery receipt summary, got:\n%s", restoreOut)
+	}
 }

@@ -2,6 +2,8 @@ package cli
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -314,5 +316,94 @@ func TestExecuteCommand_CustomTimeout(t *testing.T) {
 
 	if result["exit_code"].(float64) != 0 {
 		t.Errorf("expected exit_code=0, got %v", result["exit_code"])
+	}
+}
+
+func TestExecuteCommand_TextOutputSuccessAndFailure(t *testing.T) {
+	db.SimulateIndependentIdentityForTest(t)
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	resetExecuteFlags()
+	t.Cleanup(resetExecuteFlags)
+
+	sess := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir), testutil.WithAgent("ExecTextAgent"))
+	req := testutil.MakeRequest(t, h.DB, sess, testutil.WithCommand(testutil.TruePath(), h.ProjectDir, true))
+	req.Command.Hash = db.ComputeCommandHash(req.Command)
+	_, _ = h.DB.Exec(`UPDATE requests SET command_hash = ? WHERE id = ?`, req.Command.Hash, req.ID)
+	testutil.ApproveRequest(t, h.DB, req)
+
+	cmd := newTestExecuteCmd(h.DBPath)
+	out, err := executeCommandCapture(t, cmd, "execute", req.ID,
+		"--session-id", sess.ID,
+		"--timeout", "10",
+		"--log-dir", h.MustPath(".slb", "logs"),
+	)
+	if err != nil {
+		t.Fatalf("execute text success failed: %v\n%s", err, out)
+	}
+	for _, want := range []string{"Executed request " + req.ID, "Exit code: 0", "Evidence assurance:", "Duration:", "Log:"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("execute text output missing %q:\n%s", want, out)
+		}
+	}
+
+	resetExecuteFlags()
+	failReq := testutil.MakeRequest(t, h.DB, sess, testutil.WithCommand("exit 7", h.ProjectDir, true))
+	failReq.Command.Hash = db.ComputeCommandHash(failReq.Command)
+	_, _ = h.DB.Exec(`UPDATE requests SET command_hash = ? WHERE id = ?`, failReq.Command.Hash, failReq.ID)
+	testutil.ApproveRequest(t, h.DB, failReq)
+
+	failCmd := newTestExecuteCmd(h.DBPath)
+	failOut, failErr := executeCommandCapture(t, failCmd, "execute", failReq.ID,
+		"--session-id", sess.ID,
+		"--timeout", "10",
+		"--log-dir", h.MustPath(".slb", "logs"),
+	)
+	if failErr == nil {
+		t.Fatalf("expected non-zero exit error for 'exit 7'")
+	}
+	if !strings.Contains(failOut, "Execution failed:") || !strings.Contains(failOut, "Exit code: 7") {
+		t.Fatalf("execute text failure missing expected diagnostics:\n%s", failOut)
+	}
+
+	if _, err := executionLogDirectory("", ""); err == nil {
+		t.Fatalf("expected error from executionLogDirectory empty project, got nil")
+	}
+}
+
+func TestExecuteCommand_ValidationAndConfigErrorPaths(t *testing.T) {
+	h := testutil.NewHarness(t)
+	t.Chdir(h.ProjectDir)
+	resetExecuteFlags()
+	savedCfg := flagConfig
+	t.Cleanup(func() {
+		flagConfig = savedCfg
+		resetExecuteFlags()
+	})
+
+	// 1. Negative timeout rejected.
+	cmdNegTO := newTestExecuteCmd(h.DBPath)
+	if _, _, err := executeCommand(cmdNegTO, "execute", "req-any", "--session-id", "s1", "--timeout", "-1"); err == nil || !strings.Contains(err.Error(), "out of range") {
+		t.Fatalf("expected out of range timeout error, got: %v", err)
+	}
+
+	// 2. Directory as DB returns opening database error.
+	resetExecuteFlags()
+	cmdBadDB := newTestExecuteCmd(t.TempDir())
+	if _, _, err := executeCommand(cmdBadDB, "execute", "req-any", "--session-id", "s1", "-C", h.ProjectDir); err == nil || !strings.Contains(err.Error(), "opening database") {
+		t.Fatalf("expected opening database error, got: %v", err)
+	}
+
+	// 3. Malformed config returns loading config error.
+	badCfg := filepath.Join(h.ProjectDir, ".slb", "config.toml")
+	if err := os.WriteFile(badCfg, []byte("[general\nmin_approvals = [broken"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	resetExecuteFlags()
+	sess := testutil.MakeSession(t, h.DB, testutil.WithProject(h.ProjectDir))
+	req := testutil.MakeRequest(t, h.DB, sess, testutil.WithCommand("echo hi", h.ProjectDir, true))
+	cmdBadCfg := newTestExecuteCmd(h.DBPath)
+	if _, _, err := executeCommand(cmdBadCfg, "execute", req.ID, "--session-id", sess.ID, "-C", h.ProjectDir); err == nil || !strings.Contains(err.Error(), "loading config") {
+		t.Fatalf("expected loading config error, got: %v", err)
 	}
 }
