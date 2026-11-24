@@ -18,17 +18,13 @@ func init() {
 }
 
 func schemaFlagEnabled(cmd *cobra.Command) bool {
-	if flagSchema {
-		return true
+	if cmd != nil {
+		if f := cmd.Flags().Lookup("schema"); f != nil && f.Changed {
+			v, err := cmd.Flags().GetBool("schema")
+			return err == nil && v
+		}
 	}
-	if cmd == nil {
-		return false
-	}
-	if f := cmd.Flags().Lookup("schema"); f != nil && f.Changed {
-		v, err := cmd.Flags().GetBool("schema")
-		return err == nil && v
-	}
-	return false
+	return flagSchema
 }
 
 func canonicalCommandKey(cmd *cobra.Command) string {
@@ -71,8 +67,20 @@ func wrapCommandForSchema(cmd *cobra.Command) {
 	}
 	cmd.Annotations["slb.schema.wrapped"] = "1"
 
+	bypassedFlagValidation := false
+	restoreFlagValidation := func(c *cobra.Command) {
+		if bypassedFlagValidation {
+			bypassedFlagValidation = false
+			c.DisableFlagParsing = false
+		}
+	}
+
+	isGroupCmd := cmd != rootCmd && cmd.RunE == nil && cmd.Run == nil && len(cmd.Commands()) > 0
 	origArgs := cmd.Args
 	cmd.Args = func(c *cobra.Command, args []string) error {
+		if isGroupCmd && origArgs == nil && len(args) > 0 {
+			return fmt.Errorf("unknown command %q for %q", args[0], c.CommandPath())
+		}
 		if schemaFlagEnabled(c) {
 			return nil
 		}
@@ -82,6 +90,8 @@ func wrapCommandForSchema(cmd *cobra.Command) {
 		return nil
 	}
 
+	// Only wrap persistent hooks when already present so we never shadow
+	// inherited parent hooks during normal (non-schema) execution.
 	if cmd.PersistentPreRunE != nil {
 		origPersistentPreRunE := cmd.PersistentPreRunE
 		cmd.PersistentPreRunE = func(c *cobra.Command, args []string) error {
@@ -90,21 +100,55 @@ func wrapCommandForSchema(cmd *cobra.Command) {
 			}
 			return origPersistentPreRunE(c, args)
 		}
-	}
-
-	if cmd.PreRunE != nil {
-		origPreRunE := cmd.PreRunE
-		cmd.PreRunE = func(c *cobra.Command, args []string) error {
+	} else if cmd.PersistentPreRun != nil {
+		origPersistentPreRun := cmd.PersistentPreRun
+		cmd.PersistentPreRun = nil
+		cmd.PersistentPreRunE = func(c *cobra.Command, args []string) error {
 			if schemaFlagEnabled(c) {
 				return nil
 			}
-			return origPreRunE(c, args)
+			origPersistentPreRun(c, args)
+			return nil
 		}
 	}
 
-	if cmd.RunE != nil {
+	// Always install PreRunE so --schema bypasses Cobra's ValidateRequiredFlags
+	// and ValidateFlagGroups (which run between PreRunE and RunE and return nil
+	// when DisableFlagParsing is set). RunE immediately restores DisableFlagParsing.
+	origPreRunE := cmd.PreRunE
+	origPreRun := cmd.PreRun
+	cmd.PreRun = nil
+	cmd.PreRunE = func(c *cobra.Command, args []string) error {
+		if schemaFlagEnabled(c) {
+			if !c.DisableFlagParsing {
+				bypassedFlagValidation = true
+				c.DisableFlagParsing = true
+			}
+			return nil
+		}
+		if origPreRunE != nil {
+			return origPreRunE(c, args)
+		}
+		if origPreRun != nil {
+			origPreRun(c, args)
+		}
+		return nil
+	}
+
+	if cmd == schemaCmd && cmd.RunE != nil {
+		// schemaCmd handles --schema, --all, and positional command arguments
+		// directly so `slb schema pending --schema` and `slb schema --all --schema`
+		// honor their arguments/flags while `slb schema --schema` emits the
+		// schema catalog's own JSON Schema.
 		origRunE := cmd.RunE
 		cmd.RunE = func(c *cobra.Command, args []string) error {
+			restoreFlagValidation(c)
+			return origRunE(c, args)
+		}
+	} else if cmd.RunE != nil {
+		origRunE := cmd.RunE
+		cmd.RunE = func(c *cobra.Command, args []string) error {
+			restoreFlagValidation(c)
 			if schemaFlagEnabled(c) {
 				return emitSchemaForCommand(c)
 			}
@@ -114,6 +158,7 @@ func wrapCommandForSchema(cmd *cobra.Command) {
 		origRun := cmd.Run
 		cmd.Run = nil
 		cmd.RunE = func(c *cobra.Command, args []string) error {
+			restoreFlagValidation(c)
 			if schemaFlagEnabled(c) {
 				return emitSchemaForCommand(c)
 			}
@@ -123,10 +168,51 @@ func wrapCommandForSchema(cmd *cobra.Command) {
 	} else if cmd != rootCmd {
 		// Group command (e.g. `slb patterns --schema`, `slb daemon --schema`) with no Run/RunE.
 		cmd.RunE = func(c *cobra.Command, args []string) error {
+			restoreFlagValidation(c)
 			if schemaFlagEnabled(c) {
 				return emitSchemaForCommand(c)
 			}
 			return c.Help()
+		}
+	}
+
+	if cmd.PostRunE != nil {
+		origPostRunE := cmd.PostRunE
+		cmd.PostRunE = func(c *cobra.Command, args []string) error {
+			if schemaFlagEnabled(c) {
+				return nil
+			}
+			return origPostRunE(c, args)
+		}
+	} else if cmd.PostRun != nil {
+		origPostRun := cmd.PostRun
+		cmd.PostRun = nil
+		cmd.PostRunE = func(c *cobra.Command, args []string) error {
+			if schemaFlagEnabled(c) {
+				return nil
+			}
+			origPostRun(c, args)
+			return nil
+		}
+	}
+
+	if cmd.PersistentPostRunE != nil {
+		origPersistentPostRunE := cmd.PersistentPostRunE
+		cmd.PersistentPostRunE = func(c *cobra.Command, args []string) error {
+			if schemaFlagEnabled(c) {
+				return nil
+			}
+			return origPersistentPostRunE(c, args)
+		}
+	} else if cmd.PersistentPostRun != nil {
+		origPersistentPostRun := cmd.PersistentPostRun
+		cmd.PersistentPostRun = nil
+		cmd.PersistentPostRunE = func(c *cobra.Command, args []string) error {
+			if schemaFlagEnabled(c) {
+				return nil
+			}
+			origPersistentPostRun(c, args)
+			return nil
 		}
 	}
 }

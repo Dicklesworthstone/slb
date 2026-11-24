@@ -126,7 +126,14 @@ func ObjectSchema(desc string, props map[string]*JSONSchema, required ...string)
 		AdditionalProperties: false,
 	}
 	if len(required) > 0 {
-		req := append([]string(nil), required...)
+		seen := make(map[string]bool, len(required))
+		req := make([]string, 0, len(required))
+		for _, r := range required {
+			if !seen[r] {
+				seen[r] = true
+				req = append(req, r)
+			}
+		}
 		sort.Strings(req)
 		s.Required = req
 	}
@@ -211,7 +218,8 @@ func schemaFromType(t reflect.Type, path string, descs map[string]string, visiti
 		return NumberSchema(lookupDescription(path, t.Name(), descs))
 	case reflect.Slice, reflect.Array:
 		if t.Elem().Kind() == reflect.Uint8 && t.Kind() == reflect.Slice {
-			return StringSchema(lookupDescription(path, "base64", descs))
+			// encoding/json marshals nil []byte to JSON null and non-nil []byte to a base64 string.
+			return NullableStringSchema(lookupDescription(path, "base64", descs))
 		}
 		elemSchema := schemaFromType(t.Elem(), path+"[]", descs, visiting)
 		if t.Kind() == reflect.Slice {
@@ -234,10 +242,7 @@ func schemaFromType(t reflect.Type, path string, descs map[string]string, visiti
 		visiting[t] = true
 		defer delete(visiting, t)
 
-		props := make(map[string]*JSONSchema)
-		var required []string
-		collectStructFields(t, path, descs, visiting, props, &required)
-		sort.Strings(required)
+		props, required := collectStructFields(t, path, descs, visiting)
 		return &JSONSchema{
 			Type:                 "object",
 			Description:          lookupDescription(path, t.Name(), descs),
@@ -250,52 +255,149 @@ func schemaFromType(t reflect.Type, path string, descs map[string]string, visiti
 	}
 }
 
+type structEmbedNode struct {
+	typ        reflect.Type
+	depth      int
+	viaPointer bool
+	ancestors  []reflect.Type
+}
+
+type structFieldCandidate struct {
+	name   string
+	depth  int
+	tagged bool
+	field  reflect.StructField
+	omit   bool
+	ambig  bool
+}
+
+func containsType(types []reflect.Type, target reflect.Type) bool {
+	for _, candidate := range types {
+		if candidate == target {
+			return true
+		}
+	}
+	return false
+}
+
+// collectStructFields resolves struct fields using Go encoding/json breadth-first
+// embedding precedence: shallower fields shadow deeper embedded fields, explicit
+// json tags beat untagged fields at equal depth, ambiguous peers are omitted,
+// pointer-embedded cycles are broken safely, and required keys are deduplicated.
 func collectStructFields(
-	t reflect.Type,
+	root reflect.Type,
 	prefix string,
 	descs map[string]string,
 	visiting map[reflect.Type]bool,
-	props map[string]*JSONSchema,
-	required *[]string,
-) {
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		jsonTag := f.Tag.Get("json")
-		if jsonTag == "-" {
-			continue
-		}
-		name, opts := parseJSONTag(jsonTag)
-		if f.Anonymous && name == "" {
-			ft := f.Type
-			for ft.Kind() == reflect.Pointer {
-				ft = ft.Elem()
-			}
-			if ft.Kind() == reflect.Struct && ft != timeType {
-				collectStructFields(ft, prefix, descs, visiting, props, required)
+) (map[string]*JSONSchema, []string) {
+	byName := make(map[string]structFieldCandidate)
+	queue := []structEmbedNode{{
+		typ:       root,
+		depth:     0,
+		ancestors: []reflect.Type{root},
+	}}
+
+	for len(queue) > 0 {
+		node := queue[0]
+		queue = queue[1:]
+
+		for i := 0; i < node.typ.NumField(); i++ {
+			f := node.typ.Field(i)
+			jsonTag := f.Tag.Get("json")
+			if jsonTag == "-" {
 				continue
 			}
+			name, opts := parseJSONTag(jsonTag)
+			tagged := name != ""
+
+			if f.Anonymous && !tagged {
+				ft := f.Type
+				isPtr := ft.Kind() == reflect.Pointer
+				for ft.Kind() == reflect.Pointer {
+					ft = ft.Elem()
+				}
+				if ft.Kind() == reflect.Struct && ft != timeType {
+					if visiting[ft] || containsType(node.ancestors, ft) {
+						continue
+					}
+					nextAnc := make([]reflect.Type, len(node.ancestors)+1)
+					copy(nextAnc, node.ancestors)
+					nextAnc[len(node.ancestors)] = ft
+					queue = append(queue, structEmbedNode{
+						typ:        ft,
+						depth:      node.depth + 1,
+						viaPointer: node.viaPointer || isPtr,
+						ancestors:  nextAnc,
+					})
+					continue
+				}
+			}
+
+			if !f.IsExported() {
+				continue
+			}
+			if name == "" {
+				name = f.Name
+			}
+
+			omit := node.viaPointer || hasJSONTagOption(opts, "omitempty") || hasJSONTagOption(opts, "omitzero")
+			cand := structFieldCandidate{
+				name:   name,
+				depth:  node.depth,
+				tagged: tagged,
+				field:  f,
+				omit:   omit,
+			}
+
+			prev, exists := byName[name]
+			if !exists {
+				byName[name] = cand
+				continue
+			}
+			if cand.depth > prev.depth {
+				// Outer field shadows embedded field.
+				continue
+			}
+			// BFS visits in non-decreasing depth, so cand.depth == prev.depth here.
+			if cand.tagged && !prev.tagged {
+				byName[name] = cand
+			} else if !cand.tagged && prev.tagged {
+				continue
+			} else {
+				prev.ambig = true
+				byName[name] = prev
+			}
 		}
-		if !f.IsExported() {
-			continue
+	}
+
+	names := make([]string, 0, len(byName))
+	for name, cand := range byName {
+		if !cand.ambig {
+			names = append(names, name)
 		}
-		if name == "" {
-			name = f.Name
-		}
+	}
+	sort.Strings(names)
+
+	props := make(map[string]*JSONSchema, len(names))
+	var required []string
+	for _, name := range names {
+		cand := byName[name]
 		fieldPath := name
 		if prefix != "" {
 			fieldPath = prefix + "." + name
 		}
-		propSchema := schemaFromType(f.Type, fieldPath, descs, visiting)
+		propSchema := schemaFromType(cand.field.Type, fieldPath, descs, visiting)
 		if d := lookupExactDescription(fieldPath, name, descs); d != "" {
 			propSchema.Description = d
 		} else if propSchema.Description == "" {
 			propSchema.Description = humanizeFieldName(name)
 		}
 		props[name] = propSchema
-		if !strings.Contains(opts, "omitempty") {
-			*required = append(*required, name)
+		if !cand.omit {
+			required = append(required, name)
 		}
 	}
+	return props, required
 }
 
 func parseJSONTag(tag string) (string, string) {
@@ -304,6 +406,17 @@ func parseJSONTag(tag string) (string, string) {
 	}
 	name, opts, _ := strings.Cut(tag, ",")
 	return name, opts
+}
+
+func hasJSONTagOption(opts, target string) bool {
+	for opts != "" {
+		var opt string
+		opt, opts, _ = strings.Cut(opts, ",")
+		if opt == target {
+			return true
+		}
+	}
+	return false
 }
 
 func makeNullable(s *JSONSchema) *JSONSchema {
@@ -327,6 +440,24 @@ func makeNullable(s *JSONSchema) *JSONSchema {
 		if !hasNull {
 			cp.Type = append(append([]string(nil), tv...), "null")
 		}
+	}
+	if len(cp.Enum) > 0 {
+		hasNil := false
+		for _, ev := range cp.Enum {
+			if ev == nil {
+				hasNil = true
+				break
+			}
+		}
+		if !hasNil {
+			cp.Enum = append(append([]any(nil), cp.Enum...), nil)
+		}
+	}
+	if cp.Const != nil {
+		if len(cp.Enum) == 0 {
+			cp.Enum = []any{cp.Const, nil}
+		}
+		cp.Const = nil
 	}
 	return &cp
 }

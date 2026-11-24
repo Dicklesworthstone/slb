@@ -111,6 +111,258 @@ func TestSchemaFromType_StructAndPointers(t *testing.T) {
 	}
 }
 
+type schemaTestMutualA struct {
+	*schemaTestMutualB
+	A string `json:"a"`
+}
+
+type schemaTestMutualB struct {
+	*schemaTestMutualA
+	B string `json:"b"`
+}
+
+func TestSchemaFromType_PointerEmbeddedCycles(t *testing.T) {
+	type selfNode struct {
+		*selfNode
+		Name string `json:"name"`
+	}
+	type outerWrap struct {
+		*selfNode
+		Tag string `json:"tag"`
+	}
+
+	// 1. Direct pointer-embedded self cycle must terminate without stack overflow.
+	sSelf := SchemaFromType(reflect.TypeOf(selfNode{}), nil)
+	docSelf := mustSchemaDoc(t, sSelf)
+	if err := ValidateDocumentAgainstSchema(docSelf, mustJSONRoundTrip(t, selfNode{Name: "root"})); err != nil {
+		t.Fatalf("valid selfNode failed validation: %v", err)
+	}
+	// Planted negative: missing required "name" must fail.
+	if err := ValidateDocumentAgainstSchema(docSelf, map[string]any{}); err == nil {
+		t.Fatalf("expected missing required 'name' on selfNode to fail")
+	}
+
+	// 2. Mutual pointer-embedded cycle must terminate cleanly.
+	sMutual := SchemaFromType(reflect.TypeOf(schemaTestMutualB{}), nil)
+	docMutual := mustSchemaDoc(t, sMutual)
+	if err := ValidateDocumentAgainstSchema(docMutual, mustJSONRoundTrip(t, schemaTestMutualB{B: "ok"})); err != nil {
+		t.Fatalf("valid mutualB failed validation: %v", err)
+	}
+
+	// 3. Non-cyclic outer embedding cyclic inner must terminate cleanly and keep pointer-embedded fields optional.
+	sWrap := SchemaFromType(reflect.TypeOf(outerWrap{}), nil)
+	docWrap := mustSchemaDoc(t, sWrap)
+	if err := ValidateDocumentAgainstSchema(docWrap, mustJSONRoundTrip(t, outerWrap{Tag: "t1"})); err != nil {
+		t.Fatalf("outerWrap with nil embedded pointer failed validation: %v", err)
+	}
+	if err := ValidateDocumentAgainstSchema(docWrap, mustJSONRoundTrip(t, outerWrap{selfNode: &selfNode{Name: "n"}, Tag: "t2"})); err != nil {
+		t.Fatalf("outerWrap with populated embedded pointer failed validation: %v", err)
+	}
+	// Planted negative: missing required "tag" must fail.
+	if err := ValidateDocumentAgainstSchema(docWrap, map[string]any{"name": "n"}); err == nil {
+		t.Fatalf("expected missing required 'tag' on outerWrap to fail")
+	}
+}
+
+func TestSchemaFromType_FieldShadowingAndRequiredDedup(t *testing.T) {
+	type baseEmbedded struct {
+		ID     string `json:"id"`
+		Shared string `json:"shared"`
+		Kept   string `json:"kept"`
+	}
+	type outerAfter struct {
+		baseEmbedded
+		ID     int    `json:"id,omitempty"`
+		Shared string `json:"shared"`
+	}
+	type outerBefore struct {
+		ID     int    `json:"id,omitempty"`
+		Shared string `json:"shared"`
+		baseEmbedded
+	}
+
+	for name, typ := range map[string]reflect.Type{
+		"outer_after_embedded":  reflect.TypeOf(outerAfter{}),
+		"outer_before_embedded": reflect.TypeOf(outerBefore{}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := SchemaFromType(typ, nil)
+			// Required must have unique items: "kept" and "shared" ONLY ("id" shadowed with omitempty).
+			wantReq := []string{"kept", "shared"}
+			if !reflect.DeepEqual(s.Required, wantReq) {
+				t.Fatalf("required=%v, want %v", s.Required, wantReq)
+			}
+			if s.Properties["id"].Type != "integer" {
+				t.Fatalf("outer int field must shadow embedded string field: got %v", s.Properties["id"].Type)
+			}
+			doc := mustSchemaDoc(t, s)
+
+			// Valid payload omitting shadowed omitempty "id".
+			if err := ValidateDocumentAgainstSchema(doc, map[string]any{"shared": "ok", "kept": "yes"}); err != nil {
+				t.Fatalf("payload omitting shadowed omitempty id failed: %v", err)
+			}
+			// Valid payload including outer integer "id".
+			if err := ValidateDocumentAgainstSchema(doc, map[string]any{"id": float64(7), "shared": "ok", "kept": "yes"}); err != nil {
+				t.Fatalf("payload with outer integer id failed: %v", err)
+			}
+			// Planted negative: embedded string type for shadowed "id" must be rejected.
+			if err := ValidateDocumentAgainstSchema(doc, map[string]any{"id": "wrong-type", "shared": "ok", "kept": "yes"}); err == nil {
+				t.Fatalf("expected shadowed string id to fail integer schema")
+			}
+		})
+	}
+
+	// Verify real encoding/json marshaling of outerAfter and outerBefore conforms.
+	if err := ValidateDocumentAgainstSchema(
+		mustSchemaDoc(t, SchemaFromType(reflect.TypeOf(outerAfter{}), nil)),
+		mustJSONRoundTrip(t, outerAfter{baseEmbedded: baseEmbedded{ID: "ignored", Shared: "x", Kept: "k"}, Shared: "s"}),
+	); err != nil {
+		t.Fatalf("real marshaled outerAfter failed validation: %v", err)
+	}
+	if err := ValidateDocumentAgainstSchema(
+		mustSchemaDoc(t, SchemaFromType(reflect.TypeOf(outerBefore{}), nil)),
+		mustJSONRoundTrip(t, outerBefore{ID: 9, Shared: "s", baseEmbedded: baseEmbedded{ID: "ignored", Kept: "k"}}),
+	); err != nil {
+		t.Fatalf("real marshaled outerBefore failed validation: %v", err)
+	}
+
+	// Ambiguous sibling fields at equal depth are omitted by encoding/json and SchemaFromType.
+	type left struct {
+		Dup string
+	}
+	type right struct {
+		Dup string
+	}
+	type diamond struct {
+		left
+		right
+		Own string `json:"own"`
+	}
+	sDiamond := SchemaFromType(reflect.TypeOf(diamond{}), nil)
+	if _, exists := sDiamond.Properties["Dup"]; exists {
+		t.Fatalf("ambiguous peer field 'Dup' should be omitted to match encoding/json")
+	}
+	if err := ValidateDocumentAgainstSchema(mustSchemaDoc(t, sDiamond), mustJSONRoundTrip(t, diamond{Own: "ok"})); err != nil {
+		t.Fatalf("real marshaled diamond failed validation: %v", err)
+	}
+}
+
+func TestSchemaFromType_NilByteSlice(t *testing.T) {
+	type blobPayload struct {
+		Data  []byte  `json:"data"`
+		Fixed [4]byte `json:"fixed"`
+	}
+	s := SchemaFromType(reflect.TypeOf(blobPayload{}), nil)
+	doc := mustSchemaDoc(t, s)
+
+	// Nil []byte marshals to JSON null and must validate.
+	nilBytesPayload := mustJSONRoundTrip(t, blobPayload{Data: nil, Fixed: [4]byte{1, 2, 3, 4}})
+	if err := ValidateDocumentAgainstSchema(doc, nilBytesPayload); err != nil {
+		t.Fatalf("nil []byte payload failed validation: %v", err)
+	}
+
+	// Non-nil []byte marshals to base64 string and must validate.
+	nonNilPayload := mustJSONRoundTrip(t, blobPayload{Data: []byte("hello"), Fixed: [4]byte{1, 2, 3, 4}})
+	if err := ValidateDocumentAgainstSchema(doc, nonNilPayload); err != nil {
+		t.Fatalf("non-nil []byte payload failed validation: %v", err)
+	}
+
+	// Planted negative: integer for []byte must fail validation.
+	if err := ValidateDocumentAgainstSchema(doc, map[string]any{"data": float64(42), "fixed": []any{float64(1), float64(2), float64(3), float64(4)}}); err == nil {
+		t.Fatalf("expected integer 'data' to fail []byte nullable-string schema")
+	}
+}
+
+func TestSchemaFromType_OmitZeroAndExactTagOptions(t *testing.T) {
+	type tagPayload struct {
+		ZeroTime  time.Time `json:"zero_time,omitzero"`
+		ZeroInt   int       `json:"zero_int,omitzero"`
+		NotOmit   string    `json:"not_omit,notomitempty"`
+		MultiOpts string    `json:"multi_opts,string,omitempty"`
+	}
+
+	s := SchemaFromType(reflect.TypeOf(tagPayload{}), nil)
+	wantReq := []string{"not_omit"}
+	if !reflect.DeepEqual(s.Required, wantReq) {
+		t.Fatalf("required=%v, want %v (omitzero must be optional; substring 'notomitempty' must remain required)", s.Required, wantReq)
+	}
+	doc := mustSchemaDoc(t, s)
+
+	// Real marshaled zero struct omits zero_time, zero_int, multi_opts and keeps not_omit.
+	if err := ValidateDocumentAgainstSchema(doc, mustJSONRoundTrip(t, tagPayload{NotOmit: "present"})); err != nil {
+		t.Fatalf("marshaled tagPayload failed validation: %v", err)
+	}
+	// Planted negative: omitting "not_omit" must fail validation.
+	if err := ValidateDocumentAgainstSchema(doc, map[string]any{}); err == nil {
+		t.Fatalf("expected missing required 'not_omit' to fail validation")
+	}
+}
+
+func TestMakeNullable_EnumAndConst(t *testing.T) {
+	origEnum := EnumSchema("mode", "fast", "safe")
+	nullEnum := makeNullable(origEnum)
+	if len(origEnum.Enum) != 2 {
+		t.Fatalf("makeNullable mutated original Enum slice: %v", origEnum.Enum)
+	}
+	docEnum := mustSchemaDoc(t, nullEnum)
+	for _, valid := range []any{"fast", "safe", nil} {
+		if err := ValidateDocumentAgainstSchema(docEnum, valid); err != nil {
+			t.Fatalf("nullable enum rejected valid value %#v: %v", valid, err)
+		}
+	}
+	// Planted negative: unknown value must still fail.
+	if err := ValidateDocumentAgainstSchema(docEnum, "unknown"); err == nil {
+		t.Fatalf("nullable enum accepted invalid value 'unknown'")
+	}
+	// Calling makeNullable twice must not duplicate nil in Enum.
+	nullEnumTwice := makeNullable(nullEnum)
+	if len(nullEnumTwice.Enum) != 3 {
+		t.Fatalf("double makeNullable duplicated nil in Enum: %v", nullEnumTwice.Enum)
+	}
+
+	origConst := &JSONSchema{Type: "string", Const: "ok", Description: "Fixed status."}
+	nullConst := makeNullable(origConst)
+	if nullConst.Const != nil {
+		t.Fatalf("nullable const must clear Const, got %#v", nullConst.Const)
+	}
+	docConst := mustSchemaDoc(t, nullConst)
+	for _, valid := range []any{"ok", nil} {
+		if err := ValidateDocumentAgainstSchema(docConst, valid); err != nil {
+			t.Fatalf("nullable const rejected valid value %#v: %v", valid, err)
+		}
+	}
+	// Planted negative: other string must fail.
+	if err := ValidateDocumentAgainstSchema(docConst, "bad"); err == nil {
+		t.Fatalf("nullable const accepted invalid value 'bad'")
+	}
+}
+
+func mustSchemaDoc(t *testing.T, s *JSONSchema) map[string]any {
+	t.Helper()
+	raw, err := MarshalJSONSchema(s)
+	if err != nil {
+		t.Fatalf("MarshalJSONSchema: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal schema: %v", err)
+	}
+	return doc
+}
+
+func mustJSONRoundTrip(t *testing.T, v any) any {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var out any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	return out
+}
+
 // ValidateDocumentAgainstSchema is a strict test-only Draft 2020-12 subset validator
 // used to verify real marshaled payloads conform to emitted schemas.
 func ValidateDocumentAgainstSchema(schema map[string]any, value any) error {

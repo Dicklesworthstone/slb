@@ -93,6 +93,13 @@ Examples:
 			return writeSchemaValue(cmd.OutOrStdout(), buildAllSchemasBundle())
 		}
 		if len(args) == 0 || (len(args) == 1 && strings.EqualFold(args[0], "list")) {
+			if schemaFlagEnabled(cmd) {
+				schema, err := LookupCommandSchema("schema")
+				if err != nil {
+					return err
+				}
+				return writeSchemaValue(cmd.OutOrStdout(), schema)
+			}
 			return writeSchemaCatalog(cmd.OutOrStdout())
 		}
 		key := strings.Join(args, " ")
@@ -110,28 +117,38 @@ func init() {
 }
 
 func writeSchemaValue(w io.Writer, value any) error {
-	format := schemaOutputFormat()
+	format, err := schemaOutputFormat()
+	if err != nil {
+		return err
+	}
 	out := output.New(format, output.WithOutput(w), output.WithStats(GetStats()))
 	return out.Write(value)
 }
 
-// schemaOutputFormat always defaults to JSON so bare `slb schema <cmd>` and
+// schemaOutputFormat defaults to JSON so bare `slb schema <cmd>` and
 // `slb <cmd> --schema` emit valid JSON Schema on stdout, while honoring explicit
-// `-o yaml` or `--toon` overrides.
-func schemaOutputFormat() output.Format {
+// `-o yaml`, `-o toon`, `--toon`, or `--json` overrides and rejecting invalid
+// `-o` format names.
+func schemaOutputFormat() (output.Format, error) {
+	raw := strings.ToLower(strings.TrimSpace(flagOutput))
+	switch raw {
+	case "", "text", "json", "yaml", "toon":
+	default:
+		return "", fmt.Errorf("unsupported format: %s (use json, yaml, or toon)", flagOutput)
+	}
 	if flagJSON {
-		return output.FormatJSON
+		return output.FormatJSON, nil
 	}
 	if flagTOON {
-		return output.FormatTOON
+		return output.FormatTOON, nil
 	}
-	switch flagOutput {
+	switch raw {
 	case "yaml":
-		return output.FormatYAML
+		return output.FormatYAML, nil
 	case "toon":
-		return output.FormatTOON
+		return output.FormatTOON, nil
 	default:
-		return output.FormatJSON
+		return output.FormatJSON, nil
 	}
 }
 
@@ -302,8 +319,8 @@ func patternProposalSchema() *output.JSONSchema {
 		map[string]*output.JSONSchema{
 			"status":        output.EnumSchema("Submission status of the proposal.", "pending", "suggested"),
 			"review_status": output.StringSchema("Persisted review status of the pattern proposal."),
-			"id":            output.StringSchema("Unique identifier of the pattern change proposal."),
-			"request_id":    output.StringSchema("Alias of the pattern change proposal identifier."),
+			"id":            output.IntSchema("Unique numeric identifier of the pattern change proposal."),
+			"request_id":    output.IntSchema("Numeric alias of the pattern change proposal identifier."),
 			"pattern":       output.StringSchema("Regular expression pattern proposed."),
 			"tier":          output.StringSchema("Target risk tier for the pattern proposal (may be empty if unmatched)."),
 			"reason":        output.StringSchema("Justification supplied for the proposal."),
@@ -431,6 +448,114 @@ func configFieldDescriptions() map[string]string {
 		"TrustedSelfApprove":          "Deprecated legacy list; self-approval remains forbidden.",
 		"TrustedSelfApproveDelaySecs": "Legacy delay setting retained for config compatibility.",
 	}
+}
+
+func preflightReportSchema() *output.JSONSchema {
+	return output.SchemaFromType(reflect.TypeOf(core.PreflightReport{}), map[string]string{
+		"status":       "Preflight dry-run status (disabled, completed, failed, skipped, etc.).",
+		"command_hash": "SHA-256 hash of the command evaluated by preflight.",
+		"command":      "Preview command executed during preflight, if any.",
+		"started_at":   "RFC3339 timestamp when preflight started.",
+		"completed_at": "RFC3339 timestamp when preflight completed.",
+		"duration_ms":  "Preflight execution duration in milliseconds.",
+		"error":        "Error reported when preflight failed.",
+	})
+}
+
+func rateLimitResultSchema() *output.JSONSchema {
+	return output.SchemaFromType(reflect.TypeOf(core.RateLimitResult{}), map[string]string{
+		"allowed":              "True when the session had sufficient rate-limit capacity.",
+		"action":               "Configured rate-limit action taken (allow, reject, queue, warn).",
+		"remaining_pending":    "Remaining concurrent pending request capacity for the session.",
+		"remaining_per_minute": "Remaining per-minute request capacity for the session.",
+		"reset_at":             "RFC3339 timestamp when the current rate-limit window resets.",
+		"message":              "Advisory rate-limit status message, if any.",
+	})
+}
+
+func requestAdmissionFailureSchema() *output.JSONSchema {
+	return output.ObjectSchema(
+		"Structured refusal when request admission is denied before creation.",
+		map[string]*output.JSONSchema{
+			"status":   &output.JSONSchema{Type: "string", Const: "request_failed", Description: "Indicates admission failed before creating a request."},
+			"code":     output.StringSchema("Machine-readable admission failure code (admission_failed, rate_limited, preflight_required, etc.)."),
+			"created":  &output.JSONSchema{Type: "boolean", Const: false, Description: "Always false when admission fails."},
+			"executed": &output.JSONSchema{Type: "boolean", Const: false, Description: "Always false when admission fails."},
+			"error":    output.StringSchema("Human-readable explanation of why admission failed."),
+			"rate_limit": output.ObjectSchema(
+				"Rate-limit counters when admission failed due to rate limits.",
+				map[string]*output.JSONSchema{
+					"pending":        output.IntSchema("Current pending request count for the session."),
+					"max_pending":    output.IntSchema("Configured maximum pending requests per session."),
+					"recent":         output.IntSchema("Requests submitted in the last minute."),
+					"max_per_minute": output.IntSchema("Configured maximum requests per minute."),
+					"reset_at":       output.DateTimeSchema("RFC3339 timestamp when rate limit resets."),
+				},
+				"pending", "max_pending", "recent", "max_per_minute",
+			),
+		},
+		"status", "code", "created", "executed", "error",
+	)
+}
+
+func commandErrorSchema(desc string) *output.JSONSchema {
+	return output.ObjectSchema(
+		desc,
+		map[string]*output.JSONSchema{
+			"status":  output.StringSchema("Failure classification status."),
+			"command": output.StringSchema("Command attempted."),
+			"error":   output.StringSchema("Human-readable error explanation."),
+		},
+		"status", "command", "error",
+	)
+}
+
+func gitAssessmentFieldDescriptions() map[string]string {
+	return map[string]string{
+		"operation":            "Git hook operation evaluated (commit, push, rebase).",
+		"repository":           "Git repository root path.",
+		"snapshot":             "Deterministic snapshot hash of the Git operation.",
+		"tree":                 "Git tree OID bound to a commit snapshot.",
+		"head":                 "Git HEAD OID observed during assessment.",
+		"target_hash":          "SHA-256 digest of the push remote location.",
+		"updates":              "Ref updates parsed from Git pre-push stdin.",
+		"local_ref":            "Local Git reference name being pushed.",
+		"local_oid":            "Local Git object ID being pushed.",
+		"remote_ref":           "Remote Git reference name targeted by the push.",
+		"remote_oid":           "Remote Git object ID observed before push.",
+		"rebase":               "Hook-visible Git rebase snapshot details.",
+		"scope":                "Rebase scope identifier.",
+		"upstream":             "Upstream revision argument passed to rebase.",
+		"upstream_oid":         "Resolved upstream object ID.",
+		"root":                 "True when rebasing from repository root (--root).",
+		"branch_argument":      "Explicit branch argument supplied to rebase, if any.",
+		"branch_ref":           "Resolved Git reference name of the branch being rebased.",
+		"branch_oid":           "Resolved object ID of the branch being rebased.",
+		"head_ref":             "Current HEAD symbolic reference, if attached.",
+		"ref_tips_hash":        "Hash of repository reference tips observed before rebase.",
+		"reference_count":      "Number of repository references hashed into ref_tips_hash.",
+		"candidate_commits":    "Commit OIDs visible as rebase candidates.",
+		"candidates_truncated": "True when candidate_commits was truncated at the capture cap.",
+		"unobserved":           "Rebase options or behaviors not exposed to Git's pre-rebase hook.",
+		"reasons":              "Reasons why approval is or is not required.",
+		"requires_approval":    "True when the Git operation requires SLB approval.",
+	}
+}
+
+func gitAssessmentSchema() *output.JSONSchema {
+	return output.SchemaFromType(reflect.TypeOf(slbgit.GitAssessment{}), gitAssessmentFieldDescriptions())
+}
+
+func gitHookStatusListSchema() *output.JSONSchema {
+	item := output.SchemaFromType(reflect.TypeOf(slbgit.HookStatus{}), map[string]string{
+		"name":       "Git hook name (pre-commit, pre-push, pre-rebase).",
+		"path":       "Filesystem path to the hook inside Git's effective hooks directory.",
+		"installed":  "True when a hook file exists at path.",
+		"managed":    "True when the installed hook is managed by SLB.",
+		"executable": "True when the hook file has executable permission bits.",
+		"backup":     "Filesystem path to any preserved backup file.",
+	})
+	return output.ArraySchema("List of native Git hook installation statuses.", item)
 }
 
 func registeredSchemas() []schemaEntry {
@@ -592,8 +717,8 @@ func registeredSchemas() []schemaEntry {
 						"resolved_at":      output.DateTimeSchema("RFC3339 timestamp when a decision was reached (with --wait)."),
 						"queued":           output.BoolSchema("True if admission waited for rate-limit queue capacity."),
 						"queue_wait_ms":    output.IntSchema("Milliseconds spent waiting in the admission queue."),
-						"preflight":        output.SchemaFromType(reflect.TypeOf(core.PreflightReport{}), nil),
-						"rate_limit":       output.SchemaFromType(reflect.TypeOf(core.RateLimitResult{}), nil),
+						"preflight":        preflightReportSchema(),
+						"rate_limit":       rateLimitResultSchema(),
 						"wait_timed_out":   output.BoolSchema("True when --wait exceeded the client wait timeout."),
 						"error":            output.StringSchema("Error message when waiting failed."),
 						"executed":         output.BoolSchema("True when --execute ran the approved command."),
@@ -602,37 +727,16 @@ func registeredSchemas() []schemaEntry {
 						"log_path":         output.StringSchema("Path to the execution log file."),
 						"output":           output.StringSchema("Captured command output."),
 						"timed_out":        output.BoolSchema("True when command execution timed out."),
-						"assurance":        output.EnumSchema("Recorded execution evidence assurance.", reviewAssuranceValues...),
+						"assurance":        output.EnumSchema("Recorded execution evidence assurance (empty if execution failed before start).", append(append([]string(nil), reviewAssuranceValues...), "")...),
 						"execution_error":  output.StringSchema("Error reported when execution failed or was denied."),
 					}),
 					"approval_policy", "approval_policy_label", "request_id", "status", "tier",
 					"command", "command_hash", "min_approvals", "created_at", "queued",
 				)
-				admissionFailed := output.ObjectSchema(
-					"Structured refusal when request admission is denied before creation.",
-					map[string]*output.JSONSchema{
-						"status":   &output.JSONSchema{Type: "string", Const: "request_failed", Description: "Indicates admission failed before creating a request."},
-						"code":     output.StringSchema("Machine-readable admission failure code (admission_failed, rate_limited, preflight_required, etc.)."),
-						"created":  &output.JSONSchema{Type: "boolean", Const: false, Description: "Always false when admission fails."},
-						"executed": &output.JSONSchema{Type: "boolean", Const: false, Description: "Always false when admission fails."},
-						"error":    output.StringSchema("Human-readable explanation of why admission failed."),
-						"rate_limit": output.ObjectSchema(
-							"Rate-limit counters when admission failed due to rate limits.",
-							map[string]*output.JSONSchema{
-								"pending":        output.IntSchema("Current pending request count for the session."),
-								"max_pending":    output.IntSchema("Configured maximum pending requests per session."),
-								"recent":         output.IntSchema("Requests submitted in the last minute."),
-								"max_per_minute": output.IntSchema("Configured maximum requests per minute."),
-								"reset_at":       output.DateTimeSchema("RFC3339 timestamp when rate limit resets."),
-							},
-							"pending", "max_pending", "recent", "max_per_minute",
-						),
-					},
-					"status", "code", "created", "executed", "error",
-				)
+				cmdErr := commandErrorSchema("Structured error emitted when slb request fails before creating or executing a request.")
 				return &output.JSONSchema{
-					Description: "Either a safe-skipped response, a created approval request payload, or an admission refusal.",
-					AnyOf:       []*output.JSONSchema{skipped, created, admissionFailed},
+					Description: "Either a safe-skipped response, a created approval request payload, an admission refusal, or a structured command error.",
+					AnyOf:       []*output.JSONSchema{skipped, created, requestAdmissionFailureSchema(), cmdErr},
 				}
 			},
 		},
@@ -671,7 +775,7 @@ func registeredSchemas() []schemaEntry {
 						"rejection_count":         output.IntSchema("Number of rejection reviews recorded."),
 						"reviews":                 output.ArraySchema("List of recorded reviews.", reviewSummarySchema()),
 					}),
-					"approval_policy", "approval_policy_label", "request_id", "command", "command_hash", "cwd",
+					"approval_policy", "approval_policy_label", "request_id", "command", "command_hash",
 					"risk_tier", "status", "min_approvals", "require_different_model", "requestor_agent",
 					"requestor_model", "project_path", "created_at", "approval_count", "rejection_count", "reviews",
 				)
@@ -696,7 +800,7 @@ func registeredSchemas() []schemaEntry {
 						"hash":               output.StringSchema("SHA-256 hash of the bound command."),
 						"contains_sensitive": output.BoolSchema("True when sensitive content was detected."),
 					},
-					"raw", "cwd", "shell", "hash", "contains_sensitive",
+					"raw", "shell", "hash", "contains_sensitive",
 				)
 				justObj := output.ObjectSchema(
 					"Structured justification provided by the requester.",
@@ -713,7 +817,6 @@ func registeredSchemas() []schemaEntry {
 						"command": output.StringSchema("Preview command executed."),
 						"output":  output.StringSchema("Captured preview output."),
 					},
-					"command", "output",
 				)
 				responsesObj := output.ObjectSchema(
 					"Structured reviewer responses to justification prompts.",
@@ -742,7 +845,7 @@ func registeredSchemas() []schemaEntry {
 						"created_at":          output.DateTimeSchema("RFC3339 timestamp when review was recorded."),
 					}),
 					"approval_policy", "approval_policy_label", "assurance", "review_id",
-					"reviewer_session_id", "reviewer_agent", "reviewer_model", "decision", "signature", "created_at",
+					"reviewer_session_id", "reviewer_agent", "reviewer_model", "decision", "signature_version", "created_at",
 				)
 				execObj := output.ObjectSchema(
 					"Recorded execution result for the request.",
@@ -756,7 +859,7 @@ func registeredSchemas() []schemaEntry {
 						"duration_ms":            output.NullableIntSchema("Execution duration in milliseconds."),
 						"log_path":               output.StringSchema("Path to the execution log file."),
 					}),
-					"approval_policy", "approval_policy_label", "assurance", "log_path",
+					"approval_policy", "approval_policy_label", "assurance",
 				)
 				rollbackObj := output.ObjectSchema(
 					"Captured rollback state metadata.",
@@ -764,7 +867,6 @@ func registeredSchemas() []schemaEntry {
 						"path":           output.StringSchema("Filesystem path to rollback snapshot data."),
 						"rolled_back_at": output.DateTimeSchema("RFC3339 timestamp when rollback was applied."),
 					},
-					"path",
 				)
 				attachObj := output.ObjectSchema(
 					"Context attachment stored with the request.",
@@ -1004,18 +1106,25 @@ func registeredSchemas() []schemaEntry {
 					},
 					"status", "executed", "command", "exit_code", "duration_ms", "log_path", "tier", "skipped_approval", "output",
 				)
-				runErr := output.ObjectSchema(
-					"Structured error emitted when slb run cannot complete approval or execution.",
-					map[string]*output.JSONSchema{
-						"status":  output.StringSchema("Failure classification status."),
-						"command": output.StringSchema("Command attempted."),
-						"error":   output.StringSchema("Human-readable error explanation."),
-					},
-					"status", "command", "error",
+				yieldPending := output.ObjectSchema(
+					"Pending approval receipt returned when slb run --yield submits a non-SAFE command.",
+					withPolicy(map[string]*output.JSONSchema{
+						"status":        &output.JSONSchema{Type: "string", Const: "pending", Description: "Indicates the request is awaiting approval."},
+						"request_id":    output.StringSchema("Unique identifier of the created approval request."),
+						"tier":          output.EnumSchema("Assigned risk tier for the command.", riskTierValues...),
+						"min_approvals": output.IntSchema("Minimum number of approvals required."),
+						"message":       output.StringSchema("Human-readable guidance on checking status."),
+						"queued":        output.BoolSchema("True if admission waited for rate-limit queue capacity."),
+						"queue_wait_ms": output.IntSchema("Milliseconds spent waiting in the admission queue."),
+						"preflight":     preflightReportSchema(),
+						"rate_limit":    rateLimitResultSchema(),
+					}),
+					"approval_policy", "approval_policy_label", "status", "request_id", "tier", "min_approvals", "message", "queued",
 				)
+				runErr := commandErrorSchema("Structured error emitted when slb run cannot complete approval or execution.")
 				return &output.JSONSchema{
-					Description: "Outcome of slb run: direct safe execution, approved request execution, or structured failure.",
-					AnyOf:       []*output.JSONSchema{safeRun, executionOutcomeSchema(), runErr},
+					Description: "Outcome of slb run: direct safe execution, --yield pending receipt, approved request execution, admission refusal, or structured failure.",
+					AnyOf:       []*output.JSONSchema{safeRun, yieldPending, executionOutcomeSchema(), requestAdmissionFailureSchema(), runErr},
 				}
 			},
 		},
@@ -1242,15 +1351,16 @@ func registeredSchemas() []schemaEntry {
 			Formats:     standardFormats,
 			Build: func() *output.JSONSchema {
 				added := output.ObjectSchema(
-					"Immediate addition of a restrictive pattern.",
+					"Immediate addition of a restrictive pattern (or idempotent confirmation when it already exists).",
 					map[string]*output.JSONSchema{
-						"status":   &output.JSONSchema{Type: "string", Const: "added", Description: "Indicates the pattern took effect immediately."},
+						"id":       output.IntSchema("Database ID of the added or existing custom pattern."),
+						"status":   output.EnumSchema("Indicates whether the pattern was newly added or already existed.", "added", "already_exists"),
 						"pattern":  output.StringSchema("Regular expression pattern added."),
 						"tier":     output.EnumSchema("Restrictive risk tier assigned.", "critical", "dangerous", "caution"),
 						"reason":   output.StringSchema("Justification supplied for adding the pattern."),
 						"added_by": output.StringSchema("Actor category that added the pattern."),
 					},
-					"status", "pattern", "tier", "reason", "added_by",
+					"id", "status", "pattern", "tier", "reason", "added_by",
 				)
 				return &output.JSONSchema{
 					Description: "Either immediate restrictive pattern addition or queued SAFE pattern proposal.",
@@ -1299,11 +1409,11 @@ func registeredSchemas() []schemaEntry {
 			Slug:        "patterns-export",
 			Title:       "SLB Patterns Export Output",
 			Command:     "slb patterns export",
-			Description: "Export summary when writing to --output file, or exported pattern catalog payload.",
+			Description: "Export summary when writing to --output-file, or exported pattern catalog payload.",
 			Formats:     standardFormats,
 			Build: func() *output.JSONSchema {
 				fileSummary := output.ObjectSchema(
-					"Summary emitted when exporting patterns to a file with --output.",
+					"Summary emitted when exporting patterns to a file with --output-file.",
 					map[string]*output.JSONSchema{
 						"status": &output.JSONSchema{Type: "string", Const: "exported", Description: "Export completion status."},
 						"format": output.StringSchema("Requested export format (json, yaml, claude-hook)."),
@@ -1643,6 +1753,7 @@ func registeredSchemas() []schemaEntry {
 					"hash":                             "SHA-256 hash of raw command.",
 					"cwd":                              "Working directory where emergency command ran.",
 					"actor":                            "Unauthenticated local actor string recorded.",
+					"actor_authenticated":              "Always false because local actor labels are unauthenticated.",
 					"reason":                           "Redacted reason recorded for emergency override.",
 					"confirmation_method":              "Mechanism used to confirm emergency execution.",
 					"status":                           "Recorded emergency execution lifecycle status.",
@@ -1670,7 +1781,7 @@ func registeredSchemas() []schemaEntry {
 				return output.ObjectSchema(
 					"Recorded execution outcome payload.",
 					withPolicy(map[string]*output.JSONSchema{
-						"id":                  output.StringSchema("Unique outcome record identifier."),
+						"id":                  output.IntSchema("Unique numeric outcome record identifier."),
 						"request_id":          output.StringSchema("Executed request identifier."),
 						"caused_problems":     output.BoolSchema("True if the executed command caused problems."),
 						"problem_description": output.StringSchema("Description of problems caused, if any."),
@@ -1696,7 +1807,7 @@ func registeredSchemas() []schemaEntry {
 				item := output.ObjectSchema(
 					"Single recorded execution outcome.",
 					withPolicy(map[string]*output.JSONSchema{
-						"id":                  output.StringSchema("Unique outcome record identifier."),
+						"id":                  output.IntSchema("Unique numeric outcome record identifier."),
 						"request_id":          output.StringSchema("Executed request identifier."),
 						"caused_problems":     output.BoolSchema("True if execution caused problems."),
 						"created_at":          output.DateTimeSchema("RFC3339 timestamp when outcome was recorded."),
@@ -1816,22 +1927,24 @@ func registeredSchemas() []schemaEntry {
 					Type:        "object",
 					Description: "Hook installation status and registered settings metadata.",
 					Properties: map[string]*output.JSONSchema{
-						"status":                  output.StringSchema("Installation result status (installed)."),
-						"scope":                   output.EnumSchema("Installation scope.", "project", "global"),
-						"settings_path":           output.StringSchema("Claude Code settings.json path updated."),
-						"settings_changed":        output.BoolSchema("True when settings.json content changed."),
-						"hook_script":             output.StringSchema("Fallback hook script path."),
-						"hook_command":            output.StringSchema("Installed PreToolUse command string."),
-						"native_guard":            output.BoolSchema("True when native 'slb hook guard' is registered."),
-						"on_failure":              output.StringSchema("Configured hook failure mode (block)."),
-						"upgraded":                output.BoolSchema("True if an existing SLB hook entry was upgraded."),
-						"already_existed":         output.BoolSchema("True if an identical SLB hook entry already existed."),
-						"matcher":                 output.StringSchema("Tool matcher configured in Claude settings."),
-						"sibling_hooks_preserved": output.IntSchema("Count of non-SLB hooks preserved in settings.json."),
-						"approval_policy":         output.EnumSchema("Effective approval policy bound to the hook.", approvalPolicyValues...),
-						"review_notice":           output.StringSchema("Human-readable approval policy notice."),
-						"policy_config":           output.StringSchema("Bound explicit policy config path, if any."),
-						"policy_project":          output.StringSchema("Bound project root path."),
+						"status":                      output.StringSchema("Installation result status (installed)."),
+						"scope":                       output.EnumSchema("Installation scope.", "project", "global"),
+						"settings_path":               output.StringSchema("Claude Code settings.json path updated."),
+						"settings_changed":            output.BoolSchema("True when settings.json content changed."),
+						"hook_script":                 output.StringSchema("Fallback hook script path."),
+						"hook_command":                output.StringSchema("Installed PreToolUse command string."),
+						"native_guard":                output.BoolSchema("True when native 'slb hook guard' is registered."),
+						"on_failure":                  output.StringSchema("Configured hook failure mode (block)."),
+						"upgraded":                    output.BoolSchema("True if an existing SLB hook entry was upgraded."),
+						"already_existed":             output.BoolSchema("True if an identical SLB hook entry already existed."),
+						"matcher":                     output.StringSchema("Tool matcher configured in Claude settings."),
+						"sibling_hooks_preserved":     output.IntSchema("Count of non-SLB hooks preserved in settings.json."),
+						"approval_policy":             output.EnumSchema("Effective approval policy bound to the hook.", approvalPolicyValues...),
+						"review_notice":               output.StringSchema("Human-readable approval policy notice."),
+						"policy_config":               output.StringSchema("Bound explicit policy config path, if any."),
+						"policy_project":              output.StringSchema("Bound project root path."),
+						"previous_command":            output.StringSchema("Previously registered SLB hook command when upgraded."),
+						"duplicate_slb_hooks_removed": output.IntSchema("Count of duplicate SLB hook entries removed during installation."),
 					},
 					Required:             []string{"approval_policy", "hook_command", "native_guard", "on_failure", "review_notice", "scope", "settings_changed", "settings_path", "status"},
 					AdditionalProperties: true,
@@ -1968,25 +2081,51 @@ func registeredSchemas() []schemaEntry {
 			Slug:        "git-check",
 			Title:       "SLB Native Git Check Output",
 			Command:     "slb git-check",
-			Description: "Native Git hook risk assessment and approval requirement decision.",
+			Description: "Native Git hook risk assessment (default) or approval decision payload (with --request).",
 			Formats:     standardFormats,
 			Build: func() *output.JSONSchema {
-				return output.SchemaFromType(reflect.TypeOf(gitHookDecision{}), map[string]string{
-					"approval_policy":       "Effective approval policy governing the Git operation.",
-					"approval_policy_label": "Human-readable approval policy notice.",
-					"assurance":             "Recorded assurance level when authorized.",
-					"allowed":               "True when the Git operation is allowed to proceed without blocking.",
-					"request_id":            "Matching approved request ID, if any.",
-					"status":                "Request status if matched.",
-					"message":               "Human-readable explanation of the Git hook decision.",
-					"assessment":            "Structured Git operation assessment.",
-					"operation":             "Git hook operation evaluated (commit, push, rebase).",
-					"repository":            "Git repository root path.",
-					"snapshot":              "Deterministic snapshot hash of the Git operation.",
-					"reasons":               "Reasons why approval is or is not required.",
-					"requires_approval":     "True when the Git operation requires SLB approval.",
-				})
+				desc := gitAssessmentFieldDescriptions()
+				desc["approval_policy"] = "Effective approval policy governing the Git operation."
+				desc["approval_policy_label"] = "Human-readable approval policy notice."
+				desc["assurance"] = "Recorded assurance level when authorized."
+				desc["allowed"] = "True when the Git operation is allowed to proceed without blocking."
+				desc["request_id"] = "Matching approved request ID, if any."
+				desc["status"] = "Request status if matched."
+				desc["message"] = "Human-readable explanation of the Git hook decision."
+				desc["assessment"] = "Structured Git operation assessment."
+				decision := output.SchemaFromType(reflect.TypeOf(gitHookDecision{}), desc)
+				return &output.JSONSchema{
+					Description: "Either a GitAssessment (default) or a gitHookDecision (with --request).",
+					AnyOf:       []*output.JSONSchema{gitAssessmentSchema(), decision},
+				}
 			},
+		},
+		{
+			Key:         "git-hooks status",
+			Slug:        "git-hooks-status",
+			Title:       "SLB Native Git Hooks Status Output",
+			Command:     "slb git-hooks status",
+			Description: "Installation and management status of SLB native Git hooks.",
+			Formats:     standardFormats,
+			Build:       gitHookStatusListSchema,
+		},
+		{
+			Key:         "git-hooks install",
+			Slug:        "git-hooks-install",
+			Title:       "SLB Native Git Hooks Install Output",
+			Command:     "slb git-hooks install",
+			Description: "Resulting hook statuses after installing SLB native Git hooks.",
+			Formats:     standardFormats,
+			Build:       gitHookStatusListSchema,
+		},
+		{
+			Key:         "git-hooks uninstall",
+			Slug:        "git-hooks-uninstall",
+			Title:       "SLB Native Git Hooks Uninstall Output",
+			Command:     "slb git-hooks uninstall",
+			Description: "Resulting hook statuses after uninstalling SLB native Git hooks.",
+			Formats:     standardFormats,
+			Build:       gitHookStatusListSchema,
 		},
 		{
 			Key:         "rollback",
@@ -2042,36 +2181,36 @@ func registeredSchemas() []schemaEntry {
 			Formats:     standardFormats,
 			Build: func() *output.JSONSchema {
 				return output.SchemaFromType(reflect.TypeOf(emergencyExecutionOutcome{}), map[string]string{
-					"configured_approval_policy":       "Project approval policy bypassed by emergency execution.",
-					"configured_approval_policy_label": "Notice marking the configured policy as bypassed.",
-					"approval_policy_bypassed":         "Always true for emergency execution.",
-					"execution_mode":                   "Always 'emergency'.",
-					"assurance":                        "Always 'emergency_unreviewed'.",
-					"review_notice":                    "Notice stating execution bypassed review.",
-					"emergency_id":                     "Unique emergency execution identifier.",
-					"command":                          "Command executed under emergency override.",
-					"hash":                             "SHA-256 hash of raw command.",
-					"command_hash":                     "SHA-256 hash of normalized command.",
-					"project_path":                     "Project root path.",
-					"cwd":                              "Working directory where command ran.",
-					"confirmation_method":              "Mechanism used to confirm the override.",
-					"status":                           "Durable emergency execution status.",
-					"executed":                         "True when the command process started.",
-					"exit_code":                        "Command exit code, or -1 if not executed.",
-					"duration_ms":                      "Elapsed duration in milliseconds.",
-					"log_path":                         "Path to captured execution log.",
-					"rollback_path":                    "Path to captured rollback snapshot, if any.",
-					"output":                           "Captured command output.",
-					"timed_out":                        "True when execution timed out.",
-					"reason":                           "Recorded reason for emergency override.",
-					"actor":                            "Unauthenticated local actor string.",
-					"attempted_at":                     "RFC3339Nano timestamp when attempt was recorded.",
-					"executed_at":                      "RFC3339Nano timestamp when execution started.",
-					"recorded_at":                      "Timestamp when emergency intent was recorded.",
-					"started_at":                       "Timestamp when process started.",
-					"completed_at":                     "Timestamp when process completed.",
-					"pid":                              "Process ID of the executed command.",
-					"error":                            "Error message if execution failed.",
+					"approval_policy":          "Project approval policy bypassed by emergency execution.",
+					"approval_policy_label":    "Notice marking the configured policy as bypassed.",
+					"approval_policy_bypassed": "Always true for emergency execution.",
+					"execution_mode":           "Always 'emergency'.",
+					"assurance":                "Always 'emergency_unreviewed'.",
+					"review_notice":            "Notice stating execution bypassed review.",
+					"emergency_id":             "Unique emergency execution identifier.",
+					"command":                  "Command executed under emergency override.",
+					"hash":                     "SHA-256 hash of raw command.",
+					"command_hash":             "SHA-256 hash of normalized command.",
+					"project_path":             "Project root path.",
+					"cwd":                      "Working directory where command ran.",
+					"confirmation_method":      "Mechanism used to confirm the override.",
+					"status":                   "Durable emergency execution status.",
+					"executed":                 "True when the command process started.",
+					"exit_code":                "Command exit code, or -1 if not executed.",
+					"duration_ms":              "Elapsed duration in milliseconds.",
+					"log_path":                 "Path to captured execution log.",
+					"rollback_path":            "Path to captured rollback snapshot, if any.",
+					"output":                   "Captured command output.",
+					"timed_out":                "True when execution timed out.",
+					"reason":                   "Recorded reason for emergency override.",
+					"actor":                    "Unauthenticated local actor string.",
+					"attempted_at":             "RFC3339Nano timestamp when attempt was recorded.",
+					"executed_at":              "RFC3339Nano timestamp when execution started.",
+					"recorded_at":              "Timestamp when emergency intent was recorded.",
+					"started_at":               "Timestamp when process started.",
+					"completed_at":             "Timestamp when process completed.",
+					"pid":                      "Process ID of the executed command.",
+					"error":                    "Error message if execution failed.",
 				})
 			},
 		},

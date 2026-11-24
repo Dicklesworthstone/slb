@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -68,6 +69,16 @@ func TestAllRegisteredSchemasValidAndDescribed(t *testing.T) {
 
 func assertAllPropertiesDescribed(t *testing.T, schemaKey, path string, node map[string]any) {
 	t.Helper()
+	if req, ok := node["required"].([]any); ok {
+		seen := make(map[string]bool, len(req))
+		for _, rawReq := range req {
+			name, _ := rawReq.(string)
+			if seen[name] {
+				t.Fatalf("schema %q %s: duplicate required key %q", schemaKey, path, name)
+			}
+			seen[name] = true
+		}
+	}
 	if props, ok := node["properties"].(map[string]any); ok {
 		for propName, rawProp := range props {
 			propMap, ok := rawProp.(map[string]any)
@@ -313,6 +324,264 @@ func TestGlobalSchemaFlag_WorksWithoutArgsOrProject(t *testing.T) {
 	}
 }
 
+func TestSchemaCommand_SchemaFlagAndFormatValidation(t *testing.T) {
+	// SLB-FE1: `slb schema --schema` (no args, no --all) emits the schema catalog's JSON Schema.
+	metaOut, err := runRootWithArgs(t, "schema", "--schema")
+	if err != nil {
+		t.Fatalf("slb schema --schema failed: %v", err)
+	}
+	var metaDoc map[string]any
+	if err := json.Unmarshal([]byte(metaOut), &metaDoc); err != nil {
+		t.Fatalf("slb schema --schema invalid JSON: %v", err)
+	}
+	if metaDoc["x-slb-command"] != "slb schema" {
+		t.Fatalf("slb schema --schema x-slb-command=%v, want 'slb schema'", metaDoc["x-slb-command"])
+	}
+
+	// SLB-FE1: `slb schema list --schema` also emits the schema catalog's JSON Schema.
+	listMetaOut, err := runRootWithArgs(t, "schema", "list", "--schema")
+	if err != nil {
+		t.Fatalf("slb schema list --schema failed: %v", err)
+	}
+	var listMetaDoc map[string]any
+	if err := json.Unmarshal([]byte(listMetaOut), &listMetaDoc); err != nil {
+		t.Fatalf("slb schema list --schema invalid JSON: %v", err)
+	}
+	if listMetaDoc["x-slb-command"] != "slb schema" {
+		t.Fatalf("slb schema list --schema x-slb-command=%v, want 'slb schema'", listMetaDoc["x-slb-command"])
+	}
+
+	// SLB-FE1: `slb schema pending --schema` honors `pending` and emits the pending schema.
+	pendingOut, err := runRootWithArgs(t, "schema", "pending", "--schema")
+	if err != nil {
+		t.Fatalf("slb schema pending --schema failed: %v", err)
+	}
+	var pendingDoc map[string]any
+	if err := json.Unmarshal([]byte(pendingOut), &pendingDoc); err != nil {
+		t.Fatalf("slb schema pending --schema invalid JSON: %v", err)
+	}
+	if pendingDoc["x-slb-command"] != "slb pending" {
+		t.Fatalf("slb schema pending --schema x-slb-command=%v, want 'slb pending'", pendingDoc["x-slb-command"])
+	}
+
+	// SLB-FE1: multi-word `slb schema daemon status --schema` emits the daemon status schema.
+	daemonOut, err := runRootWithArgs(t, "schema", "daemon", "status", "--schema")
+	if err != nil {
+		t.Fatalf("slb schema daemon status --schema failed: %v", err)
+	}
+	var daemonDoc map[string]any
+	if err := json.Unmarshal([]byte(daemonOut), &daemonDoc); err != nil {
+		t.Fatalf("slb schema daemon status --schema invalid JSON: %v", err)
+	}
+	if daemonDoc["x-slb-command"] != "slb daemon status" {
+		t.Fatalf("slb schema daemon status --schema x-slb-command=%v, want 'slb daemon status'", daemonDoc["x-slb-command"])
+	}
+
+	// SLB-FE1: `slb schema --all --schema` honors --all and emits the full bundle.
+	allOut, err := runRootWithArgs(t, "schema", "--all", "--schema")
+	if err != nil {
+		t.Fatalf("slb schema --all --schema failed: %v", err)
+	}
+	var allDoc map[string]any
+	if err := json.Unmarshal([]byte(allOut), &allDoc); err != nil {
+		t.Fatalf("slb schema --all --schema invalid JSON: %v", err)
+	}
+	schemasMap, ok := allDoc["schemas"].(map[string]any)
+	if !ok || len(schemasMap) != len(RegisteredSchemaKeys()) {
+		t.Fatalf("slb schema --all --schema bundle count=%d, want %d", len(schemasMap), len(RegisteredSchemaKeys()))
+	}
+
+	// SLB-FE1 planted negative: unknown command with --schema must fail cleanly (not silently emit 'schema').
+	if _, err := runRootWithArgs(t, "schema", "not-a-real-cmd", "--schema"); err == nil {
+		t.Fatalf("expected error for 'slb schema not-a-real-cmd --schema', got nil")
+	}
+
+	// SLB-FE2: invalid -o values must fail with unsupported format error across all schema paths.
+	invalidFormatInvocations := [][]string{
+		{"schema", "pending", "-o", "bogus"},
+		{"pending", "--schema", "-o", "bogus"},
+		{"schema", "-o", "bogus"},
+		{"schema", "--all", "-o", "bogus"},
+		{"--schema", "-o", "bogus"},
+	}
+	for _, inv := range invalidFormatInvocations {
+		_, err := runRootWithArgs(t, inv...)
+		if err == nil {
+			t.Fatalf("expected unsupported format error for slb %v, got nil", inv)
+		}
+		if !strings.Contains(err.Error(), "unsupported format: bogus") {
+			t.Fatalf("slb %v error=%q, want 'unsupported format: bogus'", inv, err.Error())
+		}
+	}
+
+	// SLB-FE2 positive: explicit text/json/yaml formats work cleanly.
+	for _, fmtFlag := range []string{"text", "json", "yaml"} {
+		out, err := runRootWithArgs(t, "pending", "--schema", "-o", fmtFlag)
+		if err != nil {
+			t.Fatalf("slb pending --schema -o %s failed: %v", fmtFlag, err)
+		}
+		if !strings.Contains(out, "slb pending") {
+			t.Fatalf("slb pending --schema -o %s missing command marker: %s", fmtFlag, out)
+		}
+	}
+}
+
+func TestWrapCommandForSchema_BypassesRequiredFlagsFlagGroupsAndAllHooks(t *testing.T) {
+	oldSchema := flagSchema
+	oldJSON, oldTOON, oldOutput, oldStats := flagJSON, flagTOON, flagOutput, flagStats
+	defer func() {
+		flagSchema = oldSchema
+		flagJSON, flagTOON, flagOutput, flagStats = oldJSON, oldTOON, oldOutput, oldStats
+	}()
+	flagSchema = false
+	flagJSON, flagTOON, flagOutput, flagStats = false, false, "text", false
+
+	var pPreRan, preRan, runRan, postRan, pPostRan bool
+
+	root := &cobra.Command{
+		Use:           "slb",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		PersistentPreRun: func(*cobra.Command, []string) {
+			pPreRan = true
+		},
+		PersistentPostRun: func(*cobra.Command, []string) {
+			pPostRan = true
+		},
+	}
+	root.PersistentFlags().Bool("schema", false, "emit schema")
+
+	child := &cobra.Command{
+		Use:  "pending",
+		Args: cobra.ExactArgs(1),
+		PreRun: func(*cobra.Command, []string) {
+			preRan = true
+		},
+		RunE: func(*cobra.Command, []string) error {
+			runRan = true
+			return nil
+		},
+		PostRun: func(*cobra.Command, []string) {
+			postRan = true
+		},
+	}
+	child.Flags().String("req", "", "required flag")
+	if err := child.MarkFlagRequired("req"); err != nil {
+		t.Fatalf("MarkFlagRequired: %v", err)
+	}
+	child.Flags().Bool("opt-a", false, "one-required A")
+	child.Flags().Bool("opt-b", false, "one-required B")
+	child.MarkFlagsOneRequired("opt-a", "opt-b")
+	child.Flags().Bool("pair-a", false, "together A")
+	child.Flags().Bool("pair-b", false, "together B")
+	child.MarkFlagsRequiredTogether("pair-a", "pair-b")
+	child.Flags().Bool("ex-a", false, "exclusive A")
+	child.Flags().Bool("ex-b", false, "exclusive B")
+	child.MarkFlagsMutuallyExclusive("ex-a", "ex-b")
+	root.AddCommand(child)
+
+	// Also verify PostRunE and PersistentPostRunE are skipped on --schema.
+	var statusPostErrCalled, statusPPostErrCalled bool
+	childErrHooks := &cobra.Command{
+		Use: "status",
+		RunE: func(*cobra.Command, []string) error {
+			return nil
+		},
+		PostRunE: func(*cobra.Command, []string) error {
+			statusPostErrCalled = true
+			return fmt.Errorf("PostRunE must not run on --schema")
+		},
+		PersistentPostRunE: func(*cobra.Command, []string) error {
+			statusPPostErrCalled = true
+			return fmt.Errorf("PersistentPostRunE must not run on --schema")
+		},
+	}
+	root.AddCommand(childErrHooks)
+
+	installSchemaFlagSupport(root)
+
+	// 1. Running with --schema and WITHOUT --req, WITHOUT --opt-a/b, with partial --pair-a,
+	//    and with conflicting --ex-a/--ex-b MUST succeed and trigger ZERO lifecycle hooks.
+	var outBuf bytes.Buffer
+	root.SetOut(&outBuf)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"pending", "--schema", "--pair-a", "--ex-a", "--ex-b"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("pending --schema failed despite required/group flag bypass: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(outBuf.Bytes(), &doc); err != nil {
+		t.Fatalf("pending --schema invalid JSON: %v\n%s", err, outBuf.String())
+	}
+	if doc["x-slb-command"] != "slb pending" {
+		t.Fatalf("x-slb-command=%v, want 'slb pending'", doc["x-slb-command"])
+	}
+	if pPreRan || preRan || runRan || postRan || pPostRan {
+		t.Fatalf("lifecycle hooks must not run under --schema: pPre=%v pre=%v run=%v post=%v pPost=%v", pPreRan, preRan, runRan, postRan, pPostRan)
+	}
+
+	// Verify PostRunE and PersistentPostRunE are also skipped on --schema.
+	outBuf.Reset()
+	root.SetArgs([]string{"status", "--schema"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("status --schema failed: %v", err)
+	}
+	if statusPostErrCalled || statusPPostErrCalled {
+		t.Fatalf("PostRunE/PersistentPostRunE must not run under --schema")
+	}
+
+	// 2. Planted negative: running WITHOUT --schema and WITHOUT --req MUST still fail
+	//    with Cobra's required flag error (proving DisableFlagParsing was restored).
+	resetTestTreeFlags := func() {
+		root.PersistentFlags().VisitAll(func(f *pflag.Flag) {
+			_ = f.Value.Set(f.DefValue)
+			f.Changed = false
+		})
+		child.Flags().VisitAll(func(f *pflag.Flag) {
+			_ = f.Value.Set(f.DefValue)
+			f.Changed = false
+		})
+	}
+	resetTestTreeFlags()
+	pPreRan, preRan, runRan, postRan, pPostRan = false, false, false, false, false
+	root.SetArgs([]string{"pending", "arg1"})
+	err := root.Execute()
+	if err == nil || !strings.Contains(err.Error(), `required flag(s) "req" not set`) {
+		t.Fatalf("expected required flag error without --schema, got: %v", err)
+	}
+	if runRan || postRan || pPostRan {
+		t.Fatalf("RunE/PostRun should not run when required flag validation fails")
+	}
+
+	// 3. Planted negative: with --req but missing one-required group MUST still fail.
+	resetTestTreeFlags()
+	root.SetArgs([]string{"pending", "arg1", "--req", "val"})
+	err = root.Execute()
+	if err == nil || !strings.Contains(err.Error(), "at least one of the flags") {
+		t.Fatalf("expected one-required flag group error without --schema, got: %v", err)
+	}
+
+	// 4. Positive normal run: with valid args & flags, all lifecycle hooks execute normally.
+	resetTestTreeFlags()
+	pPreRan, preRan, runRan, postRan, pPostRan = false, false, false, false, false
+	root.SetArgs([]string{"pending", "arg1", "--req", "val", "--opt-a"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("normal pending execution failed: %v", err)
+	}
+	if !pPreRan || !preRan || !runRan || !postRan || !pPostRan {
+		t.Fatalf("expected all lifecycle hooks to run normally: pPre=%v pre=%v run=%v post=%v pPost=%v", pPreRan, preRan, runRan, postRan, pPostRan)
+	}
+
+	// 5. Group commands wrapped for --schema must still reject unknown subcommands
+	//    both with and without --schema (never silently swallowing typos).
+	if _, err := runRootWithArgs(t, "daemon", "bogus-subcmd"); err == nil || !strings.Contains(err.Error(), "unknown command") {
+		t.Fatalf("expected unknown command error for 'slb daemon bogus-subcmd', got: %v", err)
+	}
+	if _, err := runRootWithArgs(t, "patterns", "bogus-subcmd", "--schema"); err == nil || !strings.Contains(err.Error(), "unknown command") {
+		t.Fatalf("expected unknown command error for 'slb patterns bogus-subcmd --schema', got: %v", err)
+	}
+}
+
 // TestRealCommandOutputsConformToSchemas executes real SLB commands and validates
 // their actual emitted JSON bytes against each command's registered JSON Schema,
 // plus planted-negative mutations proving the validator rejects schema violations.
@@ -321,8 +590,17 @@ func TestRealCommandOutputsConformToSchemas(t *testing.T) {
 	project := h.ProjectDir
 
 	// Opt into same_host so approve/reject/execute flows run cleanly in tests.
-	if err := config.WriteValue(filepath.Join(project, ".slb", "config.toml"), "general.approval_policy", "same_host"); err != nil {
+	cfgPath := filepath.Join(project, ".slb", "config.toml")
+	if err := config.WriteValue(cfgPath, "general.approval_policy", "same_host"); err != nil {
 		t.Fatalf("writing config: %v", err)
+	}
+	cfgBytes, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("reading config: %v", err)
+	}
+	cfgBytes = append(cfgBytes, []byte("\n[patterns.safe]\npatterns = [\"^echo safe-schema-ok$\"]\n")...)
+	if err := os.WriteFile(cfgPath, cfgBytes, 0644); err != nil {
+		t.Fatalf("updating config with safe pattern: %v", err)
 	}
 
 	origWD, err := os.Getwd()
@@ -474,10 +752,109 @@ func TestRealCommandOutputsConformToSchemas(t *testing.T) {
 		}
 	}
 
-	// 9. session end
+	// 9. Live patterns add (new + duplicate already_exists) + live execute (foreground), show, outcome record & list
+	patAdded := validateCommand("patterns add", execCaptured("patterns", "add", "^echo schema-exec-ok$", "--tier", "dangerous", "--reason", "schema fidelity", "--json"))
+	patDup := validateCommand("patterns add", execCaptured("patterns", "add", "^echo schema-exec-ok$", "--tier", "dangerous", "--reason", "schema fidelity", "--json")).(map[string]any)
+	if patDup["status"] != "already_exists" {
+		t.Fatalf("expected duplicate patterns add status='already_exists', got %v", patDup["status"])
+	}
+	mutPat := cloneJSONValue(t, patAdded).(map[string]any)
+	delete(mutPat, "id")
+	patAddSchema, _ := LookupCommandSchema("patterns add")
+	if err := validatePayloadWithSchema(patAddSchema, mutPat); err == nil {
+		t.Fatalf("planted negative failed: patterns add missing required 'id' was accepted")
+	}
+
+	reqExecObj := validateCommand("request", execCaptured("request", "echo schema-exec-ok", "--session-id", reqSessionID, "--reason", "exec schema test", "--json")).(map[string]any)
+	reqExecID := reqExecObj["request_id"].(string)
+	validateCommand("approve", execCaptured("approve", reqExecID, "--session-id", revSessionID, "--session-key", revSessionKey, "--json"))
+	validateCommand("execute", execCaptured("execute", reqExecID, "--session-id", reqSessionID, "--json"))
+	validateCommand("show", execCaptured("show", reqExecID, "--json"))
+	validateCommand("outcome record", execCaptured("outcome", "record", reqExecID, "--rating", "5", "--notes", "clean run", "--json"))
+	validateCommand("outcome list", execCaptured("outcome", "list", "--json"))
+
+	// 10. Live run: SAFE direct run AND --yield pending receipt (with planted negative)
+	validateCommand("run", execCaptured("run", "echo safe-schema-ok", "--timeout", "5", "--session-id", reqSessionID, "--json"))
+	yieldVal := validateCommand("run", execCaptured("run", "echo schema-exec-ok", "--yield", "--timeout", "5", "--session-id", reqSessionID, "--reason", "yield schema test", "--json"))
+	mutYield := cloneJSONValue(t, yieldVal).(map[string]any)
+	delete(mutYield, "request_id")
+	runSchema, _ := LookupCommandSchema("run")
+	if err := validatePayloadWithSchema(runSchema, mutYield); err == nil {
+		t.Fatalf("planted negative failed: run --yield missing request_id was accepted")
+	}
+
+	// 11. Live patterns suggest, request-removal, remove, export
+	validateCommand("patterns suggest", execCaptured("patterns", "suggest", "^schema-test-suggest$", "--tier", "caution", "--reason", "suggest test", "--json"))
+	validateCommand("patterns request-removal", execCaptured("patterns", "request-removal", "^schema-test-danger$", "--tier", "dangerous", "--reason", "cleanup test", "--json"))
+	validateCommand("patterns remove", execCaptured("patterns", "remove", "^schema-test-danger$", "--json"))
+	exportFile := filepath.Join(t.TempDir(), "patterns.json")
+	validateCommand("patterns export", execCaptured("patterns", "export", "--output-file", exportFile, "--json"))
+
+	// 12. Live audit query, audit prune, audit emergency
+	auditDir := t.TempDir()
+	validateCommand("audit query", execCaptured("audit", "query", "--directory", auditDir, "--json"))
+	validateCommand("audit prune", execCaptured("audit", "prune", "--directory", auditDir, "--before", "2030-01-01", "--dry-run", "--json"))
+	validateCommand("audit emergency", execCaptured("audit", "emergency", "--json"))
+
+	// 13. Live hook generate, install, uninstall + init (in isolated temp project)
+	validateCommand("hook generate", execCaptured("hook", "generate", "--output-dir", t.TempDir(), "--json"))
+	validateCommand("hook install", execCaptured("hook", "install", "--json"))
+	validateCommand("hook status", execCaptured("hook", "status", "--json"))
+	validateCommand("hook uninstall", execCaptured("hook", "uninstall", "--json"))
+
+	initDir := t.TempDir()
+	validateCommand("init", execCaptured("init", "-C", initDir, "--json"))
+	if err := os.Chdir(project); err != nil {
+		t.Fatal(err)
+	}
+
+	// 14. Live git-check (default assessment mode!) & git-hooks status/install/uninstall in a temp git repo
+	gitDir := t.TempDir()
+	if out, err := exec.Command("git", "init", gitDir).CombinedOutput(); err != nil {
+		t.Fatalf("git init failed: %v\n%s", err, string(out))
+	}
+	if err := os.Chdir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	gitCheckOut, err := runRootWithArgs(t, "git-check", "--json")
+	if err != nil {
+		_ = os.Chdir(project)
+		t.Fatalf("slb git-check --json failed: %v", err)
+	}
+	gitCheckVal := validateCommand("git-check", gitCheckOut)
+	mutGitCheck := cloneJSONValue(t, gitCheckVal).(map[string]any)
+	delete(mutGitCheck, "snapshot")
+	gitCheckSchema, _ := LookupCommandSchema("git-check")
+	if err := validatePayloadWithSchema(gitCheckSchema, mutGitCheck); err == nil {
+		_ = os.Chdir(project)
+		t.Fatalf("planted negative failed: git-check assessment missing 'snapshot' was accepted")
+	}
+	gitHooksStatusOut, err := runRootWithArgs(t, "git-hooks", "status", "--json")
+	if err != nil {
+		_ = os.Chdir(project)
+		t.Fatalf("slb git-hooks status --json failed: %v", err)
+	}
+	validateCommand("git-hooks status", gitHooksStatusOut)
+	gitHooksInstallOut, err := runRootWithArgs(t, "git-hooks", "install", "--json")
+	if err != nil {
+		_ = os.Chdir(project)
+		t.Fatalf("slb git-hooks install --json failed: %v", err)
+	}
+	validateCommand("git-hooks install", gitHooksInstallOut)
+	gitHooksUninstallOut, err := runRootWithArgs(t, "git-hooks", "uninstall", "--json")
+	if err != nil {
+		_ = os.Chdir(project)
+		t.Fatalf("slb git-hooks uninstall --json failed: %v", err)
+	}
+	validateCommand("git-hooks uninstall", gitHooksUninstallOut)
+	if err := os.Chdir(project); err != nil {
+		t.Fatal(err)
+	}
+
+	// 15. session end
 	validateCommand("session end", execCaptured("session", "end", "--session-id", reqSessionID, "--json"))
 
-	// 10. Validate representative typed structs (watch, error, history sync) against their schemas.
+	// 16. Validate representative typed structs (watch, error, history sync, rollback, git-check decision) against their schemas.
 	nowStr := time.Now().UTC().Format(time.RFC3339)
 	watchEvent := daemon.RequestStreamEvent{
 		Event:       "request_pending",
@@ -495,6 +872,34 @@ func TestRealCommandOutputsConformToSchemas(t *testing.T) {
 	})
 	validateTypedStruct(t, "rollback", core.GitRollbackRecoveryResult{
 		RequestID: reqID, RollbackPath: "/tmp/rb", RolledBackAt: time.Now().UTC(), Status: "rolled_back", RecoveryMode: "git", DatabaseUpdated: true,
+	})
+	validateTypedStruct(t, "git-check", gitHookDecision{
+		approvalPolicyView: policyView(db.ApprovalPolicySameHost),
+		Allowed:            true,
+		Message:            "ok",
+		Assessment: &slbgit.GitAssessment{
+			Operation:        "commit",
+			Repository:       gitDir,
+			Snapshot:         "snap-1",
+			Reasons:          []string{},
+			RequiresApproval: false,
+		},
+	})
+	validateTypedStruct(t, "emergency-execute", emergencyExecutionOutcome{
+		emergencyEvidence:  emergencyEvidenceFor(db.ApprovalPolicyIndependent),
+		Command:            "echo hi",
+		Hash:               "h1",
+		CommandHash:        "h2",
+		ProjectPath:        project,
+		CWD:                project,
+		ConfirmationMethod: "flag",
+		Status:             "executed",
+		Executed:           true,
+		ExitCode:           0,
+		DurationMs:         1,
+		LogPath:            "/tmp/log",
+		Reason:             "test",
+		Actor:              "local",
 	})
 }
 
