@@ -2404,7 +2404,7 @@ The built-in SQL patterns are best-effort. For production databases:
 ### One-Line Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/slb/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/slb/main/scripts/install.sh | bash
 ```
 
 ### Go Install

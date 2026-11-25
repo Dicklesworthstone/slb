@@ -9,6 +9,7 @@ REPO="Dicklesworthstone/slb"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 BINARY="slb"
 DOWNLOADER_UA="slb-installer (+https://github.com/Dicklesworthstone/slb)"
+USE_SUDO=0
 
 # Colors
 RED='\033[0;31m'
@@ -173,24 +174,65 @@ install() {
     fi
 
     info "Installing to ${INSTALL_DIR}..."
-    if [ -w "$INSTALL_DIR" ]; then
-        if ! cp "${SLB_WORK_DIR}/${EXECUTABLE}" "${INSTALL_DIR}/${EXECUTABLE}"; then
-            error "Could not copy release executable to destination"
-        fi
-        if ! chmod 0755 "${INSTALL_DIR}/${EXECUTABLE}"; then
-            error "Could not make installed executable runnable"
-        fi
-    else
-        warn "Installing to ${INSTALL_DIR} requires sudo"
-        if ! sudo cp "${SLB_WORK_DIR}/${EXECUTABLE}" "${INSTALL_DIR}/${EXECUTABLE}"; then
-            error "Could not copy release executable to destination"
-        fi
-        if ! sudo chmod 0755 "${INSTALL_DIR}/${EXECUTABLE}"; then
-            error "Could not make installed executable runnable"
-        fi
+    prepare_install_dir
+    local destination="${INSTALL_DIR}/${EXECUTABLE}"
+    local staged="${INSTALL_DIR}/.${EXECUTABLE}.install-$$"
+    if [ -d "$destination" ]; then
+        error "Install destination is a directory: $destination"
+    fi
+    # Stage the executable beside the destination and rename it into place.
+    # Copying over an existing slb that is still running (for example
+    # `slb daemon`) fails with "Text file busy" on Linux, and on macOS the
+    # rewritten file is killed at launch until the old process exits. The
+    # rename gives the new executable its own file; running processes keep
+    # the old one until they restart.
+    if ! as_installer cp "${SLB_WORK_DIR}/${EXECUTABLE}" "$staged"; then
+        error "Could not copy release executable into ${INSTALL_DIR}"
+    fi
+    if ! as_installer chmod 0755 "$staged"; then
+        error "Could not make the staged executable runnable: $staged"
+    fi
+    if ! as_installer mv -f "$staged" "$destination"; then
+        error "Could not move the staged executable into place: $staged"
     fi
 
-    success "Installed ${BINARY} to ${INSTALL_DIR}/${EXECUTABLE}"
+    success "Installed ${BINARY} to ${destination}"
+}
+
+# Decide whether writing INSTALL_DIR needs sudo, creating it if it is missing
+# (/usr/local/bin does not exist on every macOS or Git Bash setup).
+prepare_install_dir() {
+    USE_SUDO=0
+    if [ ! -d "$INSTALL_DIR" ]; then
+        if ! mkdir -p "$INSTALL_DIR" 2>/dev/null; then
+            require_sudo
+            if ! sudo mkdir -p "$INSTALL_DIR"; then
+                error "Could not create ${INSTALL_DIR}"
+            fi
+        fi
+        info "Created ${INSTALL_DIR}"
+    fi
+    if [ ! -w "$INSTALL_DIR" ]; then
+        require_sudo
+    fi
+}
+
+require_sudo() {
+    [ "$USE_SUDO" -eq 1 ] && return 0
+    if ! command -v sudo >/dev/null 2>&1; then
+        error "${INSTALL_DIR} is not writable and sudo is not available; set INSTALL_DIR to a writable directory"
+    fi
+    warn "Installing to ${INSTALL_DIR} requires sudo"
+    USE_SUDO=1
+}
+
+# Run a file operation in INSTALL_DIR, through sudo when it is needed.
+as_installer() {
+    if [ "$USE_SUDO" -eq 1 ]; then
+        sudo "$@"
+    else
+        "$@"
+    fi
 }
 
 # Verify the exact destination, even if PATH contains a different slb.

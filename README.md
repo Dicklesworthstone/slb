@@ -82,7 +82,11 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/slb/main/scripts
 
 The installer verifies the archive against `checksums.txt` from the selected
 release and reports the retained download workspace. Set `INSTALL_DIR` to choose
-the destination. For qualification with a known scratch location,
+the destination (default `/usr/local/bin`); it is created if missing, using sudo
+only when the directory is not writable. An existing `slb` is replaced by an
+atomic rename, so a running `slb daemon` keeps working; restart it
+(`slb daemon stop`, then `slb daemon start`) to run the new version. For
+qualification with a known scratch location,
 `SLB_RETAIN_WORK_ROOT` may name an absolute path that does not exist yet and whose
 parent already exists; it is created privately and retained on success or failure.
 
