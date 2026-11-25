@@ -241,12 +241,14 @@ func Launch(ctx context.Context, executable string, args []string, job Job) (*Re
 		// Ask the supervisor to cancel, reap its command and persist its result.
 		// A broken worker is bounded, but SIGKILL/power loss cannot guarantee a
 		// terminal database outcome. Never manufacture a successful completion.
+		// Only the reaping matters here; the supervisor's exit status adds
+		// nothing to the startup error being returned.
 		_ = terminate(command.Process)
 		select {
-		case <-waited:
+		case <-waited: //nolint:errcheck // reaped; exit status intentionally unused
 		case <-time.After(3 * time.Second):
 			_ = forceTerminate(command.Process)
-			<-waited
+			<-waited //nolint:errcheck // reaped; exit status intentionally unused
 		}
 		return nil, &StartError{SupervisorPID: command.Process.Pid, SupervisorLog: diagnostics.Name(), Cause: received.err}
 	}

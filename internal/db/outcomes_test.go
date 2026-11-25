@@ -333,10 +333,11 @@ func TestGetRequestStatsByAgent(t *testing.T) {
 		}
 		db.CreateRequest(r)
 
-		if i == 0 {
+		switch i {
+		case 0:
 			// First one rejected
 			db.UpdateRequestStatus(r.ID, StatusRejected)
-		} else if i == 1 {
+		case 1:
 			// Second one executed
 			db.UpdateRequestStatus(r.ID, StatusApproved)
 			db.UpdateRequestStatus(r.ID, StatusExecuting)

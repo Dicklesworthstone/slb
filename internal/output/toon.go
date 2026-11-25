@@ -175,7 +175,7 @@ func (w *Writer) writeTOON(data any) error {
 	toonStr, err := EncodeTOON(data)
 	if err != nil {
 		// Fall back to JSON if TOON encoding fails
-		fmt.Fprintf(w.errOut, "warning: TOON encoding failed, falling back to JSON: %v\n", err)
+		_, _ = fmt.Fprintf(w.errOut, "warning: TOON encoding failed, falling back to JSON: %v\n", err)
 		enc := json.NewEncoder(w.out)
 		enc.SetIndent("", "  ")
 		return enc.Encode(data)

@@ -201,7 +201,9 @@ func TestRequestServiceWebhookCatchupRestartAndRedirection(t *testing.T) {
 	if received.Load() != 2 {
 		t.Fatal("restart resent delivered events", received.Load())
 	}
-	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, server.URL, 307) }))
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, server.URL, http.StatusTemporaryRedirect)
+	}))
 	defer redirect.Close()
 	route, err := NewRequestWebhookRoute(redirect.URL)
 	if err != nil {

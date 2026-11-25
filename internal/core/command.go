@@ -82,13 +82,15 @@ func runCommand(ctx context.Context, spec *db.CommandSpec, logPath string, strea
 		}
 		defer logFile.Close()
 
-		fmt.Fprintf(logFile, "=== SLB Command Execution ===\n")
-		fmt.Fprintf(logFile, "Time: %s\n", startTime.Format(time.RFC3339))
-		fmt.Fprintf(logFile, "Command: %s\n", spec.Raw)
-		fmt.Fprintf(logFile, "CWD: %s\n", spec.Cwd)
-		fmt.Fprintf(logFile, "Shell: %v\n", spec.Shell)
-		fmt.Fprintf(logFile, "Hash: %s\n", spec.Hash)
-		fmt.Fprintf(logFile, "=============================\n\n")
+		// Header and footer lines are best effort: a failed log write must not
+		// change the command's result.
+		_, _ = fmt.Fprintf(logFile, "=== SLB Command Execution ===\n")
+		_, _ = fmt.Fprintf(logFile, "Time: %s\n", startTime.Format(time.RFC3339))
+		_, _ = fmt.Fprintf(logFile, "Command: %s\n", spec.Raw)
+		_, _ = fmt.Fprintf(logFile, "CWD: %s\n", spec.Cwd)
+		_, _ = fmt.Fprintf(logFile, "Shell: %v\n", spec.Shell)
+		_, _ = fmt.Fprintf(logFile, "Hash: %s\n", spec.Hash)
+		_, _ = fmt.Fprintf(logFile, "=============================\n\n")
 	}
 
 	var cmd *exec.Cmd
@@ -195,13 +197,13 @@ func runCommand(ctx context.Context, spec *db.CommandSpec, logPath string, strea
 	}
 
 	if logFile != nil {
-		fmt.Fprintf(logFile, "\n=============================\n")
-		fmt.Fprintf(logFile, "Exit Code: %d\n", result.ExitCode)
-		fmt.Fprintf(logFile, "Duration: %s\n", result.Duration)
+		_, _ = fmt.Fprintf(logFile, "\n=============================\n")
+		_, _ = fmt.Fprintf(logFile, "Exit Code: %d\n", result.ExitCode)
+		_, _ = fmt.Fprintf(logFile, "Duration: %s\n", result.Duration)
 		if err != nil {
-			fmt.Fprintf(logFile, "Error: %v\n", err)
+			_, _ = fmt.Fprintf(logFile, "Error: %v\n", err)
 		}
-		fmt.Fprintf(logFile, "Completed: %s\n", time.Now().Format(time.RFC3339))
+		_, _ = fmt.Fprintf(logFile, "Completed: %s\n", time.Now().Format(time.RFC3339))
 	}
 
 	return result, err

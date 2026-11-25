@@ -27,7 +27,7 @@ type StepLogger struct {
 func NewStepLogger(t *testing.T) *StepLogger {
 	t.Helper()
 
-	var out io.Writer = io.Discard
+	out := io.Discard
 	if testing.Verbose() {
 		out = os.Stderr
 	}
@@ -96,7 +96,7 @@ func (l *StepLogger) timestamp() string {
 
 // write outputs a formatted message.
 func (l *StepLogger) write(format string, args ...any) {
-	fmt.Fprintf(l.out, format, args...)
+	_, _ = fmt.Fprintf(l.out, format, args...)
 }
 
 // LogBuffer is a test buffer that captures log output.

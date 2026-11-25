@@ -155,7 +155,7 @@ func publishNativeHook(path, script string) error {
 	if err != nil {
 		return err
 	}
-	defer os.Remove(file.Name())
+	defer func() { _ = os.Remove(file.Name()) }() // temporary name only; the hook is a separate link
 	defer file.Close()
 	if _, err := file.WriteString(script); err != nil {
 		return err
@@ -219,7 +219,8 @@ func NativeProtectedBranches(ctx context.Context, repo string) ([]string, error)
 	command := exec.CommandContext(ctx, "git", "-C", repo, "config", "--get-all", "slb.protectedBranch")
 	data, err := command.Output()
 	var exit *exec.ExitError
-	if err != nil && !(errors.As(err, &exit) && exit.ExitCode() == 1) {
+	// Exit status 1 means the key is unset.
+	if err != nil && (!errors.As(err, &exit) || exit.ExitCode() != 1) {
 		return nil, fmt.Errorf("reading protected Git branches: %w", err)
 	}
 	if err := ctx.Err(); err != nil {

@@ -14,7 +14,7 @@ import (
 func TestLogger(t *testing.T) *log.Logger {
 	t.Helper()
 
-	var out io.Writer = io.Discard
+	out := io.Discard
 	if testing.Verbose() {
 		out = os.Stderr
 	}

@@ -68,17 +68,18 @@ func TestIsSafeTier(t *testing.T) {
 
 func TestTypeAliases(t *testing.T) {
 	// Verify type aliases work correctly
-	var tier RiskTier = db.RiskTierCritical
+	// The explicit types are what this test checks.
+	var tier RiskTier = db.RiskTierCritical //nolint:staticcheck // QF1011
 	if tier != RiskTierCritical {
 		t.Errorf("RiskTier alias mismatch")
 	}
 
-	var status RequestStatus = db.StatusPending
+	var status RequestStatus = db.StatusPending //nolint:staticcheck // QF1011
 	if status != StatusPending {
 		t.Errorf("RequestStatus alias mismatch")
 	}
 
-	var decision Decision = db.DecisionApprove
+	var decision Decision = db.DecisionApprove //nolint:staticcheck // QF1011
 	if decision != DecisionApprove {
 		t.Errorf("Decision alias mismatch")
 	}

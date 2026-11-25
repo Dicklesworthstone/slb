@@ -163,7 +163,7 @@ This is useful for Claude Code hooks integration.`,
 		}
 
 		if flagPatternExitCode && result.NeedsApproval {
-			os.Stdout.Sync()
+			_ = os.Stdout.Sync() // best effort: pipes and terminals cannot be synced
 			os.Exit(1)
 		}
 		return nil

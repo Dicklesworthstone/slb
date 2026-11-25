@@ -278,7 +278,7 @@ func TestSchemaFromType_OmitZeroAndExactTagOptions(t *testing.T) {
 	type tagPayload struct {
 		ZeroTime  time.Time `json:"zero_time,omitzero"`
 		ZeroInt   int       `json:"zero_int,omitzero"`
-		NotOmit   string    `json:"not_omit,notomitempty"`
+		NotOmit   string    `json:"not_omit,notomitempty"` //nolint:staticcheck // SA5008: the unknown option is the case under test
 		MultiOpts string    `json:"multi_opts,string,omitempty"`
 	}
 

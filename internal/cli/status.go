@@ -135,9 +135,10 @@ rejection, timeout or escalation). Due policy is processed without a daemon.`,
 
 		// Count approvals and rejections, build review list
 		for _, r := range reviews {
-			if r.Decision == db.DecisionApprove {
+			switch r.Decision {
+			case db.DecisionApprove:
 				view.ApprovalCount++
-			} else if r.Decision == db.DecisionReject {
+			case db.DecisionReject:
 				view.RejectionCount++
 			}
 

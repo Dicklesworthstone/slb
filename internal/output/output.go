@@ -113,11 +113,12 @@ func (w *Writer) Write(data any) error {
 func (w *Writer) printStats(jsonBytes []byte) {
 	jsonSize := len(jsonBytes)
 
+	// Diagnostics only: a failed stderr write must not affect the command.
 	if w.format == FormatTOON {
 		// For TOON mode, show actual savings
 		toonStr, err := EncodeTOON(json.RawMessage(jsonBytes))
 		if err != nil {
-			fmt.Fprintf(w.errOut, "[slb-toon] JSON: %d bytes (TOON encoding failed)\n", jsonSize)
+			_, _ = fmt.Fprintf(w.errOut, "[slb-toon] JSON: %d bytes (TOON encoding failed)\n", jsonSize)
 			return
 		}
 		toonSize := len(toonStr)
@@ -125,16 +126,16 @@ func (w *Writer) printStats(jsonBytes []byte) {
 		if jsonSize > 0 {
 			savings = 100 - (toonSize * 100 / jsonSize)
 		}
-		fmt.Fprintf(w.errOut, "[slb-toon] JSON: %d bytes, TOON: %d bytes (%d%% savings)\n", jsonSize, toonSize, savings)
+		_, _ = fmt.Fprintf(w.errOut, "[slb-toon] JSON: %d bytes, TOON: %d bytes (%d%% savings)\n", jsonSize, toonSize, savings)
 	} else {
 		// For JSON/YAML mode, show potential TOON savings
 		if !TOONAvailable() {
-			fmt.Fprintf(w.errOut, "[slb-toon] JSON: %d bytes (TOON unavailable for comparison)\n", jsonSize)
+			_, _ = fmt.Fprintf(w.errOut, "[slb-toon] JSON: %d bytes (TOON unavailable for comparison)\n", jsonSize)
 			return
 		}
 		toonStr, err := EncodeTOON(json.RawMessage(jsonBytes))
 		if err != nil {
-			fmt.Fprintf(w.errOut, "[slb-toon] JSON: %d bytes (TOON unavailable for comparison)\n", jsonSize)
+			_, _ = fmt.Fprintf(w.errOut, "[slb-toon] JSON: %d bytes (TOON unavailable for comparison)\n", jsonSize)
 			return
 		}
 		toonSize := len(toonStr)
@@ -142,7 +143,7 @@ func (w *Writer) printStats(jsonBytes []byte) {
 		if jsonSize > 0 {
 			savings = 100 - (toonSize * 100 / jsonSize)
 		}
-		fmt.Fprintf(w.errOut, "[slb-toon] JSON: %d bytes, TOON would be: %d bytes (%d%% potential savings)\n", jsonSize, toonSize, savings)
+		_, _ = fmt.Fprintf(w.errOut, "[slb-toon] JSON: %d bytes, TOON would be: %d bytes (%d%% potential savings)\n", jsonSize, toonSize, savings)
 	}
 }
 
@@ -165,7 +166,7 @@ func (w *Writer) Success(msg string) {
 	if w.format == FormatJSON || w.format == FormatYAML || w.format == FormatTOON {
 		_ = w.Write(map[string]any{"status": "success", "message": msg})
 	} else {
-		fmt.Fprintf(w.errOut, "✓ %s\n", msg)
+		_, _ = fmt.Fprintf(w.errOut, "✓ %s\n", msg)
 	}
 }
 
@@ -176,15 +177,16 @@ func (w *Writer) Error(err error) {
 		Message: err.Error(),
 		Details: map[string]any{"code": 1},
 	}
-	if w.format == FormatJSON {
+	switch w.format {
+	case FormatJSON:
 		_ = OutputJSONError(err, 1)
-	} else if w.format == FormatTOON {
+	case FormatTOON:
 		// Use TOON encoding for error output
 		_ = w.Write(payload)
-	} else if w.format == FormatYAML {
+	case FormatYAML:
 		_ = OutputYAML(payload)
-	} else {
-		fmt.Fprintf(w.errOut, "✗ %s\n", err.Error())
+	default:
+		_, _ = fmt.Fprintf(w.errOut, "✗ %s\n", err.Error())
 	}
 }
 

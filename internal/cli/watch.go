@@ -124,7 +124,7 @@ func runWatch(cmd *cobra.Command, args []string) error {
 // runWatchDaemon streams events via daemon IPC subscription.
 func runWatchDaemon(ctx context.Context, out io.Writer, state *watchState) error {
 	ipcClient := daemon.NewProjectIPCClient(state.project)
-	defer ipcClient.Close()
+	defer func() { _ = ipcClient.Close() }()
 
 	events, err := ipcClient.Subscribe(ctx)
 	if err != nil {

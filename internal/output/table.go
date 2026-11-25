@@ -9,10 +9,11 @@ import (
 
 // OutputTable prints a simple tab-aligned table to stderr (human mode).
 func OutputTable(headers []string, rows [][]string) {
+	// tabwriter buffers; write errors surface (and are ignored) at Flush.
 	w := tabwriter.NewWriter(os.Stderr, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, strings.Join(headers, "\t"))
+	_, _ = fmt.Fprintln(w, strings.Join(headers, "\t"))
 	for _, row := range rows {
-		fmt.Fprintln(w, strings.Join(row, "\t"))
+		_, _ = fmt.Fprintln(w, strings.Join(row, "\t"))
 	}
 	_ = w.Flush()
 }

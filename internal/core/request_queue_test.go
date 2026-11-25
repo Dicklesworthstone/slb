@@ -127,10 +127,11 @@ func TestRequestQueueCancellationHasNoPhantomRequest(t *testing.T) {
 			defer cancel()
 			want := context.Canceled
 			var finished queuedRequestResult
-			if name == "pre-cancelled" {
+			switch name {
+			case "pre-cancelled":
 				cancel()
 				finished.result, finished.err = creator.CreateRequestContext(ctx, creatorAdmissionOptions(session))
-			} else if name == "deadline-before-attempt" {
+			case "deadline-before-attempt":
 				// A deadline may expire before any quota is observed. Exercise
 				// that case explicitly instead of assuming a 60ms timer permits
 				// one database attempt on every host.
@@ -138,7 +139,7 @@ func TestRequestQueueCancellationHasNoPhantomRequest(t *testing.T) {
 				defer stop()
 				finished.result, finished.err = creator.CreateRequestContext(deadlineCtx, creatorAdmissionOptions(session))
 				want = context.DeadlineExceeded
-			} else {
+			default:
 				done, resume := pauseQueuedRetry(t, creator, creatorAdmissionOptions(session), ctx)
 				cancel()
 				resume()

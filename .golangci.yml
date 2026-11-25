@@ -28,6 +28,10 @@ linters:
         - (*os.File).Close
         - (*database/sql.Tx).Rollback
         - (*database/sql.DB).Close
+        # slb's handle wraps *sql.DB (above).
+        - (*github.com/Dicklesworthstone/slb/internal/db.DB).Close
+        # Every rows loop checks rows.Err, which reports iteration failures.
+        - (*database/sql.Rows).Close
         - (net.Conn).Close
         - (*net.Conn).SetReadDeadline
         - os.Chmod
@@ -54,6 +58,12 @@ linters:
       - linters:
           - staticcheck
         text: "S1008|S1017|S1030|S1039"
+
+      # Error strings may start with a proper noun.
+      - linters:
+          - staticcheck
+        text: "ST1005"
+        source: '(errors\.New|fmt\.Errorf)\("(Git|Unix|Agent Mail) '
 
       # Ignore deprecated API warnings - these are backwards compatibility concerns
       - linters:

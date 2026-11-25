@@ -323,12 +323,13 @@ func restoreGitUntrackedEntry(ctx context.Context, reader io.Reader, hdr *tar.He
 		if err != nil {
 			return err
 		}
-		defer os.Remove(dir) // Only this call's empty temporary directory.
+		defer func() { _ = os.Remove(dir) }() // Only this call's empty temporary directory.
 		link := filepath.Join(dir, "link")
 		if err := os.Symlink(hdr.Linkname, link); err != nil {
 			return err
 		}
-		defer os.Remove(link) // Owned temporary link, never its destination.
+		// Owned temporary link, never its destination; absent after the rename.
+		defer func() { _ = os.Remove(link) }()
 		return os.Rename(link, target)
 	}
 	if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
@@ -338,7 +339,7 @@ func restoreGitUntrackedEntry(ctx context.Context, reader io.Reader, hdr *tar.He
 	if err != nil {
 		return err
 	}
-	defer os.Remove(file.Name()) // Remove only our incomplete staging file.
+	defer func() { _ = os.Remove(file.Name()) }() // Remove only our incomplete staging file.
 	_, copyErr := io.Copy(file, gitRecoveryReader{ctx, reader})
 	chmodErr := file.Chmod(os.FileMode(hdr.Mode) & os.ModePerm)
 	syncErr := file.Sync()

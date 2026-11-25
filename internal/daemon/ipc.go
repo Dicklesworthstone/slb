@@ -55,10 +55,12 @@ type lockedConn struct {
 func (c *lockedConn) Write(p []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := c.Conn.SetWriteDeadline(time.Now().Add(ipcWriteTimeout)); err != nil {
+	// Address the wrapped connection explicitly, as for Write below: c.mu is
+	// held, so these calls must never route through a lockedConn method.
+	if err := c.Conn.SetWriteDeadline(time.Now().Add(ipcWriteTimeout)); err != nil { //nolint:staticcheck // QF1008
 		return 0, err
 	}
-	defer func() { _ = c.Conn.SetWriteDeadline(time.Time{}) }()
+	defer func() { _ = c.Conn.SetWriteDeadline(time.Time{}) }() //nolint:staticcheck // QF1008
 	n, err := c.Conn.Write(p)
 	if err == nil && n != len(p) {
 		err = io.ErrShortWrite

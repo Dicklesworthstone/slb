@@ -121,10 +121,11 @@ func newGitCheckCmd() *cobra.Command {
 
 func newNativeGitHookCmd(operation string) *cobra.Command {
 	command := &cobra.Command{Use: operation, Short: "Native Git " + operation + " authorization gate", Args: cobra.NoArgs}
-	if operation == "pre-push" {
+	switch operation {
+	case "pre-push":
 		command.Args = cobra.ExactArgs(2)
 		command.Use += " <remote> <location>"
-	} else if operation == "pre-rebase" {
+	case "pre-rebase":
 		command.Args = cobra.RangeArgs(1, 2)
 		command.Use += " <upstream> [branch]"
 	}

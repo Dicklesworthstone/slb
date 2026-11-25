@@ -2,6 +2,7 @@ package harness
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/Dicklesworthstone/slb/internal/db"
@@ -290,7 +291,7 @@ func TestRandomID(t *testing.T) {
 		}
 		// Verify it's valid hex
 		for _, c := range id {
-			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			if !strings.ContainsRune("0123456789abcdef", c) {
 				t.Errorf("randomID(%d): invalid hex char %c", n, c)
 			}
 		}

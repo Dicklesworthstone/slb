@@ -477,10 +477,10 @@ func requestAdmissionFailureSchema() *output.JSONSchema {
 	return output.ObjectSchema(
 		"Structured refusal when request admission is denied before creation.",
 		map[string]*output.JSONSchema{
-			"status":   &output.JSONSchema{Type: "string", Const: "request_failed", Description: "Indicates admission failed before creating a request."},
+			"status":   {Type: "string", Const: "request_failed", Description: "Indicates admission failed before creating a request."},
 			"code":     output.StringSchema("Machine-readable admission failure code (admission_failed, rate_limited, preflight_required, etc.)."),
-			"created":  &output.JSONSchema{Type: "boolean", Const: false, Description: "Always false when admission fails."},
-			"executed": &output.JSONSchema{Type: "boolean", Const: false, Description: "Always false when admission fails."},
+			"created":  {Type: "boolean", Const: false, Description: "Always false when admission fails."},
+			"executed": {Type: "boolean", Const: false, Description: "Always false when admission fails."},
 			"error":    output.StringSchema("Human-readable explanation of why admission failed."),
 			"rate_limit": output.ObjectSchema(
 				"Rate-limit counters when admission failed due to rate limits.",
@@ -695,7 +695,7 @@ func registeredSchemas() []schemaEntry {
 				skipped := output.ObjectSchema(
 					"Response when a command is classified SAFE and skips request creation.",
 					map[string]*output.JSONSchema{
-						"status":  &output.JSONSchema{Type: "string", Const: "skipped", Description: "Indicates request creation was skipped."},
+						"status":  {Type: "string", Const: "skipped", Description: "Indicates request creation was skipped."},
 						"reason":  output.StringSchema("Explanation of why approval was skipped."),
 						"command": output.StringSchema("Command string that was evaluated."),
 						"tier":    output.EnumSchema("Matched risk tier when classification was performed.", riskTierValues...),
@@ -968,7 +968,7 @@ func registeredSchemas() []schemaEntry {
 						"review_id":              output.StringSchema("Unique identifier of the new review record."),
 						"request_id":             output.StringSchema("Identifier of the reviewed request."),
 						"request_status":         output.EnumSchema("Current lifecycle status of the request after review.", requestStatusValues...),
-						"decision":               &output.JSONSchema{Type: "string", Const: "approve", Description: "Recorded decision value."},
+						"decision":               {Type: "string", Const: "approve", Description: "Recorded decision value."},
 						"approvals":              output.IntSchema("Total approval count after this review."),
 						"rejections":             output.IntSchema("Total rejection count after this review."),
 						"request_status_changed": output.BoolSchema("True if this review transitioned the request's status."),
@@ -995,7 +995,7 @@ func registeredSchemas() []schemaEntry {
 						"review_id":              output.StringSchema("Unique identifier of the new review record."),
 						"request_id":             output.StringSchema("Identifier of the reviewed request."),
 						"request_status":         output.EnumSchema("Current lifecycle status of the request after review.", requestStatusValues...),
-						"decision":               &output.JSONSchema{Type: "string", Const: "reject", Description: "Recorded decision value."},
+						"decision":               {Type: "string", Const: "reject", Description: "Recorded decision value."},
 						"reason":                 output.StringSchema("Rejection rationale recorded by the reviewer."),
 						"approvals":              output.IntSchema("Total approval count after this review."),
 						"rejections":             output.IntSchema("Total rejection count after this review."),
@@ -1020,7 +1020,7 @@ func registeredSchemas() []schemaEntry {
 					"Request cancellation receipt.",
 					withPolicy(map[string]*output.JSONSchema{
 						"request_id":    output.StringSchema("Identifier of the cancelled request."),
-						"status":        &output.JSONSchema{Type: "string", Const: "cancelled", Description: "Terminal cancelled status."},
+						"status":        {Type: "string", Const: "cancelled", Description: "Terminal cancelled status."},
 						"cancelled_at":  output.DateTimeSchema("RFC3339 timestamp when cancellation was committed."),
 						"review_notice": output.StringSchema("Approval policy label recorded on the request."),
 					}),
@@ -1109,7 +1109,7 @@ func registeredSchemas() []schemaEntry {
 				yieldPending := output.ObjectSchema(
 					"Pending approval receipt returned when slb run --yield submits a non-SAFE command.",
 					withPolicy(map[string]*output.JSONSchema{
-						"status":        &output.JSONSchema{Type: "string", Const: "pending", Description: "Indicates the request is awaiting approval."},
+						"status":        {Type: "string", Const: "pending", Description: "Indicates the request is awaiting approval."},
 						"request_id":    output.StringSchema("Unique identifier of the created approval request."),
 						"tier":          output.EnumSchema("Assigned risk tier for the command.", riskTierValues...),
 						"min_approvals": output.IntSchema("Minimum number of approvals required."),
@@ -1233,7 +1233,7 @@ func registeredSchemas() []schemaEntry {
 				degraded := output.ObjectSchema(
 					"Transport fallback event emitted when daemon IPC subscription degrades to database polling.",
 					map[string]*output.JSONSchema{
-						"event": &output.JSONSchema{Type: "string", Const: "watch_degraded", Description: "Indicates transition to polling mode."},
+						"event": {Type: "string", Const: "watch_degraded", Description: "Indicates transition to polling mode."},
 						"mode":  output.StringSchema("Active fallback transport mode (polling)."),
 						"error": output.StringSchema("Diagnostic error explaining why daemon IPC ended."),
 					},
@@ -1295,7 +1295,7 @@ func registeredSchemas() []schemaEntry {
 					"Page boundary checkpoint record carrying the resume cursor and backlog flag.",
 					map[string]*output.JSONSchema{
 						"version":      output.IntSchema("Durable journal schema version."),
-						"event":        &output.JSONSchema{Type: "string", Const: "checkpoint", Description: "Checkpoint marker event kind."},
+						"event":        {Type: "string", Const: "checkpoint", Description: "Checkpoint marker event kind."},
 						"project_path": output.StringSchema("Absolute project root path."),
 						"cursor":       output.StringSchema("Opaque resume cursor for subsequent --after queries."),
 						"has_more":     output.BoolSchema("True when additional journal events remain beyond this page."),
@@ -1379,7 +1379,7 @@ func registeredSchemas() []schemaEntry {
 				return output.ObjectSchema(
 					"Refusal payload indicating direct pattern removal is blocked for agents.",
 					map[string]*output.JSONSchema{
-						"error":   &output.JSONSchema{Type: "string", Const: "pattern_removal_blocked", Description: "Machine-readable refusal code."},
+						"error":   {Type: "string", Const: "pattern_removal_blocked", Description: "Machine-readable refusal code."},
 						"message": output.StringSchema("Human-readable guidance directing to TUI or request-removal."),
 					},
 					"error", "message",
@@ -1415,7 +1415,7 @@ func registeredSchemas() []schemaEntry {
 				fileSummary := output.ObjectSchema(
 					"Summary emitted when exporting patterns to a file with --output-file.",
 					map[string]*output.JSONSchema{
-						"status": &output.JSONSchema{Type: "string", Const: "exported", Description: "Export completion status."},
+						"status": {Type: "string", Const: "exported", Description: "Export completion status."},
 						"format": output.StringSchema("Requested export format (json, yaml, claude-hook)."),
 						"file":   output.StringSchema("Destination file path written."),
 						"hash":   output.StringSchema("SHA-256 hash of the exported pattern set."),
@@ -1565,7 +1565,7 @@ func registeredSchemas() []schemaEntry {
 					map[string]*output.JSONSchema{
 						"session_id":          output.StringSchema("Session identifier whose rate limits were reset."),
 						"rate_limit_reset_at": output.DateTimeSchema("RFC3339 timestamp when rate limits were reset."),
-						"status":              &output.JSONSchema{Type: "string", Const: "ok", Description: "Operation status."},
+						"status":              {Type: "string", Const: "ok", Description: "Operation status."},
 					},
 					"session_id", "rate_limit_reset_at", "status",
 				)
@@ -1901,7 +1901,7 @@ func registeredSchemas() []schemaEntry {
 				return output.ObjectSchema(
 					"Generated hook script metadata.",
 					map[string]*output.JSONSchema{
-						"status":          &output.JSONSchema{Type: "string", Const: "generated", Description: "Generation completion status."},
+						"status":          {Type: "string", Const: "generated", Description: "Generation completion status."},
 						"script_path":     output.StringSchema("Path where the hook script was written."),
 						"pattern_hash":    output.StringSchema("SHA-256 hash of embedded classification patterns."),
 						"pattern_count":   output.IntSchema("Total number of embedded patterns."),
@@ -2141,7 +2141,7 @@ func registeredSchemas() []schemaEntry {
 						"request_id":     output.StringSchema("Identifier of the rolled-back request."),
 						"rollback_path":  output.StringSchema("Filesystem path to the rollback capture directory."),
 						"rolled_back_at": output.DateTimeSchema("RFC3339 timestamp when rollback completed."),
-						"status":         &output.JSONSchema{Type: "string", Const: "rolled_back", Description: "Rollback completion status."},
+						"status":         {Type: "string", Const: "rolled_back", Description: "Rollback completion status."},
 						"message":        output.StringSchema("Human-readable rollback summary."),
 					},
 					"request_id", "rollback_path", "rolled_back_at", "status", "message",

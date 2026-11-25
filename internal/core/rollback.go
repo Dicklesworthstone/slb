@@ -1055,7 +1055,7 @@ func walkFilesystemRollbackArchive(ctx context.Context, source io.Reader, roots 
 	if err != nil {
 		return fmt.Errorf("opening gzip: %w", err)
 	}
-	defer gr.Close()
+	defer func() { _ = gr.Close() }() // does not close source; reads are checked below
 	decoded := &filesystemRollbackReader{ctx: ctx, reader: gr, metadataRemaining: &metadataBytes}
 	limited := &io.LimitedReader{R: decoded, N: totalBytes + metadataBytes + 1}
 	tr := tar.NewReader(limited)
