@@ -12,6 +12,34 @@ SLB is a cross-platform CLI that implements a **two-person rule** for running po
 
 ---
 
+## [v0.7.0] -- 2026-11-25
+
+Compare: [`v0.6.2...v0.7.0`](https://github.com/Dicklesworthstone/slb/compare/v0.6.2...v0.7.0)
+
+Minor release: adds JSON Schema (Draft 2020-12) output for every command with structured output, through `slb schema` and a global `--schema` flag; makes `slb daemon logs --follow` cancellable; and fixes two installer problems from [#25](https://github.com/Dicklesworthstone/slb/issues/25): upgrading while `slb` is running, and directories created with a restrictive umask. No Go module changes since v0.6.2.
+
+### Added
+
+- **`slb schema` and `--schema`**: `slb schema` lists every command that has a structured-output schema, `slb schema <command...>` (for example `slb schema daemon status`) prints the JSON Schema for that command's `--json` output, and `slb schema --all` prints all of them as one JSON object. `slb <command> --schema` is a shorthand that prints the command's schema and exits without positional arguments, project discovery or side effects; commands without structured output fail closed. Schemas are generated from the output types (embedded structs and `json` tags), and tests validate real command output against them, including planted negatives ([`a48d75b`](https://github.com/Dicklesworthstone/slb/commit/a48d75b9f69603c895f552459a3e89a858d9cba0)).
+- Schema fidelity and routing fixes on top of that: `slb schema CMD --schema` and `slb schema --all --schema` honor their arguments; an unknown `-o` format fails with `unsupported format: ...` instead of falling back to JSON; embedded-field shadowing and `omitempty`/`omitzero` follow `encoding/json`; nil `[]byte`, `enum` and `const` fields get correct nullable schemas; the schemas of `patterns add/suggest/request-removal/export`, `outcome record/list`, `run`, `request`, `status`, `show`, `git-check`, `audit emergency`, `hook install` and `emergency-execute` now match their real output; and `git-hooks status/install/uninstall` have schemas ([`a54c3e7`](https://github.com/Dicklesworthstone/slb/commit/a54c3e7b86a1449a9acaeb50664e0e1636d7d48f)). `--schema` can no longer leave Cobra's required-flag validation disabled after a panic or a repeated in-process invocation, and `json.RawMessage`, `json.Marshaler` and `encoding.TextMarshaler` fields get correct schemas ([`a4f3ba9`](https://github.com/Dicklesworthstone/slb/commit/a4f3ba9c71a99d955f92a4d682f45375dfcd1873)).
+
+### Fixed
+
+- **`slb daemon logs --follow`** stops cleanly on a signal or cancellation, keeps a partial last line across EOF, and reports write errors instead of dropping them ([`a4f3ba9`](https://github.com/Dicklesworthstone/slb/commit/a4f3ba9c71a99d955f92a4d682f45375dfcd1873)).
+- **Installer upgrades while `slb` is running** ([#25](https://github.com/Dicklesworthstone/slb/issues/25)): `scripts/install.sh` copied the new executable over the old one in place. With a daemon running, macOS killed the rewritten binary at launch (`Killed: 9`) and Linux refused the write (`Text file busy`). The installer now copies the executable to a staged file in `INSTALL_DIR`, sets mode `0755` and renames it over the destination, so running processes keep the old file until they restart and a failure before the rename leaves the existing `slb` untouched. A missing `INSTALL_DIR` is created (through sudo when needed), and a clear error replaces `sudo: command not found` when the directory is not writable and sudo is absent ([`46d816b`](https://github.com/Dicklesworthstone/slb/commit/46d816b892281f4691a49ccd620a119f18afc2f8)).
+- **Installer directory permissions** ([#25](https://github.com/Dicklesworthstone/slb/issues/25)): the installer runs with `umask 022`, so directories it creates are `0755` even under a restrictive umask such as `077`. Before, they were created `0700` (root-owned when made through sudo), so other users, or the installing user after a sudo install, could not run `slb` ([`0c71e59`](https://github.com/Dicklesworthstone/slb/commit/0c71e594727d924eeb69e948dd4c8916f271814f)).
+- `PLAN_TO_MAKE_SLB.md`, which ships in the release archives, pointed at an install URL that returned 404 ([`46d816b`](https://github.com/Dicklesworthstone/slb/commit/46d816b892281f4691a49ccd620a119f18afc2f8)).
+
+The installer is served from `main`, so the two installer fixes have applied to `curl | bash` installs since they landed.
+
+### Build, Lint and Tests
+
+- `golangci-lint run ./...` passes on the whole module (156 findings before), with no behavior change ([`678d30a`](https://github.com/Dicklesworthstone/slb/commit/678d30ad43ce9f62cc249ba000339862b0963333)).
+- Behavioral CLI tests raise `internal/cli` statement coverage from 81.2% to 90.1% ([`a4f3ba9`](https://github.com/Dicklesworthstone/slb/commit/a4f3ba9c71a99d955f92a4d682f45375dfcd1873)).
+- Release binaries are built with Go 1.26.11 (`CGO_ENABLED=0`, `-trimpath`, `govulncheck ./...` clean).
+
+---
+
 ## [v0.6.2] -- 2026-11-23
 
 Compare: [`v0.6.1...v0.6.2`](https://github.com/Dicklesworthstone/slb/compare/v0.6.1...v0.6.2)
