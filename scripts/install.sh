@@ -3,6 +3,10 @@
 # Downloads and installs the latest release of SLB
 
 set -euo pipefail
+# Directories created for INSTALL_DIR (also through sudo, which applies the
+# caller's umask) must be usable by everyone who runs slb. The workspace
+# stays private: mktemp -d and mkdir -m 700 do not depend on the umask.
+umask 022
 
 # Configuration
 REPO="Dicklesworthstone/slb"
@@ -187,7 +191,7 @@ install() {
     # rename gives the new executable its own file; running processes keep
     # the old one until they restart.
     if ! as_installer cp "${SLB_WORK_DIR}/${EXECUTABLE}" "$staged"; then
-        error "Could not copy release executable into ${INSTALL_DIR}"
+        error "Could not copy release executable to $staged"
     fi
     if ! as_installer chmod 0755 "$staged"; then
         error "Could not make the staged executable runnable: $staged"
