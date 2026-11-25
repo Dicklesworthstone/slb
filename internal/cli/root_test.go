@@ -1126,6 +1126,32 @@ func TestExecuteEntryPoint_VersionJSON(t *testing.T) {
 	}
 }
 
+// `slb --version` answers with the first line of `slb version` outside any
+// project, and -v stays the verbose flag.
+func TestRootVersionFlag_PrintsFirstVersionLine(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Cleanup(func() {
+		if f := rootCmd.Flags().Lookup("version"); f != nil {
+			_ = f.Value.Set(f.DefValue)
+			f.Changed = false
+		}
+	})
+
+	out, err := runRootWithArgs(t, "--version")
+	if err != nil {
+		t.Fatalf("slb --version failed: %v", err)
+	}
+	if want := "slb " + version + "\n"; out != want {
+		t.Fatalf("slb --version = %q, want %q", out, want)
+	}
+	if f := rootCmd.Flags().Lookup("version"); f == nil || f.Shorthand != "" {
+		t.Fatalf("--version flag = %+v, want one with no shorthand", f)
+	}
+	if f := rootCmd.PersistentFlags().ShorthandLookup("v"); f == nil || f.Name != "verbose" {
+		t.Fatalf("-v = %+v, want --verbose", f)
+	}
+}
+
 func TestRootQuickRefTUIRunEAndEnterProjectDirError(t *testing.T) {
 	h := testutil.NewHarness(t)
 	t.Chdir(h.ProjectDir)

@@ -10,6 +10,10 @@ SLB is a cross-platform CLI that implements a **two-person rule** for running po
 
 ## [Unreleased]
 
+### Added
+
+- `slb --version` prints `slb <version>`, the first line of `slb version`, without needing a project. Installers and update checks that probe `--version` used to get an error and showed a blank version.
+
 ---
 
 ## [v0.7.0] -- 2026-11-25

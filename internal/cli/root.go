@@ -289,6 +289,12 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&flagSessionID, "session-id", "s", "", "session ID")
 	rootCmd.PersistentFlags().StringVarP(&flagProject, "project", "C", "", "project directory")
 
+	// `slb --version` prints the first line of `slb version`, the form
+	// installers and update checks probe for. Cobra answers it before any
+	// pre-run hook, so it needs no project. -v stays --verbose.
+	rootCmd.Version = version
+	rootCmd.SetVersionTemplate("slb {{.Version}}\n")
+
 	// Add subcommands
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(sessionCmd)
